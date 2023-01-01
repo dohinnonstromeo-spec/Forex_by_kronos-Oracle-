@@ -1,0 +1,14 @@
+{
+  "name": "oracle-forex",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "mongodb": "^6.0.0"
+  }
+}
