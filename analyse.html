@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Analyse IA · Oracle Forex</title>
+  <meta name="description" content="Console Kronos pour analyser jusqu'à 2 screenshots de charts Forex avec Gemini et Groq.">
+  <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
+  <link rel="stylesheet" href="/assets/oracle-extras.css">
+</head>
+<body class="oracle-page">
+  <nav class="oracle-nav">
+    <div class="oracle-nav-inner">
+      <a href="/" class="oracle-brand">
+        <span class="oracle-logo">O</span>
+        <span>ORACLE <span class="text-amber-neon">FOREX</span></span>
+      </a>
+      <div class="oracle-links">
+        <a href="/">Accueil</a>
+        <a href="/#signaux">Signaux</a>
+        <a href="/#news">Intelligence</a>
+        <a href="/#pricing">Abonnement</a>
+        <a href="/legal.html#risques">Risques</a>
+      </div>
+    </div>
+  </nav>
+
+  <main class="oracle-main">
+    <div class="analysis-layout">
+      <section class="analysis-card">
+        <p class="analysis-kicker">Console d'analyse Kronos</p>
+        <h1 class="analysis-title">⚡ Analyse de Chart IA</h1>
+        <p class="analysis-subtitle">Déposez votre screenshot · Analyse généralement en quelques secondes</p>
+
+        <form id="analysisForm">
+          <input id="chartUpload" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+          <div class="drop-zone">
+            <div>
+              <div class="font-display text-3xl text-amber-neon">📎 Glissez vos graphiques</div>
+              <p class="mt-2 text-sm text-muted-foreground">PNG/JPG/WEBP · 2 images max · MT4 / MT5 / TradingView / cTrader</p>
+            </div>
+          </div>
+          <div class="preview-grid"></div>
+
+          <section class="tv-chart-card" aria-label="Graphique TradingView">
+            <div class="signal-top">
+              <div>
+                <p class="analysis-kicker">Chart interface</p>
+                <h2 class="tv-chart-title">TradingView</h2>
+              </div>
+              <span class="oracle-tech">Affichage seulement</span>
+            </div>
+            <iframe
+              id="tradingViewFrame"
+              title="Graphique TradingView"
+              loading="lazy"
+              src="https://s.tradingview.com/widgetembed/?symbol=FX%3AEURUSD&interval=60&theme=dark&style=1&timezone=Africa%2FPorto-Novo&withdateranges=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&studies=%5B%5D"
+            ></iframe>
+            <p class="tv-chart-note">TradingView sert à visualiser le chart. Les signaux restent basés sur les APIs de données et l'analyse IA.</p>
+          </section>
+
+          <div class="analysis-form-grid">
+            <div class="analysis-field">
+              <label for="pair">Paire de devises</label>
+              <select id="pair" name="pair">
+                <optgroup label="Forex majeures">
+                  <option>EUR/USD</option><option>GBP/USD</option><option>USD/JPY</option><option>USD/CHF</option><option>USD/CAD</option><option>AUD/USD</option><option>NZD/USD</option>
+                </optgroup>
+                <optgroup label="Forex mineures">
+                  <option>EUR/GBP</option><option>EUR/JPY</option><option>EUR/CHF</option><option>EUR/CAD</option><option>EUR/AUD</option><option>EUR/NZD</option>
+                  <option>GBP/JPY</option><option>GBP/CHF</option><option>GBP/CAD</option><option>GBP/AUD</option><option>GBP/NZD</option>
+                  <option>AUD/JPY</option><option>AUD/CHF</option><option>AUD/CAD</option><option>AUD/NZD</option>
+                  <option>NZD/JPY</option><option>NZD/CHF</option><option>NZD/CAD</option>
+                  <option>CAD/JPY</option><option>CAD/CHF</option><option>CHF/JPY</option>
+                </optgroup>
+                <optgroup label="Forex exotiques courantes">
+                  <option>USD/MXN</option><option>USD/ZAR</option><option>USD/TRY</option><option>USD/SEK</option><option>USD/NOK</option><option>USD/DKK</option><option>USD/PLN</option><option>USD/HKD</option><option>USD/SGD</option><option>USD/CNH</option>
+                  <option>EUR/TRY</option><option>EUR/SEK</option><option>EUR/NOK</option><option>EUR/DKK</option><option>EUR/PLN</option><option>EUR/ZAR</option><option>GBP/TRY</option><option>GBP/ZAR</option>
+                </optgroup>
+                <optgroup label="Métaux">
+                  <option>XAU/USD</option><option>XAG/USD</option><option>XPT/USD</option><option>XPD/USD</option>
+                  <option>XAU/EUR</option><option>XAG/EUR</option><option>XAU/GBP</option><option>XAU/JPY</option>
+                </optgroup>
+                <optgroup label="Crypto et indices">
+                  <option>BTC/USD</option><option>ETH/USD</option><option>US500</option><option>NAS100</option>
+                </optgroup>
+              </select>
+            </div>
+            <div class="analysis-field">
+              <label for="timeframe">Timeframe</label>
+              <select id="timeframe" name="timeframe">
+                <option>M1</option><option>M5</option><option>M15</option><option>M30</option>
+                <option selected>H1</option><option>H4</option><option>D1</option><option>W1</option>
+              </select>
+            </div>
+            <div class="analysis-field">
+              <label for="style">Style d'analyse</label>
+              <select id="style" name="style">
+                <option selected>Mixte</option><option>Hybride SMC+Chartiste</option><option>ICT</option><option>SMC</option><option>Wyckoff</option>
+                <option>Elliott</option><option>Price Action</option><option>Ichimoku</option>
+              </select>
+            </div>
+            <div class="analysis-field">
+              <label for="risk">Gestion du risque</label>
+              <select id="risk" name="risk">
+                <option>Standard 2%</option><option>Conservateur 1%</option><option>Agressif 3%</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="kronos-engine-badge mt-4" style="justify-content:flex-start;cursor:pointer">
+            <input id="autoDetectChart" name="autoDetect" type="checkbox" style="accent-color:var(--neon-green)">
+            Détection automatique paire/timeframes sur les graphes
+          </label>
+          <div id="chartDetectionPanel" class="market-notice"></div>
+
+          <button class="analysis-submit mt-6" type="submit">⚡ Lancer l'analyse Kronos</button>
+          <div class="kronos-engine-badge"><span class="oracle-chat-dot"></span>Moteur Kronos · En ligne</div>
+        </form>
+
+        <div id="analysisResult" class="analysis-result"></div>
+      </section>
+
+      <aside class="analysis-card">
+        <div class="signal-top">
+          <div>
+            <p class="analysis-kicker">Signaux automatiques</p>
+            <h2 class="analysis-title">📡 Signaux Live Kronos</h2>
+          </div>
+          <span class="oracle-tech signals-age">Statut marché en vérification</span>
+        </div>
+
+        <div class="signal-tabs">
+          <button class="active" type="button" data-filter="Tous">Tous</button>
+          <button type="button" data-filter="Forex">Forex</button>
+          <button type="button" data-filter="Crypto">Crypto</button>
+          <button type="button" data-filter="Indices">Indices</button>
+          <button type="button" data-filter="Commodités">Commodités</button>
+        </div>
+
+        <div class="analysis-signals"></div>
+        <button class="refresh-signals mt-6" type="button">🔄 Actualiser les signaux</button>
+      </aside>
+    </div>
+  </main>
+
+  <footer class="oracle-footer-lite">
+    © 2025 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a>.
+  </footer>
+
+  <script src="/assets/oracle-chatbot.js" defer></script>
+<script src="/assets/site-sanity.js" defer></script>
+  <script src="/assets/analyse-page.js" defer></script>
+</body>
+</html>
