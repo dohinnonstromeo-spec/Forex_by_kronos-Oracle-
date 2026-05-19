@@ -26,6 +26,22 @@
   </nav>
 
   <main class="oracle-main">
+    <section class="analysis-hero">
+      <p class="analysis-kicker">Terminal Kronos</p>
+      <h1 class="analysis-title">Analyse Forex Intelligente</h1>
+      <p class="analysis-subtitle">Vision chart · prix live · styles techniques · stratégies de trading · apprentissage contrôlé</p>
+      <div class="analysis-warning">
+        <span>⚠️</span>
+        <p>Les résultats restent éducatifs. Kronos donne un plan lisible, mais l'utilisateur doit confirmer le contexte de marché avant toute décision réelle.</p>
+      </div>
+      <div class="analysis-stats" aria-label="Forces du moteur Kronos">
+        <div><strong>2</strong><span>graphes max</span></div>
+        <div><strong>6</strong><span>styles IA</span></div>
+        <div><strong>5</strong><span>stratégies</span></div>
+        <div><strong>Live</strong><span>TradingView + APIs</span></div>
+      </div>
+    </section>
+
     <div class="analysis-layout">
       <section class="analysis-card">
         <p class="analysis-kicker">Console d'analyse Kronos</p>
@@ -60,6 +76,17 @@
           </section>
 
           <div class="analysis-form-grid">
+            <div class="analysis-field analysis-field-wide">
+              <label>Paires rapides</label>
+              <div class="quick-pair-grid" data-pair-chips>
+                <button type="button" class="active" data-pair="EUR/USD">EUR/USD</button>
+                <button type="button" data-pair="GBP/USD">GBP/USD</button>
+                <button type="button" data-pair="USD/JPY">USD/JPY</button>
+                <button type="button" data-pair="XAU/USD">XAU/USD</button>
+                <button type="button" data-pair="BTC/USD">BTC/USD</button>
+                <button type="button" data-pair="NAS100">NAS100</button>
+              </div>
+            </div>
             <div class="analysis-field">
               <label for="pair">Paire de devises</label>
               <select id="pair" name="pair">
@@ -86,6 +113,16 @@
                 </optgroup>
               </select>
             </div>
+            <div class="analysis-field analysis-field-wide">
+              <label>Timeframes rapides</label>
+              <div class="timeframe-chip-row" data-timeframe-chips>
+                <button type="button" data-timeframe="M5">M5</button>
+                <button type="button" data-timeframe="M15">M15</button>
+                <button type="button" class="active" data-timeframe="H1">H1</button>
+                <button type="button" data-timeframe="H4">H4</button>
+                <button type="button" data-timeframe="D1">D1</button>
+              </div>
+            </div>
             <div class="analysis-field">
               <label for="timeframe">Timeframe</label>
               <select id="timeframe" name="timeframe">
@@ -98,6 +135,16 @@
               <select id="style" name="style">
                 <option selected>Mixte</option><option>Hybride SMC+Chartiste</option><option>ICT</option><option>SMC</option><option>Wyckoff</option>
                 <option>Elliott</option><option>Price Action</option><option>Ichimoku</option>
+              </select>
+            </div>
+            <div class="analysis-field">
+              <label for="strategy">Stratégie</label>
+              <select id="strategy" name="strategy">
+                <option>Scalping</option>
+                <option selected>Swing Trading</option>
+                <option>Position Trading</option>
+                <option>Breakout</option>
+                <option>Reversal</option>
               </select>
             </div>
             <div class="analysis-field">

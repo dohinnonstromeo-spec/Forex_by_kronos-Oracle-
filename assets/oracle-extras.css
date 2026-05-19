@@ -1,3 +1,34 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@500;600;700;800&display=swap");
+
+:root {
+  --font-display: "Syne", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --background: oklch(13% .03 265);
+  --foreground: oklch(96% .01 240);
+  --card: oklch(18% .04 265);
+  --muted-foreground: oklch(74% .03 245);
+  --amber-neon: oklch(85% .18 210);
+  --neon-orange: oklch(55% .25 295);
+  --neon-green: oklch(82% .22 150);
+  --neon-red: oklch(65% .26 18);
+  --primary-foreground: oklch(11% .02 265);
+  --shadow-card: 0 24px 80px rgba(0, 0, 0, .36);
+  --shadow-glow-amber: 0 0 26px oklch(85% .18 210 / .34);
+  --oracle-panel: rgba(14, 19, 34, .78);
+  --oracle-border: rgba(180, 230, 255, .13);
+  --oracle-gradient: linear-gradient(135deg, oklch(85% .18 210), oklch(55% .25 295));
+}
+
+body {
+  background-color: var(--background);
+  background-image:
+    linear-gradient(rgba(255,255,255,.026) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.026) 1px, transparent 1px),
+    radial-gradient(circle at 18% 8%, oklch(85% .18 210 / .18), transparent 34rem),
+    radial-gradient(circle at 88% 4%, oklch(55% .25 295 / .15), transparent 34rem);
+  background-size: 46px 46px, 46px 46px, auto, auto;
+}
+
 .oracle-chat-toggle {
   position: fixed;
   right: 24px;
@@ -10,10 +41,10 @@
   display: grid;
   place-items: center;
   cursor: pointer;
-  background: #00ff88;
-  color: #04100b;
+  background: var(--oracle-gradient);
+  color: var(--primary-foreground);
   font-size: 28px;
-  box-shadow: 0 0 28px rgba(0, 255, 136, .55), inset 0 -6px 14px rgba(0, 0, 0, .18);
+  box-shadow: 0 0 28px oklch(85% .18 210 / .45), inset 0 -6px 14px rgba(0, 0, 0, .18);
 }
 
 .oracle-chat-ai {
@@ -57,7 +88,7 @@
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, .1);
   border-radius: 16px;
-  background: rgba(5, 5, 5, .94);
+  background: rgba(9, 13, 24, .94);
   box-shadow: 0 24px 70px rgba(0, 0, 0, .65);
   backdrop-filter: blur(18px);
 }
@@ -70,7 +101,7 @@
 
 .oracle-chat-head {
   padding: 18px;
-  background: linear-gradient(135deg, #0036a8, #0060df, #00b4ff);
+  background: linear-gradient(135deg, #061e68, #0060df, #00b4ff);
   color: white;
 }
 
@@ -109,8 +140,8 @@
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: #00ff88;
-  box-shadow: 0 0 14px #00ff88;
+  background: var(--neon-green);
+  box-shadow: 0 0 14px var(--neon-green);
   animation: oracle-badge-pulse 1.3s ease-in-out infinite;
 }
 
@@ -153,8 +184,8 @@
 }
 
 .oracle-msg.user .oracle-bubble {
-  background: rgba(0, 255, 136, .13);
-  border-color: rgba(0, 255, 136, .22);
+  background: oklch(85% .18 210 / .13);
+  border-color: oklch(85% .18 210 / .28);
 }
 
 .oracle-meta {
@@ -165,7 +196,7 @@
 
 .oracle-tech {
   width: fit-content;
-  border: 1px solid rgba(245, 179, 65, .35);
+  border: 1px solid oklch(85% .18 210 / .34);
   border-radius: 999px;
   padding: 3px 8px;
   color: var(--amber-neon);
@@ -224,8 +255,8 @@
 }
 
 .oracle-send-btn {
-  background: #00ff88;
-  color: #03120a;
+  background: var(--oracle-gradient);
+  color: var(--primary-foreground);
   font-weight: 800;
 }
 
@@ -241,7 +272,7 @@
 
 .oracle-page {
   min-height: 100vh;
-  background: var(--background);
+  background: transparent;
   color: var(--foreground);
 }
 
@@ -249,8 +280,8 @@
   position: fixed;
   inset: 0 0 auto;
   z-index: 50;
-  background: rgba(5, 5, 5, .78);
-  border-bottom: 1px solid rgba(255, 255, 255, .08);
+  background: rgba(8, 12, 24, .76);
+  border-bottom: 1px solid var(--oracle-border);
   backdrop-filter: blur(14px);
 }
 
@@ -278,8 +309,8 @@
   height: 32px;
   display: grid;
   place-items: center;
-  border-radius: 4px;
-  background: var(--amber-neon);
+  border-radius: 9px;
+  background: var(--oracle-gradient);
   color: var(--primary-foreground);
   box-shadow: var(--shadow-glow-amber);
 }
@@ -303,15 +334,82 @@
   padding: 124px 24px 72px;
 }
 
+.analysis-hero {
+  margin-bottom: 24px;
+  border: 1px solid var(--oracle-border);
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(255,255,255,.07), rgba(255,255,255,.025));
+  box-shadow: var(--shadow-card);
+  padding: 26px;
+  overflow: hidden;
+  position: relative;
+}
+
+.analysis-hero::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0;
+  height: 2px;
+  background: var(--oracle-gradient);
+  opacity: .85;
+}
+
+.analysis-warning {
+  margin-top: 18px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid rgba(255, 205, 80, .2);
+  border-radius: 12px;
+  background: rgba(255, 205, 80, .07);
+  color: var(--muted-foreground);
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.analysis-stats {
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.analysis-stats div {
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 12px;
+  background: rgba(0,0,0,.22);
+  padding: 12px;
+}
+
+.analysis-stats strong,
+.analysis-stats span {
+  display: block;
+}
+
+.analysis-stats strong {
+  font-family: var(--font-display);
+  font-size: 24px;
+  color: var(--amber-neon);
+}
+
+.analysis-stats span {
+  margin-top: 2px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
 .analysis-layout {
   display: grid;
   gap: 24px;
 }
 
 .analysis-card {
-  border: 1px solid rgba(255, 255, 255, .08);
+  border: 1px solid var(--oracle-border);
   border-radius: 16px;
-  background: linear-gradient(rgba(255,255,255,.06), rgba(255,255,255,.03));
+  background: linear-gradient(145deg, var(--oracle-panel), rgba(9, 13, 24, .66));
   box-shadow: var(--shadow-card);
   backdrop-filter: blur(14px);
   padding: 24px;
@@ -341,7 +439,7 @@
 .drop-zone {
   margin-top: 24px;
   min-height: 220px;
-  border: 1px dashed rgba(245, 179, 65, .45);
+  border: 1px dashed oklch(85% .18 210 / .45);
   border-radius: 14px;
   display: grid;
   place-items: center;
@@ -352,8 +450,8 @@
 }
 
 .drop-zone.dragover {
-  border-color: #00ff88;
-  box-shadow: 0 0 24px rgba(0, 255, 136, .18);
+  border-color: var(--neon-green);
+  box-shadow: 0 0 24px oklch(82% .22 150 / .18);
 }
 
 .preview-grid {
@@ -428,6 +526,10 @@
   gap: 12px;
 }
 
+.analysis-field-wide {
+  grid-column: 1 / -1;
+}
+
 .analysis-field label {
   display: block;
   margin-bottom: 6px;
@@ -446,6 +548,34 @@
   padding: 12px;
 }
 
+.quick-pair-grid,
+.timeframe-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.quick-pair-grid button,
+.timeframe-chip-row button {
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 999px;
+  background: rgba(255,255,255,.05);
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 8px 11px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  transition: border-color .18s ease, color .18s ease, background .18s ease;
+}
+
+.quick-pair-grid button.active,
+.timeframe-chip-row button.active {
+  border-color: oklch(85% .18 210 / .55);
+  background: oklch(85% .18 210 / .11);
+  color: var(--amber-neon);
+  box-shadow: 0 0 18px oklch(85% .18 210 / .12);
+}
+
 .analysis-submit,
 .refresh-signals,
 .new-analysis {
@@ -453,11 +583,11 @@
   border: 0;
   border-radius: 10px;
   cursor: pointer;
-  background: #00ff88;
-  color: #03120a;
+  background: var(--oracle-gradient);
+  color: var(--primary-foreground);
   padding: 14px 16px;
   font-weight: 900;
-  box-shadow: 0 0 22px rgba(0, 255, 136, .22);
+  box-shadow: 0 0 22px oklch(85% .18 210 / .22);
 }
 
 .kronos-engine-badge {
@@ -474,9 +604,9 @@
 
 .market-notice {
   margin-top: 18px;
-  border: 1px solid rgba(245, 179, 65, .25);
+  border: 1px solid oklch(85% .18 210 / .25);
   border-radius: 12px;
-  background: rgba(245, 179, 65, .07);
+  background: oklch(85% .18 210 / .07);
   color: var(--muted-foreground);
   padding: 11px 12px;
   display: flex;
@@ -664,7 +794,7 @@
 }
 
 .signal-tabs button.active {
-  border-color: rgba(245, 179, 65, .45);
+  border-color: oklch(85% .18 210 / .45);
   color: var(--amber-neon);
 }
 
@@ -784,8 +914,8 @@
   width: 100%;
   justify-content: center;
   border-radius: 10px;
-  background: #00ff88;
-  color: #03120a;
+  background: var(--oracle-gradient);
+  color: var(--primary-foreground);
   padding: 12px 14px;
   font-weight: 900;
 }
@@ -798,9 +928,9 @@
 
 .payment-note {
   margin-top: 20px;
-  border: 1px solid rgba(245, 179, 65, .25);
+  border: 1px solid oklch(85% .18 210 / .25);
   border-radius: 14px;
-  background: rgba(245, 179, 65, .07);
+  background: oklch(85% .18 210 / .07);
   color: var(--muted-foreground);
   padding: 14px 16px;
   font-size: 13px;
@@ -818,6 +948,10 @@
 }
 
 @media (min-width: 900px) {
+  .analysis-stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
   .analysis-layout {
     grid-template-columns: 1.08fr .92fr;
     align-items: start;

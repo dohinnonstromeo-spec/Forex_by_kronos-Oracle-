@@ -9,6 +9,8 @@
     setupUpload();
     setupAnalyzeForm();
     setupTradingView();
+    setupQuickPairControls();
+    setupTimeframeControls();
     setupTabs();
     document.querySelector("#autoDetectChart")?.addEventListener("change", () => {
       detectedContext = null;
@@ -92,6 +94,42 @@
     pair?.addEventListener("change", update);
     timeframe?.addEventListener("change", update);
     update();
+  }
+
+  function setupQuickPairControls() {
+    const select = document.querySelector("#pair");
+    const chips = [...document.querySelectorAll("[data-pair-chips] button")];
+    if (!select || !chips.length) return;
+    const sync = () => {
+      const current = select.value.toUpperCase();
+      chips.forEach((chip) => chip.classList.toggle("active", chip.dataset.pair?.toUpperCase() === current));
+    };
+    chips.forEach((chip) => {
+      chip.addEventListener("click", () => {
+        setSelectValue("pair", chip.dataset.pair);
+        sync();
+      });
+    });
+    select.addEventListener("change", sync);
+    sync();
+  }
+
+  function setupTimeframeControls() {
+    const select = document.querySelector("#timeframe");
+    const chips = [...document.querySelectorAll("[data-timeframe-chips] button")];
+    if (!select || !chips.length) return;
+    const sync = () => {
+      const current = select.value.toUpperCase();
+      chips.forEach((chip) => chip.classList.toggle("active", chip.dataset.timeframe?.toUpperCase() === current));
+    };
+    chips.forEach((chip) => {
+      chip.addEventListener("click", () => {
+        setSelectValue("timeframe", chip.dataset.timeframe);
+        sync();
+      });
+    });
+    select.addEventListener("change", sync);
+    sync();
   }
 
   function updateTradingViewFrame(pair, timeframe) {
@@ -405,6 +443,7 @@
     return `<div class="mt-3 text-[10px] uppercase tracking-widest text-muted-foreground">
       ${quality ? `<div>Image: ${quality.score}% · ${escapeHtml(quality.reason || "")}</div>` : ""}
       ${live ? `<div>Prix live vérifié: ${escapeHtml(live)}</div>` : ""}
+      ${meta.strategy ? `<div>Stratégie: ${escapeHtml(meta.strategy)}</div>` : ""}
       ${chartContext?.primaryPair || chartContext?.executionTimeframe ? `<div>Contexte chart: ${escapeHtml(chartContext.primaryPair || "paire manuelle")} · ${escapeHtml(chartContext.executionTimeframe || "timeframe manuel")}</div>` : ""}
       ${meta.styleComparison ? `<div>Style retenu: ${escapeHtml(meta.styleComparison.bestStyle || result.technique || "n/a")} · efficacité ${Number(meta.styleComparison.bestScore || result.score || 0)}%</div>` : ""}
       ${meta.assistedLevels ? `<div>Plan: ${escapeHtml(meta.assistedLevels)}</div>` : ""}

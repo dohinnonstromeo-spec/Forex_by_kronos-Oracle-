@@ -74,6 +74,13 @@ TECHNIQUES D'ANALYSE — choisis automatiquement la plus adaptée :
 6. SMC → BOS, CHOCH, MSB, liquidité
 7. Mixte → compare toutes les techniques et retiens la plus efficace
 
+STRATÉGIES — adapte l'analyse au mode choisi :
+1. Scalping → M1 à M15, réaction rapide, SL serré, objectifs courts
+2. Swing Trading → H1 à D1, structure principale, TP plus larges
+3. Position Trading → D1 à W1, tendance de fond, niveaux majeurs
+4. Breakout → cassure, clôture, retest et risque de fausse cassure
+5. Reversal → retournement confirmé par rejet, divergence ou CHOCH
+
 FORMAT OBLIGATOIRE :
 📐 TECHNIQUE UTILISÉE : [nom + raison]
 📊 ANALYSE :
@@ -325,6 +332,7 @@ CONTEXTE:
 - Timeframes détectés: ${(chartContext.timeframes || []).join(", ") || "non détectés"}
 - Timeframe final d'exécution: ${selectedTimeframe}
 - Style demandé: ${body.style || "Mixte"}
+- Stratégie demandée: ${body.strategy || "Swing Trading"}
 - Gestion du risque: ${body.risk || "Standard 2%"}
 - Prix live validé: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
 - Qualité image estimée: ${images.length ? `${imageQuality.score}/100 (${imageQuality.reason})` : "aucun graphe uploadé: analyse texte/prix live"}
@@ -337,6 +345,7 @@ Si un ou plusieurs graphes sont fournis, distingue ce qui est réellement visibl
 Si le style demandé est "Mixte", compare ICT, SMC, Wyckoff, Elliott, Price Action et Ichimoku, puis retiens uniquement le style avec la meilleure efficacité visible.
 Si le style demandé n'est pas "Mixte" et que sa structure n'est pas clairement visible, baisse le score d'efficacité mais ne bloque pas si les niveaux sont cohérents.
 Tu dois citer les éléments techniques visibles qui justifient le style retenu.
+Adapte les niveaux à la stratégie demandée: Scalping = SL/TP courts et confirmation rapide; Swing Trading = structure H1/H4/D1; Position Trading = niveaux majeurs; Breakout = attendre clôture/retest; Reversal = confirmer rejet/CHOCH/divergence avant entrée.
 Si la détection automatique est désactivée, utilise la paire et le timeframe du formulaire comme contexte confirmé.
 Refuse seulement si aucune analyse raisonnable ne peut être estimée. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
@@ -350,6 +359,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         pair: selectedPair,
         timeframe: selectedTimeframe,
         style: body.style || "Mixte",
+        strategy: body.strategy || "Swing Trading",
         livePrice,
       });
     }
@@ -1445,7 +1455,7 @@ TECHNIQUE_UTILISEE:Price Action`;
   return { answer: text, score: extractScore(text, seed), technique: extractTechnique(text) };
 }
 
-function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", livePrice }) {
+function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice }) {
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;
@@ -1460,10 +1470,11 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
     pair,
   });
   const technique = style === "Mixte" ? "Price Action" : style;
+  const strategyLine = strategyGuide(strategy, timeframe);
   return `📐 TECHNIQUE UTILISÉE : ${technique} + prix live, car la vision IA n'a pas fourni un setup complet.
 📊 ANALYSE :
 - Tendance : ${direction === "ACHAT" ? "Haussière" : "Baissière"}
-- Signal détecté : Setup prudent basé sur support/résistance, retest et prix live ${timeframe}
+- Signal détecté : ${strategyLine}
 - Zone d'entrée : ${formatLevel(levels.entry)}
 - Stop Loss : ${formatLevel(levels.sl)}
 - Take Profit 1 : ${formatLevel(levels.tp)}
@@ -1473,6 +1484,15 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
 SCORE_CONFIANCE:58
 TECHNIQUE_UTILISEE:${technique}
 STYLE_EFFICACITE:${technique}=58`;
+}
+
+function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
+  const clean = String(strategy || "Swing Trading").toLowerCase();
+  if (clean.includes("scalping")) return `Scalping ${timeframe}: réaction courte sur support/résistance, attendre impulsion et retest`;
+  if (clean.includes("position")) return `Position Trading ${timeframe}: tendance de fond, privilégier niveaux majeurs et patience`;
+  if (clean.includes("breakout")) return `Breakout ${timeframe}: cassure à confirmer par clôture/retest avant entrée`;
+  if (clean.includes("reversal")) return `Reversal ${timeframe}: retournement seulement après rejet clair ou CHOCH`;
+  return `Swing Trading ${timeframe}: setup prudent basé sur structure, support/résistance et prix live`;
 }
 
 function normalizeAnalysis(answer, body = {}, context = {}) {
@@ -1489,6 +1509,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     pair: body.pair || "EUR/USD",
     timeframe: body.timeframe || "H1",
     style: body.style || "Mixte",
+    strategy: body.strategy || "Swing Trading",
     risk: body.risk || "Standard 2%",
     livePrice: Number.isFinite(live) ? live : null,
     imageQuality,
@@ -2035,6 +2056,7 @@ async function recordLearningAnalysis(result, body, context) {
     pair: body.pair || "EUR/USD",
     timeframe: body.timeframe || "H1",
     style: body.style || "Hybride SMC+Chartiste",
+    strategy: body.strategy || "Swing Trading",
     risk: body.risk || "Standard 2%",
     direction: result.direction,
     entry,
@@ -2082,6 +2104,7 @@ async function updateLearningOutcomes(prices = null) {
         pair: analysis.pair,
         timeframe: analysis.timeframe,
         style: analysis.style,
+        strategy: analysis.strategy || "Swing Trading",
         score: analysis.score,
         result: finalOutcome.result,
         status: finalOutcome.status,
@@ -2107,9 +2130,11 @@ function calibrationFor(log, body = {}) {
   const pair = body.pair || "EUR/USD";
   const timeframe = body.timeframe || "H1";
   const style = body.style || "Mixte";
+  const strategy = body.strategy || "Swing Trading";
   const buckets = [
-    (item) => item.style === style && item.pair === pair && item.timeframe === timeframe,
+    (item) => item.style === style && (item.strategy || "Swing Trading") === strategy && item.pair === pair && item.timeframe === timeframe,
     (item) => item.style === style && item.pair === pair,
+    (item) => item.style === style && (item.strategy || "Swing Trading") === strategy,
     (item) => item.style === style,
   ];
   for (const matches of buckets) {
@@ -2140,6 +2165,15 @@ function learningSummary(log) {
       winRate: items.length ? Math.round((styleWins / items.length) * 100) : null,
     }];
   }));
+  const strategies = ["Scalping", "Swing Trading", "Position Trading", "Breakout", "Reversal"];
+  const byStrategy = Object.fromEntries(strategies.map((strategy) => {
+    const items = closed.filter((item) => (item.strategy || "Swing Trading") === strategy);
+    const strategyWins = items.filter((item) => item.result === "win").length;
+    return [strategy, {
+      samples: items.length,
+      winRate: items.length ? Math.round((strategyWins / items.length) * 100) : null,
+    }];
+  }));
   return {
     updatedAt: log.updatedAt,
     totalAnalyses: log.analyses.length,
@@ -2148,6 +2182,7 @@ function learningSummary(log) {
     closedAnalyses: closed.length,
     globalWinRate: closed.length ? Math.round((wins / closed.length) * 100) : null,
     byStyle,
+    byStrategy,
     note: "Apprentissage contrôlé: Kronos calibre ses scores avec les résultats, sans modifier le code automatiquement.",
   };
 }
