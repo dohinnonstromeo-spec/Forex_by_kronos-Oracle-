@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createReadStream, existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { MongoClient } from "mongodb";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
@@ -10,6 +11,11 @@ const port = Number(env.PORT || 4174);
 const dataDir = join(root, "data");
 const learningPath = join(dataDir, "learning-log.json");
 const marketCachePath = join(dataDir, "market-cache.json");
+const mongoUri = env.MONGODB_URI || env.MONGO_URI || "";
+const mongoDbName = env.MONGODB_DB || env.MONGO_DB || inferMongoDbName(mongoUri) || "oracle_forex";
+let mongoClientPromise = null;
+let mongoUnavailable = false;
+let mongoLastError = null;
 const providerHealth = new Map();
 const memoryCache = {
   prices: { value: null, expiresAt: 0 },
@@ -123,6 +129,7 @@ async function handleApi(req, res, url) {
       twelveData: Boolean(env.TWELVE_DATA_API_KEY || env.TWELVEDATA_API_KEY),
       polygon: Boolean(env.POLYGON_API_KEY || env.POLYGON_KEY),
       alphaVantage: Boolean(env.ALPHA_VANTAGE_API_KEY),
+      mongoDb: Boolean(mongoUri),
       stooqFallback: true,
       dukascopyHistorical: true,
       coinbaseFallback: true,
@@ -139,6 +146,7 @@ async function handleApi(req, res, url) {
     sendJson(res, 200, {
       market: marketStatus(),
       providers: providerHealthSnapshot(),
+      database: await databaseSummary(),
       cache: await marketCacheSummary(),
       learning: learningSummary(learning),
       recommendations: healthRecommendations(),
@@ -1775,6 +1783,15 @@ function projectTp2(direction, entry, sl, tp1) {
 }
 
 async function loadMarketCache() {
+  const fromMongo = await loadStateDocument("market-cache");
+  if (fromMongo) {
+    return {
+      version: 1,
+      prices: fromMongo.prices && typeof fromMongo.prices === "object" ? fromMongo.prices : {},
+      histories: fromMongo.histories && typeof fromMongo.histories === "object" ? fromMongo.histories : {},
+      updatedAt: fromMongo.updatedAt || null,
+    };
+  }
   try {
     const raw = await readFile(marketCachePath, "utf8");
     const parsed = JSON.parse(raw);
@@ -1790,7 +1807,6 @@ async function loadMarketCache() {
 }
 
 async function saveMarketCache(cache) {
-  await mkdir(dataDir, { recursive: true });
   const trimmed = {
     version: 1,
     prices: cache.prices || {},
@@ -1801,6 +1817,8 @@ async function saveMarketCache(cache) {
     }])),
     updatedAt: new Date().toISOString(),
   };
+  if (await saveStateDocument("market-cache", trimmed)) return trimmed;
+  await mkdir(dataDir, { recursive: true });
   await writeFile(marketCachePath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
   return trimmed;
 }
@@ -1880,8 +1898,71 @@ function providerHealthSnapshot() {
   }]));
 }
 
+async function mongoDb() {
+  if (!mongoUri || mongoUnavailable) return null;
+  try {
+    if (!mongoClientPromise) {
+      const client = new MongoClient(mongoUri, {
+        serverSelectionTimeoutMS: 3500,
+        connectTimeoutMS: 3500,
+      });
+      mongoClientPromise = client.connect();
+    }
+    const client = await mongoClientPromise;
+    mongoLastError = null;
+    recordProviderHealth("mongodb", true);
+    return client.db(mongoDbName);
+  } catch (error) {
+    mongoUnavailable = true;
+    mongoClientPromise = null;
+    mongoLastError = sanitizeError(error.message);
+    recordProviderHealth("mongodb", false, mongoLastError);
+    console.warn(`MongoDB indisponible, fallback fichier local: ${mongoLastError}`);
+    return null;
+  }
+}
+
+async function stateCollection() {
+  const db = await mongoDb();
+  return db ? db.collection("app_state") : null;
+}
+
+async function loadStateDocument(id) {
+  const collection = await stateCollection();
+  if (!collection) return null;
+  try {
+    const doc = await collection.findOne({ _id: id });
+    return doc?.payload || null;
+  } catch (error) {
+    mongoUnavailable = true;
+    mongoLastError = sanitizeError(error.message);
+    recordProviderHealth("mongodb", false, mongoLastError);
+    return null;
+  }
+}
+
+async function saveStateDocument(id, payload) {
+  const collection = await stateCollection();
+  if (!collection) return false;
+  try {
+    await collection.updateOne(
+      { _id: id },
+      { $set: { payload, updatedAt: new Date() } },
+      { upsert: true },
+    );
+    return true;
+  } catch (error) {
+    mongoUnavailable = true;
+    mongoLastError = sanitizeError(error.message);
+    recordProviderHealth("mongodb", false, mongoLastError);
+    return false;
+  }
+}
+
 function healthRecommendations() {
   const tips = [];
+  if (!mongoUri) tips.push("Ajouter MONGODB_URI dans secret.dev pour persister caches, analyses et résultats sur MongoDB.");
+  if (mongoLastError) tips.push(`MongoDB indisponible: ${mongoLastError}. Le serveur utilise le fallback fichier local.`);
   if (!env.ALPHA_VANTAGE_API_KEY) tips.push("Ajouter ALPHA_VANTAGE_API_KEY dans secret.dev pour un fallback prix Forex/Crypto.");
   tips.push("Fallbacks sans clé actifs: Coinbase pour BTC/ETH spot, Frankfurter pour Forex fiat indicatif journalier.");
   if (!env.TWELVE_DATA_API_KEY && !env.TWELVEDATA_API_KEY) tips.push("Ajouter TWELVE_DATA_API_KEY: source principale prix + historiques.");
@@ -1890,7 +1971,30 @@ function healthRecommendations() {
   return tips;
 }
 
+async function databaseSummary() {
+  if (!mongoUri) {
+    return { configured: false, connected: false, storage: "file", dbName: null, lastError: null };
+  }
+  const db = await mongoDb();
+  return {
+    configured: true,
+    connected: Boolean(db),
+    storage: db ? "mongodb" : "file_fallback",
+    dbName: mongoDbName,
+    lastError: mongoLastError,
+  };
+}
+
 async function loadLearningLog() {
+  const fromMongo = await loadStateDocument("learning-log");
+  if (fromMongo) {
+    return {
+      version: 1,
+      analyses: Array.isArray(fromMongo.analyses) ? fromMongo.analyses : [],
+      outcomes: Array.isArray(fromMongo.outcomes) ? fromMongo.outcomes : [],
+      updatedAt: fromMongo.updatedAt || null,
+    };
+  }
   try {
     const raw = await readFile(learningPath, "utf8");
     const parsed = JSON.parse(raw);
@@ -1906,13 +2010,14 @@ async function loadLearningLog() {
 }
 
 async function saveLearningLog(log) {
-  await mkdir(dataDir, { recursive: true });
   const trimmed = {
     version: 1,
     analyses: log.analyses.slice(-600),
     outcomes: log.outcomes.slice(-1000),
     updatedAt: new Date().toISOString(),
   };
+  if (await saveStateDocument("learning-log", trimmed)) return trimmed;
+  await mkdir(dataDir, { recursive: true });
   await writeFile(learningPath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
   return trimmed;
 }
@@ -2102,6 +2207,12 @@ function cleanLine(text) {
   return String(text || "").replace(/^["'`]+|["'`]+$/g, "").replace(/\s+/g, " ").trim();
 }
 
+function sanitizeError(message) {
+  return String(message || "")
+    .replace(/mongodb(?:\+srv)?:\/\/[^"'\s]+/gi, "mongodb://<redacted>")
+    .replace(/(Bearer|key|token|password|pwd)\s+[^"'\s]+/gi, "$1 <redacted>");
+}
+
 async function loadEnv(path) {
   if (!existsSync(path)) return {};
   const raw = await readFile(path, "utf8");
@@ -2109,11 +2220,26 @@ async function loadEnv(path) {
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
+    if (/^mongodb(?:\+srv)?:\/\//i.test(trimmed) && !out.MONGODB_URI) {
+      out.MONGODB_URI = trimmed;
+      continue;
+    }
     const match = trimmed.match(/^([\w.-]+)\s*=\s*(.*)$/);
     if (!match) continue;
     out[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
   }
   return out;
+}
+
+function inferMongoDbName(uri) {
+  if (!uri) return null;
+  try {
+    const url = new URL(uri);
+    const db = url.pathname.replace(/^\//, "").trim();
+    return db || null;
+  } catch {
+    return null;
+  }
 }
 
 async function serveStatic(res, pathname) {
