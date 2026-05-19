@@ -4,7 +4,10 @@
 
   document.addEventListener("DOMContentLoaded", () => {
     document.querySelectorAll('a[href="/analyse"], a[href="/analyse/"]').forEach((link) => {
-      link.setAttribute("href", "/analyse.html");
+      link.setAttribute("href", "/tester-gratuitement");
+    });
+    document.querySelectorAll('a[href="/analyse.html"]').forEach((link) => {
+      if (/Analyse IA|Tester gratuitement/i.test(link.textContent || "")) link.setAttribute("href", "/tester-gratuitement");
     });
     mountChatbot();
     updateStatus();
@@ -13,15 +16,15 @@
   function mountChatbot() {
     if (document.querySelector(".oracle-chat-toggle")) return;
     document.body.insertAdjacentHTML("beforeend", `
-      <div class="oracle-chat-online">API ACTIVE</div>
-      <button class="oracle-chat-toggle" type="button" aria-label="Ouvrir ChatBot"><span class="oracle-chat-ai">AI</span></button>
+      <div class="oracle-chat-online" aria-hidden="true"></div>
+      <button class="oracle-chat-toggle" type="button" aria-label="Ouvrir ChatBot"><span class="oracle-chat-ai">CB</span></button>
       <section class="oracle-chat-panel" aria-label="ChatBot Oracle Forex">
         <header class="oracle-chat-head">
           <div class="oracle-chat-head-row">
             <div>
-              <div class="oracle-chat-title">ChatBot Oracle</div>
+              <div class="oracle-chat-title">ChatBot Kronos</div>
               <div class="oracle-chat-subtitle">Groq texte · Gemini vision · Auto-technique · 2 graphiques max</div>
-              <div class="oracle-chat-status"><span class="oracle-chat-dot"></span><span data-chat-status>API active</span></div>
+              <div class="oracle-chat-status"><span class="oracle-chat-dot"></span><span data-chat-status>En ligne</span></div>
             </div>
             <button class="oracle-chat-close" type="button" aria-label="Fermer">✕</button>
           </div>
@@ -65,7 +68,16 @@
         messages: messages.slice(-8),
       });
       pending.remove();
-      addMessage("assistant", response?.answer || "Analyse indisponible pour le moment.", response);
+      if (!response?.ok && response?.offline) {
+        setChatOnline(false);
+        addMessage("assistant", response.answer || "ChatBot hors service pour l'instant. Réessaie dans quelques minutes.", { score: 0, technique: "Hors service" });
+      } else if (!response?.answer) {
+        setChatOnline(false);
+        addMessage("assistant", "ChatBot hors service pour l'instant. Le moteur IA n'a pas répondu.", { score: 0, technique: "Hors service" });
+      } else {
+        setChatOnline(true);
+        addMessage("assistant", response.answer, response);
+      }
       files = [];
       fileInput.value = "";
       renderPreviews();
@@ -78,14 +90,28 @@
   }
 
   async function updateStatus() {
+    const health = await getJson("/api/health");
+    const groqOk = health?.providers?.groq?.status === "ok";
+    const geminiOk = health?.providers?.gemini_vision?.status === "ok" || health?.providers?.gemini_text?.status === "ok";
+    const knownDown = health?.providers?.groq?.status === "down" && health?.providers?.gemini_text?.status === "down" && health?.providers?.gemini_vision?.status === "down";
     const config = await getJson("/api/config");
+    setChatOnline(Boolean(!knownDown && (groqOk || geminiOk || config?.groq || config?.gemini)));
+  }
+
+  function setChatOnline(ready) {
     const online = document.querySelector(".oracle-chat-online");
+    const toggle = document.querySelector(".oracle-chat-toggle");
     const status = document.querySelector("[data-chat-status]");
     const dot = document.querySelector(".oracle-chat-status .oracle-chat-dot");
-    const ready = Boolean(config?.groq && config?.gemini);
-    if (online) online.textContent = ready ? "API ACTIVE" : "MODE LIMITÉ";
-    if (status) status.textContent = ready ? "APIs IA actives" : "Mode limité";
-    if (dot) dot.classList.toggle("closed", !ready);
+    online?.classList.toggle("offline", !ready);
+    toggle?.classList.toggle("offline", !ready);
+    dot?.classList.toggle("closed", !ready);
+    if (status) status.textContent = ready ? "En ligne" : "Hors service";
+    const list = document.querySelector(".oracle-chat-messages");
+    if (!ready && list && !list.querySelector("[data-offline-notice]")) {
+      const node = addMessage("assistant", "ChatBot hors service pour l'instant. Les réponses IA reprendront dès que le moteur sera disponible.", { score: 0, technique: "Hors service" });
+      node.dataset.offlineNotice = "true";
+    }
   }
 
   function addMessage(role, text, meta) {

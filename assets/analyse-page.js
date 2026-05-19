@@ -373,15 +373,24 @@
     const buy = result.direction === "ACHAT";
     container.classList.add("show");
     container.innerHTML = `
-      <div class="analysis-card">
-        <div class="direction-label ${buy ? "buy" : "sell"}">${result.direction} ${buy ? "🟢" : "🔴"}</div>
-        <div class="levels-table">
-          <div><span>Entrée</span><strong>${result.entry}</strong></div>
-          <div><span>Stop Loss</span><strong>${result.sl}</strong></div>
-          <div><span>TP1</span><strong>${result.tp1}</strong></div>
-          <div><span>TP2</span><strong>${result.tp2}</strong></div>
-          <div><span>R/R ratio</span><strong>${result.rr}</strong></div>
-          <div><span>Technique</span><strong>${result.technique}</strong></div>
+      <div class="analysis-card result-console">
+        <div class="result-head">
+          <div>
+            <p class="analysis-kicker">Conclusion Kronos</p>
+            <div class="direction-label ${buy ? "buy" : "sell"}">${result.direction} ${buy ? "🟢" : "🔴"}</div>
+          </div>
+          <div class="result-confidence">
+            <strong>${result.score}%</strong>
+            <span>Score d'efficacité</span>
+          </div>
+        </div>
+        <div class="levels-table result-level-grid">
+          <div class="level-card entry"><span>Entrée</span><strong>${result.entry}</strong></div>
+          <div class="level-card sl"><span>Stop Loss</span><strong>${result.sl}</strong></div>
+          <div class="level-card tp"><span>Take Profit 1</span><strong>${result.tp1}</strong></div>
+          <div class="level-card tp"><span>Take Profit 2</span><strong>${result.tp2}</strong></div>
+          <div class="level-card rr"><span>R/R ratio</span><strong>${result.rr}</strong></div>
+          <div class="level-card tech"><span>Technique</span><strong>${result.technique}</strong></div>
         </div>
         <div class="score-line">
           <div class="signal-bottom"><span>Score d'efficacité</span><strong>${result.score}%</strong></div>
@@ -389,7 +398,10 @@
         </div>
         ${renderTradePlan(result)}
         ${renderAnalysisMeta(result)}
-        <p class="mt-4 text-sm text-muted-foreground">${escapeHtml(result.explanation || result.answer || "")}</p>
+        <div class="result-explanation">
+          <span>Analyse détaillée</span>
+          <p>${escapeHtml(result.explanation || result.answer || "")}</p>
+        </div>
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>
     `;

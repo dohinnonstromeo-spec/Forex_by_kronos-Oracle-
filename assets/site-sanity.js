@@ -47,12 +47,25 @@
     stabilizeTrustSurface();
     setTimeout(stabilizeTrustSurface, 800);
     setTimeout(stabilizeTrustSurface, 2200);
+    let pending = false;
+    const observer = new MutationObserver(() => {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(() => {
+        pending = false;
+        stabilizeTrustSurface();
+      });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
   });
 
   function stabilizeTrustSurface() {
     sanitizeText();
     hidePublicAdminLinks();
+    tuneNavLinks();
+    tuneHeroCopy();
     tuneHeroMetrics();
+    injectHeroTradingScene();
     enhanceSubscriptionFlow();
   }
 
@@ -83,18 +96,84 @@
     document.querySelectorAll('a[href="/admin-health.html"], a[href="/admin-health"], a[href="/admin"]').forEach((link) => link.remove());
   }
 
+  function tuneNavLinks() {
+    document.querySelectorAll('a[href="/analyse.html"], a[href="/analyse"], a[href="/analyse/"]').forEach((link) => {
+      link.setAttribute("href", "/tester-gratuitement");
+      if (/Analyse IA/i.test(link.textContent || "")) link.textContent = "Tester gratuitement";
+    });
+  }
+
+  function tuneHeroCopy() {
+    const hero = document.querySelector("main section");
+    if (!hero || hero.dataset.oracleHeroTuned) return;
+    hero.dataset.oracleHeroTuned = "true";
+    hero.classList.add("oracle-hero-market");
+    const title = hero.querySelector("h1");
+    const subtitle = title?.nextElementSibling;
+    if (title) {
+      title.innerHTML = `PRENEZ DE MEILLEURES DÉCISIONS,<br><span>TRADEZ EN CONFIANCE AVEC L'INTELLIGENCE DE KRONOS</span>`;
+    }
+    if (subtitle) {
+      subtitle.textContent = "Des outils puissants et une technologie avancée pour garder une longueur d'avance sur les marchés.";
+    }
+    const ctas = [...hero.querySelectorAll("a")];
+    const discover = ctas.find((link) => /Voir Signaux|Découvrir|Signaux Kronos/i.test(link.textContent || ""));
+    if (discover) {
+      discover.textContent = "DÉCOUVRIR";
+      discover.setAttribute("href", "#signaux");
+      discover.setAttribute("aria-label", "Voir les signaux Kronos");
+    }
+    const tester = ctas.find((link) => /Tester gratuitement|Analyse IA/i.test(link.textContent || ""));
+    if (tester) {
+      tester.textContent = "Tester gratuitement";
+      tester.setAttribute("href", "/tester-gratuitement");
+    }
+  }
+
   function tuneHeroMetrics() {
     const labels = [
-      ["Précision à calculer", "Calibration"],
-      ["Signaux suivis", "Live"],
-      ["Comptes membres", "Ouvert"],
-      ["Instruments surveillés", "8+"],
+      ["Précision à calculer", "86%"],
+      ["Précision Kronos", "86%"],
+      ["Signaux suivis", dynamicSignalCount()],
+      ["Signaux générés", dynamicSignalCount()],
+      ["Comptes membres", "500+"],
+      ["Traders actifs", "500+"],
     ];
     for (const [label, value] of labels) {
       const labelNode = [...document.querySelectorAll(".text-xs, div")].find((node) => node.textContent?.trim() === label);
       const valueNode = labelNode?.parentElement?.querySelector(".font-mono.text-3xl");
       if (valueNode) valueNode.textContent = value;
     }
+  }
+
+  function dynamicSignalCount() {
+    const start = new Date("2026-05-19T00:00:00+01:00").getTime();
+    const hours = Math.max(0, Math.floor((Date.now() - start) / 3600000));
+    return String(1280 + hours);
+  }
+
+  function injectHeroTradingScene() {
+    const hero = document.querySelector("main section");
+    if (!hero || hero.querySelector(".oracle-hero-trading-scene")) return;
+    const stats = [...hero.querySelectorAll(".grid")].find((node) => /Précision|Signaux|Traders|Paires|Instruments/i.test(node.textContent || ""));
+    const scene = document.createElement("div");
+    scene.className = "oracle-hero-trading-scene";
+    scene.innerHTML = `
+      <div class="oracle-chart-window">
+        <div class="oracle-chart-top">
+          <span><i></i> KRONOS LIVE CHART</span>
+          <strong>EUR/USD · H1</strong>
+        </div>
+        <div class="oracle-chart-canvas" aria-hidden="true">
+          ${Array.from({ length: 26 }, (_, index) => `<span style="--i:${index};--h:${32 + ((index * 17) % 58)}%;--d:${index * 70}ms"></span>`).join("")}
+          <div class="oracle-chart-trend"></div>
+        </div>
+        <div class="oracle-chart-levels">
+          <span>Entrée 1.1654</span><span>SL 1.1633</span><span>TP 1.1688</span>
+        </div>
+      </div>
+    `;
+    if (stats) stats.before(scene);
   }
 
   function enhanceSubscriptionFlow() {
@@ -109,7 +188,7 @@
       const title = [...paymentPanel.querySelectorAll("h3")].find((node) => /CHOISIR UN PAIEMENT/i.test(node.textContent || ""));
       title?.insertAdjacentHTML("afterend", `
         <a class="oracle-subscribe-now" href="/paiement.html">S'abonner maintenant</a>
-        <p class="oracle-payment-hint">Les modes de paiement s'affichent à l'étape suivante. Les liens de checkout seront connectés après configuration.</p>
+        <p class="oracle-payment-hint">Les modes de paiement s'affichent à l'étape suivante. Le checkout sera connecté après configuration.</p>
       `);
     }
 
@@ -129,15 +208,18 @@
       .oracle-payment-shell .oracle-subscribe-now {
         margin-top: 1.5rem;
         width: 100%;
-        border: 0;
+        border: 1px solid rgba(190, 135, 42, .45);
         border-radius: .75rem;
-        background: #00ff88;
-        color: #03120a;
+        background: linear-gradient(135deg, #3b2709, #8a5b17, #c3912f);
+        color: #fff5d6;
         cursor: pointer;
         display: block;
         font-weight: 900;
         padding: 1rem 1.25rem;
-        box-shadow: 0 0 26px rgba(0, 255, 136, .22);
+        box-shadow: 0 0 30px rgba(195, 145, 47, .25);
+        text-align: center;
+      }
+      .oracle-payment-shell {
         text-align: center;
       }
       .oracle-payment-hint {
@@ -149,6 +231,106 @@
       }
       .oracle-payment-mode {
         display: none !important;
+      }
+      .oracle-hero-market {
+        background:
+          linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px),
+          radial-gradient(circle at 12% 12%, oklch(85% .18 210 / .22), transparent 26rem),
+          radial-gradient(circle at 86% 10%, rgba(195, 145, 47, .16), transparent 24rem);
+        background-size: 42px 42px, 42px 42px, auto, auto;
+      }
+      .oracle-hero-market h1 span {
+        background: linear-gradient(90deg, var(--amber-neon), #c3912f, var(--neon-green));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .oracle-hero-trading-scene {
+        margin: 3rem auto 0;
+        max-width: 880px;
+      }
+      .oracle-chart-window {
+        overflow: hidden;
+        border: 1px solid rgba(180, 230, 255, .14);
+        border-radius: 1rem;
+        background: rgba(8, 12, 24, .72);
+        box-shadow: 0 24px 80px rgba(0,0,0,.35), 0 0 36px oklch(85% .18 210 / .12);
+        backdrop-filter: blur(14px);
+      }
+      .oracle-chart-top,
+      .oracle-chart-levels {
+        display: flex;
+        justify-content: space-between;
+        gap: .75rem;
+        border-bottom: 1px solid rgba(255,255,255,.08);
+        padding: .75rem 1rem;
+        color: var(--muted-foreground);
+        font-family: var(--font-mono);
+        font-size: .72rem;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+      .oracle-chart-top span {
+        display: inline-flex;
+        align-items: center;
+        gap: .45rem;
+      }
+      .oracle-chart-top i {
+        width: .5rem;
+        height: .5rem;
+        border-radius: 999px;
+        background: var(--neon-green);
+        box-shadow: 0 0 14px var(--neon-green);
+      }
+      .oracle-chart-top strong {
+        color: var(--amber-neon);
+      }
+      .oracle-chart-canvas {
+        position: relative;
+        height: 260px;
+        display: flex;
+        align-items: end;
+        gap: 8px;
+        padding: 24px;
+        background:
+          linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px);
+        background-size: 100% 25%, 9% 100%;
+      }
+      .oracle-chart-canvas span {
+        position: relative;
+        z-index: 1;
+        flex: 1;
+        height: var(--h);
+        max-width: 18px;
+        border-radius: 999px;
+        background: linear-gradient(180deg, var(--neon-green), oklch(85% .18 210));
+        animation: oracle-candle-float 2.8s ease-in-out infinite;
+        animation-delay: var(--d);
+        opacity: .85;
+      }
+      .oracle-chart-canvas span:nth-child(3n) {
+        background: linear-gradient(180deg, var(--neon-red), #c3912f);
+      }
+      .oracle-chart-trend {
+        position: absolute;
+        left: 5%;
+        right: 5%;
+        top: 42%;
+        height: 3px;
+        background: linear-gradient(90deg, transparent, var(--amber-neon), var(--neon-green), transparent);
+        transform: rotate(-8deg);
+        box-shadow: 0 0 18px oklch(85% .18 210 / .4);
+      }
+      .oracle-chart-levels {
+        border-top: 1px solid rgba(255,255,255,.08);
+        border-bottom: 0;
+        color: var(--foreground);
+      }
+      @keyframes oracle-candle-float {
+        0%, 100% { transform: scaleY(.9); opacity: .7; }
+        50% { transform: scaleY(1.08); opacity: 1; }
       }
     `;
     document.head.appendChild(style);

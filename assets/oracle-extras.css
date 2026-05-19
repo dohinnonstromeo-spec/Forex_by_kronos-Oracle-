@@ -67,14 +67,27 @@ body {
   bottom: 90px;
   z-index: 9999;
   border-radius: 999px;
-  padding: 4px 9px;
-  background: #ff2e4d;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  background: var(--neon-green);
   color: white;
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 800;
   letter-spacing: .08em;
+  box-shadow: 0 0 16px var(--neon-green);
   animation: oracle-badge-pulse 1.25s ease-in-out infinite;
+}
+
+.oracle-chat-online.offline {
+  background: var(--neon-red);
+  box-shadow: 0 0 16px var(--neon-red);
+}
+
+.oracle-chat-toggle.offline {
+  background: linear-gradient(135deg, #3b1014, var(--neon-red));
+  box-shadow: 0 0 28px rgba(255, 46, 77, .32), inset 0 -6px 14px rgba(0, 0, 0, .18);
 }
 
 .oracle-chat-panel {
@@ -687,6 +700,73 @@ body {
   letter-spacing: .06em;
 }
 
+.result-console {
+  position: relative;
+  overflow: hidden;
+}
+
+.result-console::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: var(--oracle-gradient);
+  opacity: .8;
+}
+
+.result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.result-head .direction-label {
+  margin-top: 6px;
+  text-align: left;
+  font-size: 42px;
+}
+
+.result-confidence {
+  width: 132px;
+  aspect-ratio: 1;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  border: 1px solid oklch(85% .18 210 / .25);
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at center, rgba(255,255,255,.07), transparent 58%),
+    conic-gradient(from 180deg, var(--neon-green), var(--amber-neon), var(--neon-orange), var(--neon-green));
+  box-shadow: 0 0 28px oklch(85% .18 210 / .16);
+}
+
+.result-confidence strong,
+.result-confidence span {
+  display: block;
+  width: 88%;
+  text-align: center;
+  background: rgba(8,12,24,.82);
+}
+
+.result-confidence strong {
+  padding-top: 22px;
+  border-radius: 999px 999px 0 0;
+  color: var(--foreground);
+  font-family: var(--font-display);
+  font-size: 30px;
+}
+
+.result-confidence span {
+  padding: 2px 10px 22px;
+  border-radius: 0 0 999px 999px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
 .direction-label.buy {
   color: var(--neon-green);
 }
@@ -709,6 +789,72 @@ body {
   border-radius: 10px;
   padding: 10px;
   background: rgba(0,0,0,.25);
+}
+
+.result-level-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.level-card {
+  min-height: 82px;
+  display: grid;
+  align-content: space-between;
+}
+
+.level-card span,
+.level-card strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.level-card span {
+  color: var(--muted-foreground);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.level-card strong {
+  margin-top: 10px;
+  font-size: 16px;
+}
+
+.level-card.entry strong,
+.level-card.rr strong,
+.level-card.tech strong {
+  color: var(--amber-neon);
+}
+
+.level-card.sl strong {
+  color: var(--neon-red);
+}
+
+.level-card.tp strong {
+  color: var(--neon-green);
+}
+
+.result-explanation {
+  margin-top: 16px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 12px;
+  background: rgba(0,0,0,.24);
+  padding: 14px;
+}
+
+.result-explanation span {
+  color: var(--amber-neon);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .12em;
+}
+
+.result-explanation p {
+  margin-top: 8px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
 }
 
 .trade-plan {
@@ -984,6 +1130,19 @@ body {
   }
 
   .copy-level-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .result-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .result-confidence {
+    width: 112px;
+  }
+
+  .result-level-grid {
     grid-template-columns: 1fr;
   }
 

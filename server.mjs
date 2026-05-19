@@ -242,13 +242,25 @@ Réponds en français, de façon concise mais utile.`;
     const answer = images.length ? await geminiVision(prompt, images) : await groq(prompt, 420, 0.3);
     if (images.length && !answer) {
       sendJson(res, 200, {
+        ok: false,
+        offline: true,
         answer: "Vision Gemini indisponible: je ne peux pas analyser ce graphique de façon fiable. Pose une question texte ou vérifie la clé Gemini.",
         score: 0,
         technique: "Vision indisponible",
       });
       return;
     }
-    sendJson(res, 200, normalizeAiAnswer(answer, question));
+    if (!answer) {
+      sendJson(res, 200, {
+        ok: false,
+        offline: true,
+        answer: "ChatBot hors service pour l'instant: le moteur IA ne répond pas. Réessaie dans quelques minutes.",
+        score: 0,
+        technique: "Hors service",
+      });
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...normalizeAiAnswer(answer, question) });
     return;
   }
 
@@ -2284,6 +2296,8 @@ async function serveStatic(res, pathname) {
   }
   const aliases = {
     "/analyse": "/analyse.html",
+    "/analyse-ia": "/analyse.html",
+    "/tester-gratuitement": "/analyse.html",
     "/paiement": "/paiement.html",
     "/abonnement": "/paiement.html",
     "/admin-health": "/admin-health.html",
