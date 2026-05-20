@@ -239,7 +239,7 @@ CONTEXTE RECENT:
 ${context}
 
 Réponds en français, de façon concise mais utile.`;
-    const answer = images.length ? await geminiVision(prompt, images) : await groq(prompt, 420, 0.3);
+    const answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 420, 0.3);
     if (images.length && !answer) {
       sendJson(res, 200, {
         ok: false,
@@ -287,7 +287,7 @@ Réponds en JSON strict:
   "needsConfirmation": true|false,
   "reason": "phrase courte"
 }`;
-    const answer = await geminiVision(prompt, images);
+    const answer = await analyzeChartImage(prompt, images);
     const detected = normalizeChartDetection(parseJson(answer, null));
     sendJson(res, 200, detected);
     return;
@@ -365,7 +365,7 @@ Si plusieurs graphes sont fournis: utilise les timeframes élevés pour la tenda
 Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
 
     Analyse le contexte fourni et donne un setup éducatif exploitable avec prudence.`;
-    let answer = images.length ? await geminiVision(prompt, images) : await groq(prompt, 500, 0.3);
+    let answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 500, 0.3);
     if (!answer) {
       answer = buildDeterministicAnalysisText({
         pair: selectedPair,
@@ -1248,6 +1248,65 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
       recordProviderHealth("gemini_text", false, error.message);
       console.warn(`Gemini text failed with ${model}: ${error.message}`);
     }
+  }
+  return "";
+}
+
+async function groqVision(prompt, images) {
+  const key = env.GROQ_KEY || env.GROQ_API_KEY;
+  if (!key) return "";
+  const groqVisionModels = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+  ];
+  for (const model of groqVisionModels) {
+    try {
+      const imageContent = images.map((image) => ({
+        type: "image_url",
+        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+      }));
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{
+            role: "user",
+            content: [{ type: "text", text: prompt }, ...imageContent],
+          }],
+          temperature: 0.25,
+          max_tokens: 1000,
+        }),
+      });
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`groq_vision_${response.status}_${model}: ${errText.slice(0, 240)}`);
+      }
+      const data = await response.json();
+      const result = data.choices?.[0]?.message?.content?.trim() || "";
+      if (result) {
+        recordProviderHealth("groq_vision", true);
+        return result;
+      }
+    } catch (error) {
+      recordProviderHealth("groq_vision", false, error.message);
+      console.warn(`Groq Vision failed with ${model}: ${error.message}`);
+    }
+  }
+  return "";
+}
+
+async function analyzeChartImage(prompt, images) {
+  if (!images?.length) return "";
+  if (env.GROQ_KEY || env.GROQ_API_KEY) {
+    const result = await groqVision(prompt, images);
+    if (result && result.length > 50) return result;
+    console.warn("Groq Vision insufficient, falling back to Gemini Vision.");
+  }
+  if (env.GEMINI_API_KEY || env.GEMINI_KEY) {
+    const result = await geminiVision(prompt, images);
+    if (result && result.length > 50) return result;
+    console.warn("Gemini Vision insufficient.");
   }
   return "";
 }
