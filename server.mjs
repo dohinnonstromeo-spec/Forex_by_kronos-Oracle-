@@ -32,6 +32,21 @@ const GEMINI_FALLBACK_MODELS = [
   "gemini-2.5-flash",
   "gemini-1.5-flash-latest",
 ].filter((model, index, list) => model && list.indexOf(model) === index);
+const TWELVE_DATA_KEYS = collectEnvKeys("TWELVE_DATA_API_KEY", "TWELVEDATA_API_KEY");
+const ALPHA_VANTAGE_KEYS = collectEnvKeys("ALPHA_VANTAGE_API_KEY");
+const EXCHANGERATE_KEYS = collectEnvKeys("EXCHANGERATE_API_KEY");
+const GROQ_KEYS = collectEnvKeys("GROQ_KEY", "GROQ_API_KEY");
+const FINNHUB_KEYS = collectEnvKeys("FINNHUB_API_KEY");
+const MARKETAUX_KEYS = collectEnvKeys("MARKETAUX_API_KEY");
+const rotationCounters = {
+  twelveData: 0,
+  alphaVantage: 0,
+  exchangeRate: 0,
+  groq: 0,
+  finnhub: 0,
+  marketaux: 0,
+};
+const exhaustedKeys = new Map();
 const symbols = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD"];
 
 const fallbackPrices = {
@@ -129,20 +144,28 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/provider-status") {
+    sendJson(res, 200, getApiStatus());
+    return;
+  }
+
   if (url.pathname === "/api/config") {
     sendJson(res, 200, {
-      groq: Boolean(env.GROQ_KEY || env.GROQ_API_KEY),
+      groq: GROQ_KEYS.length > 0,
       gemini: Boolean(env.GEMINI_API_KEY || env.GEMINI_KEY),
-      twelveData: Boolean(env.TWELVE_DATA_API_KEY || env.TWELVEDATA_API_KEY),
+      twelveData: TWELVE_DATA_KEYS.length > 0,
       polygon: Boolean(env.POLYGON_API_KEY || env.POLYGON_KEY),
-      alphaVantage: Boolean(env.ALPHA_VANTAGE_API_KEY),
+      alphaVantage: ALPHA_VANTAGE_KEYS.length > 0,
+      exchangeRateApi: EXCHANGERATE_KEYS.length > 0,
+      binanceFallback: true,
       mongoDb: Boolean(mongoUri),
       stooqFallback: true,
       dukascopyHistorical: true,
       coinbaseFallback: true,
       frankfurterFallback: true,
-      finnhub: Boolean(env.FINNHUB_API_KEY),
-      news: Boolean(env.NEWS_API_KEY || env.GNEWS_API_KEY || env.NEWSDATA_API_KEY),
+      finnhub: FINNHUB_KEYS.length > 0,
+      marketaux: MARKETAUX_KEYS.length > 0,
+      news: Boolean(env.NEWS_API_KEY || env.GNEWS_API_KEY || env.NEWSDATA_API_KEY || MARKETAUX_KEYS.length),
       market: marketStatus(),
     });
     return;
@@ -200,6 +223,12 @@ Identifie : paire impactée + direction.
 Format : PAIRE DIRECTION · résumé court`;
     const summary = await groq(prompt, 40, 0.3);
     sendJson(res, 200, { summary: cleanLine(summary).toUpperCase() });
+    return;
+  }
+
+  if (url.pathname === "/api/news") {
+    const symbol = url.searchParams.get("symbol") || "EURUSD";
+    sendJson(res, 200, { provider: "marketaux", news: await getMarketauxNews(symbol) });
     return;
   }
 
@@ -398,7 +427,7 @@ async function getPrices() {
 }
 
 async function fetchBestPrice(symbol, cached) {
-  const providers = [fetchTwelveDataPrice, fetchPolygonPrice, fetchAlphaVantagePrice, fetchCoinbasePrice, fetchStooqPrice, fetchFrankfurterPrice];
+  const providers = [fetchTwelveDataPrice, fetchBinancePrice, fetchExchangeRatePrice, fetchPolygonPrice, fetchAlphaVantagePrice, fetchCoinbasePrice, fetchStooqPrice, fetchFrankfurterPrice];
   const errors = [];
   for (const provider of providers) {
     try {
@@ -429,23 +458,117 @@ async function getExternalPrice(symbol) {
   }
 }
 
+function collectEnvKeys(...baseNames) {
+  const keys = [];
+  for (const base of baseNames) {
+    if (env[base]) keys.push(env[base]);
+    for (let index = 1; index <= 8; index += 1) {
+      if (env[`${base}_${index}`]) keys.push(env[`${base}_${index}`]);
+    }
+  }
+  return [...new Set(keys.filter(Boolean))];
+}
+
+function isKeyExhausted(key) {
+  if (!key || !exhaustedKeys.has(key)) return false;
+  const exhaustedAt = exhaustedKeys.get(key);
+  if (Date.now() - exhaustedAt > 60 * 60 * 1000) {
+    exhaustedKeys.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markKeyExhausted(key) {
+  if (key) exhaustedKeys.set(key, Date.now());
+}
+
+function isQuotaError(errorOrData) {
+  const text = typeof errorOrData === "string"
+    ? errorOrData
+    : [
+        errorOrData?.message,
+        errorOrData?.Note,
+        errorOrData?.Information,
+        errorOrData?.["Error Message"],
+        errorOrData?.["error-type"],
+        errorOrData?.code,
+        errorOrData?.status,
+      ].filter(Boolean).join(" ");
+  return /429|rate limit|quota|exceeded|limit reached|api call frequency|credits|too many|premium/i.test(text);
+}
+
+async function fetchWithRotation(apiName, keys, fetchFn) {
+  if (!keys?.length) return null;
+  const start = rotationCounters[apiName] || 0;
+  let lastError = null;
+  for (let attempt = 0; attempt < keys.length; attempt += 1) {
+    const index = (start + attempt) % keys.length;
+    const key = keys[index];
+    if (isKeyExhausted(key)) continue;
+    try {
+      const result = await fetchFn(key, index);
+      rotationCounters[apiName] = (index + 1) % keys.length;
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (isQuotaError(error.message)) {
+        markKeyExhausted(key);
+        rotationCounters[apiName] = (index + 1) % keys.length;
+        continue;
+      }
+      rotationCounters[apiName] = (index + 1) % keys.length;
+    }
+  }
+  if (lastError) throw lastError;
+  return null;
+}
+
 async function fetchTwelveDataPrice(symbol) {
-  const key = env.TWELVE_DATA_API_KEY || env.TWELVEDATA_API_KEY;
-  if (!key) return null;
-  try {
+  if (!TWELVE_DATA_KEYS.length) return null;
+  return fetchWithRotation("twelveData", TWELVE_DATA_KEYS, async (key) => {
     const api = new URL("https://api.twelvedata.com/quote");
     api.searchParams.set("symbol", symbol);
     api.searchParams.set("apikey", key);
     const data = await fetchJson(api);
+    if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
     const price = Number(data.close || data.price || data.previous_close);
     const change = Number(data.percent_change || data.change || 0);
     if (!Number.isFinite(price)) throw new Error("invalid_price");
     recordProviderHealth("twelve_data", true);
     return pricePayload(symbol, { price, change }, "twelve_data", null, { reliability: 95 });
+  });
+}
+
+async function fetchBinancePrice(symbol) {
+  const binanceSymbol = toBinanceSymbol(symbol);
+  if (!binanceSymbol) return null;
+  try {
+    const api = new URL("https://api.binance.com/api/v3/ticker/price");
+    api.searchParams.set("symbol", binanceSymbol);
+    const data = await fetchJson(api);
+    const price = Number(data.price);
+    if (!Number.isFinite(price)) throw new Error("invalid_price");
+    recordProviderHealth("binance_price", true);
+    return pricePayload(symbol, { price, change: 0 }, "binance", null, { reliability: 90 });
   } catch (error) {
-    recordProviderHealth("twelve_data", false, error.message);
+    recordProviderHealth("binance_price", false, error.message);
     throw error;
   }
+}
+
+async function fetchExchangeRatePrice(symbol) {
+  if (!EXCHANGERATE_KEYS.length || !/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol) || /XAU|XAG|BTC|ETH/i.test(symbol)) return null;
+  const [from, to] = symbol.split("/");
+  return fetchWithRotation("exchangeRate", EXCHANGERATE_KEYS, async (key) => {
+    const api = new URL(`https://v6.exchangerate-api.com/v6/${encodeURIComponent(key)}/pair/${from}/${to}`);
+    const data = await fetchJson(api);
+    if (data.result && data.result !== "success") throw new Error(data["error-type"] || "api_error");
+    const price = Number(data.conversion_rate);
+    if (!Number.isFinite(price)) throw new Error("invalid_price");
+    recordProviderHealth("exchangerate_price", true);
+    return pricePayload(symbol, { price, change: 0 }, "exchangerate_api", null, { reliability: 82 });
+  });
 }
 
 async function fetchPolygonPrice(symbol) {
@@ -472,10 +595,9 @@ async function fetchPolygonPrice(symbol) {
 }
 
 async function fetchAlphaVantagePrice(symbol) {
-  const key = env.ALPHA_VANTAGE_API_KEY;
-  if (!key) return null;
+  if (!ALPHA_VANTAGE_KEYS.length) return null;
   if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol) && !/BTC|ETH/i.test(symbol)) return null;
-  try {
+  return fetchWithRotation("alphaVantage", ALPHA_VANTAGE_KEYS, async (key) => {
     const [from, to] = symbol.split("/");
     const api = new URL("https://www.alphavantage.co/query");
     api.searchParams.set("function", "CURRENCY_EXCHANGE_RATE");
@@ -483,15 +605,13 @@ async function fetchAlphaVantagePrice(symbol) {
     api.searchParams.set("to_currency", to || "USD");
     api.searchParams.set("apikey", key);
     const data = await fetchJson(api);
+    if (data.Note || data.Information || data["Error Message"]) throw new Error(data.Note || data.Information || data["Error Message"]);
     const payload = data["Realtime Currency Exchange Rate"] || {};
     const price = Number(payload["5. Exchange Rate"]);
-    if (!Number.isFinite(price)) throw new Error(data.Note ? "rate_limited" : "invalid_price");
+    if (!Number.isFinite(price)) throw new Error("invalid_price");
     recordProviderHealth("alpha_vantage", true);
     return pricePayload(symbol, { price, change: 0 }, "alpha_vantage", null, { reliability: 80 });
-  } catch (error) {
-    recordProviderHealth("alpha_vantage", false, error.message);
-    throw error;
-  }
+  });
 }
 
 async function fetchCoinbasePrice(symbol) {
@@ -559,9 +679,8 @@ async function getHistories(prices) {
   if (memoryCache.histories.value && memoryCache.histories.key === usableKey && Date.now() < memoryCache.histories.expiresAt) {
     return memoryCache.histories.value;
   }
-  const key = env.TWELVE_DATA_API_KEY || env.TWELVEDATA_API_KEY;
   const cache = await loadMarketCache();
-  if (!key) {
+  if (!TWELVE_DATA_KEYS.length) {
     const histories = await fetchFreeHistories(cache, prices);
     memoryCache.histories = { key: usableKey, value: histories, expiresAt: Date.now() + 15 * 60 * 1000 };
     return histories;
@@ -570,6 +689,19 @@ async function getHistories(prices) {
     const price = prices[symbol];
     if (!price?.open || !isUsableLivePrice(price)) return [symbol, cachedHistory(symbol, cache)];
     const errors = [];
+    for (const interval of historyIntervals(symbol)) {
+      try {
+        const bars = await fetchBinanceHistory(symbol, interval);
+        if (bars.length >= 30) {
+          tagHistory(bars, `binance:${interval}`, false);
+          recordProviderHealth("binance_history", true);
+          return [symbol, bars];
+        }
+        if (bars.length) errors.push(`binance_${interval}:insufficient_bars`);
+      } catch (error) {
+        errors.push(`binance_${interval}:${error.message}`);
+      }
+    }
     for (const interval of historyIntervals(symbol)) {
       try {
         const bars = await fetchPolygonHistory(symbol, interval);
@@ -585,7 +717,7 @@ async function getHistories(prices) {
     }
     for (const interval of historyIntervals(symbol)) {
       try {
-        const bars = await fetchTwelveDataHistory(symbol, interval, key);
+        const bars = await fetchTwelveDataHistory(symbol, interval);
         if (bars.length >= 30) {
           tagHistory(bars, `twelve_data:${interval}`, false);
           recordProviderHealth("twelve_data_history", true);
@@ -652,6 +784,19 @@ async function fetchFreeHistories(cache, prices) {
     const errors = [];
     for (const interval of historyIntervals(symbol)) {
       try {
+        const bars = await fetchBinanceHistory(symbol, interval);
+        if (bars.length >= 30) {
+          tagHistory(bars, `binance:${interval}`, false);
+          recordProviderHealth("binance_history", true);
+          return [symbol, bars];
+        }
+        if (bars.length) errors.push(`binance_${interval}:insufficient_bars`);
+      } catch (error) {
+        errors.push(`binance_${interval}:${error.message}`);
+      }
+    }
+    for (const interval of historyIntervals(symbol)) {
+      try {
         const bars = await fetchStooqHistory(symbol, interval);
         if (bars.length >= 30) {
           tagHistory(bars, `stooq:${interval}`, false);
@@ -685,21 +830,49 @@ async function fetchFreeHistories(cache, prices) {
   return histories;
 }
 
-async function fetchTwelveDataHistory(symbol, interval, key) {
-  const api = new URL("https://api.twelvedata.com/time_series");
-  api.searchParams.set("symbol", symbol);
-  api.searchParams.set("interval", interval);
-  api.searchParams.set("outputsize", "80");
-  api.searchParams.set("apikey", key);
+async function fetchTwelveDataHistory(symbol, interval) {
+  if (!TWELVE_DATA_KEYS.length) return [];
+  return fetchWithRotation("twelveData", TWELVE_DATA_KEYS, async (key) => {
+    const api = new URL("https://api.twelvedata.com/time_series");
+    api.searchParams.set("symbol", symbol);
+    api.searchParams.set("interval", interval);
+    api.searchParams.set("outputsize", "80");
+    api.searchParams.set("apikey", key);
+    const data = await fetchJson(api);
+    if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
+    const values = Array.isArray(data.values) ? data.values : [];
+    return values.map((bar) => ({
+      close: Number(bar.close),
+      high: Number(bar.high),
+      low: Number(bar.low),
+      datetime: bar.datetime,
+    })).filter((bar) => Number.isFinite(bar.close)).reverse();
+  });
+}
+
+async function fetchBinanceHistory(symbol, interval) {
+  const binanceSymbol = toBinanceSymbol(symbol);
+  if (!binanceSymbol) return [];
+  const binanceInterval = {
+    "15min": "15m",
+    "30min": "30m",
+    "1h": "1h",
+    "4h": "4h",
+    "1day": "1d",
+    "1week": "1w",
+  }[interval] || "1h";
+  const api = new URL("https://api.binance.com/api/v3/klines");
+  api.searchParams.set("symbol", binanceSymbol);
+  api.searchParams.set("interval", binanceInterval);
+  api.searchParams.set("limit", "80");
   const data = await fetchJson(api);
-  if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
-  const values = Array.isArray(data.values) ? data.values : [];
-  return values.map((bar) => ({
-    close: Number(bar.close),
-    high: Number(bar.high),
-    low: Number(bar.low),
-    datetime: bar.datetime,
-  })).filter((bar) => Number.isFinite(bar.close)).reverse();
+  if (!Array.isArray(data)) throw new Error("invalid_history");
+  return data.map((bar) => ({
+    close: Number(bar[4]),
+    high: Number(bar[2]),
+    low: Number(bar[3]),
+    datetime: bar[0] ? new Date(bar[0]).toISOString() : null,
+  })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
 }
 
 async function fetchPolygonHistory(symbol, interval) {
@@ -788,6 +961,18 @@ function toStooqSymbol(symbol = "") {
   if (aliases[normalized]) return aliases[normalized];
   if (/^[A-Z]{3}\/[A-Z]{3}$/.test(normalized)) return normalized.replace("/", "").toLowerCase();
   return null;
+}
+
+function toBinanceSymbol(symbol = "") {
+  const normalized = String(symbol).toUpperCase().replace(/[^A-Z0-9/]/g, "");
+  const aliases = {
+    "BTC/USD": "BTCUSDT",
+    "ETH/USD": "ETHUSDT",
+    "BNB/USD": "BNBUSDT",
+    "SOL/USD": "SOLUSDT",
+    "XRP/USD": "XRPUSDT",
+  };
+  return aliases[normalized] || null;
 }
 
 function toStooqInterval(interval = "") {
@@ -1040,7 +1225,7 @@ function pricePayload(symbol, value, source, error, options = {}) {
 }
 
 function isLivePriceSource(source = "") {
-  return ["twelve_data", "polygon", "alpha_vantage", "coinbase", "stooq"].includes(source);
+  return ["twelve_data", "polygon", "alpha_vantage", "coinbase", "stooq", "binance", "exchangerate_api"].includes(source);
 }
 
 function isUsableLivePrice(price) {
@@ -1121,23 +1306,43 @@ function formatInTimeZone(date, timeZone) {
 
 async function getEconomicCalendar() {
   if (memoryCache.calendar.value && Date.now() < memoryCache.calendar.expiresAt) return memoryCache.calendar.value;
-  const key = env.FINNHUB_API_KEY;
-  if (!key) return [];
+  if (!FINNHUB_KEYS.length) return [];
   try {
     const today = new Date();
     const from = today.toISOString().slice(0, 10);
     const to = new Date(today.getTime() + 86400000).toISOString().slice(0, 10);
-    const api = new URL("https://finnhub.io/api/v1/calendar/economic");
-    api.searchParams.set("from", from);
-    api.searchParams.set("to", to);
-    api.searchParams.set("token", key);
-    const data = await fetchJson(api);
+    const data = await fetchWithRotation("finnhub", FINNHUB_KEYS, async (key) => {
+      const api = new URL("https://finnhub.io/api/v1/calendar/economic");
+      api.searchParams.set("from", from);
+      api.searchParams.set("to", to);
+      api.searchParams.set("token", key);
+      return fetchJson(api);
+    });
     const events = data.economicCalendar || [];
     memoryCache.calendar = { value: events, expiresAt: Date.now() + 30 * 60 * 1000 };
     recordProviderHealth("finnhub_calendar", true);
     return events;
   } catch (error) {
     recordProviderHealth("finnhub_calendar", false, error.message);
+    return [];
+  }
+}
+
+async function getMarketauxNews(symbol = "EURUSD") {
+  if (!MARKETAUX_KEYS.length) return [];
+  try {
+    const data = await fetchWithRotation("marketaux", MARKETAUX_KEYS, async (key) => {
+      const api = new URL("https://api.marketaux.com/v1/news/all");
+      api.searchParams.set("symbols", symbol);
+      api.searchParams.set("filter_entities", "true");
+      api.searchParams.set("language", "en");
+      api.searchParams.set("api_token", key);
+      return fetchJson(api);
+    });
+    recordProviderHealth("marketaux_news", true);
+    return Array.isArray(data?.data) ? data.data.slice(0, 12) : [];
+  } catch (error) {
+    recordProviderHealth("marketaux_news", false, error.message);
     return [];
   }
 }
@@ -1196,12 +1401,11 @@ function signalAffectedByNews(pair, currency) {
 }
 
 async function groq(prompt, maxTokens = 150, temperature = 0.3) {
-  const key = env.GROQ_KEY || env.GROQ_API_KEY;
-  if (!key) return geminiText(prompt, maxTokens, temperature);
+  if (!GROQ_KEYS.length) return geminiText(prompt, maxTokens, temperature);
   const models = [...new Set([GROQ_MODEL, GROQ_FALLBACK_MODEL])];
   for (const model of models) {
     try {
-      return await groqOnce(key, model, prompt, maxTokens, temperature);
+      return await fetchWithRotation("groq", GROQ_KEYS, (key) => groqOnce(key, model, prompt, maxTokens, temperature));
     } catch (error) {
       recordProviderHealth("groq", false, error.message);
       console.warn(`Groq failed with ${model}: ${error.message}`);
@@ -1253,37 +1457,38 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
 }
 
 async function groqVision(prompt, images) {
-  const key = env.GROQ_KEY || env.GROQ_API_KEY;
-  if (!key) return "";
+  if (!GROQ_KEYS.length) return "";
   const groqVisionModels = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
   ];
   for (const model of groqVisionModels) {
     try {
-      const imageContent = images.map((image) => ({
-        type: "image_url",
-        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
-      }));
-      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          messages: [{
-            role: "user",
-            content: [{ type: "text", text: prompt }, ...imageContent],
-          }],
-          temperature: 0.25,
-          max_tokens: 1000,
-        }),
+      const result = await fetchWithRotation("groq", GROQ_KEYS, async (key) => {
+        const imageContent = images.map((image) => ({
+          type: "image_url",
+          image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+        }));
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model,
+            messages: [{
+              role: "user",
+              content: [{ type: "text", text: prompt }, ...imageContent],
+            }],
+            temperature: 0.25,
+            max_tokens: 1000,
+          }),
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`groq_vision_${response.status}_${model}: ${errText.slice(0, 240)}`);
+        }
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content?.trim() || "";
       });
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`groq_vision_${response.status}_${model}: ${errText.slice(0, 240)}`);
-      }
-      const data = await response.json();
-      const result = data.choices?.[0]?.message?.content?.trim() || "";
       if (result) {
         recordProviderHealth("groq_vision", true);
         return result;
@@ -1298,7 +1503,7 @@ async function groqVision(prompt, images) {
 
 async function analyzeChartImage(prompt, images) {
   if (!images?.length) return "";
-  if (env.GROQ_KEY || env.GROQ_API_KEY) {
+  if (GROQ_KEYS.length) {
     const result = await groqVision(prompt, images);
     if (result && result.length > 50) return result;
     console.warn("Groq Vision insufficient, falling back to Gemini Vision.");
@@ -1990,6 +2195,28 @@ function providerHealthSnapshot() {
   }]));
 }
 
+function getApiStatus() {
+  const statusFor = (name, keys) => ({
+    totalKeys: keys.length,
+    activeKeys: keys.filter((key) => !isKeyExhausted(key)).length,
+    currentIndex: rotationCounters[name] || 0,
+  });
+  return {
+    twelveData: statusFor("twelveData", TWELVE_DATA_KEYS),
+    alphaVantage: statusFor("alphaVantage", ALPHA_VANTAGE_KEYS),
+    exchangeRate: statusFor("exchangeRate", EXCHANGERATE_KEYS),
+    groq: statusFor("groq", GROQ_KEYS),
+    finnhub: statusFor("finnhub", FINNHUB_KEYS),
+    marketaux: statusFor("marketaux", MARKETAUX_KEYS),
+    binance: { status: "unlimited", noKey: true },
+    coinbase: { status: "unlimited", noKey: true },
+    frankfurter: { status: "unlimited", noKey: true },
+    stooq: { status: "unlimited", noKey: true },
+    exhaustedKeys: exhaustedKeys.size,
+    blacklistTtlMinutes: 60,
+  };
+}
+
 async function mongoDb() {
   if (!mongoUri || mongoUnavailable) return null;
   try {
@@ -2055,9 +2282,10 @@ function healthRecommendations() {
   const tips = [];
   if (!mongoUri) tips.push("Ajouter MONGODB_URI dans secret.dev pour persister caches, analyses et résultats sur MongoDB.");
   if (mongoLastError) tips.push(`MongoDB indisponible: ${mongoLastError}. Le serveur utilise le fallback fichier local.`);
-  if (!env.ALPHA_VANTAGE_API_KEY) tips.push("Ajouter ALPHA_VANTAGE_API_KEY dans secret.dev pour un fallback prix Forex/Crypto.");
-  tips.push("Fallbacks sans clé actifs: Coinbase pour BTC/ETH spot, Frankfurter pour Forex fiat indicatif journalier.");
-  if (!env.TWELVE_DATA_API_KEY && !env.TWELVEDATA_API_KEY) tips.push("Ajouter TWELVE_DATA_API_KEY: source principale prix + historiques.");
+  if (!ALPHA_VANTAGE_KEYS.length) tips.push("Ajouter ALPHA_VANTAGE_API_KEY ou ALPHA_VANTAGE_API_KEY_1..8 dans secret.dev pour un fallback prix Forex/Crypto.");
+  tips.push("Fallbacks sans clé actifs: Binance pour crypto, Coinbase pour BTC/ETH spot, Stooq/Frankfurter pour Forex indicatif.");
+  if (!TWELVE_DATA_KEYS.length) tips.push("Ajouter TWELVE_DATA_API_KEY ou TWELVE_DATA_API_KEY_1..8: source principale prix + historiques.");
+  if (!GROQ_KEYS.length) tips.push("Ajouter GROQ_KEY ou GROQ_KEY_1..3: moteur texte et Groq Vision.");
   if (!env.GEMINI_API_KEY && !env.GEMINI_KEY) tips.push("Ajouter GEMINI_API_KEY: obligatoire pour analyser les screenshots.");
   if (!tips.length) tips.push("Toutes les clés principales sont présentes; surveiller /api/health pour les dégradations.");
   return tips;
