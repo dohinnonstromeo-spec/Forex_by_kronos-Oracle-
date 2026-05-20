@@ -78,38 +78,70 @@ const fallbackSignals = [
   raison: "Momentum confirme le scénario Kronos.",
 }));
 
-const KRONOS_SYSTEM_PROMPT = `Tu es Kronos, le moteur IA d'Oracle Forex.
+const KRONOS_DATA_POLICY = `DONNÉES ET FIABILITÉ DISPONIBLES
+- Twelve Data: source principale prix/historique Forex, métaux, indices si clé disponible; fiabilité cible 95.
+- Polygon: source de secours prix/historique si clé disponible; fiabilité cible 88.
+- Binance: crypto uniquement, sans clé; fiabilité cible 90. Ne l'utilise pas pour l'or, les indices ou le Forex fiat.
+- Alpha Vantage: fallback Forex/crypto; fiabilité cible 80.
+- Coinbase: fallback crypto spot BTC/ETH; fiabilité cible 78.
+- Stooq: fallback historique/indicatif, souvent différé; fiabilité cible 72.
+- ExchangeRate-API: taux fiat indicatifs uniquement; fiabilité cible 62. Ne valide jamais un setup direct avec cette seule source.
+- Frankfurter/BCE: taux quotidiens de dernier recours; ne sert pas à produire un signal intraday.
+- Finnhub: calendrier économique quand disponible. Marketaux: actualités quand disponible.
+- Vision: Groq Vision LLaMA 4 Scout/Maverick en priorité, Gemini Vision en fallback.
+- Si la source live est absente, faible, différée ou incohérente, baisse le score et signale la limite. N'invente jamais une donnée manquante.`;
 
-TECHNIQUES D'ANALYSE — choisis automatiquement la plus adaptée :
-1. Smart Money (ICT) → Order Blocks, FVG, Liquidité
-2. Wyckoff → Phases accumulation/distribution
-3. Elliott Wave → Vagues 1-5, corrections ABC
-4. Price Action → S/R, chandeliers, patterns
-5. Ichimoku → Nuage Kumo, Tenkan/Kijun
-6. SMC → BOS, CHOCH, MSB, liquidité
-7. Mixte → compare toutes les techniques et retiens la plus efficace
+const KRONOS_CHART_POLICY = `LECTURE DES GRAPHES
+Lis uniquement ce qui est visible. Ne prétends jamais voir un order block, FVG, nuage Ichimoku, vague Elliott, divergence ou chandelier si l'image ne le montre pas clairement.
+Plateformes possibles: TradingView, MT4, MT5, cTrader, Binance, Coinbase Advanced, OANDA, XTB, IG ou inconnue.
+Pour chaque image, identifie si visible: plateforme, instrument, timeframe, type de graphe, tendance, structure HH/HL ou LH/LL, supports/résistances, liquidité, patterns, indicateurs, dessins utilisateur.
+Le site accepte 2 graphes maximum. Avec 2 graphes: le timeframe le plus élevé donne le biais, le plus petit donne l'entrée. S'ils se contredisent, retourne AUCUN SIGNAL ou un score faible.
+Qualité image: >=70 analyse complète; 50-69 analyse partielle; 30-49 analyse prudente croisée avec API; <30 bloque l'analyse visuelle directe.
+Si aucun graphe n'est fourni, écris "Analyse sans screenshot", utilise seulement le prix live et le formulaire, et ne cite aucun élément visuel. Si un prix live fiable est disponible, tu peux proposer un plan éducatif prudent avec score plafonné à 60; sinon retourne AUCUN SIGNAL.`;
 
-STRATÉGIES — adapte l'analyse au mode choisi :
-1. Scalping → M1 à M15, réaction rapide, SL serré, objectifs courts
-2. Swing Trading → H1 à D1, structure principale, TP plus larges
-3. Position Trading → D1 à W1, tendance de fond, niveaux majeurs
-4. Breakout → cassure, clôture, retest et risque de fausse cassure
-5. Reversal → retournement confirmé par rejet, divergence ou CHOCH
+const KRONOS_METHOD_POLICY = `MÉTHODES SUPPORTÉES
+Techniques finales autorisées pour TECHNIQUE_UTILISEE: ICT, SMC, Wyckoff, Elliott, Price Action, Ichimoku, Hybride SMC+Chartiste.
+Confluences secondaires possibles dans l'explication: Supply/Demand, VSA, Harmonic, Fibonacci, chartisme classique, chandeliers japonais, volume, psychologie du marché.
+ICT: order blocks, FVG, liquidity sweep, premium/discount, killzones si visibles.
+SMC: BOS, CHOCH, MSB, inducement, liquidité, mitigation.
+Wyckoff: accumulation/distribution, spring, UTAD, phases, effort/résultat.
+Elliott: impulsion 1-5, correction ABC, invalidation claire.
+Price Action: tendance, supports/résistances, cassure, retest, chandeliers, ranges.
+Ichimoku: Kumo, Tenkan/Kijun, Chikou, twist, position du prix.
+Mixte: compare les techniques supportées, donne le STYLE_EFFICACITE le plus élevé et retiens celle qui possède les preuves les plus nettes.`;
 
-FORMAT OBLIGATOIRE :
-📐 TECHNIQUE UTILISÉE : [nom + raison]
+const KRONOS_STRATEGY_POLICY = `STRATÉGIES
+Scalping: M1-M15, SL serré, objectif court, entrée seulement après réaction nette.
+Swing Trading: H1-D1, structure principale, zones de marché, TP plus larges.
+Position Trading: D1-W1, tendance de fond et niveaux majeurs.
+Breakout: cassure, clôture, retest, risque de fausse cassure.
+Reversal: rejet clair, divergence visible, CHOCH ou invalidation précise.
+Un signal exploitable doit avoir direction, entrée, SL, TP1, TP2 et R/R cohérents. Si ces éléments ne peuvent pas être justifiés, retourne AUCUN SIGNAL.`;
+
+const KRONOS_OUTPUT_POLICY = `FORMAT OBLIGATOIRE
+📐 TECHNIQUE UTILISÉE : [nom + raison courte]
 📊 ANALYSE :
 - Tendance : [Haussière/Baissière/Neutre]
-- Signal détecté : [description]
-- Zone d'entrée : [niveau]
-- Stop Loss : [niveau]
-- Take Profit 1 : [niveau]
-- Take Profit 2 : [niveau]
-✅ CONFLUENCE : [si plusieurs graphiques]
+- Signal détecté : [description courte ou AUCUN SIGNAL]
+- Zone d'entrée : [niveau numérique ou —]
+- Stop Loss : [niveau numérique ou —]
+- Take Profit 1 : [niveau numérique ou —]
+- Take Profit 2 : [niveau numérique ou —]
+✅ CONFLUENCE : [alignement multi-graphe/API/news ou limite]
 ⚠️ RISQUE : Ce n'est pas un conseil financier.
 SCORE_CONFIANCE:[0-100]
-TECHNIQUE_UTILISEE:[nom court]
-STYLE_EFFICACITE:[style]=[0-100]`;
+TECHNIQUE_UTILISEE:[ICT|SMC|Wyckoff|Elliott|Price Action|Ichimoku|Hybride SMC+Chartiste]
+STYLE_EFFICACITE:[style]=[0-100]
+Si le signal n'est pas assez confirmé, écris explicitement AUCUN SIGNAL et n'ajoute pas de faux niveaux.`;
+
+const KRONOS_SYSTEM_PROMPT = [
+  "Tu es Kronos, le moteur IA éducatif d'Oracle Forex. Tu analyses comme un analyste senior: précis, prudent, structuré, jamais vendeur de rêve. Tu ne donnes jamais de conseil financier; tu fournis une lecture éducative du marché.",
+  KRONOS_DATA_POLICY,
+  KRONOS_CHART_POLICY,
+  KRONOS_METHOD_POLICY,
+  KRONOS_STRATEGY_POLICY,
+  KRONOS_OUTPUT_POLICY,
+].join("\n\n");
 
 const mime = {
   ".html": "text/html; charset=utf-8",
@@ -267,7 +299,9 @@ ${question || "Analyse ces graphiques."}
 CONTEXTE RECENT:
 ${context}
 
-Réponds en français, de façon concise mais utile.`;
+Réponds en français, de façon concise mais utile.
+Si l'utilisateur pose une question générale, explique directement sans forcer le format signal.
+Utilise le format Kronos complet seulement quand l'utilisateur demande explicitement un signal, un setup ou une analyse de graphe.`;
     const answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 420, 0.3);
     if (images.length && !answer) {
       sendJson(res, 200, {
@@ -300,8 +334,8 @@ Réponds en français, de façon concise mais utile.`;
       sendJson(res, 200, { ok: false, reason: "image_required" });
       return;
     }
-    if (!env.GEMINI_API_KEY && !env.GEMINI_KEY) {
-      sendJson(res, 200, { ok: false, reason: "gemini_required" });
+    if (!hasVisionProvider()) {
+      sendJson(res, 200, { ok: false, reason: "vision_provider_required" });
       return;
     }
     const prompt = `Lis ces screenshots de charts trading.
@@ -342,7 +376,7 @@ Réponds en JSON strict:
       });
       return;
     }
-    if (images.length && !env.GEMINI_API_KEY && !env.GEMINI_KEY) {
+    if (images.length && !hasVisionProvider()) {
       sendJson(res, 200, {
         direction: "AUCUN SIGNAL",
         entry: "—",
@@ -352,7 +386,7 @@ Réponds en JSON strict:
         rr: "—",
         score: 0,
         technique: "Vision indisponible",
-        explanation: "Gemini Vision est requis pour analyser un screenshot. Kronos bloque le signal pour éviter une analyse inventée.",
+        explanation: "Aucune clé Groq Vision ou Gemini Vision n'est disponible pour analyser un screenshot. Kronos bloque le signal pour éviter une analyse inventée.",
         noSignal: true,
       });
       return;
@@ -388,7 +422,7 @@ Si le style demandé n'est pas "Mixte" et que sa structure n'est pas clairement 
 Tu dois citer les éléments techniques visibles qui justifient le style retenu.
 Adapte les niveaux à la stratégie demandée: Scalping = SL/TP courts et confirmation rapide; Swing Trading = structure H1/H4/D1; Position Trading = niveaux majeurs; Breakout = attendre clôture/retest; Reversal = confirmer rejet/CHOCH/divergence avant entrée.
 Si la détection automatique est désactivée, utilise la paire et le timeframe du formulaire comme contexte confirmé.
-Refuse seulement si aucune analyse raisonnable ne peut être estimée. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live.
+Si le setup n'est pas confirmé, retourne AUCUN SIGNAL au lieu de forcer une opportunité. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
 Si plusieurs graphes sont fournis: utilise les timeframes élevés pour la tendance/contexte et le plus petit timeframe détecté pour l'entrée finale.
 Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
@@ -405,7 +439,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
       });
     }
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe }, { livePrice, imageQuality, calibration, chartContext });
-    if (!result.educationalOnly) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration });
+    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration });
     sendJson(res, 200, result);
     return;
   }
@@ -1607,6 +1641,10 @@ function normalizeImages(images) {
   }).filter(Boolean);
 }
 
+function hasVisionProvider() {
+  return GROQ_KEYS.length > 0 || Boolean(env.GEMINI_API_KEY || env.GEMINI_KEY);
+}
+
 function normalizeChartDetection(value) {
   const raw = value && typeof value === "object" ? value : {};
   const pair = normalizePair(raw.primaryPair || raw.pair || raw.symbol);
@@ -1798,6 +1836,16 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     chartContext,
     styleComparison: validation.styleComparison,
   };
+  const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
+  if (explicitNoSignal) {
+    return blockAnalysis(normalized, {
+      score: Math.min(normalized.score, validation.score, 45),
+      technique: normalized.technique === "Mixte" ? "Aucun style validé" : normalized.technique || validation.technique,
+      explanation: `${text}\n\nVALIDATION KRONOS: signal bloqué volontairement, car l'analyse IA n'a pas confirmé un setup exploitable.`,
+      validation: { ...validation, valid: false, reason: "Aucun signal confirmé par Kronos." },
+      meta,
+    });
+  }
   if (hasChartImages && imageQuality.score < 20) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, imageQuality.score),
@@ -1911,7 +1959,7 @@ const styleRules = {
   },
   Elliott: {
     technique: "Elliott",
-    groups: [["vague", "wave"], ["1", "2", "3", "4", "5", "abc"], ["invalidation", "correction", "impulsion"]],
+    groups: [["vague", "wave", "elliott"], ["abc", "vague 1", "vague 2", "vague 3", "vague 4", "vague 5", "wave 1"], ["invalidation", "correction", "impulsion"]],
   },
   "Price Action": {
     technique: "Price Action",
@@ -2051,7 +2099,7 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair }) {
     sl: finalSl,
     tp: finalTp,
     tp2: finalTp2,
-    reason: "Niveaux assistés générés depuis le prix live car Gemini n'a pas fourni tous les chiffres.",
+    reason: "Niveaux assistés générés depuis le prix live car l'IA n'a pas fourni tous les chiffres.",
   };
 }
 
@@ -2291,7 +2339,8 @@ function healthRecommendations() {
   tips.push("Fallbacks sans clé actifs: Binance pour crypto, Coinbase pour BTC/ETH spot, Stooq/Frankfurter pour Forex indicatif.");
   if (!TWELVE_DATA_KEYS.length) tips.push("Ajouter TWELVE_DATA_API_KEY ou TWELVE_DATA_API_KEY_1..8: source principale prix + historiques.");
   if (!GROQ_KEYS.length) tips.push("Ajouter GROQ_KEY ou GROQ_KEY_1..3: moteur texte et Groq Vision.");
-  if (!env.GEMINI_API_KEY && !env.GEMINI_KEY) tips.push("Ajouter GEMINI_API_KEY: obligatoire pour analyser les screenshots.");
+  if (!hasVisionProvider()) tips.push("Ajouter GROQ_KEY ou GEMINI_API_KEY: nécessaire pour analyser les screenshots.");
+  else if (!env.GEMINI_API_KEY && !env.GEMINI_KEY) tips.push("Ajouter GEMINI_API_KEY si tu veux un fallback vision quand Groq Vision est indisponible.");
   if (!tips.length) tips.push("Toutes les clés principales sont présentes; surveiller /api/health pour les dégradations.");
   return tips;
 }
@@ -2512,16 +2561,18 @@ function extractScore(text, seed = "") {
 }
 
 function extractTechnique(text) {
-  const known = ["Mixte", "ICT", "Wyckoff", "Elliott", "Price Action", "Ichimoku", "SMC"];
+  const known = ["Hybride SMC+Chartiste", "ICT", "Wyckoff", "Elliott", "Price Action", "Ichimoku", "SMC"];
   const match = String(text).match(/TECHNIQUE_UTILISEE\s*:?\s*([^\n\r]+)/i);
   if (match) {
     const captured = cleanLine(match[1])
       .replace(/\b(?:SCORE_CONFIANCE|STYLE_EFFICACITE)\b.*$/i, "")
       .trim();
     if (/^PA\b/i.test(captured)) return "Price Action";
-    return known.find((item) => new RegExp(`\\b${item.replace(" ", "\\s+")}\\b`, "i").test(captured)) || captured.slice(0, 28);
+    const haystack = normalizeForSearch(captured);
+    return known.find((item) => haystack.includes(normalizeForSearch(item))) || captured.slice(0, 28);
   }
-  return known.find((item) => new RegExp(item, "i").test(text)) || "Price Action";
+  const haystack = normalizeForSearch(text);
+  return known.find((item) => haystack.includes(normalizeForSearch(item))) || "Price Action";
 }
 
 function extractLevel(text, regex, fallback) {
