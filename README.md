@@ -14,13 +14,13 @@ Puis ouvrir:
 http://127.0.0.1:4174/#signaux
 ```
 
-## APIs a brancher plus tard
+## APIs
 
 Variables attendues dans `secret.dev`:
 
 ```env
 GROQ_KEY=...
-GROQ_MODEL=llama3-70b-8192
+GROQ_MODEL=llama-3.3-70b-versatile
 TWELVE_DATA_API_KEY=...
 FINNHUB_API_KEY=...
 NEWS_API_KEY=...
@@ -29,5 +29,24 @@ MONGODB_DB=oracle_forex
 ```
 
 Le navigateur appelle seulement `/api/...`; les cles restent cote serveur local.
+
+Le serveur accepte aussi les cles en rotation:
+
+```env
+GROQ_KEY_1=...
+GROQ_KEY_2=...
+TWELVE_DATA_API_KEY_1=...
+TWELVE_DATA_API_KEY_2=...
+ALPHA_VANTAGE_API_KEY_1=...
+FINNHUB_API_KEY_1=...
+MARKETAUX_API_KEY_1=...
+EXCHANGERATE_API_KEY_1=...
+```
+
+Voir l'etat des rotations avec:
+
+```txt
+http://127.0.0.1:4174/api/provider-status
+```
 
 Si le mot de passe MongoDB contient des caracteres speciaux comme `@`, encodez-les dans l'URI (`@` devient `%40`).

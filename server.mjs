@@ -526,18 +526,23 @@ async function fetchWithRotation(apiName, keys, fetchFn) {
 
 async function fetchTwelveDataPrice(symbol) {
   if (!TWELVE_DATA_KEYS.length) return null;
-  return fetchWithRotation("twelveData", TWELVE_DATA_KEYS, async (key) => {
-    const api = new URL("https://api.twelvedata.com/quote");
-    api.searchParams.set("symbol", symbol);
-    api.searchParams.set("apikey", key);
-    const data = await fetchJson(api);
-    if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
-    const price = Number(data.close || data.price || data.previous_close);
-    const change = Number(data.percent_change || data.change || 0);
-    if (!Number.isFinite(price)) throw new Error("invalid_price");
-    recordProviderHealth("twelve_data", true);
-    return pricePayload(symbol, { price, change }, "twelve_data", null, { reliability: 95 });
-  });
+  try {
+    return await fetchWithRotation("twelveData", TWELVE_DATA_KEYS, async (key) => {
+      const api = new URL("https://api.twelvedata.com/quote");
+      api.searchParams.set("symbol", symbol);
+      api.searchParams.set("apikey", key);
+      const data = await fetchJson(api);
+      if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
+      const price = Number(data.close || data.price || data.previous_close);
+      const change = Number(data.percent_change || data.change || 0);
+      if (!Number.isFinite(price)) throw new Error("invalid_price");
+      recordProviderHealth("twelve_data", true);
+      return pricePayload(symbol, { price, change }, "twelve_data", null, { reliability: 95 });
+    });
+  } catch (error) {
+    recordProviderHealth("twelve_data", false, error.message);
+    throw error;
+  }
 }
 
 async function fetchBinancePrice(symbol) {
@@ -560,15 +565,23 @@ async function fetchBinancePrice(symbol) {
 async function fetchExchangeRatePrice(symbol) {
   if (!EXCHANGERATE_KEYS.length || !/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol) || /XAU|XAG|BTC|ETH/i.test(symbol)) return null;
   const [from, to] = symbol.split("/");
-  return fetchWithRotation("exchangeRate", EXCHANGERATE_KEYS, async (key) => {
-    const api = new URL(`https://v6.exchangerate-api.com/v6/${encodeURIComponent(key)}/pair/${from}/${to}`);
-    const data = await fetchJson(api);
-    if (data.result && data.result !== "success") throw new Error(data["error-type"] || "api_error");
-    const price = Number(data.conversion_rate);
-    if (!Number.isFinite(price)) throw new Error("invalid_price");
-    recordProviderHealth("exchangerate_price", true);
-    return pricePayload(symbol, { price, change: 0 }, "exchangerate_api", null, { reliability: 82 });
-  });
+  try {
+    return await fetchWithRotation("exchangeRate", EXCHANGERATE_KEYS, async (key) => {
+      const api = new URL(`https://v6.exchangerate-api.com/v6/${encodeURIComponent(key)}/pair/${from}/${to}`);
+      const data = await fetchJson(api);
+      if (data.result && data.result !== "success") throw new Error(data["error-type"] || "api_error");
+      const price = Number(data.conversion_rate);
+      if (!Number.isFinite(price)) throw new Error("invalid_price");
+      recordProviderHealth("exchangerate_price", true);
+      return pricePayload(symbol, { price, change: 0 }, "exchangerate_api", null, {
+        stale: true,
+        reliability: 62,
+      });
+    });
+  } catch (error) {
+    recordProviderHealth("exchangerate_price", false, error.message);
+    throw error;
+  }
 }
 
 async function fetchPolygonPrice(symbol) {
@@ -597,21 +610,26 @@ async function fetchPolygonPrice(symbol) {
 async function fetchAlphaVantagePrice(symbol) {
   if (!ALPHA_VANTAGE_KEYS.length) return null;
   if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol) && !/BTC|ETH/i.test(symbol)) return null;
-  return fetchWithRotation("alphaVantage", ALPHA_VANTAGE_KEYS, async (key) => {
-    const [from, to] = symbol.split("/");
-    const api = new URL("https://www.alphavantage.co/query");
-    api.searchParams.set("function", "CURRENCY_EXCHANGE_RATE");
-    api.searchParams.set("from_currency", from);
-    api.searchParams.set("to_currency", to || "USD");
-    api.searchParams.set("apikey", key);
-    const data = await fetchJson(api);
-    if (data.Note || data.Information || data["Error Message"]) throw new Error(data.Note || data.Information || data["Error Message"]);
-    const payload = data["Realtime Currency Exchange Rate"] || {};
-    const price = Number(payload["5. Exchange Rate"]);
-    if (!Number.isFinite(price)) throw new Error("invalid_price");
-    recordProviderHealth("alpha_vantage", true);
-    return pricePayload(symbol, { price, change: 0 }, "alpha_vantage", null, { reliability: 80 });
-  });
+  try {
+    return await fetchWithRotation("alphaVantage", ALPHA_VANTAGE_KEYS, async (key) => {
+      const [from, to] = symbol.split("/");
+      const api = new URL("https://www.alphavantage.co/query");
+      api.searchParams.set("function", "CURRENCY_EXCHANGE_RATE");
+      api.searchParams.set("from_currency", from);
+      api.searchParams.set("to_currency", to || "USD");
+      api.searchParams.set("apikey", key);
+      const data = await fetchJson(api);
+      if (data.Note || data.Information || data["Error Message"]) throw new Error(data.Note || data.Information || data["Error Message"]);
+      const payload = data["Realtime Currency Exchange Rate"] || {};
+      const price = Number(payload["5. Exchange Rate"]);
+      if (!Number.isFinite(price)) throw new Error("invalid_price");
+      recordProviderHealth("alpha_vantage", true);
+      return pricePayload(symbol, { price, change: 0 }, "alpha_vantage", null, { reliability: 80 });
+    });
+  } catch (error) {
+    recordProviderHealth("alpha_vantage", false, error.message);
+    throw error;
+  }
 }
 
 async function fetchCoinbasePrice(symbol) {
@@ -726,19 +744,6 @@ async function getHistories(prices) {
         errors.push(`${interval}:insufficient_bars`);
       } catch (error) {
         errors.push(`${interval}:${error.message}`);
-      }
-    }
-    for (const interval of historyIntervals(symbol)) {
-      try {
-        const bars = await fetchPolygonHistory(symbol, interval);
-        if (bars.length >= 30) {
-          tagHistory(bars, `polygon:${interval}`, false);
-          recordProviderHealth("polygon_history", true);
-          return [symbol, bars];
-        }
-        errors.push(`polygon_${interval}:insufficient_bars`);
-      } catch (error) {
-        errors.push(`polygon_${interval}:${error.message}`);
       }
     }
     for (const interval of historyIntervals(symbol)) {
@@ -1056,7 +1061,7 @@ function buildDeterministicSignals(prices, histories) {
 
     if (!price.open) return inactive("Marché fermé · analyse auto suspendue jusqu'à la réouverture.");
     if (!isUsableLivePrice(price)) return inactive("Analyse auto suspendue · donnée non fiable ou fallback.");
-    if (history.length < 30) return cautiousSignal(symbol, price, base, "Historique gratuit insuffisant · signal prudent basé sur prix live.");
+    if (history.length < 30) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
 
     const closes = history.map((bar) => bar.close);
     const last = Number(price.price);
@@ -1073,11 +1078,11 @@ function buildDeterministicSignals(prices, histories) {
     const strength = Math.abs(momentum) + Math.min(Math.abs(move), 2) * 0.35 + confluence * 0.08;
 
     if (!Number.isFinite(last) || !Number.isFinite(momentum) || !Number.isFinite(rsi)) {
-      return cautiousSignal(symbol, price, base, "Indicateurs incomplets · signal prudent basé sur prix live.");
+      return cautiousSignal(symbol, price, base, "Indicateurs incomplets · aucun signal direct validé.", history);
     }
 
     if (strength < 0.18 || confluence < 2 || !trendAligned) {
-      return cautiousSignal(symbol, price, base, `Momentum faible · signal prudent, confluence ${confluence}/4.`);
+      return cautiousSignal(symbol, price, base, `Momentum faible · setup non validé, confluence ${confluence}/4.`, history);
     }
 
     const direction = momentum >= 0 ? "ACHAT" : "VENTE";
@@ -1112,7 +1117,7 @@ function buildDeterministicSignals(prices, histories) {
   });
 }
 
-function cautiousSignal(symbol, price, base, reason) {
+function cautiousSignal(symbol, price, base, reason, history = []) {
   const last = Number(price.price || base.entree);
   const direction = Number(price.change) < 0 ? "VENTE" : "ACHAT";
   const risk = assistedRiskDistance(last, symbol);
@@ -1133,11 +1138,11 @@ function cautiousSignal(symbol, price, base, reason) {
     technique: chooseTechnique(symbol, 0, Number(price.change) || 0),
     raison: reason,
     open: price.open,
-    direct: true,
+    direct: false,
     source: price.source,
-    suspended: false,
+    suspended: true,
     nextOpen: null,
-    quality: qualityPayload(price, [], true, reason),
+    quality: qualityPayload(price, history, false, reason),
     cautious: true,
   };
 }
@@ -1225,7 +1230,7 @@ function pricePayload(symbol, value, source, error, options = {}) {
 }
 
 function isLivePriceSource(source = "") {
-  return ["twelve_data", "polygon", "alpha_vantage", "coinbase", "stooq", "binance", "exchangerate_api"].includes(source);
+  return ["twelve_data", "polygon", "alpha_vantage", "coinbase", "stooq", "binance"].includes(source);
 }
 
 function isUsableLivePrice(price) {
@@ -1547,14 +1552,14 @@ async function geminiVision(prompt, images) {
   return "";
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
+async function fetchJson(url, timeoutMs = 4500) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
   return response.json();
 }
 
-async function fetchText(url) {
-  const response = await fetch(url);
+async function fetchText(url, timeoutMs = 4500) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
   return response.text();
 }

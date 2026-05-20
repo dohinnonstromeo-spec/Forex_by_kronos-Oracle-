@@ -216,8 +216,25 @@
     if (marketHeader && market?.forex) {
       const anyLive = Object.values(prices || {}).some((price) => price.open && !price.stale);
       const text = anyLive ? "Marchés en direct" : market.forex.open ? "Marché ouvert · données non-live" : "Marchés fermés";
-      marketHeader.innerHTML = `<span class="h-2 w-2 rounded-full ${anyLive ? "bg-neon-green" : "bg-neon-red"} pulse-dot"></span>${text} · Twelve Data`;
+      const sources = [...new Set(Object.values(prices || {})
+        .filter((price) => price?.source && price.source !== "static_fallback")
+        .map((price) => sourceLabel(price.source)))].slice(0, 3);
+      const sourceText = sources.length ? sources.join(" · ") : "sources indisponibles";
+      marketHeader.innerHTML = `<span class="h-2 w-2 rounded-full ${anyLive ? "bg-neon-green" : "bg-neon-red"} pulse-dot"></span>${text} · ${sourceText}`;
     }
+  }
+
+  function sourceLabel(source) {
+    return ({
+      twelve_data: "Twelve Data",
+      polygon: "Polygon",
+      alpha_vantage: "Alpha Vantage",
+      coinbase: "Coinbase",
+      stooq: "Stooq",
+      binance: "Binance",
+      frankfurter_daily: "Frankfurter",
+      exchangerate_api: "ExchangeRate",
+    })[source] || source;
   }
 
   async function wireNewsSummaries() {

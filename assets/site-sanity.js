@@ -48,15 +48,18 @@
     setTimeout(stabilizeTrustSurface, 800);
     setTimeout(stabilizeTrustSurface, 2200);
     let pending = false;
+    let runs = 0;
     const observer = new MutationObserver(() => {
-      if (pending) return;
+      if (pending || runs >= 8) return;
       pending = true;
       window.requestAnimationFrame(() => {
         pending = false;
+        runs += 1;
         stabilizeTrustSurface();
       });
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => observer.disconnect(), 6000);
   });
 
   function stabilizeTrustSurface() {
@@ -88,7 +91,7 @@
       for (const [pattern, replacement] of replacements) {
         text = text.replace(pattern, replacement);
       }
-      node.nodeValue = text;
+      if (text !== node.nodeValue) node.nodeValue = text;
     }
   }
 
@@ -142,7 +145,7 @@
     for (const [label, value] of labels) {
       const labelNode = [...document.querySelectorAll(".text-xs, div")].find((node) => node.textContent?.trim() === label);
       const valueNode = labelNode?.parentElement?.querySelector(".font-mono.text-3xl");
-      if (valueNode) valueNode.textContent = value;
+      if (valueNode && valueNode.textContent !== value) valueNode.textContent = value;
     }
   }
 
