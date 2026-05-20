@@ -1,4 +1,5 @@
 (() => {
+  let performanceState = null;
   const replacements = [
     [/Résultats prouvés\./g, "Indicateurs estimés, à confirmer."],
     [/Signaux algorithmiques\. Analyse charts IA\. Indicateurs estimés, à confirmer\./g, "Données de marché, analyses IA et signaux éducatifs soumis aux horaires et à la fraîcheur des APIs."],
@@ -45,6 +46,7 @@
   document.addEventListener("DOMContentLoaded", () => {
     injectTrustStyles();
     stabilizeTrustSurface();
+    refreshPerformanceMetrics();
     setTimeout(stabilizeTrustSurface, 800);
     setTimeout(stabilizeTrustSurface, 2200);
     let pending = false;
@@ -134,19 +136,58 @@
   }
 
   function tuneHeroMetrics() {
+    const precision = performanceState?.precisionAudited ? performanceState.precisionLabel : "À auditer";
+    const signals = performanceState ? String(performanceState.activeSignals || performanceState.totalAnalyses || dynamicSignalCount()) : dynamicSignalCount();
+    const members = performanceState?.membersLabel || "500+";
+    const instruments = performanceState?.instrumentsTracked ? String(performanceState.instrumentsTracked) : null;
     const labels = [
-      ["Précision à calculer", "86%"],
-      ["Précision Kronos", "86%"],
-      ["Signaux suivis", dynamicSignalCount()],
-      ["Signaux générés", dynamicSignalCount()],
-      ["Comptes membres", "500+"],
-      ["Traders actifs", "500+"],
+      ["Précision à calculer", precision],
+      ["Précision Kronos", precision],
+      ["Signaux suivis", signals],
+      ["Signaux générés", signals],
+      ["Comptes membres", members],
+      ["Traders actifs", members],
+      ["Instruments surveillés", instruments],
+      ["Paires couvertes", instruments],
     ];
     for (const [label, value] of labels) {
+      if (!value) continue;
       const labelNode = [...document.querySelectorAll(".text-xs, div")].find((node) => node.textContent?.trim() === label);
       const valueNode = labelNode?.parentElement?.querySelector(".font-mono.text-3xl");
       if (valueNode && valueNode.textContent !== value) valueNode.textContent = value;
     }
+  }
+
+  async function refreshPerformanceMetrics() {
+    try {
+      const response = await fetch("/api/performance");
+      if (!response.ok) return;
+      performanceState = await response.json();
+      tuneHeroMetrics();
+      tunePerformanceBlocks();
+    } catch {
+      performanceState = null;
+    }
+  }
+
+  function tunePerformanceBlocks() {
+    if (!performanceState) return;
+    [...document.querySelectorAll("h3")].forEach((title) => {
+      if (!/Performances/i.test(title.textContent || "")) return;
+      const panel = title.closest(".glass-card");
+      if (!panel) return;
+      const rows = performanceState.recent?.length
+        ? performanceState.recent.map((item) => `
+          <div class="flex items-center justify-between rounded border border-border bg-background/40 px-3 py-2">
+            <span class="text-muted-foreground">${escapeHtml(item.pair)} · ${escapeHtml(item.style || "Style")}</span>
+            <span class="${item.result === "win" ? "text-neon-green" : "text-neon-red"}">${item.result === "win" ? "TP1" : "SL"} · ${Number(item.score || 0)}%</span>
+          </div>
+        `).join("")
+        : `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Pas encore assez de signaux clôturés pour publier une performance réelle.</div>`;
+      title.textContent = "Performances · résultats réels";
+      const grid = panel.querySelector(".grid");
+      if (grid) grid.innerHTML = rows;
+    });
   }
 
   function dynamicSignalCount() {
@@ -337,5 +378,9 @@
       }
     `;
     document.head.appendChild(style);
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
   }
 })();

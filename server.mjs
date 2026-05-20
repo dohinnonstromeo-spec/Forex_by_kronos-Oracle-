@@ -239,6 +239,13 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/performance") {
+    const prices = await getPrices();
+    const learning = await updateLearningOutcomes(prices);
+    sendJson(res, 200, performancePayload(learning));
+    return;
+  }
+
   if (url.pathname === "/api/comment") {
     const body = await readBody(req);
     const prompt = `${body.pair} vient de passer de ${body.previous} à ${body.current} (${body.changePercent}%). 1 phrase d'analyse trader en français. Maximum 12 mots.`;
@@ -288,6 +295,11 @@ Génère un briefing trader en JSON : {"titre":"","paires_surveiller":[],"scenar
     const body = await readBody(req);
     const images = normalizeImages(body.images);
     const question = cleanLine(body.message || body.messages?.at?.(-1)?.content || "");
+    const chatPair = detectPairFromText(question) || body.pair || "EUR/USD";
+    const prices = await getPrices();
+    const livePrice = prices[chatPair] || await getExternalPrice(chatPair);
+    const history = await getHistoryForSymbol(chatPair, livePrice);
+    const technicalSnapshot = buildTechnicalSnapshot(chatPair, history, livePrice);
     const context = Array.isArray(body.messages)
       ? body.messages.slice(-6).map((m) => `${m.role || "user"}: ${m.content || ""}`).join("\n")
       : "";
@@ -298,6 +310,11 @@ ${question || "Analyse ces graphiques."}
 
 CONTEXTE RECENT:
 ${context}
+
+CONTEXTE MARCHÉ SI UTILE:
+- Instrument détecté: ${chatPair}
+- Prix live: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
+- Synthèse technique interne: ${technicalSnapshot.text}
 
 Réponds en français, de façon concise mais utile.
 Si l'utilisateur pose une question générale, explique directement sans forcer le format signal.
@@ -397,6 +414,8 @@ Réponds en JSON strict:
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
     const livePrice = prices[selectedPair] || await getExternalPrice(selectedPair);
+    const history = await getHistoryForSymbol(selectedPair, livePrice);
+    const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice);
     const learning = await updateLearningOutcomes(prices);
     const calibration = calibrationFor(learning, body);
     const prompt = `${KRONOS_SYSTEM_PROMPT}
@@ -410,6 +429,8 @@ CONTEXTE:
 - Stratégie demandée: ${body.strategy || "Swing Trading"}
 - Gestion du risque: ${body.risk || "Standard 2%"}
 - Prix live validé: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
+- Historique API: ${technicalSnapshot.bars} bougies (${technicalSnapshot.source}, ${technicalSnapshot.stale ? "indicatif/différé" : "frais"})
+- Synthèse technique interne: ${technicalSnapshot.text}
 - Qualité image estimée: ${images.length ? `${imageQuality.score}/100 (${imageQuality.reason})` : "aucun graphe uploadé: analyse texte/prix live"}
 - Calibration historique Kronos: ${calibration.message}
 
@@ -438,7 +459,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         livePrice,
       });
     }
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe }, { livePrice, imageQuality, calibration, chartContext });
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot });
     if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration });
     sendJson(res, 200, result);
     return;
@@ -814,6 +835,59 @@ async function getHistories(prices) {
   });
   memoryCache.histories = { key: usableKey, value: histories, expiresAt: Date.now() + 10 * 60 * 1000 };
   return histories;
+}
+
+async function getHistoryForSymbol(symbol, price = null) {
+  const cache = await loadMarketCache();
+  const cached = cachedHistory(symbol, cache);
+  if (cached.length >= 30 && !cached._meta?.stale) return cached;
+  if (!price?.open || !isUsableLivePrice(price)) return cached;
+  const deadline = Date.now() + 12000;
+  const errors = [];
+  const attempts = [
+    ["binance", fetchBinanceHistory],
+    ["polygon", fetchPolygonHistory],
+    ["twelve_data", fetchTwelveDataHistory],
+    ["stooq", fetchStooqHistory],
+  ];
+  for (const [source, loader] of attempts) {
+    for (const interval of historyIntervals(symbol)) {
+      if (Date.now() > deadline) {
+        errors.push("history_budget_exceeded");
+        return cached;
+      }
+      try {
+        const bars = await loader(symbol, interval);
+        if (bars.length >= 30) {
+          tagHistory(bars, `${source}:${interval}`, false);
+          await saveMarketCache({
+            ...cache,
+            histories: mergeCachedHistories(cache.histories || {}, { [symbol]: bars }),
+          });
+          recordProviderHealth(`${source}_history_single`, true);
+          return bars;
+        }
+        if (bars.length) errors.push(`${source}_${interval}:insufficient_bars`);
+      } catch (error) {
+        errors.push(`${source}_${interval}:${error.message}`);
+      }
+    }
+  }
+  if (Date.now() <= deadline) {
+    try {
+      const bars = await fetchDukascopyHistory(symbol);
+      if (bars.length >= 30) {
+        tagHistory(bars, "dukascopy:daily", true);
+        recordProviderHealth("dukascopy_history_single", true);
+        return bars;
+      }
+      errors.push("dukascopy:insufficient_bars");
+    } catch (error) {
+      errors.push(`dukascopy:${error.message}`);
+    }
+  }
+  recordProviderHealth("history_single", false, errors.join(" | ") || "no_history");
+  return cached;
 }
 
 async function fetchFreeHistories(cache, prices) {
@@ -1814,6 +1888,86 @@ function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
   return `Swing Trading ${timeframe}: setup prudent basé sur structure, support/résistance et prix live`;
 }
 
+function buildTechnicalSnapshot(pair, history = [], livePrice = null) {
+  const bars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
+  const closes = bars.map((bar) => Number(bar.close));
+  const live = Number(livePrice?.price);
+  const last = Number.isFinite(live) ? live : closes.at(-1);
+  const meta = history?._meta || {};
+  if (!Number.isFinite(last) || closes.length < 10) {
+    return {
+      pair,
+      bars: closes.length,
+      source: meta.source || livePrice?.source || "aucun historique",
+      stale: Boolean(meta.stale || livePrice?.stale),
+      valid: false,
+      text: "Historique insuffisant: lecture visuelle prioritaire, aucun setup direct à forcer.",
+    };
+  }
+  const sma10 = average(closes.slice(-10));
+  const sma30 = closes.length >= 30 ? average(closes.slice(-30)) : NaN;
+  const rsi = closes.length >= 15 ? calculateRsi(closes.slice(-15)) : NaN;
+  const atr = average(bars.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.004;
+  const recent = bars.slice(-30);
+  const support = Math.min(...recent.map((bar) => Number(bar.low)).filter(Number.isFinite));
+  const resistance = Math.max(...recent.map((bar) => Number(bar.high)).filter(Number.isFinite));
+  const momentum = Number.isFinite(sma30) && sma30 > 0 ? ((sma10 - sma30) / sma30) * 100 : 0;
+  const trend = !Number.isFinite(sma30)
+    ? "neutre"
+    : momentum > 0.04 && Number(rsi) >= 52
+      ? "haussière"
+      : momentum < -0.04 && Number(rsi) <= 48
+        ? "baissière"
+        : "neutre/range";
+  const volatility = Number.isFinite(atr) && last ? (atr / last) * 100 : 0;
+  const confirmations = [
+    closes.length >= 30,
+    !meta.stale,
+    trend !== "neutre/range",
+    Number.isFinite(support) && Number.isFinite(resistance) && resistance > support,
+    volatility > 0.04,
+  ].filter(Boolean).length;
+  const valid = closes.length >= 30 && confirmations >= 3 && !meta.stale;
+  return {
+    pair,
+    bars: closes.length,
+    source: meta.source || livePrice?.source || "historique",
+    stale: Boolean(meta.stale || livePrice?.stale),
+    valid,
+    last: roundLevel(last),
+    sma10: roundLevel(sma10),
+    sma30: Number.isFinite(sma30) ? roundLevel(sma30) : null,
+    rsi: Number.isFinite(rsi) ? Math.round(rsi) : null,
+    atr: roundLevel(atr),
+    support: Number.isFinite(support) ? roundLevel(support) : null,
+    resistance: Number.isFinite(resistance) ? roundLevel(resistance) : null,
+    trend,
+    momentum: Number(momentum.toFixed(3)),
+    volatility: Number(volatility.toFixed(3)),
+    confirmations,
+    text: [
+      `${closes.length} bougies ${meta.source || livePrice?.source || "API"}`,
+      `tendance ${trend}`,
+      `SMA10 ${formatLevel(sma10)}${Number.isFinite(sma30) ? ` / SMA30 ${formatLevel(sma30)}` : ""}`,
+      Number.isFinite(rsi) ? `RSI ${Math.round(rsi)}` : "RSI indisponible",
+      `ATR ${formatLevel(atr)}`,
+      Number.isFinite(support) && Number.isFinite(resistance) ? `support ${formatLevel(support)}, résistance ${formatLevel(resistance)}` : "zones S/R insuffisantes",
+      `confirmations ${confirmations}/5`,
+      meta.stale ? "historique indicatif/différé" : "historique frais ou cache récent",
+    ].join("; "),
+  };
+}
+
+function detectPairFromText(text = "") {
+  const normalized = String(text).toUpperCase();
+  const candidates = [
+    ...symbols,
+    "NAS100", "XAG/USD", "XPT/USD", "XPD/USD",
+    "GBP/USD", "USD/JPY", "USD/CHF", "USD/CAD", "AUD/USD", "NZD/USD", "EUR/JPY",
+  ];
+  return candidates.find((pair) => normalized.includes(pair) || normalized.includes(pair.replace("/", ""))) || null;
+}
+
 function normalizeAnalysis(answer, body = {}, context = {}) {
   const normalized = normalizeAiAnswer(answer, body.pair || "");
   const text = normalized.answer;
@@ -1834,6 +1988,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     imageQuality,
     calibration,
     chartContext,
+    technicalSnapshot: context.technicalSnapshot || null,
     styleComparison: validation.styleComparison,
   };
   const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
@@ -2537,6 +2692,43 @@ function learningSummary(log) {
     byStyle,
     byStrategy,
     note: "Apprentissage contrôlé: Kronos calibre ses scores avec les résultats, sans modifier le code automatiquement.",
+  };
+}
+
+function performancePayload(log) {
+  const summary = learningSummary(log);
+  const closed = log.outcomes.filter((item) => ["win", "loss"].includes(item.result));
+  const recent = closed.slice(-12).reverse();
+  const totalSignals = log.analyses.filter((item) => item.active).length;
+  const precisionLabel = summary.closedAnalyses >= 20 && summary.globalWinRate !== null
+    ? `${summary.globalWinRate}%`
+    : "À auditer";
+  return {
+    updatedAt: summary.updatedAt,
+    precision: summary.globalWinRate,
+    precisionLabel,
+    precisionAudited: summary.closedAnalyses >= 20,
+    closedAnalyses: summary.closedAnalyses,
+    totalAnalyses: summary.totalAnalyses,
+    activeSignals: totalSignals,
+    blockedAnalyses: summary.blockedAnalyses,
+    openAnalyses: summary.openAnalyses,
+    instrumentsTracked: symbols.length,
+    membersLabel: "500+",
+    byStyle: summary.byStyle,
+    byStrategy: summary.byStrategy,
+    recent: recent.map((item) => ({
+      pair: item.pair,
+      style: item.style,
+      strategy: item.strategy,
+      result: item.result,
+      status: item.status,
+      score: item.score,
+      closedAt: item.closedAt,
+    })),
+    disclaimer: summary.closedAnalyses >= 20
+      ? "Performance calculée sur les signaux clôturés enregistrés par Kronos."
+      : "Échantillon encore trop petit: la précision publique doit rester non auditée.",
   };
 }
 

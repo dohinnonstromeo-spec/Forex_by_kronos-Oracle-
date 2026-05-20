@@ -449,12 +449,14 @@
     const quality = meta.imageQuality;
     const calibration = meta.calibration;
     const chartContext = meta.chartContext;
+    const technical = meta.technicalSnapshot;
     const live = meta.livePrice;
     const id = result.learningId;
-    if (!quality && !calibration && !live && !id && !chartContext) return "";
+    if (!quality && !calibration && !live && !id && !chartContext && !technical) return "";
     return `<div class="mt-3 text-[10px] uppercase tracking-widest text-muted-foreground">
       ${quality ? `<div>Image: ${quality.score}% · ${escapeHtml(quality.reason || "")}</div>` : ""}
       ${live ? `<div>Prix live vérifié: ${escapeHtml(live)}</div>` : ""}
+      ${technical ? `<div>Technique API: ${escapeHtml(technical.trend || "n/a")} · RSI ${escapeHtml(technical.rsi ?? "n/a")} · ${escapeHtml(technical.bars || 0)} bougies · ${escapeHtml(technical.source || "source n/a")}</div>` : ""}
       ${meta.strategy ? `<div>Stratégie: ${escapeHtml(meta.strategy)}</div>` : ""}
       ${chartContext?.primaryPair || chartContext?.executionTimeframe ? `<div>Contexte chart: ${escapeHtml(chartContext.primaryPair || "paire manuelle")} · ${escapeHtml(chartContext.executionTimeframe || "timeframe manuel")}</div>` : ""}
       ${meta.styleComparison ? `<div>Style retenu: ${escapeHtml(meta.styleComparison.bestStyle || result.technique || "n/a")} · efficacité ${Number(meta.styleComparison.bestScore || result.score || 0)}%</div>` : ""}

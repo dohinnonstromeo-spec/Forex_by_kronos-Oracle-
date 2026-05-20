@@ -14,11 +14,13 @@
     injectStyles();
     await updatePrices();
     await updateSignals();
+    await updatePerformancePanel();
     wireNewsSummaries();
     setInterval(updateCountdowns, 1000);
     setInterval(updatePrices, 60000);
     setInterval(updateSignals, 15 * 60 * 1000);
     setInterval(updateSignalScores, 5 * 60 * 1000);
+    setInterval(updatePerformancePanel, 5 * 60 * 1000);
   }
 
   async function updatePrices() {
@@ -247,6 +249,28 @@
       const data = await postJson("/api/news-summary", { title });
       if (data?.summary) firstCell.innerHTML = `<span class="inline-flex text-xs md:text-sm">${flap(data.summary.slice(0, 38))}</span>`;
     }
+  }
+
+  async function updatePerformancePanel() {
+    const data = await getJson("/api/performance");
+    if (!data) return;
+    [...document.querySelectorAll("h3")].forEach((title) => {
+      if (!/Performances/i.test(title.textContent || "")) return;
+      const panel = title.closest(".glass-card");
+      const grid = panel?.querySelector(".grid");
+      if (!grid) return;
+      title.textContent = "Performances · résultats réels";
+      if (!Array.isArray(data.recent) || !data.recent.length) {
+        grid.innerHTML = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Pas encore assez de signaux clôturés pour publier une performance réelle.</div>`;
+        return;
+      }
+      grid.innerHTML = data.recent.map((item) => `
+        <div class="flex items-center justify-between rounded border border-border bg-background/40 px-3 py-2">
+          <span class="text-muted-foreground">${escapeHtml(item.pair)} · ${escapeHtml(item.style || "Style")}</span>
+          <span class="${item.result === "win" ? "text-neon-green" : "text-neon-red"}">${item.result === "win" ? "TP1" : "SL"} · ${Number(item.score || 0)}%</span>
+        </div>
+      `).join("");
+    });
   }
 
   function flap(value) {
