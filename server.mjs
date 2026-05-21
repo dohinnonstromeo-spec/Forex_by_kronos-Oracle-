@@ -49,13 +49,15 @@ const rotationCounters = {
 const exhaustedKeys = new Map();
 const symbols = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD"];
 
+// Static fallback only: emergency display values when every live source fails.
+// They are intentionally low-reliability and must never validate a direct setup.
 const fallbackPrices = {
-  "EUR/USD": { price: 1.0847, change: 0.32 },
-  "XAU/USD": { price: 2384.5, change: 1.21 },
-  "BTC/USD": { price: 67420, change: 2.84 },
-  "GBP/JPY": { price: 198.42, change: -0.18 },
-  US500: { price: 5240.3, change: 0.41 },
-  "ETH/USD": { price: 3120.5, change: 1.13 },
+  "EUR/USD": { price: 1.0850, change: 0 },
+  "XAU/USD": { price: 2350.0, change: 0 },
+  "BTC/USD": { price: 65000, change: 0 },
+  "GBP/JPY": { price: 195.0, change: 0 },
+  US500: { price: 5200.0, change: 0 },
+  "ETH/USD": { price: 3000.0, change: 0 },
 };
 
 const fallbackSignals = [
@@ -79,6 +81,7 @@ const fallbackSignals = [
 }));
 
 const KRONOS_DATA_POLICY = `DONNÉES ET FIABILITÉ DISPONIBLES
+Les sources à clés utilisent une rotation automatique multi-clés. Une clé épuisée ou en quota est mise en pause temporaire, puis une autre clé est essayée.
 - Twelve Data: source principale prix/historique Forex, métaux, indices si clé disponible; fiabilité cible 95.
 - Polygon: source de secours prix/historique si clé disponible; fiabilité cible 88.
 - Binance: crypto uniquement, sans clé; fiabilité cible 90. Ne l'utilise pas pour l'or, les indices ou le Forex fiat.
@@ -89,6 +92,7 @@ const KRONOS_DATA_POLICY = `DONNÉES ET FIABILITÉ DISPONIBLES
 - Frankfurter/BCE: taux quotidiens de dernier recours; ne sert pas à produire un signal intraday.
 - Finnhub: calendrier économique quand disponible. Marketaux: actualités quand disponible.
 - Vision: Groq Vision LLaMA 4 Scout/Maverick en priorité, Gemini Vision en fallback.
+- Historique: jusqu'à 80 bougies; >=50 bougies = analyse technique complète, 30-49 = partielle, <30 = prudence/prix live seulement.
 - Si la source live est absente, faible, différée ou incohérente, baisse le score et signale la limite. N'invente jamais une donnée manquante.`;
 
 const KRONOS_CHART_POLICY = `LECTURE DES GRAPHES
@@ -99,26 +103,58 @@ Le site accepte 2 graphes maximum. Avec 2 graphes: le timeframe le plus élevé 
 Qualité image: >=70 analyse complète; 50-69 analyse partielle; 30-49 analyse prudente croisée avec API; <30 bloque l'analyse visuelle directe.
 Si aucun graphe n'est fourni, écris "Analyse sans screenshot", utilise seulement le prix live et le formulaire, et ne cite aucun élément visuel. Si un prix live fiable est disponible, tu peux proposer un plan éducatif prudent avec score plafonné à 60; sinon retourne AUCUN SIGNAL.`;
 
-const KRONOS_METHOD_POLICY = `MÉTHODES SUPPORTÉES
+const KRONOS_METHOD_POLICY = `MÉTHODES D'ANALYSE SUPPORTÉES
 Techniques finales autorisées pour TECHNIQUE_UTILISEE: ICT, SMC, Wyckoff, Elliott, Price Action, Ichimoku, Hybride SMC+Chartiste.
-Confluences secondaires possibles dans l'explication: Supply/Demand, VSA, Harmonic, Fibonacci, chartisme classique, chandeliers japonais, volume, psychologie du marché.
-ICT: order blocks, FVG, liquidity sweep, premium/discount, killzones si visibles.
-SMC: BOS, CHOCH, MSB, inducement, liquidité, mitigation.
-Wyckoff: accumulation/distribution, spring, UTAD, phases, effort/résultat.
-Elliott: impulsion 1-5, correction ABC, invalidation claire.
-Price Action: tendance, supports/résistances, cassure, retest, chandeliers, ranges.
-Ichimoku: Kumo, Tenkan/Kijun, Chikou, twist, position du prix.
-Mixte: compare les techniques supportées, donne le STYLE_EFFICACITE le plus élevé et retiens celle qui possède les preuves les plus nettes.`;
+Confluences secondaires possibles dans l'explication: Supply/Demand, VSA, Harmonic, Fibonacci, chartisme classique, chandeliers japonais, volume, psychologie du marché. Elles ne doivent pas remplacer la technique finale autorisée.
 
-const KRONOS_STRATEGY_POLICY = `STRATÉGIES
-Scalping: M1-M15, SL serré, objectif court, entrée seulement après réaction nette.
-Swing Trading: H1-D1, structure principale, zones de marché, TP plus larges.
-Position Trading: D1-W1, tendance de fond et niveaux majeurs.
-Breakout: cassure, clôture, retest, risque de fausse cassure.
-Reversal: rejet clair, divergence visible, CHOCH ou invalidation précise.
-Un signal exploitable doit avoir direction, entrée, SL, TP1, TP2 et R/R cohérents. Si ces éléments ne peuvent pas être justifiés, retourne AUCUN SIGNAL.`;
+Price Action: structure HH/HL ou LH/LL, range, supports/résistances, cassure/retest, measured move, chandeliers de confirmation. Le contexte prime toujours sur une bougie isolée.
+SMC: order block, FVG, BOS, CHOCH, MSB, inducement, liquidité, mitigation, premium/discount, breaker block. Un CHOCH seul est une alerte, pas une confirmation.
+ICT: kill zones, liquidity sweep, Judas swing, OTE, Power of 3, Silver Bullet et macros uniquement si l'heure/session ou le contexte est fourni.
+Wyckoff: accumulation/distribution, Selling Climax, Automatic Rally, Spring, SOS, LPS, Buying Climax, UTAD, effort/résultat. Un Spring/UTAD visible est prioritaire.
+Elliott: impulsion 1-5, correction ABC, invalidation claire, règles absolues de vague 2, vague 3 et vague 4. Ne force jamais un comptage ambigu.
+Ichimoku: prix vs Kumo, Tenkan/Kijun, Chikou, twist, Kijun bounce. Signal fort seulement si au moins 2-3 confirmations sont alignées.
+Supply & Demand: DBR/RBD, zones fraîches, nombre de retests. Une zone fraîche + OB/FVG au même niveau renforce la confluence.
+Harmonic: XABCD, Gartley, Bat, Butterfly, Crab, Cypher seulement si les points et ratios sont visibles; attendre confirmation au point D.
+VSA: No Supply, No Demand, Stopping Volume, Upthrust, effort/résultat seulement si volume ou spread est visible.
+Chartisme: H&S, double top/bottom, triangles, drapeaux, fanions, wedges, cup & handle. Attendre clôture et retest avant breakout.
+Indicateurs: RSI, MACD, Bollinger, ATR, moyennes mobiles seulement quand visibles ou fournis par le serveur.
+Mixte: compare les techniques supportées, retiens celle qui possède les preuves les plus nettes et donne STYLE_EFFICACITE.`;
+
+const KRONOS_STRATEGY_POLICY = `STRATÉGIES DE TRADING
+Scalping: M1-M15, idéalement London Open ou NY Open, SL court, TP court, R:R minimum 1:1.5, risque réduit.
+Day Trading: contexte H1/H4, entrée M15/M30, volatilité session London/NY, R:R minimum 1:2.
+Swing Trading: contexte Daily/H4, entrée H4/H1, niveaux majeurs, R:R minimum 1:2.5.
+Position Trading: Weekly/Daily, drivers fondamentaux, SL plus large, R:R minimum 1:3.
+Breakout: cassure + clôture + retest; signal faible si la cassure n'est pas confirmée.
+Reversal: rejet clair + divergence/CHOCH/invalidation; jamais uniquement parce que le prix est haut ou bas.
+Adaptation automatique: M1-M15 = scalping, M30-H4 = day/swing, D1+ = swing/position.
+Un signal exploitable doit avoir direction, entrée, SL structurel, TP1, TP2 et R/R cohérents. Sinon: AUCUN SIGNAL.`;
+
+const KRONOS_RISK_POLICY = `GESTION DU RISQUE
+R:R minimum: 1:1.5. Optimal: 1:2 ou 1:3. Évite toute entrée sous 1:1.5.
+Risk par trade: Conservateur 1%, Standard 2%, Agressif 3% uniquement si score très fort, pas de news rouge et confluences solides.
+SL toujours structurel: sous support/demand/OB/FVG pour achat, au-dessus résistance/supply/OB/FVG pour vente. Jamais un nombre arbitraire.
+Corrélation: signale les expositions doublées, par exemple long EUR/USD + long GBP/USD = double risque USD.
+Si événement macro fort proche, données faibles, MTF contradictoire ou image mauvaise, baisse le score ou bloque.
+Scoring: >=85 FORT, 71-84 STANDARD, 55-70 PRUDENT, <55 BLOQUÉ.`;
+
+const KRONOS_FUNDAMENTAL_POLICY = `ANALYSE FONDAMENTALE À CITER SI UTILE
+EUR/USD: différentiel Fed/BCE, inflation, croissance, DXY.
+GBP/JPY: paire très volatile, sensible au risque global et aux politiques BOE/BOJ.
+XAU/USD: or refuge, sensible au DXY, taux réels US, inflation, tensions géopolitiques.
+BTC/USD et ETH/USD: 24/7, corrélation fréquente avec le risque et les indices US.
+US500/NAS100: indices sensibles aux taux, earnings, inflation, Fed, sentiment risque.
+News high impact: NFP, FOMC, CPI, PPI, BCE, BOE, BOJ. Si un risque news est transmis par le serveur, respecte-le strictement.`;
 
 const KRONOS_OUTPUT_POLICY = `FORMAT OBLIGATOIRE
+📸 LECTURE DES GRAPHIQUES :
+[Si image] Plateforme: [X] | Paire: [X] | Timeframe: [X] | Structure visible: [description]
+[Sans image] Analyse sans screenshot — utilise uniquement prix live + formulaire + synthèse technique API.
+
+📡 DONNÉES LIVE :
+- Prix live: [valeur] | Source: [source] | Fiabilité: [si connue]
+- Historique: [bougies] | SMA10/SMA30: [X] | RSI: [X] | ATR: [X]
+
 📐 TECHNIQUE UTILISÉE : [nom + raison courte]
 📊 ANALYSE :
 - Tendance : [Haussière/Baissière/Neutre]
@@ -127,6 +163,7 @@ const KRONOS_OUTPUT_POLICY = `FORMAT OBLIGATOIRE
 - Stop Loss : [niveau numérique ou —]
 - Take Profit 1 : [niveau numérique ou —]
 - Take Profit 2 : [niveau numérique ou —]
+- R/R ratio : [1:X]
 ✅ CONFLUENCE : [alignement multi-graphe/API/news ou limite]
 ⚠️ RISQUE : Ce n'est pas un conseil financier.
 SCORE_CONFIANCE:[0-100]
@@ -140,6 +177,8 @@ const KRONOS_SYSTEM_PROMPT = [
   KRONOS_CHART_POLICY,
   KRONOS_METHOD_POLICY,
   KRONOS_STRATEGY_POLICY,
+  KRONOS_RISK_POLICY,
+  KRONOS_FUNDAMENTAL_POLICY,
   KRONOS_OUTPUT_POLICY,
 ].join("\n\n");
 
@@ -324,7 +363,7 @@ Utilise le format Kronos complet seulement quand l'utilisateur demande explicite
       sendJson(res, 200, {
         ok: false,
         offline: true,
-        answer: "Vision Gemini indisponible: je ne peux pas analyser ce graphique de façon fiable. Pose une question texte ou vérifie la clé Gemini.",
+        answer: "Vision indisponible: impossible d'analyser ce graphique de façon fiable. Vérifie que Groq ou Gemini est configuré, ou pose une question texte.",
         score: 0,
         technique: "Vision indisponible",
       });
