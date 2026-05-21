@@ -229,7 +229,7 @@
       if (panel) panel.textContent = "";
       return;
     }
-    panel.innerHTML = `<span class="oracle-chat-dot"></span> Lecture paire/timeframes par Gemini...`;
+    panel.innerHTML = `<span class="oracle-chat-dot"></span> Lecture paire/timeframes par IA vision...`;
     const data = await postJson("/api/detect-chart-context", { images });
     if (!data?.ok) {
       panel.innerHTML = `<span class="oracle-chat-dot closed"></span> Détection indisponible. Sélection manuelle conservée.`;
