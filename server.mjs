@@ -188,6 +188,31 @@ const KRONOS_SYSTEM_PROMPT = [
   KRONOS_OUTPUT_POLICY,
 ].join("\n\n");
 
+const CHATBOT_SYSTEM_PROMPT = `Tu es ChatBot Kronos, l'assistant conversationnel trading d'Oracle Forex.
+
+Rôle:
+- Discuter naturellement avec l'utilisateur, comme un vrai chatbot.
+- Répondre à toute question liée au trading: Forex, crypto, indices, métaux, psychologie, money management, brokers, lots, pips, spreads, sessions, news, stratégies, erreurs de débutant, lecture de graphe.
+- Expliquer simplement quand l'utilisateur apprend.
+- Être capable de proposer un plan d'action éducatif quand l'utilisateur demande quoi faire.
+- Basculer en mode analyse/setup seulement quand l'utilisateur demande un signal, une entrée, TP/SL, une analyse de paire ou envoie un graphe.
+
+Capital faible:
+- Si l'utilisateur parle d'un petit capital comme 10$, ne le bloque pas sèchement. Explique ce qui est possible et impossible.
+- Propose une approche réaliste: cent account, micro-lots si disponible, risque très faible, patience, objectif d'apprentissage, pas de martingale.
+- Tu peux proposer des scénarios éducatifs ou une watchlist, mais tu ne promets jamais de gagner vite ou facilement.
+
+Sécurité:
+- Ne donne jamais de garantie de profit.
+- Ne présente jamais une réponse comme un conseil financier.
+- Si une demande est risquée, réponds utilement: explique le risque et propose une alternative plus saine.
+
+Style:
+- Français naturel, direct, humain.
+- Réponse courte par défaut, plus détaillée si la question le demande.
+- Pose une question de clarification quand il manque la paire, le timeframe, le capital, le style ou le risque.
+- Pour un signal exploitable: donne direction, entrée, SL, TP1, TP2, R/R, score et raison, uniquement si le contexte est suffisant.`;
+
 const mime = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
@@ -346,7 +371,8 @@ Génère un briefing trader en JSON : {"titre":"","paires_surveiller":[],"scenar
       return;
     }
     const chatPair = detectPairFromText(question) || body.pair || "EUR/USD";
-    const needsMarketContext = images.length || wantsTradingSetup(question);
+    const intent = classifyChatIntent(question, images);
+    const needsMarketContext = intent.needsMarketContext;
     const prices = needsMarketContext ? await getPrices() : {};
     const livePrice = needsMarketContext ? prices[chatPair] || await getExternalPrice(chatPair) : null;
     const history = needsMarketContext ? await getHistoryForSymbol(chatPair, livePrice) : [];
@@ -354,7 +380,13 @@ Génère un briefing trader en JSON : {"titre":"","paires_surveiller":[],"scenar
     const context = Array.isArray(body.messages)
       ? body.messages.slice(-6).map((m) => `${m.role || "user"}: ${m.content || ""}`).join("\n")
       : "";
-    const prompt = `${KRONOS_SYSTEM_PROMPT}
+    const marketBlock = needsMarketContext
+      ? `CONTEXTE MARCHÉ DISPONIBLE:
+- Instrument détecté: ${chatPair}
+- Prix live: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
+- Synthèse technique interne: ${technicalSnapshot.text}`
+      : "CONTEXTE MARCHÉ DISPONIBLE: non demandé pour cette question. Ne cite pas EUR/USD ou une autre paire sauf si l'utilisateur la mentionne.";
+    const prompt = `${CHATBOT_SYSTEM_PROMPT}
 
 QUESTION UTILISATEUR:
 ${question || "Analyse ces graphiques."}
@@ -362,16 +394,18 @@ ${question || "Analyse ces graphiques."}
 CONTEXTE RECENT:
 ${context}
 
-CONTEXTE MARCHÉ SI UTILE:
-- Instrument détecté: ${chatPair}
-- Prix live: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
-- Synthèse technique interne: ${technicalSnapshot.text}
+MODE DÉTECTÉ:
+- Type: ${intent.type}
+- Besoin contexte marché: ${needsMarketContext ? "oui" : "non"}
 
-Réponds en français, de façon concise mais utile.
-Tu es aussi un vrai assistant conversationnel: si l'utilisateur salue, réponds naturellement; s'il demande une explication, enseigne clairement; s'il donne un petit capital, aide à gérer le risque.
-Ne promets jamais de transformer un petit capital en gain rapide ou facile. Pour 10$, propose surtout gestion du risque, compte démo, micro-lots/cent account, patience, et seulement des scénarios éducatifs.
-Si l'utilisateur pose une question générale, explique directement sans forcer le format signal.
-Utilise le format Kronos complet seulement quand l'utilisateur demande explicitement un signal, un setup ou une analyse de graphe.`;
+${marketBlock}
+
+INSTRUCTIONS DE RÉPONSE:
+- Si c'est une conversation ou une question générale, réponds naturellement sans format rigide.
+- Si l'utilisateur demande une méthode, donne des étapes concrètes.
+- Si l'utilisateur demande un signal/setup, utilise le contexte marché ci-dessus, explique les limites, et demande confirmation si les données sont insuffisantes.
+- Si l'utilisateur veut gagner vite/facilement, recadre sans moraliser et propose une voie prudente.
+- Termine par une prochaine action utile.`;
     const answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 420, 0.3);
     if (images.length && !answer) {
       sendJson(res, 200, {
@@ -393,7 +427,7 @@ Utilise le format Kronos complet seulement quand l'utilisateur demande explicite
       });
       return;
     }
-    sendJson(res, 200, { ok: true, ...normalizeAiAnswer(answer, question) });
+    sendJson(res, 200, { ok: true, ...normalizeChatAnswer(answer, intent, question) });
     return;
   }
 
@@ -2134,18 +2168,40 @@ function quickChatAnswer(question = "", images = []) {
       technique: "Conversation",
     };
   }
-  if (/(j.ai|j'ai|jai|avec)\s*(10|5|20)\s*(\$|usd|dollar|€|eur)|capital.*(10|5|20)/i.test(question)) {
-    return {
-      answer: "Avec un petit capital comme 10$, le plus intelligent n'est pas de chercher un trade rapide, mais de survivre: risque max 0,10$ à 0,20$ par idée, compte démo ou cent account, un seul setup par jour, pas de martingale. Je peux t'aider à construire un plan très prudent, mais je ne dois pas te promettre un gain facile.",
-      score: 82,
-      technique: "Risk Management",
-    };
-  }
   return null;
 }
 
-function wantsTradingSetup(question = "") {
-  return /signal|setup|analyse|entrée|entree|tp|take profit|sl|stop loss|achat|vente|scalp|swing|trade|trader|position|paire|xau|eur|usd|gbp|jpy|btc|eth|nas|us500/i.test(question);
+function classifyChatIntent(question = "", images = []) {
+  if (images.length) return { type: "analyse_graphique", needsMarketContext: true };
+  const text = normalizeForSearch(question);
+  const asksSignal = /signal|setup|analyse|entrée|entree|tp|take profit|sl|stop loss|achat|vente|scalp|swing|position|point d.entree|point d'entrée/i.test(question);
+  const hasInstrument = /xau|gold|or|eur|usd|gbp|jpy|btc|eth|nas|us500|sp500|forex|crypto|indice|paire/i.test(text);
+  const asksCapital = /capital|budget|compte|10\s*(\$|usd|dollar|€|eur)|petit compte|combien risquer|lot|micro lot|cent account/i.test(question);
+  const asksEducation = /c.est quoi|explique|comment|pourquoi|apprendre|strategie|stratégie|psychologie|spread|pip|lot|leverage|levier|marge|broker/i.test(question);
+  if (asksSignal || (hasInstrument && /trade|trader|acheter|vendre|maintenant|aujourd'hui/i.test(question))) {
+    return { type: "signal_ou_setup", needsMarketContext: true };
+  }
+  if (asksCapital) return { type: "gestion_capital", needsMarketContext: false };
+  if (asksEducation) return { type: "formation_trading", needsMarketContext: false };
+  if (hasInstrument) return { type: "discussion_marche", needsMarketContext: true };
+  return { type: "conversation_trading", needsMarketContext: false };
+}
+
+function normalizeChatAnswer(answer, intent, seed = "") {
+  if (intent?.type === "signal_ou_setup" || intent?.type === "analyse_graphique") {
+    return normalizeAiAnswer(answer, seed);
+  }
+  const techniqueByIntent = {
+    gestion_capital: "Gestion du risque",
+    formation_trading: "Formation",
+    discussion_marche: "Contexte marché",
+    conversation_trading: "Conversation",
+  };
+  return {
+    answer: cleanLine(answer),
+    score: intent?.type === "gestion_capital" ? 82 : 78,
+    technique: techniqueByIntent[intent?.type] || "Conversation",
+  };
 }
 
 function normalizeAnalysis(answer, body = {}, context = {}) {
