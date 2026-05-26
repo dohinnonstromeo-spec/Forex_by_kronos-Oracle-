@@ -775,6 +775,98 @@ body {
   color: var(--neon-red);
 }
 
+.no-signal-card {
+  border-color: rgba(255, 189, 89, .22);
+  background:
+    linear-gradient(135deg, rgba(255, 189, 89, .08), transparent 38%),
+    rgba(6, 10, 20, .82);
+}
+
+.no-signal-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.no-signal-title {
+  margin-top: 6px;
+  color: var(--neon-orange);
+  text-align: left;
+  font-size: clamp(28px, 5vw, 42px);
+}
+
+.no-signal-confidence {
+  background:
+    radial-gradient(circle at center, rgba(255,255,255,.06), transparent 58%),
+    conic-gradient(from 180deg, var(--neon-orange), var(--amber-neon), rgba(255,255,255,.12), var(--neon-orange));
+}
+
+.no-signal-message {
+  margin-top: 14px;
+  color: var(--foreground);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.no-signal-grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.no-signal-grid div {
+  min-height: 74px;
+  border: 1px solid rgba(255, 189, 89, .16);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, .24);
+  padding: 11px;
+}
+
+.no-signal-grid span,
+.no-signal-grid strong {
+  display: block;
+}
+
+.no-signal-grid span {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+}
+
+.no-signal-grid strong {
+  margin-top: 10px;
+  color: var(--amber-neon);
+  font-size: 14px;
+}
+
+.next-actions {
+  margin-top: 14px;
+  border: 1px solid rgba(0, 180, 255, .18);
+  border-radius: 12px;
+  background: rgba(0, 180, 255, .06);
+  padding: 13px;
+}
+
+.next-actions > span {
+  color: var(--neon-blue);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .12em;
+}
+
+.next-actions ul {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .levels-table {
   margin-top: 16px;
   display: grid;
@@ -1138,8 +1230,17 @@ body {
     flex-direction: column;
   }
 
+  .no-signal-hero {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
   .result-confidence {
     width: 112px;
+  }
+
+  .no-signal-grid {
+    grid-template-columns: 1fr;
   }
 
   .result-level-grid {

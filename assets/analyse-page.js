@@ -330,18 +330,7 @@
       `;
       return;
     }
-    const fallback = {
-      direction: "ACHAT",
-      entry: "1.0847",
-      sl: "1.0810",
-      tp1: "1.0890",
-      tp2: "1.0935",
-      rr: "1:2.4",
-      score: 76,
-      technique: "Price Action",
-      explanation: "Kronos recommande d'attendre une confirmation claire avant toute entrée. ⚠️ RISQUE : Ce n'est pas un conseil financier.",
-    };
-    const result = { ...fallback, ...data };
+    const result = normalizeAnalysisPayload(data);
     if (result.educationalOnly) {
       container.classList.add("show");
       container.innerHTML = `
@@ -355,19 +344,7 @@
     }
     if (result.noSignal || result.direction === "AUCUN SIGNAL") {
       container.classList.add("show");
-      container.innerHTML = `
-        <div class="analysis-card">
-          <div class="direction-label">⏸ AUCUN SIGNAL</div>
-          <div class="score-line">
-            <div class="signal-bottom"><span>Validation style</span><strong>${result.score || 0}%</strong></div>
-            <div class="oracle-score"><span class="score-fill red" style="width:${Math.max(0, Math.min(100, result.score || 0))}%"></span></div>
-          </div>
-          <div class="mt-3"><span class="oracle-tech">${escapeHtml(result.technique || "Non validé")}</span></div>
-          ${renderAnalysisMeta(result)}
-          <p class="mt-4 text-sm text-muted-foreground">${escapeHtml(result.explanation || result.answer || "")}</p>
-          <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
-        </div>
-      `;
+      container.innerHTML = renderNoSignalResult(result);
       return;
     }
     const buy = result.direction === "ACHAT";
@@ -401,6 +378,74 @@
         <div class="result-explanation">
           <span>Analyse détaillée</span>
           <p>${escapeHtml(result.explanation || result.answer || "")}</p>
+        </div>
+        <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
+      </div>
+    `;
+  }
+
+  function normalizeAnalysisPayload(data) {
+    return {
+      direction: "AUCUN SIGNAL",
+      entry: "—",
+      sl: "—",
+      tp1: "—",
+      tp2: "—",
+      rr: "—",
+      score: 0,
+      technique: "Non validé",
+      explanation: "",
+      ...data,
+    };
+  }
+
+  function renderNoSignalResult(result) {
+    const score = Math.max(0, Math.min(100, Number(result.score || 0)));
+    const diagnostic = result.diagnostic || {};
+    const label = result.statusLabel || diagnostic.statusLabel || "Setup non confirmé";
+    const message = result.userMessage || diagnostic.userMessage || "Kronos bloque le trade pour éviter un signal forcé.";
+    const actions = Array.isArray(result.nextActions) ? result.nextActions : diagnostic.nextActions || [];
+    return `
+      <div class="analysis-card no-signal-card">
+        <div class="no-signal-hero">
+          <div>
+            <p class="analysis-kicker">Diagnostic Kronos</p>
+            <div class="direction-label no-signal-title">⏸ ${escapeHtml(label)}</div>
+          </div>
+          <div class="result-confidence no-signal-confidence">
+            <strong>${score}%</strong>
+            <span>Validité</span>
+          </div>
+        </div>
+        <p class="no-signal-message">${escapeHtml(message)}</p>
+        <div class="score-line">
+          <div class="signal-bottom"><span>Confiance exploitable</span><strong>${score}%</strong></div>
+          <div class="oracle-score"><span class="score-fill ${scoreColor(score)}" style="width:${score}%"></span></div>
+        </div>
+        <div class="no-signal-grid">
+          <div>
+            <span>Technique lue</span>
+            <strong>${escapeHtml(result.technique || "Non validé")}</strong>
+          </div>
+          <div>
+            <span>Décision</span>
+            <strong>Pas d'entrée</strong>
+          </div>
+          <div>
+            <span>Copie SL/TP</span>
+            <strong>Désactivée</strong>
+          </div>
+        </div>
+        ${actions.length ? `
+          <div class="next-actions">
+            <span>Que faire maintenant ?</span>
+            <ul>${actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ul>
+          </div>
+        ` : ""}
+        ${renderAnalysisMeta(result)}
+        <div class="result-explanation">
+          <span>Lecture de marché</span>
+          <p>${escapeHtml(result.explanation || result.answer || "Aucune explication reçue du moteur Kronos.")}</p>
         </div>
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>

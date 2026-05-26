@@ -132,6 +132,9 @@ Un signal exploitable doit avoir direction, entrée, SL structurel, TP1, TP2 et 
 
 const KRONOS_RISK_POLICY = `GESTION DU RISQUE
 R:R minimum: 1:1.5. Optimal: 1:2 ou 1:3. Évite toute entrée sous 1:1.5.
+R:R > 10 = niveaux suspects: marque "Trade risqué" et ne présente pas le plan comme directement tradable.
+TP1 trop rond/fallback évident (1.0000, 2.0000, 100.0000) = niveaux suspects: marque "Trade risqué".
+SL trop proche (< 2 pips sur Forex, < 0.02 sur JPY, < 0.20 sur XAU) = niveaux suspects: marque "Trade risqué".
 Risk par trade: Conservateur 1%, Standard 2%, Agressif 3% uniquement si score très fort, pas de news rouge et confluences solides.
 SL toujours structurel: sous support/demand/OB/FVG pour achat, au-dessus résistance/supply/OB/FVG pour vente. Jamais un nombre arbitraire.
 Corrélation: signale les expositions doublées, par exemple long EUR/USD + long GBP/USD = double risque USD.
@@ -169,7 +172,9 @@ const KRONOS_OUTPUT_POLICY = `FORMAT OBLIGATOIRE
 SCORE_CONFIANCE:[0-100]
 TECHNIQUE_UTILISEE:[ICT|SMC|Wyckoff|Elliott|Price Action|Ichimoku|Hybride SMC+Chartiste]
 STYLE_EFFICACITE:[style]=[0-100]
-Si le signal n'est pas assez confirmé, écris explicitement AUCUN SIGNAL et n'ajoute pas de faux niveaux.`;
+Si le signal n'est pas assez confirmé, écris explicitement AUCUN SIGNAL et n'ajoute pas de faux niveaux.
+Si les niveaux sont seulement indicatifs parce que le graphique n'a pas pu être lu, écris:
+⚠️ NIVEAUX INDICATIFS UNIQUEMENT — Kronos n'a pas pu lire le graphique. Ne pas trader ces niveaux directement.`;
 
 const KRONOS_SYSTEM_PROMPT = [
   "Tu es Kronos, le moteur IA éducatif d'Oracle Forex. Tu analyses comme un analyste senior: précis, prudent, structuré, jamais vendeur de rêve. Tu ne donnes jamais de conseil financier; tu fournis une lecture éducative du marché.",
@@ -1242,7 +1247,7 @@ function buildDeterministicSignals(prices, histories) {
     const confidence = Math.round(Math.max(48, Math.min(88, 52 + strength * 8 + history.length / 12 + confluence * 4 + (price.reliability || 60) / 12 - freshnessPenalty)));
     const technique = chooseTechnique(symbol, momentum, move);
 
-    return {
+    return applySignalSafety({
       paire: symbol,
       direction,
       entree: roundLevel(entry),
@@ -1260,7 +1265,7 @@ function buildDeterministicSignals(prices, histories) {
       nextOpen: null,
       quality: qualityPayload(price, history, true, `Source ${price.source}, historique ${history._meta?.source || "twelve_data"}, confluence ${confluence}/4.`),
       indicators: { sma10: roundLevel(sma10), sma30: roundLevel(sma30), rsi: Math.round(rsi), confluence },
-    };
+    });
   });
 }
 
@@ -1273,7 +1278,7 @@ function cautiousSignal(symbol, price, base, reason, history = []) {
   const tp1 = direction === "ACHAT" ? entry + risk * 1.4 : entry - risk * 1.4;
   const tp2 = direction === "ACHAT" ? entry + risk * 2.1 : entry - risk * 2.1;
   const confidence = Math.max(42, Math.min(62, Math.round((price.reliability || 55) * 0.65)));
-  return {
+  return applySignalSafety({
     paire: symbol,
     direction,
     entree: roundLevel(entry),
@@ -1291,7 +1296,7 @@ function cautiousSignal(symbol, price, base, reason, history = []) {
     nextOpen: null,
     quality: qualityPayload(price, history, false, reason),
     cautious: true,
-  };
+  });
 }
 
 function deterministicConfidence(body) {
@@ -1850,7 +1855,7 @@ function normalizeSignals(value, prices = {}) {
     const price = prices[pair];
     const open = price?.open ?? isSymbolOpen(pair);
     const direct = isUsableLivePrice(price);
-    return {
+    const normalizedSignal = {
       paire: pair,
       direction: signal.direction === "VENTE" ? "VENTE" : "ACHAT",
       entree: finiteNumber(signal.entree ?? signal.entry, fallback.entree),
@@ -1869,6 +1874,7 @@ function normalizeSignals(value, prices = {}) {
       suspended: !direct,
       nextOpen: !open && assetClass(pair) !== "crypto" ? marketStatus().forex.nextOpen : null,
     };
+    return applySignalSafety(normalizedSignal);
   });
   return [...normalized, ...fallbackSignals.slice(normalized.length)].slice(0, 6);
 }
@@ -1877,13 +1883,17 @@ function normalizeAiAnswer(answer, seed = "") {
   const text = cleanLine(answer) || `📐 TECHNIQUE UTILISÉE : Price Action
 📊 ANALYSE :
 - Tendance : Neutre
-- Signal détecté : Attendre confirmation
-- Zone d'entrée : Marché actuel
-- Stop Loss : Sous le dernier creux
-- Take Profit : Prochaine résistance
+- Signal détecté : AUCUN SIGNAL
+- Zone d'entrée : —
+- Stop Loss : —
+- Take Profit 1 : —
+- Take Profit 2 : —
+- R/R ratio : —
 ⚠️ RISQUE : Ce n'est pas un conseil financier.
-SCORE_CONFIANCE:62
-TECHNIQUE_UTILISEE:Price Action`;
+⚠️ NIVEAUX INDICATIFS UNIQUEMENT — Kronos n'a pas pu lire le graphique. Ne pas trader ces niveaux directement.
+SCORE_CONFIANCE:45
+TECHNIQUE_UTILISEE:Price Action
+STYLE_EFFICACITE:Price Action=45`;
   return { answer: text, score: extractScore(text, seed), technique: extractTechnique(text) };
 }
 
@@ -1905,17 +1915,18 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
   const strategyLine = strategyGuide(strategy, timeframe);
   return `📐 TECHNIQUE UTILISÉE : ${technique} + prix live, car la vision IA n'a pas fourni un setup complet.
 📊 ANALYSE :
-- Tendance : ${direction === "ACHAT" ? "Haussière" : "Baissière"}
-- Signal détecté : ${strategyLine}
+- Tendance : ${direction === "ACHAT" ? "Haussière indicative" : "Baissière indicative"}
+- Signal détecté : AUCUN SIGNAL — ${strategyLine}
 - Zone d'entrée : ${formatLevel(levels.entry)}
 - Stop Loss : ${formatLevel(levels.sl)}
 - Take Profit 1 : ${formatLevel(levels.tp)}
 - Take Profit 2 : ${formatLevel(levels.tp2)}
 ✅ CONFLUENCE : Prix live ${pair} à confirmer sur le graphe
 ⚠️ RISQUE : Ce n'est pas un conseil financier.
-SCORE_CONFIANCE:58
+⚠️ NIVEAUX INDICATIFS UNIQUEMENT — Kronos n'a pas pu lire le graphique. Ne pas trader ces niveaux directement.
+SCORE_CONFIANCE:45
 TECHNIQUE_UTILISEE:${technique}
-STYLE_EFFICACITE:${technique}=58`;
+STYLE_EFFICACITE:${technique}=45`;
 }
 
 function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
@@ -2092,6 +2103,16 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     });
   }
   const rr = rewardRisk(direction, entry, sl, tp);
+  const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair: body.pair });
+  if (suspicious.risky) {
+    return blockAnalysis(normalized, {
+      score: Math.min(validation.score, normalized.score, 45),
+      technique: validation.technique,
+      explanation: `${text}\n\nVALIDATION KRONOS: Trade risqué — ${suspicious.reason}. Les niveaux sont indicatifs uniquement et ne doivent pas être copiés directement.`,
+      validation: { ...validation, valid: false, reason: `Trade risqué: ${suspicious.reason}` },
+      meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
+    });
+  }
   const effectiveImageScore = hasChartImages ? imageQuality.score : 65;
   const calibratedScore = Math.max(0, Math.min(100, Math.round(
     normalized.score * 0.42 + validation.score * 0.18 + effectiveImageScore * 0.2 + levelCheck.score * 0.2 + calibration.adjustment,
@@ -2121,6 +2142,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
 }
 
 function blockAnalysis(normalized, details) {
+  const diagnostic = buildNoSignalDiagnostic(details);
   return {
     ...normalized,
     direction: "AUCUN SIGNAL",
@@ -2135,6 +2157,109 @@ function blockAnalysis(normalized, details) {
     validation: details.validation,
     meta: details.meta,
     noSignal: true,
+    status: diagnostic.status,
+    statusLabel: diagnostic.statusLabel,
+    userMessage: diagnostic.userMessage,
+    nextActions: diagnostic.nextActions,
+    diagnostic,
+  };
+}
+
+function buildNoSignalDiagnostic(details = {}) {
+  const meta = details.meta || {};
+  const validation = details.validation || {};
+  const quality = meta.imageQuality || {};
+  const technical = meta.technicalSnapshot || {};
+  const levelCheck = meta.levelCheck || {};
+  const explanation = `${details.explanation || ""} ${validation.reason || ""} ${levelCheck.reason || ""}`.toLowerCase();
+
+  if (/trade risqué|niveaux suspects|sl trop proche|r\/r trop élevé|tp1 suspect/.test(explanation)) {
+    return {
+      status: "TRADE_RISQUE",
+      statusLabel: "Trade risqué",
+      userMessage: "Kronos a détecté des niveaux suspects. Le plan est bloqué pour éviter une exécution dangereuse.",
+      nextActions: [
+        "Ne copie pas ces niveaux dans MT4/MT5.",
+        "Relance avec un graphe plus clair ou un timeframe supérieur.",
+        "Attends des niveaux confirmés par la structure du graphique.",
+      ],
+    };
+  }
+
+  if (quality.images > 0 && Number(quality.score) < 35) {
+    return {
+      status: "IMAGE_INSUFFISANTE",
+      statusLabel: "Image insuffisante",
+      userMessage: "Kronos a reçu le graphe, mais la capture n'est pas assez lisible pour sortir des niveaux fiables.",
+      nextActions: [
+        "Envoyer une capture plus nette avec la paire, le timeframe et le prix visibles.",
+        "Montrer au moins 60 à 100 bougies, sans zoom excessif.",
+        "Garder 1 ou 2 graphes maximum: contexte puis entrée.",
+      ],
+    };
+  }
+
+  if (/vision indisponible|aucune clé groq vision|gemini vision/.test(explanation)) {
+    return {
+      status: "VISION_HORS_SERVICE",
+      statusLabel: "Vision IA indisponible",
+      userMessage: "Le serveur ne peut pas lire les screenshots pour l'instant. L'analyse image est donc bloquée.",
+      nextActions: [
+        "Vérifier les clés Groq/Gemini dans secret.dev ou sur Render.",
+        "Relancer le serveur après modification des variables.",
+        "Utiliser temporairement une analyse texte/prix live.",
+      ],
+    };
+  }
+
+  if (technical.valid === false || /historique insuffisant|donnée non fiable|fallback|indisponible/.test(explanation)) {
+    return {
+      status: "DONNEES_FAIBLES",
+      statusLabel: "Données marché faibles",
+      userMessage: "Les données live ou l'historique ne suffisent pas pour valider un setup propre.",
+      nextActions: [
+        "Réessayer sur une paire majeure comme EUR/USD, GBP/USD ou XAU/USD.",
+        "Attendre une source fraîche ou changer de timeframe.",
+        "Ajouter un screenshot clair pour compenser les limites API.",
+      ],
+    };
+  }
+
+  if (/niveau|entrée|sl|tp|ratio|cohérent/.test(explanation)) {
+    return {
+      status: "NIVEAUX_INCOHERENTS",
+      statusLabel: "Niveaux non exploitables",
+      userMessage: "L'IA a produit une idée, mais les niveaux entrée, SL ou TP ne sont pas assez cohérents pour être copiés.",
+      nextActions: [
+        "Changer de style d'analyse en Mixte.",
+        "Confirmer la paire et le timeframe manuellement.",
+        "Relancer avec un graphe montrant clairement supports, résistances et prix actuel.",
+      ],
+    };
+  }
+
+  if (/range|neutre|momentum faible|setup non valid|aucun signal|score d'efficacité insuffisant/.test(explanation) || technical.trend === "neutre/range") {
+    return {
+      status: "SETUP_NON_CONFIRME",
+      statusLabel: "Setup non confirmé",
+      userMessage: "Kronos comprend le contexte, mais le marché ne donne pas assez de confluence pour entrer maintenant.",
+      nextActions: [
+        "Attendre une cassure, un retest ou un rejet clair.",
+        "Surveiller les zones support/résistance indiquées dans l'analyse.",
+        "Relancer après une nouvelle bougie ou sur un timeframe supérieur.",
+      ],
+    };
+  }
+
+  return {
+    status: "ANALYSE_PRUDENTE",
+    statusLabel: "Analyse prudente",
+    userMessage: "Kronos bloque le trade pour éviter un signal forcé. L'analyse reste utile comme lecture de marché.",
+    nextActions: [
+      "Confirmer le contexte avec un screenshot net.",
+      "Choisir le mode Mixte pour comparer les styles.",
+      "Ne prendre aucun trade sans confirmation visuelle.",
+    ],
   };
 }
 
@@ -2264,6 +2389,8 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair }) {
   if (!buy && !(sl > entry && tp < entry)) return { valid: false, score: 20, reason: "Pour une vente, SL doit être au-dessus de l'entrée et TP sous l'entrée." };
   const rr = rewardRisk(direction, entry, sl, tp);
   if (!Number.isFinite(rr) || rr < 1.2) return { valid: false, score: 35, reason: `R/R trop faible (${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}).` };
+  const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair });
+  if (suspicious.risky) return { valid: false, score: 28, reason: `Trade risqué: ${suspicious.reason}` };
   if (Number.isFinite(live)) {
     const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
     const tolerance = levelTolerance(pair);
@@ -2318,6 +2445,73 @@ function rewardRisk(direction, entry, sl, tp) {
   const risk = Math.abs(entry - sl);
   const reward = Math.abs(tp - entry);
   return risk > 0 ? reward / risk : NaN;
+}
+
+function applySignalSafety(signal) {
+  const suspicious = inspectSuspiciousLevels({
+    direction: signal.direction,
+    entry: Number(signal.entree),
+    sl: Number(signal.sl),
+    tp1: Number(signal.tp1),
+    rr: parseRr(signal.rr),
+    pair: signal.paire,
+  });
+  if (!suspicious.risky) return signal;
+  return {
+    ...signal,
+    suspended: true,
+    direct: false,
+    confiance: Math.min(Number(signal.confiance) || 45, 45),
+    raison: `⚠️ Trade risqué — ${suspicious.reason}.`,
+    quality: {
+      ...(signal.quality || {}),
+      valid: false,
+      reason: "niveaux_suspects",
+      details: suspicious,
+    },
+  };
+}
+
+function inspectSuspiciousLevels({ direction, entry, sl, tp1, rr, pair }) {
+  const reasons = [];
+  const rrValue = Number.isFinite(Number(rr)) ? Number(rr) : parseRr(rr);
+  if (Number.isFinite(rrValue) && rrValue > 10) reasons.push(`R/R trop élevé (${rrValue.toFixed(1)})`);
+  if (isFallbackRoundLevel(tp1)) reasons.push(`TP1 suspect (${formatLevel(tp1)})`);
+  const minDistance = minStopDistance(pair);
+  if (minDistance > 0 && Number.isFinite(entry) && Number.isFinite(sl)) {
+    const risk = Math.abs(entry - sl);
+    if (risk > 0 && risk < minDistance) reasons.push(`SL trop proche (${formatLevel(risk)} < ${formatLevel(minDistance)})`);
+  }
+  if (Number.isFinite(entry) && Number.isFinite(sl) && direction === "ACHAT" && sl >= entry) reasons.push("SL achat au-dessus ou égal à l'entrée");
+  if (Number.isFinite(entry) && Number.isFinite(sl) && direction === "VENTE" && sl <= entry) reasons.push("SL vente sous ou égal à l'entrée");
+  return {
+    risky: reasons.length > 0,
+    reason: reasons.join(" · "),
+    reasons,
+  };
+}
+
+function parseRr(value) {
+  const match = String(value ?? "").replace(",", ".").match(/([0-9]+(?:\.[0-9]+)?)/g);
+  if (!match?.length) return NaN;
+  return Number(match.at(-1));
+}
+
+function isFallbackRoundLevel(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return false;
+  if ([1, 2, 100].some((candidate) => Math.abs(number - candidate) < 1e-9)) return true;
+  const text = String(value);
+  return /^(1|2|100)(?:[.,]0+)?$/.test(text);
+}
+
+function minStopDistance(pair = "") {
+  if (/BTC|ETH|US500|NAS|SPX/i.test(pair)) return 0;
+  if (/XAU/i.test(pair)) return 0.2;
+  if (/XAG/i.test(pair)) return 0.02;
+  if (/JPY/i.test(pair)) return 0.02;
+  if (/USD|EUR|GBP|AUD|NZD|CAD|CHF/i.test(pair)) return 0.0002;
+  return 0;
 }
 
 function projectTp2(direction, entry, sl, tp1) {
