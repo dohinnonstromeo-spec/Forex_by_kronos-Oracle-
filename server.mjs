@@ -454,12 +454,14 @@ Réponds en JSON strict:
     }
     const prices = await getPrices();
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
+    const includeNewsContext = body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true";
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
     const livePrice = prices[selectedPair] || await getExternalPrice(selectedPair);
     const history = await getHistoryForSymbol(selectedPair, livePrice);
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice);
+    const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
     const learning = await updateLearningOutcomes(prices);
     const calibration = calibrationFor(learning, body);
     const prompt = `${KRONOS_SYSTEM_PROMPT}
@@ -475,6 +477,7 @@ CONTEXTE:
 - Prix live validé: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
 - Historique API: ${technicalSnapshot.bars} bougies (${technicalSnapshot.source}, ${technicalSnapshot.stale ? "indicatif/différé" : "frais"})
 - Synthèse technique interne: ${technicalSnapshot.text}
+- Contexte news/API: ${newsContext.summary}
 - Qualité image estimée: ${images.length ? `${imageQuality.score}/100 (${imageQuality.reason})` : "aucun graphe uploadé: analyse texte/prix live"}
 - Calibration historique Kronos: ${calibration.message}
 
@@ -490,6 +493,7 @@ Si la détection automatique est désactivée, utilise la paire et le timeframe 
 Si le setup n'est pas confirmé, retourne AUCUN SIGNAL au lieu de forcer une opportunité. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
 Si plusieurs graphes sont fournis: utilise les timeframes élevés pour la tendance/contexte et le plus petit timeframe détecté pour l'entrée finale.
+Si le contexte news/API est activé, croise le setup avec les titres récents et le calendrier économique. Si une news rouge proche touche la devise, bloque ou baisse le score au lieu de forcer un trade.
 Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
 
     Analyse le contexte fourni et donne un setup éducatif exploitable avec prudence.`;
@@ -503,7 +507,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         livePrice,
       });
     }
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot });
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext });
     if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration });
     sendJson(res, 200, result);
     return;
@@ -1504,6 +1508,76 @@ async function getMarketauxNews(symbol = "EURUSD") {
   }
 }
 
+async function analysisNewsContext(pair = "EUR/USD") {
+  const [risk, headlines] = await Promise.all([
+    economicRiskWindow(),
+    getMarketauxNews(toNewsSymbol(pair)),
+  ]);
+  const keywords = newsKeywordsForPair(pair);
+  const compactHeadlines = headlines.map((item) => ({
+    title: cleanLine(item.title || item.headline || item.description || "Actualité marché"),
+    source: cleanLine(item.source || item.source_name || ""),
+    publishedAt: item.published_at || item.publishedAt || item.date || null,
+  }))
+    .filter((item) => item.title)
+    .filter((item) => keywords.some((keyword) => item.title.toUpperCase().includes(keyword)))
+    .slice(0, 5);
+  const eventText = risk.events?.length
+    ? risk.events.map((event) => `${event.currency || "N/A"} ${event.impact}: ${event.name}`).join(" | ")
+    : risk.reason;
+  const headlineText = compactHeadlines.length
+    ? compactHeadlines.map((item) => item.title).join(" | ")
+    : "Aucun titre Marketaux récent exploitable.";
+  return {
+    enabled: true,
+    activeRisk: Boolean(risk.active),
+    events: risk.events || [],
+    headlines: compactHeadlines,
+    summary: `Calendrier: ${eventText}. News: ${headlineText}`,
+  };
+}
+
+function toNewsSymbol(pair = "") {
+  const clean = String(pair || "EUR/USD").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (clean === "BTCUSD") return "BTCUSD";
+  if (clean === "ETHUSD") return "ETHUSD";
+  if (clean === "XAUUSD") return "XAUUSD";
+  if (clean === "XAGUSD") return "XAGUSD";
+  if (clean === "US500") return "SPY";
+  if (clean === "NAS100") return "QQQ";
+  return clean || "EURUSD";
+}
+
+function newsKeywordsForPair(pair = "") {
+  const clean = String(pair || "EUR/USD").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const chunks = clean.match(/[A-Z]{3,4}/g) || [];
+  const keywords = new Set([clean, ...chunks]);
+  if (clean.includes("EUR")) keywords.add("EURO");
+  if (clean.includes("USD")) {
+    keywords.add("DOLLAR");
+    keywords.add("FED");
+    keywords.add("DXY");
+  }
+  if (clean.includes("GBP")) keywords.add("POUND");
+  if (clean.includes("JPY")) keywords.add("YEN");
+  if (clean.includes("XAU")) {
+    keywords.add("GOLD");
+    keywords.add("XAU");
+  }
+  if (clean.includes("XAG")) {
+    keywords.add("SILVER");
+    keywords.add("XAG");
+  }
+  if (clean.includes("BTC")) keywords.add("BITCOIN");
+  if (clean.includes("ETH")) keywords.add("ETHEREUM");
+  if (clean.includes("US500")) {
+    keywords.add("S&P");
+    keywords.add("SPX");
+    keywords.add("US500");
+  }
+  return [...keywords].filter(Boolean);
+}
+
 async function economicRiskWindow(now = new Date()) {
   const events = await getEconomicCalendar();
   const windowMs = 45 * 60 * 1000;
@@ -2039,6 +2113,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     calibration,
     chartContext,
     technicalSnapshot: context.technicalSnapshot || null,
+    newsContext: context.newsContext || null,
     styleComparison: validation.styleComparison,
   };
   const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);

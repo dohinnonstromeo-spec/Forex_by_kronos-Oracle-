@@ -351,7 +351,10 @@ body {
   margin-bottom: 24px;
   border: 1px solid var(--oracle-border);
   border-radius: 18px;
-  background: linear-gradient(135deg, rgba(255,255,255,.07), rgba(255,255,255,.025));
+  background:
+    radial-gradient(circle at 12% 0%, rgba(0, 180, 255, .11), transparent 28rem),
+    radial-gradient(circle at 86% 10%, rgba(195, 145, 47, .13), transparent 24rem),
+    linear-gradient(135deg, rgba(5, 8, 18, .98), rgba(9, 13, 24, .88));
   box-shadow: var(--shadow-card);
   padding: 26px;
   overflow: hidden;
@@ -422,7 +425,9 @@ body {
 .analysis-card {
   border: 1px solid var(--oracle-border);
   border-radius: 16px;
-  background: linear-gradient(145deg, var(--oracle-panel), rgba(9, 13, 24, .66));
+  background:
+    linear-gradient(145deg, rgba(7, 10, 20, .97), rgba(9, 13, 24, .86)),
+    var(--oracle-panel);
   box-shadow: var(--shadow-card);
   backdrop-filter: blur(14px);
   padding: 24px;
@@ -556,9 +561,26 @@ body {
   width: 100%;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 10px;
-  background: rgba(255,255,255,.06);
+  background: #070b16;
   color: var(--foreground);
   padding: 12px;
+  color-scheme: dark;
+}
+
+.analysis-field select option {
+  background: #070b16;
+  color: var(--foreground);
+}
+
+.analysis-live-toggle {
+  justify-content: flex-start;
+  cursor: pointer;
+  border-color: rgba(0, 255, 136, .28);
+  background: rgba(0, 255, 136, .07);
+}
+
+.analysis-live-toggle input {
+  accent-color: var(--neon-green);
 }
 
 .quick-pair-grid,
