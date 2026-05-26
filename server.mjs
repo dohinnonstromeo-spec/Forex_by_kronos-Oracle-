@@ -33,6 +33,7 @@ const GEMINI_FALLBACK_MODELS = [
   "gemini-1.5-flash-latest",
 ].filter((model, index, list) => model && list.indexOf(model) === index);
 const TWELVE_DATA_KEYS = collectEnvKeys("TWELVE_DATA_API_KEY", "TWELVEDATA_API_KEY");
+const MASSIVE_KEYS = collectEnvKeys("MASSIVE_API_KEY", "MASSIVE_KEY");
 const ALPHA_VANTAGE_KEYS = collectEnvKeys("ALPHA_VANTAGE_API_KEY");
 const EXCHANGERATE_KEYS = collectEnvKeys("EXCHANGERATE_API_KEY");
 const GROQ_KEYS = collectEnvKeys("GROQ_KEY", "GROQ_API_KEY");
@@ -83,7 +84,7 @@ const fallbackSignals = [
 const KRONOS_DATA_POLICY = `DONNÉES ET FIABILITÉ DISPONIBLES
 Les sources à clés utilisent une rotation automatique multi-clés. Une clé épuisée ou en quota est mise en pause temporaire, puis une autre clé est essayée.
 - Twelve Data: source principale prix/historique Forex, métaux, indices si clé disponible; fiabilité cible 95.
-- Polygon: source de secours prix/historique si clé disponible; fiabilité cible 88.
+- Massive: source de secours prix/historique si clé disponible; fiabilité cible 88.
 - Binance: crypto uniquement, sans clé; fiabilité cible 90. Ne l'utilise pas pour l'or, les indices ou le Forex fiat.
 - Alpha Vantage: fallback Forex/crypto; fiabilité cible 80.
 - Coinbase: fallback crypto spot BTC/ETH; fiabilité cible 78.
@@ -230,7 +231,7 @@ async function handleApi(req, res, url) {
       groq: GROQ_KEYS.length > 0,
       gemini: Boolean(env.GEMINI_API_KEY || env.GEMINI_KEY),
       twelveData: TWELVE_DATA_KEYS.length > 0,
-      polygon: Boolean(env.POLYGON_API_KEY || env.POLYGON_KEY),
+      massive: MASSIVE_KEYS.length > 0,
       alphaVantage: ALPHA_VANTAGE_KEYS.length > 0,
       exchangeRateApi: EXCHANGERATE_KEYS.length > 0,
       binanceFallback: true,
@@ -339,11 +340,17 @@ Génère un briefing trader en JSON : {"titre":"","paires_surveiller":[],"scenar
     const body = await readBody(req);
     const images = normalizeImages(body.images);
     const question = cleanLine(body.message || body.messages?.at?.(-1)?.content || "");
+    const localAnswer = quickChatAnswer(question, images);
+    if (localAnswer) {
+      sendJson(res, 200, { ok: true, ...localAnswer });
+      return;
+    }
     const chatPair = detectPairFromText(question) || body.pair || "EUR/USD";
-    const prices = await getPrices();
-    const livePrice = prices[chatPair] || await getExternalPrice(chatPair);
-    const history = await getHistoryForSymbol(chatPair, livePrice);
-    const technicalSnapshot = buildTechnicalSnapshot(chatPair, history, livePrice);
+    const needsMarketContext = images.length || wantsTradingSetup(question);
+    const prices = needsMarketContext ? await getPrices() : {};
+    const livePrice = needsMarketContext ? prices[chatPair] || await getExternalPrice(chatPair) : null;
+    const history = needsMarketContext ? await getHistoryForSymbol(chatPair, livePrice) : [];
+    const technicalSnapshot = needsMarketContext ? buildTechnicalSnapshot(chatPair, history, livePrice) : { text: "Non requis pour cette question conversationnelle." };
     const context = Array.isArray(body.messages)
       ? body.messages.slice(-6).map((m) => `${m.role || "user"}: ${m.content || ""}`).join("\n")
       : "";
@@ -361,6 +368,8 @@ CONTEXTE MARCHÉ SI UTILE:
 - Synthèse technique interne: ${technicalSnapshot.text}
 
 Réponds en français, de façon concise mais utile.
+Tu es aussi un vrai assistant conversationnel: si l'utilisateur salue, réponds naturellement; s'il demande une explication, enseigne clairement; s'il donne un petit capital, aide à gérer le risque.
+Ne promets jamais de transformer un petit capital en gain rapide ou facile. Pour 10$, propose surtout gestion du risque, compte démo, micro-lots/cent account, patience, et seulement des scénarios éducatifs.
 Si l'utilisateur pose une question générale, explique directement sans forcer le format signal.
 Utilise le format Kronos complet seulement quand l'utilisateur demande explicitement un signal, un setup ou une analyse de graphe.`;
     const answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 420, 0.3);
@@ -525,14 +534,22 @@ async function getPrices() {
     ...cache,
     prices: mergeCachedPrices(cache.prices || {}, prices),
   });
-  memoryCache.prices = { value: prices, expiresAt: Date.now() + 45 * 1000 };
+  memoryCache.prices = { value: prices, expiresAt: Date.now() + 2 * 60 * 1000 };
   return prices;
 }
 
 async function fetchBestPrice(symbol, cached) {
-  const providers = [fetchTwelveDataPrice, fetchBinancePrice, fetchExchangeRatePrice, fetchPolygonPrice, fetchAlphaVantagePrice, fetchCoinbasePrice, fetchStooqPrice, fetchFrankfurterPrice];
+  if (isRecentCache(cached, cacheTtlMs(symbol))) {
+    return pricePayload(symbol, cached, cached.source || "cache", "fresh_cache", {
+      stale: false,
+      reliability: Math.min(90, Number(cached.reliability) || 80),
+    });
+  }
+  const providers = providersForSymbol(symbol);
   const errors = [];
+  const deadline = Date.now() + 3200;
   for (const provider of providers) {
+    if (Date.now() > deadline) break;
     try {
       const price = await provider(symbol);
       if (price) return price;
@@ -550,6 +567,13 @@ async function fetchBestPrice(symbol, cached) {
     stale: true,
     reliability: 15,
   });
+}
+
+function providersForSymbol(symbol) {
+  if (/BTC|ETH/i.test(symbol)) return [fetchBinancePrice, fetchTwelveDataPrice, fetchMassivePrice, fetchCoinbasePrice];
+  if (/US500|NAS|SPX/i.test(symbol)) return [fetchMassivePrice, fetchTwelveDataPrice, fetchStooqPrice];
+  if (/XAU|XAG|XPT|XPD/i.test(symbol)) return [fetchTwelveDataPrice, fetchMassivePrice, fetchStooqPrice];
+  return [fetchTwelveDataPrice, fetchMassivePrice, fetchAlphaVantagePrice, fetchStooqPrice, fetchExchangeRatePrice, fetchFrankfurterPrice];
 }
 
 async function getExternalPrice(symbol) {
@@ -687,25 +711,26 @@ async function fetchExchangeRatePrice(symbol) {
   }
 }
 
-async function fetchPolygonPrice(symbol) {
-  const key = env.POLYGON_API_KEY || env.POLYGON_KEY;
-  if (!key) return null;
-  const ticker = toPolygonTicker(symbol);
+async function fetchMassivePrice(symbol) {
+  if (!MASSIVE_KEYS.length) return null;
+  const ticker = toMassiveTicker(symbol);
   if (!ticker) return null;
   try {
-    const api = new URL(`https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev`);
-    api.searchParams.set("adjusted", "true");
-    api.searchParams.set("apiKey", key);
-    const data = await fetchJson(api);
-    const bar = Array.isArray(data.results) ? data.results[0] : null;
-    const price = Number(bar?.c);
-    const open = Number(bar?.o);
-    const change = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
-    if (!Number.isFinite(price)) throw new Error(data.error || "invalid_price");
-    recordProviderHealth("polygon_price", true);
-    return pricePayload(symbol, { price, change }, "polygon", null, { reliability: 88 });
+    return await fetchWithRotation("massive", MASSIVE_KEYS, async (key) => {
+      const api = new URL(`https://api.massive.com/v2/aggs/ticker/${encodeURIComponent(ticker)}/prev`);
+      api.searchParams.set("adjusted", "true");
+      api.searchParams.set("apiKey", key);
+      const data = await fetchJson(api);
+      const bar = Array.isArray(data.results) ? data.results[0] : null;
+      const price = Number(bar?.c);
+      const open = Number(bar?.o);
+      const change = Number.isFinite(open) && open > 0 ? ((price - open) / open) * 100 : 0;
+      if (!Number.isFinite(price)) throw new Error(data.error || "invalid_price");
+      recordProviderHealth("massive_price", true);
+      return pricePayload(symbol, { price, change }, "massive", null, { reliability: 88 });
+    });
   } catch (error) {
-    recordProviderHealth("polygon_price", false, error.message);
+    recordProviderHealth("massive_price", false, error.message);
     throw error;
   }
 }
@@ -801,6 +826,12 @@ async function getHistories(prices) {
     return memoryCache.histories.value;
   }
   const cache = await loadMarketCache();
+  const cached = cachedHistories(cache, prices);
+  const cachedCount = Object.values(cached).filter((bars) => Array.isArray(bars) && bars.length >= 30 && !bars._meta?.stale).length;
+  if (cachedCount >= 4) {
+    memoryCache.histories = { key: usableKey, value: cached, expiresAt: Date.now() + 8 * 60 * 1000 };
+    return cached;
+  }
   if (!TWELVE_DATA_KEYS.length) {
     const histories = await fetchFreeHistories(cache, prices);
     memoryCache.histories = { key: usableKey, value: histories, expiresAt: Date.now() + 15 * 60 * 1000 };
@@ -825,15 +856,15 @@ async function getHistories(prices) {
     }
     for (const interval of historyIntervals(symbol)) {
       try {
-        const bars = await fetchPolygonHistory(symbol, interval);
+        const bars = await fetchMassiveHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `polygon:${interval}`, false);
-          recordProviderHealth("polygon_history", true);
+          tagHistory(bars, `massive:${interval}`, false);
+          recordProviderHealth("massive_history", true);
           return [symbol, bars];
         }
-        errors.push(`polygon_${interval}:insufficient_bars`);
+        errors.push(`massive_${interval}:insufficient_bars`);
       } catch (error) {
-        errors.push(`polygon_${interval}:${error.message}`);
+        errors.push(`massive_${interval}:${error.message}`);
       }
     }
     for (const interval of historyIntervals(symbol)) {
@@ -894,7 +925,7 @@ async function getHistoryForSymbol(symbol, price = null) {
   const errors = [];
   const attempts = [
     ["binance", fetchBinanceHistory],
-    ["polygon", fetchPolygonHistory],
+    ["massive", fetchMassiveHistory],
     ["twelve_data", fetchTwelveDataHistory],
     ["stooq", fetchStooqHistory],
   ];
@@ -1036,27 +1067,28 @@ async function fetchBinanceHistory(symbol, interval) {
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
 }
 
-async function fetchPolygonHistory(symbol, interval) {
-  const key = env.POLYGON_API_KEY || env.POLYGON_KEY;
-  const ticker = toPolygonTicker(symbol);
-  const span = toPolygonTimespan(interval);
-  if (!key || !ticker || !span) return [];
+async function fetchMassiveHistory(symbol, interval) {
+  const ticker = toMassiveTicker(symbol);
+  const span = toMassiveTimespan(interval);
+  if (!MASSIVE_KEYS.length || !ticker || !span) return [];
   const to = new Date();
-  const from = new Date(to.getTime() - polygonLookbackMs(interval));
-  const api = new URL(`https://api.polygon.io/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/${span.multiplier}/${span.timespan}/${from.toISOString().slice(0, 10)}/${to.toISOString().slice(0, 10)}`);
-  api.searchParams.set("adjusted", "true");
-  api.searchParams.set("sort", "asc");
-  api.searchParams.set("limit", "120");
-  api.searchParams.set("apiKey", key);
-  const data = await fetchJson(api);
-  if (data.status === "ERROR" || data.error) throw new Error(data.error || "api_error");
-  const values = Array.isArray(data.results) ? data.results : [];
-  return values.map((bar) => ({
-    close: Number(bar.c),
-    high: Number(bar.h),
-    low: Number(bar.l),
-    datetime: bar.t ? new Date(bar.t).toISOString() : null,
-  })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low)).slice(-80);
+  const from = new Date(to.getTime() - massiveLookbackMs(interval));
+  return fetchWithRotation("massive", MASSIVE_KEYS, async (key) => {
+    const api = new URL(`https://api.massive.com/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/${span.multiplier}/${span.timespan}/${from.toISOString().slice(0, 10)}/${to.toISOString().slice(0, 10)}`);
+    api.searchParams.set("adjusted", "true");
+    api.searchParams.set("sort", "asc");
+    api.searchParams.set("limit", "120");
+    api.searchParams.set("apiKey", key);
+    const data = await fetchJson(api);
+    if (data.status === "ERROR" || data.error) throw new Error(data.error || "api_error");
+    const values = Array.isArray(data.results) ? data.results : [];
+    return values.map((bar) => ({
+      close: Number(bar.c),
+      high: Number(bar.h),
+      low: Number(bar.l),
+      datetime: bar.t ? new Date(bar.t).toISOString() : null,
+    })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low)).slice(-80);
+  });
 }
 
 async function fetchStooqHistory(symbol, interval) {
@@ -1146,7 +1178,7 @@ function toStooqInterval(interval = "") {
   })[interval] || null;
 }
 
-function toPolygonTicker(symbol = "") {
+function toMassiveTicker(symbol = "") {
   const normalized = String(symbol).toUpperCase().replace(/[^A-Z0-9/]/g, "");
   if (/^[A-Z]{3}\/[A-Z]{3}$/.test(normalized)) return `C:${normalized.replace("/", "")}`;
   if (normalized === "XAU/USD") return "C:XAUUSD";
@@ -1158,7 +1190,7 @@ function toPolygonTicker(symbol = "") {
   return null;
 }
 
-function toPolygonTimespan(interval = "") {
+function toMassiveTimespan(interval = "") {
   return ({
     "15min": { multiplier: 15, timespan: "minute" },
     "30min": { multiplier: 30, timespan: "minute" },
@@ -1168,7 +1200,7 @@ function toPolygonTimespan(interval = "") {
   })[interval] || null;
 }
 
-function polygonLookbackMs(interval = "") {
+function massiveLookbackMs(interval = "") {
   if (interval === "1day" || interval === "1d") return 140 * 24 * 60 * 60 * 1000;
   return 7 * 24 * 60 * 60 * 1000;
 }
@@ -1386,7 +1418,7 @@ function pricePayload(symbol, value, source, error, options = {}) {
 }
 
 function isLivePriceSource(source = "") {
-  return ["twelve_data", "polygon", "alpha_vantage", "coinbase", "stooq", "binance"].includes(source);
+  return ["twelve_data", "massive", "alpha_vantage", "coinbase", "stooq", "binance"].includes(source);
 }
 
 function isUsableLivePrice(price) {
@@ -1778,13 +1810,13 @@ async function geminiVision(prompt, images) {
   return "";
 }
 
-async function fetchJson(url, timeoutMs = 4500) {
+async function fetchJson(url, timeoutMs = 2200) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
   return response.json();
 }
 
-async function fetchText(url, timeoutMs = 4500) {
+async function fetchText(url, timeoutMs = 2200) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
   return response.text();
@@ -2090,6 +2122,30 @@ function detectPairFromText(text = "") {
     "GBP/USD", "USD/JPY", "USD/CHF", "USD/CAD", "AUD/USD", "NZD/USD", "EUR/JPY",
   ];
   return candidates.find((pair) => normalized.includes(pair) || normalized.includes(pair.replace("/", ""))) || null;
+}
+
+function quickChatAnswer(question = "", images = []) {
+  const text = normalizeForSearch(question);
+  if (images.length) return null;
+  if (!text || /^(salut|bonjour|bonsoir|hello|hi|slt|cc|coucou)\b/.test(text)) {
+    return {
+      answer: "Salut, je suis ChatBot Kronos. Tu peux me demander une explication trading, un plan de gestion du risque, une lecture de paire ou envoyer jusqu'à 2 graphes pour une analyse éducative.",
+      score: 90,
+      technique: "Conversation",
+    };
+  }
+  if (/(j.ai|j'ai|jai|avec)\s*(10|5|20)\s*(\$|usd|dollar|€|eur)|capital.*(10|5|20)/i.test(question)) {
+    return {
+      answer: "Avec un petit capital comme 10$, le plus intelligent n'est pas de chercher un trade rapide, mais de survivre: risque max 0,10$ à 0,20$ par idée, compte démo ou cent account, un seul setup par jour, pas de martingale. Je peux t'aider à construire un plan très prudent, mais je ne dois pas te promettre un gain facile.",
+      score: 82,
+      technique: "Risk Management",
+    };
+  }
+  return null;
+}
+
+function wantsTradingSetup(question = "") {
+  return /signal|setup|analyse|entrée|entree|tp|take profit|sl|stop loss|achat|vente|scalp|swing|trade|trader|position|paire|xau|eur|usd|gbp|jpy|btc|eth|nas|us500/i.test(question);
 }
 
 function normalizeAnalysis(answer, body = {}, context = {}) {
@@ -2673,7 +2729,12 @@ function isRecentCache(item, ttlMs) {
 
 function cacheTtlMs(symbol) {
   if (/BTC|ETH/i.test(symbol)) return 5 * 60 * 1000;
-  return isSymbolOpen(symbol) ? 10 * 60 * 1000 : 12 * 60 * 60 * 1000;
+  return isSymbolOpen(symbol) ? 20 * 60 * 1000 : 12 * 60 * 60 * 1000;
+}
+
+function fastPriceCacheTtlMs(symbol) {
+  if (/BTC|ETH/i.test(symbol)) return 90 * 1000;
+  return isSymbolOpen(symbol) ? 3 * 60 * 1000 : 12 * 60 * 60 * 1000;
 }
 
 async function marketCacheSummary() {
@@ -2720,6 +2781,7 @@ function getApiStatus() {
   return {
     twelveData: statusFor("twelveData", TWELVE_DATA_KEYS),
     alphaVantage: statusFor("alphaVantage", ALPHA_VANTAGE_KEYS),
+    massive: statusFor("massive", MASSIVE_KEYS),
     exchangeRate: statusFor("exchangeRate", EXCHANGERATE_KEYS),
     groq: statusFor("groq", GROQ_KEYS),
     finnhub: statusFor("finnhub", FINNHUB_KEYS),
@@ -2738,8 +2800,8 @@ async function mongoDb() {
   try {
     if (!mongoClientPromise) {
       const client = new MongoClient(mongoUri, {
-        serverSelectionTimeoutMS: 3500,
-        connectTimeoutMS: 3500,
+        serverSelectionTimeoutMS: 900,
+        connectTimeoutMS: 900,
       });
       mongoClientPromise = client.connect();
     }
@@ -2799,6 +2861,7 @@ function healthRecommendations() {
   if (!mongoUri) tips.push("Ajouter MONGODB_URI dans secret.dev pour persister caches, analyses et résultats sur MongoDB.");
   if (mongoLastError) tips.push(`MongoDB indisponible: ${mongoLastError}. Le serveur utilise le fallback fichier local.`);
   if (!ALPHA_VANTAGE_KEYS.length) tips.push("Ajouter ALPHA_VANTAGE_API_KEY ou ALPHA_VANTAGE_API_KEY_1..8 dans secret.dev pour un fallback prix Forex/Crypto.");
+  if (!MASSIVE_KEYS.length) tips.push("Ajouter MASSIVE_API_KEY dans secret.dev pour remplacer Polygon avec un fallback prix/historique plus propre.");
   tips.push("Fallbacks sans clé actifs: Binance pour crypto, Coinbase pour BTC/ETH spot, Stooq/Frankfurter pour Forex indicatif.");
   if (!TWELVE_DATA_KEYS.length) tips.push("Ajouter TWELVE_DATA_API_KEY ou TWELVE_DATA_API_KEY_1..8: source principale prix + historiques.");
   if (!GROQ_KEYS.length) tips.push("Ajouter GROQ_KEY ou GROQ_KEY_1..3: moteur texte et Groq Vision.");

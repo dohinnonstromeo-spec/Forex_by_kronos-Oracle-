@@ -161,6 +161,7 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
       });
       return response.ok ? response.json() : null;
     } catch {
@@ -170,7 +171,7 @@
 
   async function getJson(url) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(3500) });
       return response.ok ? response.json() : null;
     } catch {
       return null;

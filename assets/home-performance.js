@@ -3,7 +3,7 @@
 
   async function refreshHomeMetrics() {
     try {
-      const response = await fetch("/api/performance");
+      const response = await fetch("/api/performance", { signal: AbortSignal.timeout(3500) });
       if (!response.ok) return;
       const data = await response.json();
       setMetric("precision", data.precisionAudited ? data.precisionLabel : "À auditer");
