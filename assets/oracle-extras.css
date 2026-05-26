@@ -1540,62 +1540,21 @@ body {
 
 .home-chart-body {
   position: relative;
-  height: 280px;
-  display: flex;
-  align-items: end;
-  gap: 12px;
-  padding: 30px 34px;
-  background:
-    linear-gradient(rgba(255,255,255,.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,.045) 1px, transparent 1px);
-  background-size: 100% 25%, 10% 100%;
+  height: 420px;
+  background: #050812;
 }
 
-.home-chart-body span {
-  position: relative;
-  z-index: 1;
-  flex: 1;
-  max-width: 22px;
-  height: var(--h);
-  border-radius: 999px;
-  background: linear-gradient(180deg, var(--neon-green), #00b4ff);
-  animation: home-candle 2.7s ease-in-out infinite;
-  animation-delay: var(--d);
+.home-tv-chart {
+  padding: 0;
+  overflow: hidden;
 }
 
-.home-chart-body span:nth-child(3n) {
-  background: linear-gradient(180deg, var(--neon-red), #d7a63b);
-}
-
-.home-chart-line {
-  position: absolute;
-  left: 7%;
-  right: 7%;
-  top: 43%;
-  height: 3px;
-  background: linear-gradient(90deg, transparent, var(--amber-neon), var(--neon-green), transparent);
-  transform: rotate(-8deg);
-  box-shadow: 0 0 20px rgba(0,255,136,.34);
-}
-
-.home-chart-zone {
-  position: absolute;
-  right: 18px;
-  padding: 4px 8px;
-  border-radius: 999px;
-  font: 700 .65rem var(--font-mono);
-}
-
-.zone-a {
-  top: 26%;
-  border: 1px solid rgba(0,255,136,.35);
-  color: var(--neon-green);
-}
-
-.zone-b {
-  bottom: 23%;
-  border: 1px solid rgba(255,80,80,.35);
-  color: var(--neon-red);
+.home-tv-chart iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #050812;
 }
 
 .home-metrics {
@@ -1811,7 +1770,7 @@ body {
   .home-nav { min-height: 68px; }
   .home-nav-cta { display: none; }
   .home-hero h1 { font-size: 3rem; }
-  .home-chart-body { height: 220px; gap: 7px; padding: 24px 18px; }
+  .home-chart-body { height: 340px; }
   .home-chart-foot,
   .home-chart-head,
   .home-pricing-card,
