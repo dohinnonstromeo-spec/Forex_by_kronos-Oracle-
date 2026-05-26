@@ -66,7 +66,7 @@
       event.preventDefault();
       const submit = form.querySelector(".analysis-submit");
       submit.disabled = true;
-      submit.textContent = "Kronos analyse...";
+      submit.textContent = "Kronos analyse en profondeur...";
       const progress = startAnalysisProgress(form);
       const body = Object.fromEntries(new FormData(form).entries());
       body.images = images;
@@ -190,9 +190,10 @@
     const steps = [
       "Lecture des images et paramètres...",
       "Vérification paire, timeframe et prix live...",
+      "Croisement news/API et contexte macro...",
       "Comparaison ICT, SMC, Wyckoff, Elliott, Price Action et Ichimoku...",
       "Calcul SL/TP et score d'efficacité...",
-      "Finalisation du résultat éducatif...",
+      "Relecture de cohérence avant affichage...",
     ];
     let value = 1;
     let stepIndex = 0;
@@ -202,10 +203,11 @@
     step.textContent = steps[0];
     const timer = setInterval(() => {
       value = Math.min(94, value + Math.max(1, Math.round((95 - value) / 9)));
-      if (value > 22 && stepIndex < 1) stepIndex = 1;
-      if (value > 43 && stepIndex < 2) stepIndex = 2;
-      if (value > 66 && stepIndex < 3) stepIndex = 3;
-      if (value > 84 && stepIndex < 4) stepIndex = 4;
+      if (value > 18 && stepIndex < 1) stepIndex = 1;
+      if (value > 34 && stepIndex < 2) stepIndex = 2;
+      if (value > 52 && stepIndex < 3) stepIndex = 3;
+      if (value > 72 && stepIndex < 4) stepIndex = 4;
+      if (value > 88 && stepIndex < 5) stepIndex = 5;
       label.textContent = `${value}%`;
       fill.style.width = `${value}%`;
       step.textContent = steps[stepIndex];
@@ -218,7 +220,7 @@
     clearInterval(progress.timer);
     progress.label.textContent = "100%";
     progress.fill.style.width = "100%";
-    progress.step.textContent = ok ? "Analyse terminée." : "Service indisponible, vérifiez les APIs.";
+    progress.step.textContent = ok ? "Analyse terminée." : "Délai dépassé: l'analyse profonde n'a pas répondu à temps.";
     setTimeout(() => progress.node.classList.remove("show"), 900);
   }
 
@@ -323,8 +325,8 @@
       container.classList.add("show");
       container.innerHTML = `
         <div class="analysis-card">
-          <div class="direction-label">⏸ SERVICE INDISPONIBLE</div>
-          <p class="mt-4 text-sm text-muted-foreground">Kronos n'a pas reçu de réponse exploitable. Vérifiez les APIs, puis relancez l'analyse.</p>
+          <div class="direction-label">⏸ ANALYSE NON REÇUE</div>
+          <p class="mt-4 text-sm text-muted-foreground">Kronos n'a pas renvoyé de résultat dans le délai prévu. L'analyse profonde peut prendre plus longtemps quand elle croise graphes, prix, news et IA vision.</p>
           <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
         </div>
       `;
@@ -676,10 +678,22 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(65000),
       });
       return response.ok ? response.json() : null;
-    } catch {
+    } catch (error) {
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        return {
+          direction: "AUCUN SIGNAL",
+          score: 0,
+          technique: "Analyse profonde",
+          explanation: "L'analyse profonde a dépassé le délai côté navigateur. Les APIs ou le modèle IA répondent trop lentement; relancez ou réduisez le nombre d'images/news.",
+          noSignal: true,
+          statusLabel: "Analyse trop longue",
+          userMessage: "Kronos prend trop de temps à croiser toutes les sources. Ce n'est pas forcément une panne, mais le résultat n'est pas arrivé dans le délai.",
+          nextActions: ["Réessayer avec 1 seul graphe net.", "Désactiver temporairement le contexte news/API si besoin.", "Relancer l'analyse après quelques secondes."],
+        };
+      }
       return null;
     }
   }

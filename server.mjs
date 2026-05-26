@@ -1715,6 +1715,7 @@ async function groqOnce(key, model, prompt, maxTokens, temperature) {
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(18000),
     body: JSON.stringify({
       model,
       messages: [{ role: "user", content: prompt }],
@@ -1736,6 +1737,7 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(18000),
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: { temperature, maxOutputTokens: maxTokens },
@@ -1769,6 +1771,7 @@ async function groqVision(prompt, images) {
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
           headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(22000),
           body: JSON.stringify({
             model,
             messages: [{
@@ -1821,6 +1824,7 @@ async function geminiVision(prompt, images) {
       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(22000),
         body: JSON.stringify({
           contents: [{
             role: "user",
