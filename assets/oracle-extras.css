@@ -1037,6 +1037,70 @@ body {
   font-size: 12px;
 }
 
+.danger-panel,
+.quality-gate,
+.beginner-plan {
+  margin-top: 14px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .045);
+  padding: 12px;
+}
+
+.danger-panel p,
+.quality-gate p {
+  margin: 8px 0 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.danger-panel.low {
+  border-color: rgba(0, 255, 136, .22);
+}
+
+.danger-panel.medium {
+  border-color: rgba(255, 176, 0, .3);
+}
+
+.danger-panel.high {
+  border-color: rgba(255, 77, 109, .34);
+}
+
+.quality-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.quality-checks span {
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 999px;
+  padding: 5px 8px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.quality-checks .ok {
+  color: var(--neon-green);
+  background: rgba(0, 255, 136, .08);
+}
+
+.quality-checks .bad {
+  color: var(--neon-orange);
+  background: rgba(255, 176, 0, .08);
+}
+
+.beginner-plan ol {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .signal-tabs {
   margin: 20px 0;
   display: flex;

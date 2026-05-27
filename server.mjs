@@ -2457,6 +2457,17 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
     });
   }
+  const danger = computeDangerScore({ meta, validation, levelCheck, rr, live, entry, strategy: body.strategy });
+  const qualityGate = buildQualityGate({ meta, validation, levelCheck, danger, hasChartImages });
+  if (!qualityGate.valid) {
+    return blockAnalysis(normalized, {
+      score: Math.min(validation.score, normalized.score, 58),
+      technique: validation.technique,
+      explanation: `${text}\n\nVALIDATION KRONOS: contrôle qualité non validé — ${qualityGate.reason}`,
+      validation: { ...validation, valid: false, reason: qualityGate.reason },
+      meta: { ...meta, levelCheck, rr, dangerScore: danger.score, danger, qualityGate },
+    });
+  }
   const effectiveImageScore = hasChartImages ? imageQuality.score : 65;
   const calibratedScore = Math.max(0, Math.min(100, Math.round(
     normalized.score * 0.42 + validation.score * 0.18 + effectiveImageScore * 0.2 + levelCheck.score * 0.2 + calibration.adjustment,
@@ -2470,6 +2481,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr },
     });
   }
+  const beginnerPlan = buildBeginnerPlan({ direction, entry, sl, tp1: tp, tp2, pair: body.pair, strategy: body.strategy });
   return {
     ...normalized,
     direction,
@@ -2479,12 +2491,17 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     tp2: formatLevel(Number.isFinite(tp2) ? tp2 : projectTp2(direction, entry, sl, tp), body.pair),
     rr: `1:${rr.toFixed(1)}`,
     score: calibratedScore,
+    dangerScore: danger.score,
+    beginnerPlan,
     explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. ${calibration.message}`,
     validation,
     meta: {
       ...meta,
       levelCheck,
       rr,
+      dangerScore: danger.score,
+      danger,
+      qualityGate,
       styleComparison: validation.styleComparison,
       assistedLevels: assistedLevels.used ? assistedLevels.reason : null,
       targetConstraint: targetConstraint.used ? targetConstraint.reason : null,
@@ -2494,6 +2511,18 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
 
 function blockAnalysis(normalized, details) {
   const diagnostic = buildNoSignalDiagnostic(details);
+  const danger = details.meta?.danger || computeDangerScore({ meta: details.meta || {}, validation: details.validation || {}, levelCheck: details.meta?.levelCheck || null });
+  const qualityGate = details.meta?.qualityGate || {
+    ...buildQualityGate({
+      meta: details.meta || {},
+      validation: details.validation || {},
+      levelCheck: details.meta?.levelCheck || { valid: false, reason: details.validation?.reason || diagnostic.statusLabel || "Signal non validé" },
+      danger,
+      hasChartImages: Number(details.meta?.imageQuality?.images || 0) > 0,
+    }),
+    valid: false,
+    reason: details.validation?.reason || diagnostic.statusLabel || "Signal non validé",
+  };
   return {
     ...normalized,
     direction: "AUCUN SIGNAL",
@@ -2508,10 +2537,12 @@ function blockAnalysis(normalized, details) {
     validation: details.validation,
     meta: details.meta,
     noSignal: true,
+    dangerScore: danger.score,
     status: diagnostic.status,
     statusLabel: diagnostic.statusLabel,
     userMessage: diagnostic.userMessage,
     nextActions: diagnostic.nextActions,
+    qualityGate,
     diagnostic,
   };
 }
@@ -2611,6 +2642,128 @@ function buildNoSignalDiagnostic(details = {}) {
       "Choisir le mode Mixte pour comparer les styles.",
       "Ne prendre aucun trade sans confirmation visuelle.",
     ],
+  };
+}
+
+function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = null, live = null, entry = null, strategy = "" }) {
+  const reasons = [];
+  let score = 12;
+  const technical = meta.technicalSnapshot || {};
+  const news = meta.newsContext || {};
+  const image = meta.imageQuality || {};
+  if (technical.valid === false) {
+    score += 22;
+    reasons.push("historique/timeframe faible");
+  }
+  if (technical.trend === "neutre/range") {
+    score += isScalpingStrategy(strategy || meta.strategy) ? 16 : 12;
+    reasons.push("marché en range");
+  }
+  if (technical.stale || technical.timeframeCompatible === false) {
+    score += 18;
+    reasons.push("données non alignées");
+  }
+  if (news.activeRisk) {
+    score += 28;
+    reasons.push("news rouge proche");
+  }
+  if (Number(image.images || 0) > 0 && Number(image.score || 0) < 45) {
+    score += 18;
+    reasons.push("image peu lisible");
+  }
+  if (validation.valid === false || Number(validation.score || 0) < 55) {
+    score += 12;
+    reasons.push("style peu confirmé");
+  }
+  if (levelCheck?.valid === false) {
+    score += 22;
+    reasons.push("niveaux invalides");
+  }
+  if (Number.isFinite(Number(rr)) && Number(rr) > (isScalpingStrategy(strategy || meta.strategy) ? 2.2 : 4.5)) {
+    score += 10;
+    reasons.push("objectif trop ambitieux");
+  }
+  const liveNumber = Number(live ?? meta.livePrice);
+  const entryNumber = Number(entry);
+  if (Number.isFinite(liveNumber) && Number.isFinite(entryNumber) && liveNumber > 0) {
+    const distance = Math.abs(entryNumber - liveNumber) / liveNumber;
+    if (distance > levelTolerance(meta.pair, strategy || meta.strategy)) {
+      score += 14;
+      reasons.push("entrée éloignée");
+    }
+  }
+  return {
+    score: Math.max(0, Math.min(100, Math.round(score))),
+    label: score >= 70 ? "Élevé" : score >= 40 ? "Moyen" : "Faible",
+    reasons: reasons.length ? reasons : ["risque standard"],
+  };
+}
+
+function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger = {}, hasChartImages = false }) {
+  const checks = [
+    {
+      name: "Prix live",
+      ok: Number.isFinite(Number(meta.livePrice)),
+      detail: Number.isFinite(Number(meta.livePrice)) ? "prix disponible" : "prix indisponible",
+    },
+    {
+      name: "Historique",
+      ok: meta.technicalSnapshot?.valid !== false,
+      detail: meta.technicalSnapshot?.source || "source inconnue",
+    },
+    {
+      name: "News",
+      ok: !meta.newsContext?.activeRisk,
+      detail: meta.newsContext?.activeRisk ? "news rouge proche" : "pas de blocage macro",
+    },
+    {
+      name: "Style",
+      ok: validation.valid !== false && Number(validation.score || 0) >= 45,
+      detail: `${Number(validation.score || 0)}%`,
+    },
+    {
+      name: "Niveaux",
+      ok: levelCheck?.valid !== false,
+      detail: levelCheck?.reason || "cohérents",
+    },
+    {
+      name: "Danger",
+      ok: Number(danger.score || 0) < 65,
+      detail: `${Number(danger.score || 0)}%`,
+    },
+  ];
+  if (hasChartImages) {
+    checks.push({
+      name: "Image",
+      ok: Number(meta.imageQuality?.score || 0) >= 35,
+      detail: `${Number(meta.imageQuality?.score || 0)}%`,
+    });
+  }
+  const failed = checks.filter((check) => !check.ok);
+  return {
+    valid: failed.length === 0,
+    reason: failed.length ? failed.map((check) => `${check.name}: ${check.detail}`).join(" · ") : "Tous les contrôles qualité sont validés.",
+    checks,
+  };
+}
+
+function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy }) {
+  return {
+    title: isScalpingStrategy(strategy) ? "Plan scalping débutant" : "Plan débutant",
+    steps: [
+      `Entrée seulement si le prix confirme ${formatLevel(entry, pair)}.`,
+      `Stop Loss à ${formatLevel(sl, pair)} sans l'élargir après entrée.`,
+      `TP1 prudent à ${formatLevel(tp1, pair)}: fermer 50% ou sécuriser une partie.`,
+      `Après TP1, déplacer le SL vers breakeven si la plateforme le permet.`,
+      `TP2 moyen à ${formatLevel(tp2, pair)}: laisser courir uniquement si le momentum reste propre.`,
+    ],
+    copy: [
+      `ENTREE: ${formatLevel(entry, pair)}`,
+      `SL: ${formatLevel(sl, pair)}`,
+      `TP1 PRUDENT: ${formatLevel(tp1, pair)}`,
+      `TP2 MOYEN: ${formatLevel(tp2, pair)}`,
+      "GESTION: Fermer 50% à TP1 puis protéger le reste.",
+    ].join("\n"),
   };
 }
 

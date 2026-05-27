@@ -376,7 +376,10 @@
           <div class="signal-bottom"><span>Score d'efficacité</span><strong>${result.score}%</strong></div>
           <div class="oracle-score"><span class="score-fill ${scoreColor(result.score)}" style="width:${result.score}%"></span></div>
         </div>
+        ${renderDangerScore(result)}
+        ${renderQualityGate(result)}
         ${renderTradePlan(result)}
+        ${renderBeginnerPlan(result)}
         ${renderAnalysisMeta(result)}
         <div class="result-explanation">
           <span>Analyse détaillée</span>
@@ -398,6 +401,7 @@
       score: 0,
       technique: "Non validé",
       explanation: "",
+      dangerScore: 0,
       ...data,
     };
   }
@@ -425,6 +429,8 @@
           <div class="signal-bottom"><span>Confiance exploitable</span><strong>${score}%</strong></div>
           <div class="oracle-score"><span class="score-fill ${scoreColor(score)}" style="width:${score}%"></span></div>
         </div>
+        ${renderDangerScore(result)}
+        ${renderQualityGate(result)}
         <div class="no-signal-grid">
           <div>
             <span>Technique lue</span>
@@ -605,6 +611,47 @@
           ${renderCopyValue("TP2", result.tp2)}
         </div>
         <pre class="trade-plan-copy">${escapeHtml(plan)}</pre>
+      </div>
+    `;
+  }
+
+  function renderDangerScore(result) {
+    const score = Math.max(0, Math.min(100, Number(result.dangerScore ?? result.meta?.dangerScore ?? 0)));
+    const danger = result.meta?.danger || {};
+    const label = danger.label || (score >= 70 ? "Élevé" : score >= 40 ? "Moyen" : "Faible");
+    const reasons = Array.isArray(danger.reasons) ? danger.reasons.slice(0, 3).join(" · ") : "risque standard";
+    return `
+      <div class="danger-panel ${score >= 70 ? "high" : score >= 40 ? "medium" : "low"}">
+        <div class="signal-bottom"><span>Score danger</span><strong>${score}% · ${escapeHtml(label)}</strong></div>
+        <div class="oracle-score"><span class="score-fill ${score >= 70 ? "red" : score >= 40 ? "orange" : "green"}" style="width:${score}%"></span></div>
+        <p>${escapeHtml(reasons)}</p>
+      </div>
+    `;
+  }
+
+  function renderQualityGate(result) {
+    const gate = result.qualityGate || result.meta?.qualityGate;
+    if (!gate || !Array.isArray(gate.checks)) return "";
+    return `
+      <div class="quality-gate ${gate.valid ? "valid" : "blocked"}">
+        <div class="signal-bottom"><span>Contrôle qualité</span><strong>${gate.valid ? "Validé" : "Bloqué"}</strong></div>
+        <div class="quality-checks">
+          ${gate.checks.map((check) => `
+            <span class="${check.ok ? "ok" : "bad"}">${check.ok ? "✓" : "!"} ${escapeHtml(check.name)}</span>
+          `).join("")}
+        </div>
+        <p>${escapeHtml(gate.reason || "")}</p>
+      </div>
+    `;
+  }
+
+  function renderBeginnerPlan(result) {
+    const plan = result.beginnerPlan;
+    if (!plan || !Array.isArray(plan.steps)) return "";
+    return `
+      <div class="beginner-plan">
+        <div class="signal-bottom"><span>${escapeHtml(plan.title || "Plan débutant")}</span><button type="button" data-copy-value="${escapeHtml(plan.copy || "")}">Copier plan</button></div>
+        <ol>${plan.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>
       </div>
     `;
   }
