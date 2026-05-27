@@ -2054,6 +2054,7 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
     tp2: NaN,
     live: price,
     pair,
+    strategy,
   });
   const technique = style === "Mixte" ? "Price Action" : style;
   const strategyLine = strategyGuide(strategy, timeframe);
@@ -2061,10 +2062,10 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
 📊 ANALYSE :
 - Tendance : ${direction === "ACHAT" ? "Haussière indicative" : "Baissière indicative"}
 - Signal détecté : AUCUN SIGNAL — ${strategyLine}
-- Zone d'entrée : ${formatLevel(levels.entry)}
-- Stop Loss : ${formatLevel(levels.sl)}
-- Take Profit 1 : ${formatLevel(levels.tp)}
-- Take Profit 2 : ${formatLevel(levels.tp2)}
+- Zone d'entrée : ${formatLevel(levels.entry, pair)}
+- Stop Loss : ${formatLevel(levels.sl, pair)}
+- Take Profit 1 : ${formatLevel(levels.tp, pair)}
+- Take Profit 2 : ${formatLevel(levels.tp2, pair)}
 ✅ CONFLUENCE : Prix live ${pair} à confirmer sur le graphe
 ⚠️ RISQUE : Ce n'est pas un conseil financier.
 ⚠️ NIVEAUX INDICATIFS UNIQUEMENT — Kronos n'a pas pu lire le graphique. Ne pas trader ces niveaux directement.
@@ -2256,7 +2257,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   let sl = extractLevel(text, /(?:stop loss|sl)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp = extractLevel(text, /(?:take profit\s*1|tp1|take profit|tp)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp2 = extractLevel(text, /(?:take profit\s*2|tp2)\s*:?\s*([0-9.,]+)/i, NaN);
-  let assistedLevels = buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair: body.pair });
+  let assistedLevels = buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair: body.pair, strategy: body.strategy });
   if (assistedLevels.used) {
     entry = assistedLevels.entry;
     sl = assistedLevels.sl;
@@ -2272,16 +2273,16 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta,
     });
   }
-  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair });
+  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy });
   if (!levelCheck.valid) {
-    const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair });
+    const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair, strategy: body.strategy });
     if (repairedLevels.used) {
       entry = repairedLevels.entry;
       sl = repairedLevels.sl;
       tp = repairedLevels.tp;
       tp2 = repairedLevels.tp2;
       assistedLevels = repairedLevels;
-      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair });
+      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy });
     }
   }
   if (!levelCheck.valid) {
@@ -2320,10 +2321,10 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   return {
     ...normalized,
     direction,
-    entry: formatLevel(entry),
-    sl: formatLevel(sl),
-    tp1: formatLevel(tp),
-    tp2: formatLevel(Number.isFinite(tp2) ? tp2 : projectTp2(direction, entry, sl, tp)),
+    entry: formatLevel(entry, body.pair),
+    sl: formatLevel(sl, body.pair),
+    tp1: formatLevel(tp, body.pair),
+    tp2: formatLevel(Number.isFinite(tp2) ? tp2 : projectTp2(direction, entry, sl, tp), body.pair),
     rr: `1:${rr.toFixed(1)}`,
     score: calibratedScore,
     explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. ${calibration.message}`,
@@ -2573,7 +2574,7 @@ function assessImageQuality(images) {
   return { score, reason, images: images.length, averageBytes: Math.round(avg) };
 }
 
-function validateTradeLevels({ direction, entry, sl, tp, live, pair }) {
+function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy }) {
   if (![entry, sl, tp].every(Number.isFinite)) return { valid: false, score: 0, reason: "Niveaux numériques invalides." };
   const buy = direction === "ACHAT";
   if (buy && !(sl < entry && tp > entry)) return { valid: false, score: 20, reason: "Pour un achat, SL doit être sous l'entrée et TP au-dessus." };
@@ -2584,15 +2585,20 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair }) {
   if (suspicious.risky) return { valid: false, score: 28, reason: `Trade risqué: ${suspicious.reason}` };
   if (Number.isFinite(live)) {
     const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
-    const tolerance = levelTolerance(pair);
+    const tolerance = levelTolerance(pair, strategy);
     if (distance > tolerance) {
-      return { valid: true, score: 50, reason: `Niveaux cohérents, mais entrée éloignée du prix live (${(distance * 100).toFixed(2)}%). À confirmer avant exécution.` };
+      const strict = isScalpingStrategy(strategy) || distance > tolerance * 2;
+      return {
+        valid: !strict,
+        score: strict ? 32 : 50,
+        reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%, tolérance ${(tolerance * 100).toFixed(2)}%). ${strict ? "Setup bloqué: attendre un prix plus proche." : "À confirmer avant exécution."}`,
+      };
     }
   }
   return { valid: true, score: Math.max(55, Math.min(100, Math.round(55 + rr * 12))), reason: "Niveaux cohérents avec direction, R/R et prix live." };
 }
 
-function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair }) {
+function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strategy }) {
   if ([entry, sl, tp].every(Number.isFinite)) {
     return { used: false, entry, sl, tp, tp2 };
   }
@@ -2600,7 +2606,7 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair }) {
     return { used: false, entry, sl, tp, tp2 };
   }
   const buy = direction !== "VENTE";
-  const risk = assistedRiskDistance(live, pair);
+  const risk = assistedRiskDistance(live, pair, strategy);
   const finalEntry = Number.isFinite(entry) ? entry : live;
   const finalSl = Number.isFinite(sl) ? sl : buy ? finalEntry - risk : finalEntry + risk;
   const finalTp = Number.isFinite(tp) ? tp : buy ? finalEntry + risk * 1.6 : finalEntry - risk * 1.6;
@@ -2615,21 +2621,27 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair }) {
   };
 }
 
-function assistedRiskDistance(price, pair = "") {
+function assistedRiskDistance(price, pair = "", strategy = "") {
+  const scalp = isScalpingStrategy(strategy);
   if (/BTC/i.test(pair)) return Math.max(price * 0.006, 250);
   if (/ETH/i.test(pair)) return Math.max(price * 0.008, 12);
-  if (/XAU/i.test(pair)) return Math.max(price * 0.0025, 8);
+  if (/XAU/i.test(pair)) return scalp ? Math.max(price * 0.0009, 2.5) : Math.max(price * 0.0025, 8);
   if (/XAG/i.test(pair)) return Math.max(price * 0.006, 0.18);
   if (/US500|NAS|SPX/i.test(pair)) return Math.max(price * 0.0035, 18);
-  if (/JPY/i.test(pair)) return Math.max(price * 0.0025, 0.25);
-  return Math.max(price * 0.0018, 0.0018);
+  if (/JPY/i.test(pair)) return scalp ? Math.max(price * 0.0007, 0.07) : Math.max(price * 0.0025, 0.25);
+  return scalp ? Math.max(price * 0.00045, 0.00045) : Math.max(price * 0.0018, 0.0018);
 }
 
-function levelTolerance(pair = "") {
-  if (/BTC|ETH/i.test(pair)) return 0.035;
-  if (/XAU|XAG|US500|NAS|SPX/i.test(pair)) return 0.025;
-  if (/JPY/i.test(pair)) return 0.018;
-  return 0.012;
+function levelTolerance(pair = "", strategy = "") {
+  const scalp = isScalpingStrategy(strategy);
+  if (/BTC|ETH/i.test(pair)) return scalp ? 0.012 : 0.035;
+  if (/XAU|XAG|US500|NAS|SPX/i.test(pair)) return scalp ? 0.006 : 0.018;
+  if (/JPY/i.test(pair)) return scalp ? 0.0035 : 0.008;
+  return scalp ? 0.0015 : 0.0035;
+}
+
+function isScalpingStrategy(strategy = "") {
+  return /scalp|m1|m5|m15/i.test(String(strategy));
 }
 
 function rewardRisk(direction, entry, sl, tp) {
@@ -3210,10 +3222,20 @@ function finiteNumber(value, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-function formatLevel(value) {
-  if (value >= 1000) return Number(value).toLocaleString("fr-FR", { maximumFractionDigits: 1 });
-  if (value >= 100) return Number(value).toFixed(2);
-  return Number(value).toFixed(4);
+function formatLevel(value, pair = "") {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  const digits = decimalsForPair(pair, number);
+  return number.toFixed(digits);
+}
+
+function decimalsForPair(pair = "", value = 0) {
+  const symbol = String(pair).toUpperCase();
+  if (/BTC|ETH|US500|NAS|SPX/i.test(symbol)) return Math.abs(value) >= 1000 ? 1 : 2;
+  if (/XAU|XAG|XPT|XPD/i.test(symbol)) return 2;
+  if (/JPY/i.test(symbol)) return 3;
+  if (/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol) || Math.abs(value) < 10) return 5;
+  return Math.abs(value) >= 100 ? 2 : 5;
 }
 
 function cleanLine(text) {
