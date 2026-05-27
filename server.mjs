@@ -499,6 +499,8 @@ Réponds en JSON strict:
     const prices = await getPrices();
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
     const includeNewsContext = body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true";
+    const analysisDepth = normalizeAnalysisDepth(body.analysisDepth);
+    const deepAnalysis = analysisDepth === "Profonde";
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
@@ -511,6 +513,12 @@ Réponds en JSON strict:
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Swing Trading",
     });
+    const multiTimeframe = deepAnalysis
+      ? await buildMultiTimeframeContext(selectedPair, livePrice, {
+        timeframe: selectedTimeframe,
+        strategy: body.strategy || "Swing Trading",
+      })
+      : [];
     const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
     const learning = await updateLearningOutcomes(prices);
     const calibration = calibrationFor(learning, body);
@@ -524,9 +532,11 @@ CONTEXTE:
 - Style demandé: ${body.style || "Mixte"}
 - Stratégie demandée: ${body.strategy || "Swing Trading"}
 - Gestion du risque: ${body.risk || "Standard 2%"}
+- Mode d'analyse: ${analysisDepth}
 - Prix live validé: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
 - Historique API: ${technicalSnapshot.bars} bougies (${technicalSnapshot.source}, ${technicalSnapshot.stale ? "indicatif/différé" : "frais"})
 - Synthèse technique interne: ${technicalSnapshot.text}
+- Lecture multi-timeframe: ${multiTimeframe.length ? multiTimeframe.map((item) => `${item.timeframe}: ${item.trend}, RSI ${item.rsi ?? "n/a"}, source ${item.source}`).join(" | ") : "mode rapide ou indisponible"}
 - Contexte news/API: ${newsContext.summary}
 - Qualité image estimée: ${images.length ? `${imageQuality.score}/100 (${imageQuality.reason})` : "aucun graphe uploadé: analyse texte/prix live"}
 - Calibration historique Kronos: ${calibration.message}
@@ -538,12 +548,13 @@ Si un ou plusieurs graphes sont fournis, distingue ce qui est réellement visibl
 Si le style demandé est "Mixte", compare ICT, SMC, Wyckoff, Elliott, Price Action et Ichimoku, puis retiens uniquement le style avec la meilleure efficacité visible.
 Si le style demandé n'est pas "Mixte" et que sa structure n'est pas clairement visible, baisse le score d'efficacité mais ne bloque pas si les niveaux sont cohérents.
 Tu dois citer les éléments techniques visibles qui justifient le style retenu.
-Adapte les niveaux à la stratégie demandée: Scalping = SL/TP courts et confirmation rapide; Swing Trading = structure H1/H4/D1; Position Trading = niveaux majeurs; Breakout = attendre clôture/retest; Reversal = confirmer rejet/CHOCH/divergence avant entrée.
+Adapte les niveaux à la stratégie demandée: Scalping = entrée proche du prix live, SL court, TP1 proche/prudent et TP2 moyen; Swing Trading = structure H1/H4/D1; Position Trading = niveaux majeurs; Breakout = attendre clôture/retest; Reversal = confirmer rejet/CHOCH/divergence avant entrée.
+En scalping, TP1 doit souvent être autour de 0.8R à 1.2R et TP2 autour de 1.4R à 2.0R. N'étire pas les profits comme un swing trade.
 Si la détection automatique est désactivée, utilise la paire et le timeframe du formulaire comme contexte confirmé.
 Si le setup n'est pas confirmé, retourne AUCUN SIGNAL au lieu de forcer une opportunité. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
 Format des niveaux: Forex non-JPY toujours avec 5 décimales (ex: 1.08472), paires JPY avec 3 décimales, métaux avec 2 décimales, indices/crypto selon leur cotation.
-Si plusieurs graphes sont fournis: utilise les timeframes élevés pour la tendance/contexte et le plus petit timeframe détecté pour l'entrée finale.
+Si plusieurs graphes sont fournis ou si le mode Profonde est actif: utilise les timeframes élevés pour la tendance/contexte et le plus petit timeframe détecté pour l'entrée finale.
 Si le contexte news/API est activé, croise le setup avec les titres récents et le calendrier économique. Si une news rouge proche touche la devise, bloque ou baisse le score au lieu de forcer un trade.
 Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
 
@@ -558,8 +569,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         livePrice,
       });
     }
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext });
-    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration });
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe });
+    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth });
     sendJson(res, 200, result);
     return;
   }
@@ -1012,6 +1023,48 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   return cached;
 }
 
+async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
+  const timeframes = analysisTimeframes(options.timeframe, options.strategy);
+  const items = [];
+  for (const timeframe of timeframes) {
+    const history = await getHistoryForSymbol(symbol, livePrice, {
+      timeframe,
+      strategy: options.strategy,
+    });
+    const snapshot = buildTechnicalSnapshot(symbol, history, livePrice, {
+      timeframe,
+      strategy: options.strategy,
+    });
+    items.push({
+      timeframe,
+      source: snapshot.source,
+      bars: snapshot.bars,
+      valid: snapshot.valid,
+      trend: snapshot.trend || "n/a",
+      rsi: snapshot.rsi,
+      support: snapshot.support,
+      resistance: snapshot.resistance,
+      volatility: snapshot.volatility,
+      timeframeCompatible: snapshot.timeframeCompatible,
+    });
+  }
+  return items;
+}
+
+function analysisTimeframes(timeframe = "H1", strategy = "") {
+  const normalized = normalizeTimeframe(timeframe) || "H1";
+  if (isScalpingStrategy(strategy) || ["M1", "M5", "M15"].includes(normalized)) {
+    return uniqueList(["H1", "M15", normalized === "M1" ? "M5" : normalized, "M1"]);
+  }
+  if (/breakout|reversal/i.test(String(strategy))) return uniqueList(["H4", "H1", normalized, "M15"]);
+  if (/position/i.test(String(strategy)) || ["D1", "W1", "MN1"].includes(normalized)) return uniqueList(["W1", "D1", "H4", normalized]);
+  return uniqueList(["D1", "H4", normalized, "M15"]);
+}
+
+function uniqueList(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
 async function fetchFreeHistories(cache, prices) {
   const entries = await Promise.all(symbols.map(async (symbol) => {
     const price = prices[symbol];
@@ -1174,7 +1227,9 @@ async function fetchDukascopyHistory(symbol) {
 function historyIntervals(symbol, options = {}) {
   const timeframe = normalizeTimeframe(options.timeframe);
   const strategy = String(options.strategy || "");
-  if (isScalpingStrategy(strategy) || ["M1", "M5", "M15"].includes(timeframe)) {
+  if (timeframe === "M1") return ["1min", "5min", "15min"];
+  if (timeframe === "M5") return ["5min", "1min", "15min"];
+  if (timeframe === "M15") {
     if (/BTC|ETH/i.test(symbol)) return ["1min", "5min", "15min", "30min"];
     return ["1min", "5min", "15min", "30min"];
   }
@@ -1188,6 +1243,7 @@ function historyIntervals(symbol, options = {}) {
     if (/US500|NAS|SPX/i.test(symbol)) return ["1h", "1day"];
     return ["1h", "4h", "1day"];
   }
+  if (isScalpingStrategy(strategy)) return ["5min", "1min", "15min", "30min"];
   if (/BTC|ETH/i.test(symbol)) return ["15min", "30min", "1h"];
   if (/US500|NAS|SPX/i.test(symbol)) return ["30min", "1h", "1day"];
   return ["15min", "30min", "1h", "1day"];
@@ -1199,10 +1255,12 @@ function isHistoryCompatible(history, options = {}) {
   const timeframe = normalizeTimeframe(options.timeframe);
   if (timeframe === "M1") return historySourceHasInterval(source, ["1min"]);
   if (timeframe === "M5") return historySourceHasInterval(source, ["1min", "5min"]);
-  if (isScalpingStrategy(strategy) || timeframe === "M15") {
+  if (timeframe === "M15") {
     return historySourceHasInterval(source, ["1min", "5min", "15min"]) && !/1day|daily|:d\b/i.test(source);
   }
   if (["M30", "H1"].includes(timeframe)) return historySourceHasInterval(source, ["15min", "30min", "1h"]);
+  if (["H4", "D1", "W1", "MN1"].includes(timeframe)) return historySourceHasInterval(source, ["1h", "4h", "1day", "1week"]);
+  if (isScalpingStrategy(strategy)) return historySourceHasInterval(source, ["1min", "5min", "15min"]);
   return true;
 }
 
@@ -2023,6 +2081,10 @@ function normalizeTimeframe(value) {
   return `${unit}${match[1]}`;
 }
 
+function normalizeAnalysisDepth(value) {
+  return /rapide|fast|quick/i.test(String(value || "")) ? "Rapide" : "Profonde";
+}
+
 function smallestTimeframe(timeframes) {
   return [...timeframes].sort((a, b) => timeframeMinutes(a) - timeframeMinutes(b))[0] || null;
 }
@@ -2293,12 +2355,14 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     style: body.style || "Mixte",
     strategy: body.strategy || "Swing Trading",
     risk: body.risk || "Standard 2%",
+    analysisDepth: body.analysisDepth || "Profonde",
     livePrice: Number.isFinite(live) ? live : null,
     imageQuality,
     calibration,
     chartContext,
     technicalSnapshot: context.technicalSnapshot || null,
     newsContext: context.newsContext || null,
+    multiTimeframe: context.multiTimeframe || [],
     styleComparison: validation.styleComparison,
   };
   const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
@@ -2341,6 +2405,11 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     tp = assistedLevels.tp;
     tp2 = assistedLevels.tp2;
   }
+  let targetConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy });
+  if (targetConstraint.used) {
+    tp = targetConstraint.tp;
+    tp2 = targetConstraint.tp2;
+  }
   if (![entry, sl, tp].every(Number.isFinite)) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, 35),
@@ -2358,6 +2427,12 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       sl = repairedLevels.sl;
       tp = repairedLevels.tp;
       tp2 = repairedLevels.tp2;
+      const repairedConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy });
+      if (repairedConstraint.used) {
+        tp = repairedConstraint.tp;
+        tp2 = repairedConstraint.tp2;
+        targetConstraint = repairedConstraint;
+      }
       assistedLevels = repairedLevels;
       levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy });
     }
@@ -2406,7 +2481,14 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     score: calibratedScore,
     explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. ${calibration.message}`,
     validation,
-    meta: { ...meta, levelCheck, rr, styleComparison: validation.styleComparison, assistedLevels: assistedLevels.used ? assistedLevels.reason : null },
+    meta: {
+      ...meta,
+      levelCheck,
+      rr,
+      styleComparison: validation.styleComparison,
+      assistedLevels: assistedLevels.used ? assistedLevels.reason : null,
+      targetConstraint: targetConstraint.used ? targetConstraint.reason : null,
+    },
   };
 }
 
@@ -2657,7 +2739,8 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy })
   if (buy && !(sl < entry && tp > entry)) return { valid: false, score: 20, reason: "Pour un achat, SL doit être sous l'entrée et TP au-dessus." };
   if (!buy && !(sl > entry && tp < entry)) return { valid: false, score: 20, reason: "Pour une vente, SL doit être au-dessus de l'entrée et TP sous l'entrée." };
   const rr = rewardRisk(direction, entry, sl, tp);
-  if (!Number.isFinite(rr) || rr < 1.2) return { valid: false, score: 35, reason: `R/R trop faible (${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}).` };
+  const minRr = isScalpingStrategy(strategy) ? 0.75 : 1.2;
+  if (!Number.isFinite(rr) || rr < minRr) return { valid: false, score: 35, reason: `R/R trop faible (${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}).` };
   const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair });
   if (suspicious.risky) return { valid: false, score: 28, reason: `Trade risqué: ${suspicious.reason}` };
   if (Number.isFinite(live)) {
@@ -2684,10 +2767,11 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strate
   }
   const buy = direction !== "VENTE";
   const risk = assistedRiskDistance(live, pair, strategy);
+  const targets = targetMultipliers(strategy);
   const finalEntry = Number.isFinite(entry) ? entry : live;
   const finalSl = Number.isFinite(sl) ? sl : buy ? finalEntry - risk : finalEntry + risk;
-  const finalTp = Number.isFinite(tp) ? tp : buy ? finalEntry + risk * 1.6 : finalEntry - risk * 1.6;
-  const finalTp2 = Number.isFinite(tp2) ? tp2 : buy ? finalEntry + risk * 2.4 : finalEntry - risk * 2.4;
+  const finalTp = Number.isFinite(tp) ? tp : buy ? finalEntry + risk * targets.tp1 : finalEntry - risk * targets.tp1;
+  const finalTp2 = Number.isFinite(tp2) ? tp2 : buy ? finalEntry + risk * targets.tp2 : finalEntry - risk * targets.tp2;
   return {
     used: true,
     entry: finalEntry,
@@ -2698,15 +2782,48 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strate
   };
 }
 
+function constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy }) {
+  if (![entry, sl, tp].every(Number.isFinite)) return { used: false, tp, tp2 };
+  const targets = targetMultipliers(strategy);
+  const risk = Math.abs(entry - sl);
+  if (!risk) return { used: false, tp, tp2 };
+  const buy = direction !== "VENTE";
+  const rr1 = Math.abs(tp - entry) / risk;
+  const rr2 = Number.isFinite(tp2) ? Math.abs(tp2 - entry) / risk : NaN;
+  const clampRr = (value, min, max, fallback) => Math.max(min, Math.min(max, Number.isFinite(value) ? value : fallback));
+  const safeRr1 = clampRr(rr1, targets.minTp1, targets.maxTp1, targets.tp1);
+  const safeRr2 = clampRr(rr2, targets.minTp2, targets.maxTp2, targets.tp2);
+  const finalTp = buy ? entry + risk * safeRr1 : entry - risk * safeRr1;
+  const finalTp2 = buy ? entry + risk * Math.max(safeRr2, safeRr1 + 0.25) : entry - risk * Math.max(safeRr2, safeRr1 + 0.25);
+  const changed = Math.abs(finalTp - tp) > risk * 0.05 || !Number.isFinite(tp2) || Math.abs(finalTp2 - tp2) > risk * 0.05;
+  return {
+    used: changed,
+    tp: changed ? finalTp : tp,
+    tp2: changed ? finalTp2 : tp2,
+    reason: isScalpingStrategy(strategy)
+      ? `Objectifs scalping resserrés: TP1 ${safeRr1.toFixed(1)}R prudent, TP2 ${Math.max(safeRr2, safeRr1 + 0.25).toFixed(1)}R moyen.`
+      : `Objectifs ajustés selon la stratégie: TP1 ${safeRr1.toFixed(1)}R, TP2 ${Math.max(safeRr2, safeRr1 + 0.25).toFixed(1)}R.`,
+  };
+}
+
+function targetMultipliers(strategy = "") {
+  if (isScalpingStrategy(strategy)) {
+    return { tp1: 0.95, tp2: 1.65, minTp1: 0.75, maxTp1: 1.2, minTp2: 1.35, maxTp2: 2.0 };
+  }
+  if (/breakout/i.test(String(strategy))) return { tp1: 1.2, tp2: 2.2, minTp1: 1.0, maxTp1: 1.8, minTp2: 1.7, maxTp2: 3.2 };
+  if (/position/i.test(String(strategy))) return { tp1: 1.8, tp2: 3.2, minTp1: 1.2, maxTp1: 2.4, minTp2: 2.2, maxTp2: 4.5 };
+  return { tp1: 1.35, tp2: 2.2, minTp1: 1.0, maxTp1: 1.8, minTp2: 1.7, maxTp2: 3.2 };
+}
+
 function assistedRiskDistance(price, pair = "", strategy = "") {
   const scalp = isScalpingStrategy(strategy);
-  if (/BTC/i.test(pair)) return Math.max(price * 0.006, 250);
-  if (/ETH/i.test(pair)) return Math.max(price * 0.008, 12);
-  if (/XAU/i.test(pair)) return scalp ? Math.max(price * 0.0009, 2.5) : Math.max(price * 0.0025, 8);
-  if (/XAG/i.test(pair)) return Math.max(price * 0.006, 0.18);
-  if (/US500|NAS|SPX/i.test(pair)) return Math.max(price * 0.0035, 18);
-  if (/JPY/i.test(pair)) return scalp ? Math.max(price * 0.0007, 0.07) : Math.max(price * 0.0025, 0.25);
-  return scalp ? Math.max(price * 0.00045, 0.00045) : Math.max(price * 0.0018, 0.0018);
+  if (/BTC/i.test(pair)) return scalp ? Math.max(price * 0.0022, 80) : Math.max(price * 0.006, 250);
+  if (/ETH/i.test(pair)) return scalp ? Math.max(price * 0.003, 4) : Math.max(price * 0.008, 12);
+  if (/XAU/i.test(pair)) return scalp ? Math.max(price * 0.00045, 1.2) : Math.max(price * 0.0025, 8);
+  if (/XAG/i.test(pair)) return scalp ? Math.max(price * 0.0025, 0.06) : Math.max(price * 0.006, 0.18);
+  if (/US500|NAS|SPX/i.test(pair)) return scalp ? Math.max(price * 0.0012, 6) : Math.max(price * 0.0035, 18);
+  if (/JPY/i.test(pair)) return scalp ? Math.max(price * 0.00028, 0.03) : Math.max(price * 0.0025, 0.25);
+  return scalp ? Math.max(price * 0.00025, 0.00025) : Math.max(price * 0.0018, 0.0018);
 }
 
 function levelTolerance(pair = "", strategy = "") {
@@ -2796,7 +2913,7 @@ function minStopDistance(pair = "") {
 
 function projectTp2(direction, entry, sl, tp1) {
   const risk = Math.abs(entry - sl);
-  const rr2 = Math.max(rewardRisk(direction, entry, sl, tp1), 2.0);
+  const rr2 = Math.max(rewardRisk(direction, entry, sl, tp1), 1.6);
   return direction === "ACHAT" ? entry + risk * Math.min(rr2 + 0.8, 4) : entry - risk * Math.min(rr2 + 0.8, 4);
 }
 
@@ -3079,6 +3196,7 @@ async function recordLearningAnalysis(result, body, context) {
   const entry = parseFormattedNumber(result.entry);
   const sl = parseFormattedNumber(result.sl);
   const tp1 = parseFormattedNumber(result.tp1);
+  const tp2 = parseFormattedNumber(result.tp2);
   log.analyses.push({
     id,
     createdAt: new Date().toISOString(),
@@ -3087,10 +3205,12 @@ async function recordLearningAnalysis(result, body, context) {
     style: body.style || "Hybride SMC+Chartiste",
     strategy: body.strategy || "Swing Trading",
     risk: body.risk || "Standard 2%",
+    analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
     direction: result.direction,
     entry,
     sl,
     tp1,
+    tp2,
     rr: result.rr,
     score: Number(result.score) || 0,
     active,
@@ -3100,6 +3220,8 @@ async function recordLearningAnalysis(result, body, context) {
     imageQuality: context.imageQuality,
     calibration: context.calibration,
     validation: result.validation,
+    technicalSnapshot: context.technicalSnapshot || null,
+    multiTimeframe: context.multiTimeframe || [],
   });
   await saveLearningLog(log);
   result.learningId = id;
@@ -3134,6 +3256,7 @@ async function updateLearningOutcomes(prices = null) {
         timeframe: analysis.timeframe,
         style: analysis.style,
         strategy: analysis.strategy || "Swing Trading",
+        analysisDepth: analysis.analysisDepth || "Profonde",
         score: analysis.score,
         result: finalOutcome.result,
         status: finalOutcome.status,
@@ -3148,6 +3271,10 @@ async function updateLearningOutcomes(prices = null) {
 function evaluateOutcome(analysis, price) {
   const buy = analysis.direction === "ACHAT";
   if (![analysis.entry, analysis.sl, analysis.tp1].every(Number.isFinite)) return null;
+  if (Number.isFinite(analysis.tp2)) {
+    if (buy && price >= analysis.tp2) return { status: "TP2_HIT", result: "win", price, reason: "TP2 touché." };
+    if (!buy && price <= analysis.tp2) return { status: "TP2_HIT", result: "win", price, reason: "TP2 touché." };
+  }
   if (buy && price >= analysis.tp1) return { status: "TP1_HIT", result: "win", price, reason: "TP1 touché." };
   if (buy && price <= analysis.sl) return { status: "SL_HIT", result: "loss", price, reason: "Stop Loss touché." };
   if (!buy && price <= analysis.tp1) return { status: "TP1_HIT", result: "win", price, reason: "TP1 touché." };

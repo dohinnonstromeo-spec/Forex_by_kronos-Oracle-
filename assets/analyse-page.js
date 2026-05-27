@@ -66,9 +66,10 @@
       event.preventDefault();
       const submit = form.querySelector(".analysis-submit");
       submit.disabled = true;
-      submit.textContent = "Kronos analyse en profondeur...";
       const progress = startAnalysisProgress(form);
       const body = Object.fromEntries(new FormData(form).entries());
+      const deep = body.analysisDepth !== "Rapide";
+      submit.textContent = deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...";
       body.images = images;
       body.autoDetect = isAutoDetectEnabled();
       body.detectedContext = isAutoDetectEnabled() ? detectedContext : null;
@@ -505,11 +506,14 @@
       ${quality ? `<div>Image: ${quality.score}% · ${escapeHtml(quality.reason || "")}</div>` : ""}
       ${live ? `<div>Prix live vérifié: ${escapeHtml(live)}</div>` : ""}
       ${technical ? `<div>Technique API: ${escapeHtml(technical.trend || "n/a")} · RSI ${escapeHtml(technical.rsi ?? "n/a")} · ${escapeHtml(technical.bars || 0)} bougies · ${escapeHtml(technical.source || "source n/a")}</div>` : ""}
+      ${meta.analysisDepth ? `<div>Mode analyse: ${escapeHtml(meta.analysisDepth)}</div>` : ""}
+      ${Array.isArray(meta.multiTimeframe) && meta.multiTimeframe.length ? `<div>Multi-timeframe: ${escapeHtml(meta.multiTimeframe.map((tf) => `${tf.timeframe}:${tf.trend || "n/a"}`).join(" · "))}</div>` : ""}
       ${news ? `<div>News/API: ${news.enabled ? (news.activeRisk ? "risque macro actif" : "contexte consulté") : "désactivé"} · ${escapeHtml(news.headlines?.[0]?.title || news.summary || "aucun titre")}</div>` : ""}
       ${meta.strategy ? `<div>Stratégie: ${escapeHtml(meta.strategy)}</div>` : ""}
       ${chartContext?.primaryPair || chartContext?.executionTimeframe ? `<div>Contexte chart: ${escapeHtml(chartContext.primaryPair || "paire manuelle")} · ${escapeHtml(chartContext.executionTimeframe || "timeframe manuel")}</div>` : ""}
       ${meta.styleComparison ? `<div>Style retenu: ${escapeHtml(meta.styleComparison.bestStyle || result.technique || "n/a")} · efficacité ${Number(meta.styleComparison.bestScore || result.score || 0)}%</div>` : ""}
       ${meta.assistedLevels ? `<div>Plan: ${escapeHtml(meta.assistedLevels)}</div>` : ""}
+      ${meta.targetConstraint ? `<div>Objectifs: ${escapeHtml(meta.targetConstraint)}</div>` : ""}
       ${calibration ? `<div>Apprentissage: ${escapeHtml(calibration.message || "")}</div>` : ""}
       ${id ? `<div>ID analyse: ${escapeHtml(id)}</div>` : ""}
     </div>`;
