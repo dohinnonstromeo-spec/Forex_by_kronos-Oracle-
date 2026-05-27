@@ -37,6 +37,7 @@ const MASSIVE_KEYS = collectEnvKeys("MASSIVE_API_KEY", "MASSIVE_KEY");
 const ALPHA_VANTAGE_KEYS = collectEnvKeys("ALPHA_VANTAGE_API_KEY");
 const EXCHANGERATE_KEYS = collectEnvKeys("EXCHANGERATE_API_KEY");
 const GROQ_KEYS = collectEnvKeys("GROQ_KEY", "GROQ_API_KEY");
+const GEMINI_KEYS = collectEnvKeys("GEMINI_API_KEY", "GEMINI_KEY");
 const FINNHUB_KEYS = collectEnvKeys("FINNHUB_API_KEY");
 const MARKETAUX_KEYS = collectEnvKeys("MARKETAUX_API_KEY");
 const rotationCounters = {
@@ -254,7 +255,7 @@ async function handleApi(req, res, url) {
   if (url.pathname === "/api/config") {
     sendJson(res, 200, {
       groq: GROQ_KEYS.length > 0,
-      gemini: Boolean(env.GEMINI_API_KEY || env.GEMINI_KEY),
+      gemini: GEMINI_KEYS.length > 0,
       twelveData: TWELVE_DATA_KEYS.length > 0,
       massive: MASSIVE_KEYS.length > 0,
       alphaVantage: ALPHA_VANTAGE_KEYS.length > 0,
@@ -502,8 +503,14 @@ Réponds en JSON strict:
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
     const livePrice = prices[selectedPair] || await getExternalPrice(selectedPair);
-    const history = await getHistoryForSymbol(selectedPair, livePrice);
-    const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice);
+    const history = await getHistoryForSymbol(selectedPair, livePrice, {
+      timeframe: selectedTimeframe,
+      strategy: body.strategy || "Swing Trading",
+    });
+    const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
+      timeframe: selectedTimeframe,
+      strategy: body.strategy || "Swing Trading",
+    });
     const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
     const learning = await updateLearningOutcomes(prices);
     const calibration = calibrationFor(learning, body);
@@ -535,6 +542,7 @@ Adapte les niveaux à la stratégie demandée: Scalping = SL/TP courts et confir
 Si la détection automatique est désactivée, utilise la paire et le timeframe du formulaire comme contexte confirmé.
 Si le setup n'est pas confirmé, retourne AUCUN SIGNAL au lieu de forcer une opportunité. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
+Format des niveaux: Forex non-JPY toujours avec 5 décimales (ex: 1.08472), paires JPY avec 3 décimales, métaux avec 2 décimales, indices/crypto selon leur cotation.
 Si plusieurs graphes sont fournis: utilise les timeframes élevés pour la tendance/contexte et le plus petit timeframe détecté pour l'entrée finale.
 Si le contexte news/API est activé, croise le setup avec les titres récents et le calendrier économique. Si une news rouge proche touche la devise, bloque ou baisse le score au lieu de forcer un trade.
 Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
@@ -950,10 +958,11 @@ async function getHistories(prices) {
   return histories;
 }
 
-async function getHistoryForSymbol(symbol, price = null) {
+async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cache = await loadMarketCache();
   const cached = cachedHistory(symbol, cache);
-  if (cached.length >= 30 && !cached._meta?.stale) return cached;
+  const preferredIntervals = historyIntervals(symbol, options);
+  if (cached.length >= 30 && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
   if (!price?.open || !isUsableLivePrice(price)) return cached;
   const deadline = Date.now() + 12000;
   const errors = [];
@@ -964,7 +973,7 @@ async function getHistoryForSymbol(symbol, price = null) {
     ["stooq", fetchStooqHistory],
   ];
   for (const [source, loader] of attempts) {
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of preferredIntervals) {
       if (Date.now() > deadline) {
         errors.push("history_budget_exceeded");
         return cached;
@@ -1080,6 +1089,8 @@ async function fetchBinanceHistory(symbol, interval) {
   const binanceSymbol = toBinanceSymbol(symbol);
   if (!binanceSymbol) return [];
   const binanceInterval = {
+    "1min": "1m",
+    "5min": "5m",
     "15min": "15m",
     "30min": "30m",
     "1h": "1h",
@@ -1160,10 +1171,44 @@ async function fetchDukascopyHistory(symbol) {
   return bars.slice(-80);
 }
 
-function historyIntervals(symbol) {
+function historyIntervals(symbol, options = {}) {
+  const timeframe = normalizeTimeframe(options.timeframe);
+  const strategy = String(options.strategy || "");
+  if (isScalpingStrategy(strategy) || ["M1", "M5", "M15"].includes(timeframe)) {
+    if (/BTC|ETH/i.test(symbol)) return ["1min", "5min", "15min", "30min"];
+    return ["1min", "5min", "15min", "30min"];
+  }
+  if (["M30", "H1"].includes(timeframe)) {
+    if (/BTC|ETH/i.test(symbol)) return ["15min", "30min", "1h"];
+    if (/US500|NAS|SPX/i.test(symbol)) return ["30min", "1h", "1day"];
+    return ["15min", "30min", "1h", "1day"];
+  }
+  if (["H4", "D1", "W1", "MN1"].includes(timeframe) || /swing|position/i.test(strategy)) {
+    if (/BTC|ETH/i.test(symbol)) return ["1h", "4h", "1day"];
+    if (/US500|NAS|SPX/i.test(symbol)) return ["1h", "1day"];
+    return ["1h", "4h", "1day"];
+  }
   if (/BTC|ETH/i.test(symbol)) return ["15min", "30min", "1h"];
   if (/US500|NAS|SPX/i.test(symbol)) return ["30min", "1h", "1day"];
   return ["15min", "30min", "1h", "1day"];
+}
+
+function isHistoryCompatible(history, options = {}) {
+  const source = String(history?._meta?.source || "");
+  const strategy = String(options.strategy || "");
+  const timeframe = normalizeTimeframe(options.timeframe);
+  if (timeframe === "M1") return historySourceHasInterval(source, ["1min"]);
+  if (timeframe === "M5") return historySourceHasInterval(source, ["1min", "5min"]);
+  if (isScalpingStrategy(strategy) || timeframe === "M15") {
+    return historySourceHasInterval(source, ["1min", "5min", "15min"]) && !/1day|daily|:d\b/i.test(source);
+  }
+  if (["M30", "H1"].includes(timeframe)) return historySourceHasInterval(source, ["15min", "30min", "1h"]);
+  return true;
+}
+
+function historySourceHasInterval(source = "", intervals = []) {
+  const interval = String(source).toLowerCase().split(":").pop();
+  return intervals.map((item) => item.toLowerCase()).includes(interval);
 }
 
 function toStooqSymbol(symbol = "") {
@@ -1204,6 +1249,8 @@ function toBinanceSymbol(symbol = "") {
 
 function toStooqInterval(interval = "") {
   return ({
+    "1min": "1",
+    "5min": "5",
     "15min": "15",
     "30min": "30",
     "1h": "60",
@@ -1226,9 +1273,12 @@ function toMassiveTicker(symbol = "") {
 
 function toMassiveTimespan(interval = "") {
   return ({
+    "1min": { multiplier: 1, timespan: "minute" },
+    "5min": { multiplier: 5, timespan: "minute" },
     "15min": { multiplier: 15, timespan: "minute" },
     "30min": { multiplier: 30, timespan: "minute" },
     "1h": { multiplier: 1, timespan: "hour" },
+    "4h": { multiplier: 4, timespan: "hour" },
     "1day": { multiplier: 1, timespan: "day" },
     "1d": { multiplier: 1, timespan: "day" },
   })[interval] || null;
@@ -1543,7 +1593,7 @@ async function getEconomicCalendar() {
       api.searchParams.set("from", from);
       api.searchParams.set("to", to);
       api.searchParams.set("token", key);
-      return fetchJson(api);
+      return fetchJson(api, 5000);
     });
     const events = data.economicCalendar || [];
     memoryCache.calendar = { value: events, expiresAt: Date.now() + 30 * 60 * 1000 };
@@ -1564,7 +1614,7 @@ async function getMarketauxNews(symbol = "EURUSD") {
       api.searchParams.set("filter_entities", "true");
       api.searchParams.set("language", "en");
       api.searchParams.set("api_token", key);
-      return fetchJson(api);
+      return fetchJson(api, 5000);
     });
     recordProviderHealth("marketaux_news", true);
     return Array.isArray(data?.data) ? data.data.slice(0, 12) : [];
@@ -1730,23 +1780,30 @@ async function groqOnce(key, model, prompt, maxTokens, temperature) {
 }
 
 async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
-  const key = env.GEMINI_API_KEY || env.GEMINI_KEY;
-  if (!key) return "";
+  if (!GEMINI_KEYS.length) return "";
   for (const model of GEMINI_FALLBACK_MODELS) {
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(18000),
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature, maxOutputTokens: maxTokens },
-        }),
+      const result = await fetchWithRotation("gemini", GEMINI_KEYS, async (key) => {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(18000),
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: { temperature, maxOutputTokens: maxTokens },
+          }),
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`gemini_text_${response.status}_${model}: ${errText.slice(0, 240)}`);
+        }
+        const data = await response.json();
+        return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "";
       });
-      if (!response.ok) throw new Error(`gemini_text_${response.status}_${model}`);
-      const data = await response.json();
-      recordProviderHealth("gemini_text", true);
-      return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "";
+      if (result) {
+        recordProviderHealth("gemini_text", true);
+        return result;
+      }
     } catch (error) {
       recordProviderHealth("gemini_text", false, error.message);
       console.warn(`Gemini text failed with ${model}: ${error.message}`);
@@ -1808,7 +1865,7 @@ async function analyzeChartImage(prompt, images) {
     if (result && result.length > 50) return result;
     console.warn("Groq Vision insufficient, falling back to Gemini Vision.");
   }
-  if (env.GEMINI_API_KEY || env.GEMINI_KEY) {
+  if (GEMINI_KEYS.length) {
     const result = await geminiVision(prompt, images);
     if (result && result.length > 50) return result;
     console.warn("Gemini Vision insufficient.");
@@ -1817,29 +1874,36 @@ async function analyzeChartImage(prompt, images) {
 }
 
 async function geminiVision(prompt, images) {
-  const key = env.GEMINI_API_KEY || env.GEMINI_KEY;
-  if (!key) return "";
+  if (!GEMINI_KEYS.length) return "";
   for (const model of GEMINI_FALLBACK_MODELS) {
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(22000),
-        body: JSON.stringify({
-          contents: [{
-            role: "user",
-            parts: [
-              { text: prompt },
-              ...images.map((image) => ({ inline_data: { mime_type: image.mimeType, data: image.data } })),
-            ],
-          }],
-          generationConfig: { temperature: 0.25, maxOutputTokens: 700 },
-        }),
+      const result = await fetchWithRotation("gemini", GEMINI_KEYS, async (key) => {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(22000),
+          body: JSON.stringify({
+            contents: [{
+              role: "user",
+              parts: [
+                { text: prompt },
+                ...images.map((image) => ({ inline_data: { mime_type: image.mimeType, data: image.data } })),
+              ],
+            }],
+            generationConfig: { temperature: 0.25, maxOutputTokens: 700 },
+          }),
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`gemini_${response.status}_${model}: ${errText.slice(0, 240)}`);
+        }
+        const data = await response.json();
+        return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "";
       });
-      if (!response.ok) throw new Error(`gemini_${response.status}_${model}`);
-      const data = await response.json();
-      recordProviderHealth("gemini_vision", true);
-      return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "";
+      if (result) {
+        recordProviderHealth("gemini_vision", true);
+        return result;
+      }
     } catch (error) {
       recordProviderHealth("gemini_vision", false, error.message);
       console.warn(`Gemini failed with ${model}: ${error.message}`);
@@ -1904,7 +1968,7 @@ function normalizeImages(images) {
 }
 
 function hasVisionProvider() {
-  return GROQ_KEYS.length > 0 || Boolean(env.GEMINI_API_KEY || env.GEMINI_KEY);
+  return GROQ_KEYS.length > 0 || GEMINI_KEYS.length > 0;
 }
 
 function normalizeChartDetection(value) {
@@ -2083,12 +2147,13 @@ function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
   return `Swing Trading ${timeframe}: setup prudent basé sur structure, support/résistance et prix live`;
 }
 
-function buildTechnicalSnapshot(pair, history = [], livePrice = null) {
+function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = {}) {
   const bars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
   const closes = bars.map((bar) => Number(bar.close));
   const live = Number(livePrice?.price);
   const last = Number.isFinite(live) ? live : closes.at(-1);
   const meta = history?._meta || {};
+  const compatible = isHistoryCompatible(history, options);
   if (!Number.isFinite(last) || closes.length < 10) {
     return {
       pair,
@@ -2118,24 +2183,26 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null) {
   const confirmations = [
     closes.length >= 30,
     !meta.stale,
+    compatible,
     trend !== "neutre/range",
     Number.isFinite(support) && Number.isFinite(resistance) && resistance > support,
     volatility > 0.04,
   ].filter(Boolean).length;
-  const valid = closes.length >= 30 && confirmations >= 3 && !meta.stale;
+  const valid = closes.length >= 30 && confirmations >= 4 && !meta.stale && compatible;
   return {
     pair,
     bars: closes.length,
     source: meta.source || livePrice?.source || "historique",
-    stale: Boolean(meta.stale || livePrice?.stale),
+    stale: Boolean(meta.stale || livePrice?.stale || !compatible),
+    timeframeCompatible: compatible,
     valid,
-    last: roundLevel(last),
-    sma10: roundLevel(sma10),
-    sma30: Number.isFinite(sma30) ? roundLevel(sma30) : null,
+    last: Number(formatLevel(last, pair)),
+    sma10: Number(formatLevel(sma10, pair)),
+    sma30: Number.isFinite(sma30) ? Number(formatLevel(sma30, pair)) : null,
     rsi: Number.isFinite(rsi) ? Math.round(rsi) : null,
-    atr: roundLevel(atr),
-    support: Number.isFinite(support) ? roundLevel(support) : null,
-    resistance: Number.isFinite(resistance) ? roundLevel(resistance) : null,
+    atr: Number(formatLevel(atr, pair)),
+    support: Number.isFinite(support) ? Number(formatLevel(support, pair)) : null,
+    resistance: Number.isFinite(resistance) ? Number(formatLevel(resistance, pair)) : null,
     trend,
     momentum: Number(momentum.toFixed(3)),
     volatility: Number(volatility.toFixed(3)),
@@ -2143,11 +2210,12 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null) {
     text: [
       `${closes.length} bougies ${meta.source || livePrice?.source || "API"}`,
       `tendance ${trend}`,
-      `SMA10 ${formatLevel(sma10)}${Number.isFinite(sma30) ? ` / SMA30 ${formatLevel(sma30)}` : ""}`,
+      `SMA10 ${formatLevel(sma10, pair)}${Number.isFinite(sma30) ? ` / SMA30 ${formatLevel(sma30, pair)}` : ""}`,
       Number.isFinite(rsi) ? `RSI ${Math.round(rsi)}` : "RSI indisponible",
-      `ATR ${formatLevel(atr)}`,
-      Number.isFinite(support) && Number.isFinite(resistance) ? `support ${formatLevel(support)}, résistance ${formatLevel(resistance)}` : "zones S/R insuffisantes",
-      `confirmations ${confirmations}/5`,
+      `ATR ${formatLevel(atr, pair)}`,
+      Number.isFinite(support) && Number.isFinite(resistance) ? `support ${formatLevel(support, pair)}, résistance ${formatLevel(resistance, pair)}` : "zones S/R insuffisantes",
+      `confirmations ${confirmations}/6`,
+      compatible ? "timeframe cohérent avec la stratégie" : "historique non aligné avec le timeframe demandé",
       meta.stale ? "historique indicatif/différé" : "historique frais ou cache récent",
     ].join("; "),
   };
@@ -2249,6 +2317,15 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       technique: validation.technique,
       explanation: `${text}\n\nVALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
       validation: { ...validation, valid: false, reason: `Qualité image insuffisante: ${imageQuality.reason}` },
+      meta,
+    });
+  }
+  if (!hasChartImages && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
+    return blockAnalysis(normalized, {
+      score: Math.min(normalized.score, validation.score, 42),
+      technique: validation.technique,
+      explanation: `${text}\n\nVALIDATION KRONOS: signal bloqué car aucun screenshot n'a été fourni et l'historique API n'est pas assez aligné avec la stratégie/timeframe demandé.`,
+      validation: { ...validation, valid: false, reason: "Historique API insuffisant ou non aligné sans screenshot." },
       meta,
     });
   }
@@ -2417,19 +2494,6 @@ function buildNoSignalDiagnostic(details = {}) {
     };
   }
 
-  if (/niveau|entrée|sl|tp|ratio|cohérent/.test(explanation)) {
-    return {
-      status: "NIVEAUX_INCOHERENTS",
-      statusLabel: "Niveaux non exploitables",
-      userMessage: "L'IA a produit une idée, mais les niveaux entrée, SL ou TP ne sont pas assez cohérents pour être copiés.",
-      nextActions: [
-        "Changer de style d'analyse en Mixte.",
-        "Confirmer la paire et le timeframe manuellement.",
-        "Relancer avec un graphe montrant clairement supports, résistances et prix actuel.",
-      ],
-    };
-  }
-
   if (/range|neutre|momentum faible|setup non valid|aucun signal|score d'efficacité insuffisant/.test(explanation) || technical.trend === "neutre/range") {
     return {
       status: "SETUP_NON_CONFIRME",
@@ -2439,6 +2503,19 @@ function buildNoSignalDiagnostic(details = {}) {
         "Attendre une cassure, un retest ou un rejet clair.",
         "Surveiller les zones support/résistance indiquées dans l'analyse.",
         "Relancer après une nouvelle bougie ou sur un timeframe supérieur.",
+      ],
+    };
+  }
+
+  if (/niveau|entrée|sl|tp|ratio|cohérent/.test(explanation)) {
+    return {
+      status: "NIVEAUX_INCOHERENTS",
+      statusLabel: "Niveaux non exploitables",
+      userMessage: "L'IA a produit une idée, mais les niveaux entrée, SL ou TP ne sont pas assez cohérents pour être copiés.",
+      nextActions: [
+        "Changer de style d'analyse en Mixte.",
+        "Confirmer la paire et le timeframe manuellement.",
+        "Relancer avec un graphe montrant clairement supports, résistances et prix actuel.",
       ],
     };
   }
@@ -2856,6 +2933,7 @@ function getApiStatus() {
     massive: statusFor("massive", MASSIVE_KEYS),
     exchangeRate: statusFor("exchangeRate", EXCHANGERATE_KEYS),
     groq: statusFor("groq", GROQ_KEYS),
+    gemini: statusFor("gemini", GEMINI_KEYS),
     finnhub: statusFor("finnhub", FINNHUB_KEYS),
     marketaux: statusFor("marketaux", MARKETAUX_KEYS),
     binance: { status: "unlimited", noKey: true },
@@ -2938,7 +3016,7 @@ function healthRecommendations() {
   if (!TWELVE_DATA_KEYS.length) tips.push("Ajouter TWELVE_DATA_API_KEY ou TWELVE_DATA_API_KEY_1..8: source principale prix + historiques.");
   if (!GROQ_KEYS.length) tips.push("Ajouter GROQ_KEY ou GROQ_KEY_1..3: moteur texte et Groq Vision.");
   if (!hasVisionProvider()) tips.push("Ajouter GROQ_KEY ou GEMINI_API_KEY: nécessaire pour analyser les screenshots.");
-  else if (!env.GEMINI_API_KEY && !env.GEMINI_KEY) tips.push("Ajouter GEMINI_API_KEY si tu veux un fallback vision quand Groq Vision est indisponible.");
+  else if (!GEMINI_KEYS.length) tips.push("Ajouter GEMINI_API_KEY ou GEMINI_API_KEY_1..8 si tu veux un fallback vision quand Groq Vision est indisponible.");
   if (!tips.length) tips.push("Toutes les clés principales sont présentes; surveiller /api/health pour les dégradations.");
   return tips;
 }
