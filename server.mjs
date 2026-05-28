@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createReadStream, existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import { MongoClient } from "mongodb";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -11,6 +12,7 @@ const port = Number(env.PORT || 4174);
 const dataDir = join(root, "data");
 const learningPath = join(dataDir, "learning-log.json");
 const marketCachePath = join(dataDir, "market-cache.json");
+const authPath = join(dataDir, "auth-store.json");
 const mongoUri = env.MONGODB_URI || env.MONGO_URI || "";
 const mongoDbName = env.MONGODB_DB || env.MONGO_DB || inferMongoDbName(mongoUri) || "oracle_forex";
 let mongoClientPromise = null;
@@ -242,6 +244,40 @@ createServer(async (req, res) => {
 });
 
 async function handleApi(req, res, url) {
+  if (url.pathname === "/api/signup") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const body = await readBody(req);
+    const result = await signupUser(body);
+    if (!result.ok) return sendJson(res, 400, result);
+    setSessionCookie(res, result.session.token);
+    sendJson(res, 200, { ok: true, user: publicUser(result.user) });
+    return;
+  }
+
+  if (url.pathname === "/api/login") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const body = await readBody(req);
+    const result = await loginUser(body);
+    if (!result.ok) return sendJson(res, 401, result);
+    setSessionCookie(res, result.session.token);
+    sendJson(res, 200, { ok: true, user: publicUser(result.user) });
+    return;
+  }
+
+  if (url.pathname === "/api/me") {
+    const session = await currentSession(req);
+    sendJson(res, 200, { ok: Boolean(session), user: session ? publicUser(session.user) : null });
+    return;
+  }
+
+  if (url.pathname === "/api/logout") {
+    const token = cookieValue(req, "oracle_session");
+    if (token) await destroySession(token);
+    clearSessionCookie(res);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
   if (url.pathname === "/api/market-status") {
     sendJson(res, 200, marketStatus());
     return;
@@ -3305,6 +3341,178 @@ async function databaseSummary() {
   };
 }
 
+async function loadAuthStore() {
+  const fromMongo = await loadStateDocument("auth-store");
+  if (fromMongo) {
+    return {
+      version: 1,
+      users: Array.isArray(fromMongo.users) ? fromMongo.users : [],
+      sessions: Array.isArray(fromMongo.sessions) ? fromMongo.sessions : [],
+      updatedAt: fromMongo.updatedAt || null,
+    };
+  }
+  try {
+    const raw = await readFile(authPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      version: 1,
+      users: Array.isArray(parsed.users) ? parsed.users : [],
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+      updatedAt: parsed.updatedAt || null,
+    };
+  } catch {
+    return { version: 1, users: [], sessions: [], updatedAt: null };
+  }
+}
+
+async function saveAuthStore(store) {
+  const now = new Date().toISOString();
+  const trimmed = {
+    version: 1,
+    users: store.users.slice(-5000),
+    sessions: store.sessions
+      .filter((session) => new Date(session.expiresAt).getTime() > Date.now())
+      .slice(-10000)
+      .map(({ token, ...session }) => session),
+    updatedAt: now,
+  };
+  if (await saveStateDocument("auth-store", trimmed)) return trimmed;
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(authPath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
+  return trimmed;
+}
+
+async function signupUser(body = {}) {
+  const name = cleanLine(body.name || body.fullName || "");
+  const email = normalizeEmail(body.email);
+  const password = String(body.password || "");
+  if (name.length < 2) return { ok: false, error: "Nom trop court." };
+  if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
+  if (password.length < 8) return { ok: false, error: "Mot de passe trop court: 8 caractères minimum." };
+  const store = await loadAuthStore();
+  if (store.users.some((user) => user.email === email)) return { ok: false, error: "Un compte existe déjà avec cet email." };
+  const now = new Date().toISOString();
+  const user = {
+    id: `usr_${Date.now()}_${randomBytes(4).toString("hex")}`,
+    name,
+    email,
+    passwordHash: hashPassword(password),
+    plan: "free",
+    role: "user",
+    createdAt: now,
+    updatedAt: now,
+    preferences: {
+      level: "débutant",
+      favoritePairs: ["EUR/USD", "XAU/USD"],
+    },
+  };
+  const session = createSession(user.id);
+  store.users.push(user);
+  store.sessions.push(session);
+  await saveAuthStore(store);
+  return { ok: true, user, session };
+}
+
+async function loginUser(body = {}) {
+  const email = normalizeEmail(body.email);
+  const password = String(body.password || "");
+  const store = await loadAuthStore();
+  const user = store.users.find((item) => item.email === email);
+  if (!user || !verifyPassword(password, user.passwordHash)) return { ok: false, error: "Email ou mot de passe incorrect." };
+  const session = createSession(user.id);
+  store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
+  store.sessions.push(session);
+  user.lastLoginAt = new Date().toISOString();
+  await saveAuthStore(store);
+  return { ok: true, user, session };
+}
+
+async function currentSession(req) {
+  const token = cookieValue(req, "oracle_session");
+  if (!token) return null;
+  const tokenHash = sessionHash(token);
+  const store = await loadAuthStore();
+  const session = store.sessions.find((item) => item.tokenHash === tokenHash && new Date(item.expiresAt).getTime() > Date.now());
+  if (!session) return null;
+  const user = store.users.find((item) => item.id === session.userId);
+  if (!user) return null;
+  return { session, user };
+}
+
+async function destroySession(token) {
+  const tokenHash = sessionHash(token);
+  const store = await loadAuthStore();
+  store.sessions = store.sessions.filter((item) => item.tokenHash !== tokenHash);
+  await saveAuthStore(store);
+}
+
+function createSession(userId) {
+  const token = randomBytes(32).toString("base64url");
+  return {
+    id: `ses_${Date.now()}_${randomBytes(4).toString("hex")}`,
+    userId,
+    token,
+    tokenHash: sessionHash(token),
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+  };
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    plan: user.plan || "free",
+    role: user.role || "user",
+    createdAt: user.createdAt,
+    lastLoginAt: user.lastLoginAt || null,
+    preferences: user.preferences || {},
+  };
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16).toString("hex");
+  const hash = pbkdf2Sync(password, salt, 120000, 32, "sha256").toString("hex");
+  return `pbkdf2_sha256$120000$${salt}$${hash}`;
+}
+
+function verifyPassword(password, stored = "") {
+  const [algo, iterations, salt, hash] = String(stored).split("$");
+  if (algo !== "pbkdf2_sha256" || !iterations || !salt || !hash) return false;
+  const computed = pbkdf2Sync(password, salt, Number(iterations), 32, "sha256");
+  const expected = Buffer.from(hash, "hex");
+  return expected.length === computed.length && timingSafeEqual(expected, computed);
+}
+
+function sessionHash(token) {
+  return pbkdf2Sync(String(token), "oracle_forex_session", 40000, 32, "sha256").toString("hex");
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function cookieValue(req, name) {
+  const cookies = String(req.headers.cookie || "").split(";").map((part) => part.trim());
+  const prefix = `${name}=`;
+  const found = cookies.find((part) => part.startsWith(prefix));
+  return found ? decodeURIComponent(found.slice(prefix.length)) : "";
+}
+
+function setSessionCookie(res, token) {
+  const secure = env.COOKIE_SECURE === "true" ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `oracle_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${14 * 24 * 60 * 60}${secure}`);
+}
+
+function clearSessionCookie(res) {
+  res.setHeader("Set-Cookie", "oracle_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+}
+
 async function loadLearningLog() {
   const fromMongo = await loadStateDocument("learning-log");
   if (fromMongo) {
@@ -3646,6 +3854,11 @@ async function serveStatic(res, pathname) {
     "/tester-gratuitement": "/analyse.html",
     "/paiement": "/paiement.html",
     "/abonnement": "/paiement.html",
+    "/login": "/login.html",
+    "/connexion": "/login.html",
+    "/signup": "/signup.html",
+    "/inscription": "/signup.html",
+    "/dashboard": "/dashboard.html",
     "/admin-health": "/admin-health.html",
     "/admin": "/admin-health.html",
     "/legal": "/legal.html",

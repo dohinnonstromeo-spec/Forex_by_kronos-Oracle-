@@ -1101,6 +1101,147 @@ body {
   line-height: 1.7;
 }
 
+.auth-main,
+.dashboard-main {
+  min-height: calc(100vh - 130px);
+}
+
+.auth-main {
+  display: grid;
+  place-items: center;
+}
+
+.auth-card,
+.dashboard-card,
+.dashboard-panel {
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 14px;
+  background: rgba(6, 10, 18, .74);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .32);
+  backdrop-filter: blur(18px);
+}
+
+.auth-card {
+  width: min(100%, 480px);
+  padding: 28px;
+}
+
+.auth-form {
+  display: grid;
+  gap: 14px;
+  margin-top: 22px;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.auth-form input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .28);
+  color: var(--foreground);
+  padding: 12px 14px;
+}
+
+.auth-message {
+  min-height: 20px;
+  color: var(--neon-green);
+  font-size: 12px;
+}
+
+.auth-message.error {
+  color: var(--neon-red);
+}
+
+.auth-switch {
+  margin-top: 16px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.auth-switch a,
+.auth-logout {
+  color: var(--neon-green);
+}
+
+.auth-logout {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.dashboard-hero {
+  margin-bottom: 24px;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.dashboard-card,
+.dashboard-panel {
+  padding: 20px;
+}
+
+.dashboard-card span,
+.dashboard-metrics span {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.dashboard-card strong,
+.dashboard-metrics strong {
+  display: block;
+  margin-top: 8px;
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 22px;
+}
+
+.dashboard-card p {
+  margin: 10px 0 14px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+
+.dashboard-panel {
+  margin-top: 18px;
+}
+
+.dashboard-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.dashboard-metrics div {
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .04);
+  padding: 14px;
+}
+
+@media (max-width: 760px) {
+  .dashboard-grid,
+  .dashboard-metrics {
+    grid-template-columns: 1fr;
+  }
+}
+
 .signal-tabs {
   margin: 20px 0;
   display: flex;

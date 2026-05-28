@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard · Oracle Forex</title>
+  <meta name="description" content="Dashboard membre Oracle Forex pour suivre Kronos, les signaux et l'abonnement.">
+  <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
+  <link rel="stylesheet" href="/assets/oracle-extras.css">
+</head>
+<body class="oracle-page auth-page">
+  <nav class="oracle-nav">
+    <div class="oracle-nav-inner">
+      <a href="/" class="oracle-brand">
+        <span class="oracle-logo">O</span>
+        <span>ORACLE <span class="text-amber-neon">FOREX</span></span>
+      </a>
+      <div class="oracle-links">
+        <a href="/">Accueil</a>
+        <a href="/tester-gratuitement">Analyse IA</a>
+        <a href="/paiement">S'abonner</a>
+        <button class="auth-logout" type="button" data-logout>Déconnexion</button>
+      </div>
+    </div>
+  </nav>
+
+  <main class="oracle-main dashboard-main">
+    <section class="dashboard-hero">
+      <p class="analysis-kicker">Espace membre</p>
+      <h1 class="analysis-title">Dashboard Kronos</h1>
+      <p class="analysis-subtitle" data-user-greeting>Chargement du profil...</p>
+    </section>
+
+    <section class="dashboard-grid">
+      <article class="dashboard-card">
+        <span>Plan actuel</span>
+        <strong data-user-plan>Free</strong>
+        <p>Les quotas premium seront activés quand le paiement sera connecté.</p>
+        <a class="payment-method-button" href="/paiement">S'abonner maintenant</a>
+      </article>
+      <article class="dashboard-card">
+        <span>Analyse IA</span>
+        <strong>Kronos</strong>
+        <p>Lance une analyse profonde avec score danger, quality gate et plan débutant.</p>
+        <a class="payment-method-button" href="/tester-gratuitement">Tester gratuitement</a>
+      </article>
+      <article class="dashboard-card">
+        <span>Suivi signaux</span>
+        <strong data-performance-label>En préparation</strong>
+        <p>Le suivi TP1/TP2/SL sera relié aux analyses enregistrées.</p>
+      </article>
+    </section>
+
+    <section class="dashboard-panel">
+      <div class="signal-top">
+        <div>
+          <p class="analysis-kicker">Performance Kronos</p>
+          <h2 class="analysis-title">Résumé actuel</h2>
+        </div>
+        <span class="oracle-tech" data-dashboard-status>Synchronisation</span>
+      </div>
+      <div class="dashboard-metrics" data-dashboard-metrics></div>
+    </section>
+  </main>
+
+  <script src="/assets/auth.js" defer></script>
+  <script src="/assets/oracle-chatbot.js" defer></script>
+</body>
+</html>
