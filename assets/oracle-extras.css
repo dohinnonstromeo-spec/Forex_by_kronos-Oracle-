@@ -1194,7 +1194,8 @@ body {
 }
 
 .dashboard-card span,
-.dashboard-metrics span {
+.dashboard-metrics span,
+.dashboard-history span {
   color: var(--muted-foreground);
   font-size: 11px;
   font-weight: 800;
@@ -1235,9 +1236,62 @@ body {
   padding: 14px;
 }
 
+.dashboard-history {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.dashboard-history article,
+.dashboard-empty {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .04);
+  padding: 14px;
+}
+
+.dashboard-empty {
+  display: block;
+  color: var(--muted-foreground);
+}
+
+.dashboard-history strong {
+  display: block;
+  color: var(--foreground);
+}
+
+.dashboard-history-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dashboard-history-levels button {
+  border: 1px solid rgba(0, 255, 136, .25);
+  border-radius: 999px;
+  background: rgba(0, 255, 136, .08);
+  color: var(--foreground);
+  padding: 7px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.history-open {
+  color: var(--neon-green);
+}
+
+.history-blocked {
+  color: var(--neon-red);
+}
+
 @media (max-width: 760px) {
   .dashboard-grid,
-  .dashboard-metrics {
+  .dashboard-metrics,
+  .dashboard-history article {
     grid-template-columns: 1fr;
   }
 }

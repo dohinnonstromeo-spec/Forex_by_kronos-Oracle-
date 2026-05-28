@@ -286,12 +286,18 @@
   }
 
   async function refreshSignals() {
-    const data = await getJson("/api/signals");
+    const data = await getJson("/api/signals", 10000);
     if (!data) {
-      renderSignals([]);
+      const market = await getJson("/api/market-status", 5000);
+      renderSignals(staticSignals.map((signal) => ({
+        ...signal,
+        suspended: true,
+        open: market?.forex?.open ?? false,
+        reason: "Synchronisation des données live en cours.",
+      })));
       const badge = document.querySelector(".signals-age");
-      if (badge) badge.textContent = "API marché indisponible · relancez le serveur local";
-      renderMarketNotice(null);
+      if (badge) badge.textContent = market?.forex?.label ? `${market.forex.label} · signaux en synchronisation` : "Connexion marché en synchronisation";
+      renderMarketNotice(market, "Connexion marché en synchronisation · vérifiez que le serveur local est lancé.");
       return;
     }
     const signals = Array.isArray(data?.signals) ? data.signals.map((signal, index) => ({
@@ -553,7 +559,7 @@
     return "Aucun signal actif · setup non confirmé";
   }
 
-  function renderMarketNotice(market) {
+  function renderMarketNotice(market, fallbackText = "Connexion marché en synchronisation · vérifiez que le serveur local est lancé.") {
     let notice = document.querySelector(".market-notice");
     const host = document.querySelector(".signal-tabs");
     if (!host) return;
@@ -563,7 +569,7 @@
       host.before(notice);
     }
     if (!market?.forex) {
-      notice.innerHTML = `<span class="oracle-chat-dot closed"></span> Statut marché indisponible · serveur/API à vérifier.`;
+      notice.innerHTML = `<span class="oracle-chat-dot closed"></span> ${escapeHtml(fallbackText)}`;
       return;
     }
     notice.innerHTML = market.forex.open
@@ -714,9 +720,9 @@
     }
   }
 
-  async function getJson(url) {
+  async function getJson(url, timeoutMs = 9000) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
       return response.ok ? response.json() : null;
     } catch {
       return null;

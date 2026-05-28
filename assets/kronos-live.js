@@ -24,9 +24,10 @@
   }
 
   async function updatePrices() {
-    const data = await getJson("/api/prices");
+    const data = await getJson("/api/prices", 9000);
     if (!data?.prices) {
-      updateMarketBanner(null, null, "API marché indisponible");
+      const market = await getJson("/api/market-status", 5000);
+      updateMarketBanner(market, null, "Connexion marché en synchronisation");
       return;
     }
     updateMarketBanner(data.market, data.prices);
@@ -45,10 +46,11 @@
   }
 
   async function updateSignals() {
-    const data = await getJson("/api/signals");
+    const data = await getJson("/api/signals", 10000);
     const signals = Array.isArray(data?.signals) ? data.signals : [];
     if (!signals.length) {
-      updateMarketBanner(null, null, "API signaux indisponible");
+      const market = data?.market || await getJson("/api/market-status", 5000);
+      updateMarketBanner(market, state.prices, "Signaux en synchronisation");
       return;
     }
     state.signals = signals;
@@ -298,9 +300,9 @@
     return Number(value).toFixed(symbol.includes("JPY") ? 2 : 4);
   }
 
-  async function getJson(url) {
+  async function getJson(url, timeoutMs = 9000) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(3500) });
+      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
       return response.ok ? response.json() : null;
     } catch {
       return null;

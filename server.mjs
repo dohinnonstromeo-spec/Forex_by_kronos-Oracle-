@@ -353,6 +353,18 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/my-analyses") {
+    const session = await currentSession(req);
+    if (!session) {
+      sendJson(res, 401, { ok: false, error: "auth_required" });
+      return;
+    }
+    const prices = await getPrices();
+    const learning = await updateLearningOutcomes(prices);
+    sendJson(res, 200, personalAnalysesPayload(learning, session.user.id));
+    return;
+  }
+
   if (url.pathname === "/api/comment") {
     const body = await readBody(req);
     const prompt = `${body.pair} vient de passer de ${body.previous} à ${body.current} (${body.changePercent}%). 1 phrase d'analyse trader en français. Maximum 12 mots.`;
@@ -498,6 +510,7 @@ Réponds en JSON strict:
   }
 
   if (url.pathname === "/api/analyze-chart") {
+    const session = await currentSession(req);
     const body = await readBody(req);
     const images = normalizeImages(body.images);
     const imageQuality = assessImageQuality(images);
@@ -606,7 +619,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
       });
     }
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe });
-    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth });
+    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null });
     sendJson(res, 200, result);
     return;
   }
@@ -3561,6 +3574,7 @@ async function recordLearningAnalysis(result, body, context) {
   log.analyses.push({
     id,
     createdAt: new Date().toISOString(),
+    userId: context.user?.id || null,
     pair: body.pair || "EUR/USD",
     timeframe: body.timeframe || "H1",
     style: body.style || "Hybride SMC+Chartiste",
@@ -3613,6 +3627,7 @@ async function updateLearningOutcomes(prices = null) {
       analysis.outcomeReason = finalOutcome.reason;
       log.outcomes.push({
         id: analysis.id,
+        userId: analysis.userId || null,
         pair: analysis.pair,
         timeframe: analysis.timeframe,
         style: analysis.style,
@@ -3738,6 +3753,40 @@ function performancePayload(log) {
     disclaimer: summary.closedAnalyses >= 20
       ? "Performance calculée sur les signaux clôturés enregistrés par Kronos."
       : "Échantillon encore trop petit: la précision publique doit rester non auditée.",
+  };
+}
+
+function personalAnalysesPayload(log, userId) {
+  const analyses = log.analyses.filter((item) => item.userId === userId);
+  const analysisIds = new Set(analyses.map((item) => item.id));
+  const closed = log.outcomes.filter((item) => (item.userId === userId || analysisIds.has(item.id)) && ["win", "loss"].includes(item.result));
+  const wins = closed.filter((item) => item.result === "win").length;
+  return {
+    ok: true,
+    summary: {
+      total: analyses.length,
+      open: analyses.filter((item) => item.status === "OPEN").length,
+      blocked: analyses.filter((item) => item.status === "BLOCKED").length,
+      closed: closed.length,
+      winRate: closed.length ? Math.round((wins / closed.length) * 100) : null,
+    },
+    analyses: analyses.slice(-20).reverse().map((item) => ({
+      id: item.id,
+      createdAt: item.createdAt,
+      pair: item.pair,
+      timeframe: item.timeframe,
+      style: item.style,
+      strategy: item.strategy,
+      direction: item.direction,
+      entry: item.entry,
+      sl: item.sl,
+      tp1: item.tp1,
+      tp2: item.tp2,
+      rr: item.rr,
+      score: item.score,
+      status: item.status,
+      blockReason: item.blockReason,
+    })),
   };
 }
 

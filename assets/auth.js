@@ -60,6 +60,43 @@
         ["Bloquées", performance?.blockedAnalyses ?? 0],
       ].map(([name, value]) => `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
     }
+
+    const personal = await fetchJson("/api/my-analyses");
+    renderPersonalHistory(personal);
+  }
+
+  function renderPersonalHistory(data) {
+    const host = document.querySelector("[data-dashboard-history]");
+    const status = document.querySelector("[data-personal-status]");
+    if (!host) return;
+    if (status) {
+      const total = data?.summary?.total ?? 0;
+      status.textContent = total ? `${total} analyse${total > 1 ? "s" : ""}` : "Aucune analyse";
+    }
+    if (!Array.isArray(data?.analyses) || !data.analyses.length) {
+      host.innerHTML = `<div class="dashboard-empty">Aucune analyse personnelle enregistrée pour ce compte. Lance une analyse depuis la page Analyse IA.</div>`;
+      return;
+    }
+    host.innerHTML = data.analyses.map((item) => `
+      <article>
+        <div>
+          <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
+          <span>${escapeHtml(item.timeframe)} · ${escapeHtml(item.style)} · ${formatDate(item.createdAt)}</span>
+        </div>
+        <div class="dashboard-history-levels">
+          <button type="button" data-copy-level="${escapeHtml(item.sl)}">SL ${escapeHtml(item.sl)}</button>
+          <button type="button" data-copy-level="${escapeHtml(item.tp1)}">TP1 ${escapeHtml(item.tp1)}</button>
+          <button type="button" data-copy-level="${escapeHtml(item.tp2)}">TP2 ${escapeHtml(item.tp2)}</button>
+        </div>
+        <span class="${item.status === "OPEN" ? "history-open" : "history-blocked"}">${escapeHtml(item.status)}</span>
+      </article>
+    `).join("");
+    host.querySelectorAll("[data-copy-level]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        await navigator.clipboard?.writeText(button.dataset.copyLevel || "");
+        button.textContent = "Copié";
+      });
+    });
   }
 
   async function fetchJson(url) {
@@ -85,5 +122,13 @@
       '"': "&quot;",
       "'": "&#039;",
     }[char]));
+  }
+
+  function formatDate(value) {
+    try {
+      return new Intl.DateTimeFormat("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+    } catch {
+      return "date inconnue";
+    }
   }
 })();
