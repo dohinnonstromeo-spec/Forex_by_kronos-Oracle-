@@ -3,10 +3,11 @@
 
   async function refreshHomeMetrics() {
     try {
-      const response = await fetch("/api/performance", { signal: AbortSignal.timeout(3500) });
+      const response = await fetch("/api/performance", { signal: AbortSignal.timeout(9000) });
       if (!response.ok) return;
       const data = await response.json();
-      setMetric("precision", data.precisionAudited ? data.precisionLabel : "À auditer");
+      const publishablePrecision = data.precisionAudited && Number(data.precision) >= 55;
+      setMetric("precision", publishablePrecision ? data.precisionLabel : "En audit");
       setMetric("signals", String(data.activeSignals || data.totalAnalyses || 0));
       setMetric("members", data.membersLabel || "500+");
       setMetric("pairs", String(data.instrumentsTracked || 6));
@@ -25,8 +26,8 @@
     const panel = document.querySelector(".home-performance-panel");
     const grid = panel?.querySelector(".grid");
     if (!grid) return;
-    if (!Array.isArray(data.recent) || !data.recent.length) {
-      grid.innerHTML = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Pas encore assez de signaux clôturés pour publier une performance réelle.</div>`;
+    if (!Array.isArray(data.recent) || !data.recent.length || Number(data.precision || 0) < 55) {
+      grid.innerHTML = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Performance en audit: Kronos collecte encore assez de résultats propres avant publication commerciale.</div>`;
       return;
     }
     grid.innerHTML = data.recent.slice(0, 8).map((item) => `
