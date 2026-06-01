@@ -26,6 +26,7 @@ FINNHUB_API_KEY=...
 NEWS_API_KEY=...
 MONGODB_URI=mongodb+srv://USER:PASSWORD@cluster.mongodb.net/oracle_forex?retryWrites=true&w=majority
 MONGODB_DB=oracle_forex
+ADMIN_TOKEN=une_phrase_secrete_longue
 ```
 
 Le navigateur appelle seulement `/api/...`; les cles restent cote serveur local.
@@ -50,3 +51,25 @@ http://127.0.0.1:4174/api/provider-status
 ```
 
 Si le mot de passe MongoDB contient des caracteres speciaux comme `@`, encodez-les dans l'URI (`@` devient `%40`).
+
+## Acces premium manuel
+
+Avant de connecter le paiement, vous pouvez donner Premium a des testeurs:
+
+1. Ajoutez `ADMIN_TOKEN=...` dans `secret.dev` puis relancez `node server.mjs`.
+2. Demandez au testeur de creer un compte sur `/signup`.
+3. Ouvrez `/premium-admin`.
+4. Entrez le token admin, l'email du compte et la duree en jours.
+
+Les visiteurs anonymes et comptes free restent limites par quotas journaliers. Les comptes premium/admin sont illimites.
+
+Quotas configurables:
+
+```env
+VISITOR_DAILY_ANALYSES=1
+VISITOR_DAILY_CHAT=5
+VISITOR_DAILY_DETECTIONS=2
+FREE_DAILY_ANALYSES=3
+FREE_DAILY_CHAT=25
+FREE_DAILY_DETECTIONS=8
+```

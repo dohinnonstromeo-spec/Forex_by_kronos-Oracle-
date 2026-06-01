@@ -19,10 +19,13 @@ let mongoClientPromise = null;
 let mongoUnavailable = false;
 let mongoLastError = null;
 const providerHealth = new Map();
+const anonymousUsage = new Map();
 const memoryCache = {
   prices: { value: null, expiresAt: 0 },
   histories: { key: "", value: null, expiresAt: 0 },
   calendar: { value: null, expiresAt: 0 },
+  signals: { value: null, expiresAt: 0 },
+  performance: { value: null, expiresAt: 0 },
 };
 
 const GROQ_MODEL = env.GROQ_MODEL || "llama-3.3-70b-versatile";
@@ -278,6 +281,39 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/admin/members") {
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const store = await loadAuthStore();
+    sendJson(res, 200, {
+      ok: true,
+      users: store.users
+        .slice()
+        .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+        .slice(0, 200)
+        .map(adminUserPayload),
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/admin/grant-premium") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    sendJson(res, 200, await grantPremiumAccess(body));
+    return;
+  }
+
+  if (url.pathname === "/api/admin/revoke-premium") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    sendJson(res, 200, await revokePremiumAccess(body));
+    return;
+  }
+
   if (url.pathname === "/api/market-status") {
     sendJson(res, 200, marketStatus());
     return;
@@ -317,6 +353,7 @@ async function handleApi(req, res, url) {
       providers: providerHealthSnapshot(),
       database: await databaseSummary(),
       cache: await marketCacheSummary(),
+      runtimeCache: runtimeCacheSummary(),
       learning: learningSummary(learning),
       recommendations: healthRecommendations(),
     });
@@ -329,13 +366,20 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/signals") {
+    const cached = memoryCache.signals.value;
+    if (cached && Date.now() < memoryCache.signals.expiresAt) {
+      sendJson(res, 200, { ...cached, cached: true, cacheTtlSeconds: Math.max(0, Math.round((memoryCache.signals.expiresAt - Date.now()) / 1000)) });
+      return;
+    }
     const prices = await getPrices();
     const market = marketStatus();
     const histories = await getHistories(prices);
     await updateLearningOutcomes(prices);
     const newsRisk = await economicRiskWindow();
     const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
-    sendJson(res, 200, { generatedAt: new Date().toISOString(), market, newsRisk, signals });
+    const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
+    memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
+    sendJson(res, 200, payload);
     return;
   }
 
@@ -347,9 +391,15 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/performance") {
+    if (memoryCache.performance.value && Date.now() < memoryCache.performance.expiresAt) {
+      sendJson(res, 200, { ...memoryCache.performance.value, cached: true });
+      return;
+    }
     const prices = await getPrices();
     const learning = await updateLearningOutcomes(prices);
-    sendJson(res, 200, performancePayload(learning));
+    const payload = performancePayload(learning);
+    memoryCache.performance = { value: payload, expiresAt: Date.now() + 5 * 60 * 1000 };
+    sendJson(res, 200, payload);
     return;
   }
 
@@ -411,6 +461,12 @@ Génère un briefing trader en JSON : {"titre":"","paires_surveiller":[],"scenar
   }
 
   if (url.pathname === "/api/chat") {
+    const session = await currentSession(req);
+    const quota = await consumeQuota(session?.user, "chat", req);
+    if (!quota.ok) {
+      sendJson(res, 429, quota);
+      return;
+    }
     const body = await readBody(req);
     const images = normalizeImages(body.images);
     const question = cleanLine(body.message || body.messages?.at?.(-1)?.content || "");
@@ -481,6 +537,12 @@ INSTRUCTIONS DE RÉPONSE:
   }
 
   if (url.pathname === "/api/detect-chart-context") {
+    const session = await currentSession(req);
+    const quota = await consumeQuota(session?.user, "detection", req);
+    if (!quota.ok) {
+      sendJson(res, 429, quota);
+      return;
+    }
     const body = await readBody(req);
     const images = normalizeImages(body.images);
     if (!images.length) {
@@ -511,6 +573,11 @@ Réponds en JSON strict:
 
   if (url.pathname === "/api/analyze-chart") {
     const session = await currentSession(req);
+    const quota = await consumeQuota(session?.user, "analysis", req);
+    if (!quota.ok) {
+      sendJson(res, 429, quota);
+      return;
+    }
     const body = await readBody(req);
     const images = normalizeImages(body.images);
     const imageQuality = assessImageQuality(images);
@@ -638,6 +705,12 @@ async function getPrices() {
   });
   memoryCache.prices = { value: prices, expiresAt: Date.now() + 2 * 60 * 1000 };
   return prices;
+}
+
+function signalCacheTtlMs(signals = [], newsRisk = null) {
+  if (newsRisk?.active) return 60 * 1000;
+  const hasDirect = signals.some((signal) => signal.direct && !signal.suspended);
+  return hasDirect ? 3 * 60 * 1000 : 90 * 1000;
 }
 
 async function fetchBestPrice(symbol, cached) {
@@ -3356,6 +3429,20 @@ async function marketCacheSummary() {
   };
 }
 
+function runtimeCacheSummary() {
+  const item = (cache) => ({
+    active: Boolean(cache.value && Date.now() < cache.expiresAt),
+    ttlSeconds: cache.value ? Math.max(0, Math.round((cache.expiresAt - Date.now()) / 1000)) : 0,
+  });
+  return {
+    prices: item(memoryCache.prices),
+    histories: item(memoryCache.histories),
+    signals: item(memoryCache.signals),
+    performance: item(memoryCache.performance),
+    calendar: item(memoryCache.calendar),
+  };
+}
+
 function recordProviderHealth(provider, ok, error = null) {
   const previous = providerHealth.get(provider) || { ok: 0, fail: 0 };
   providerHealth.set(provider, {
@@ -3616,12 +3703,196 @@ function publicUser(user) {
     id: user.id,
     name: user.name,
     email: user.email,
-    plan: user.plan || "free",
+    plan: effectivePlan(user),
     role: user.role || "user",
     createdAt: user.createdAt,
     lastLoginAt: user.lastLoginAt || null,
+    premiumUntil: user.premiumUntil || null,
     preferences: user.preferences || {},
+    quotas: quotaSnapshot(user),
   };
+}
+
+async function consumeQuota(user, feature, req = null) {
+  if (!user) return consumeAnonymousQuota(req, feature);
+  if (hasPremiumAccess(user)) {
+    return { ok: true, unlimited: true, feature };
+  }
+  const limits = {
+    analysis: Number(env.FREE_DAILY_ANALYSES || 3),
+    chat: Number(env.FREE_DAILY_CHAT || 25),
+    detection: Number(env.FREE_DAILY_DETECTIONS || 8),
+  };
+  const limit = limits[feature] ?? 10;
+  const today = new Date().toISOString().slice(0, 10);
+  const store = await loadAuthStore();
+  const stored = store.users.find((item) => item.id === user.id);
+  if (!stored) return { ok: false, error: "session_invalid" };
+  stored.usage = normalizeUsage(stored.usage, today);
+  const used = Number(stored.usage[feature] || 0);
+  if (used >= limit) {
+    return {
+      ok: false,
+      error: "quota_exceeded",
+      feature,
+      plan: effectivePlan(stored),
+      limit,
+      used,
+      resetsAt: nextQuotaReset().toISOString(),
+      message: "Quota gratuit atteint pour aujourd'hui. Passe en premium ou réessaie demain.",
+    };
+  }
+  stored.usage[feature] = used + 1;
+  stored.updatedAt = new Date().toISOString();
+  await saveAuthStore(store);
+  return { ok: true, feature, plan: effectivePlan(stored), limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
+}
+
+function consumeAnonymousQuota(req, feature) {
+  const limits = {
+    analysis: Number(env.VISITOR_DAILY_ANALYSES || 1),
+    chat: Number(env.VISITOR_DAILY_CHAT || 5),
+    detection: Number(env.VISITOR_DAILY_DETECTIONS || 2),
+  };
+  const limit = limits[feature] ?? 3;
+  const today = new Date().toISOString().slice(0, 10);
+  const key = `${clientFingerprint(req)}:${today}`;
+  const usage = normalizeUsage(anonymousUsage.get(key), today);
+  const used = Number(usage[feature] || 0);
+  if (used >= limit) {
+    return {
+      ok: false,
+      error: "visitor_quota_exceeded",
+      feature,
+      plan: "visitor",
+      limit,
+      used,
+      resetsAt: nextQuotaReset().toISOString(),
+      message: "Limite visiteur atteinte. Crée un compte gratuit ou demande un accès premium test.",
+    };
+  }
+  usage[feature] = used + 1;
+  anonymousUsage.set(key, usage);
+  return { ok: true, anonymous: true, feature, plan: "visitor", limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
+}
+
+function quotaSnapshot(user = {}) {
+  const today = new Date().toISOString().slice(0, 10);
+  const usage = normalizeUsage(user.usage, today);
+  const premium = hasPremiumAccess(user);
+  return {
+    date: today,
+    plan: effectivePlan(user),
+    analysis: { used: usage.analysis || 0, limit: premium ? "illimité" : Number(env.FREE_DAILY_ANALYSES || 3) },
+    chat: { used: usage.chat || 0, limit: premium ? "illimité" : Number(env.FREE_DAILY_CHAT || 25) },
+    detection: { used: usage.detection || 0, limit: premium ? "illimité" : Number(env.FREE_DAILY_DETECTIONS || 8) },
+    resetsAt: nextQuotaReset().toISOString(),
+  };
+}
+
+function hasPremiumAccess(user = {}) {
+  if (user.role === "admin") return true;
+  const plan = String(user.plan || "").toLowerCase();
+  if (["pro", "admin"].includes(plan)) return true;
+  if (plan !== "premium") return false;
+  if (!user.premiumUntil) return true;
+  return new Date(user.premiumUntil).getTime() > Date.now();
+}
+
+function effectivePlan(user = {}) {
+  return hasPremiumAccess(user) ? String(user.plan || "premium").toLowerCase() : "free";
+}
+
+function clientFingerprint(req) {
+  const forwarded = String(req?.headers?.["x-forwarded-for"] || "").split(",")[0].trim();
+  const ip = forwarded || req?.socket?.remoteAddress || "local";
+  return String(ip).replace(/[^a-zA-Z0-9:._-]/g, "_").slice(0, 80);
+}
+
+function normalizeUsage(usage = {}, today = new Date().toISOString().slice(0, 10)) {
+  return usage?.date === today
+    ? { date: today, analysis: Number(usage.analysis || 0), chat: Number(usage.chat || 0), detection: Number(usage.detection || 0) }
+    : { date: today, analysis: 0, chat: 0, detection: 0 };
+}
+
+function nextQuotaReset() {
+  const next = new Date();
+  next.setUTCHours(24, 0, 0, 0);
+  return next;
+}
+
+async function requireAdmin(req) {
+  const expectedToken = env.ADMIN_TOKEN || env.ADMIN_ACCESS_TOKEN || "";
+  const providedToken = String(req.headers["x-admin-token"] || "").trim()
+    || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  if (expectedToken && providedToken && timingSafeStringEqual(providedToken, expectedToken)) {
+    return { ok: true, via: "token" };
+  }
+  const session = await currentSession(req);
+  if (session?.user?.role === "admin") return { ok: true, via: "session", user: publicUser(session.user) };
+  return {
+    ok: false,
+    status: 403,
+    error: "admin_required",
+    message: expectedToken
+      ? "Accès admin requis. Utilise le token admin ou un compte admin."
+      : "Ajoute ADMIN_TOKEN dans secret.dev pour gérer les accès premium manuels.",
+  };
+}
+
+async function grantPremiumAccess(body = {}) {
+  const email = normalizeEmail(body.email);
+  const days = Math.max(1, Math.min(730, Number(body.days || body.durationDays || 30)));
+  if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
+  const store = await loadAuthStore();
+  const user = store.users.find((item) => item.email === email);
+  if (!user) return { ok: false, error: "Utilisateur introuvable. La personne doit d'abord créer un compte." };
+  const premiumUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+  user.plan = "premium";
+  user.premiumUntil = premiumUntil;
+  user.manualPremium = true;
+  user.premiumSource = "manual_admin";
+  user.updatedAt = new Date().toISOString();
+  user.usage = normalizeUsage(user.usage);
+  await saveAuthStore(store);
+  return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
+}
+
+async function revokePremiumAccess(body = {}) {
+  const email = normalizeEmail(body.email);
+  if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
+  const store = await loadAuthStore();
+  const user = store.users.find((item) => item.email === email);
+  if (!user) return { ok: false, error: "Utilisateur introuvable." };
+  user.plan = "free";
+  user.premiumUntil = null;
+  user.manualPremium = false;
+  user.premiumSource = null;
+  user.updatedAt = new Date().toISOString();
+  await saveAuthStore(store);
+  return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
+}
+
+function adminUserPayload(user = {}) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    plan: effectivePlan(user),
+    rawPlan: user.plan || "free",
+    role: user.role || "user",
+    premiumUntil: user.premiumUntil || null,
+    manualPremium: Boolean(user.manualPremium),
+    createdAt: user.createdAt || null,
+    lastLoginAt: user.lastLoginAt || null,
+    quotas: quotaSnapshot(user),
+  };
+}
+
+function timingSafeStringEqual(a, b) {
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function hashPassword(password) {
@@ -4048,6 +4319,8 @@ async function serveStatic(res, pathname) {
     "/signup": "/signup.html",
     "/inscription": "/signup.html",
     "/dashboard": "/dashboard.html",
+    "/premium-admin": "/premium-admin.html",
+    "/admin-premium": "/premium-admin.html",
     "/admin-health": "/admin-health.html",
     "/admin": "/admin-health.html",
     "/legal": "/legal.html",

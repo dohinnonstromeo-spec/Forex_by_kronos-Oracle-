@@ -1178,6 +1178,24 @@ body {
   font-weight: 700;
 }
 
+.premium-admin-card {
+  width: min(760px, 100%);
+}
+
+.premium-admin-actions {
+  margin-top: 16px;
+}
+
+.premium-admin-actions button {
+  border: 1px solid rgba(195, 145, 47, .32);
+  border-radius: 8px;
+  background: rgba(195, 145, 47, .08);
+  color: var(--amber-neon);
+  padding: 10px 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
 .dashboard-hero {
   margin-bottom: 24px;
 }
