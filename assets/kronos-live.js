@@ -46,7 +46,7 @@
   }
 
   async function updateSignals() {
-    const data = await getJson("/api/signals", 10000);
+    const data = await getJson("/api/signals", 18000);
     const signals = Array.isArray(data?.signals) ? data.signals : [];
     if (!signals.length) {
       const market = data?.market || await getJson("/api/market-status", 5000);

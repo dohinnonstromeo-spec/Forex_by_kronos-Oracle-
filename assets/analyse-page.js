@@ -286,7 +286,7 @@
   }
 
   async function refreshSignals() {
-    const data = await getJson("/api/signals", 10000);
+    const data = await getJson("/api/signals", 18000);
     if (!data) {
       const market = await getJson("/api/market-status", 5000);
       renderSignals(staticSignals.map((signal) => ({
@@ -499,8 +499,11 @@
   function renderQuality(quality) {
     if (!quality) return "";
     const ok = quality.valid;
+    const grade = quality.grade ? ` · grade ${quality.grade}` : "";
+    const dataScore = Number.isFinite(Number(quality.dataScore)) ? ` · score data ${quality.dataScore}%` : "";
+    const blockers = Array.isArray(quality.blockers) && quality.blockers.length ? ` · ${quality.blockers.slice(0, 2).join(" · ")}` : "";
     return `<div class="mt-2 text-[10px] uppercase tracking-widest ${ok ? "text-neon-green" : "text-neon-orange"}">
-      Qualité: ${ok ? "validée" : "bloquée"} · ${quality.source || "n/a"} · fiabilité ${quality.reliability || 0}% · ${quality.bars || 0} barres
+      Qualité: ${ok ? "validée" : "bloquée"}${grade}${dataScore} · ${quality.source || "n/a"} · fiabilité ${quality.reliability || 0}% · ${quality.bars || 0} barres${blockers}
     </div>`;
   }
 
@@ -511,6 +514,8 @@
     const chartContext = meta.chartContext;
     const technical = meta.technicalSnapshot;
     const news = meta.newsContext;
+    const dataReliability = meta.dataReliability;
+    const mtfConsensus = meta.mtfConsensus;
     const live = meta.livePrice;
     const id = result.learningId;
     if (!quality && !calibration && !live && !id && !chartContext && !technical && !news) return "";
@@ -518,7 +523,9 @@
       ${quality ? `<div>Image: ${quality.score}% · ${escapeHtml(quality.reason || "")}</div>` : ""}
       ${live ? `<div>Prix live vérifié: ${escapeHtml(live)}</div>` : ""}
       ${technical ? `<div>Technique API: ${escapeHtml(technical.trend || "n/a")} · RSI ${escapeHtml(technical.rsi ?? "n/a")} · ${escapeHtml(technical.bars || 0)} bougies · ${escapeHtml(technical.source || "source n/a")}</div>` : ""}
+      ${dataReliability ? `<div>Fiabilité données: ${Number(dataReliability.score || 0)}% · grade ${escapeHtml(dataReliability.grade || "n/a")}${Array.isArray(dataReliability.blockers) && dataReliability.blockers.length ? ` · ${escapeHtml(dataReliability.blockers.slice(0, 2).join(" · "))}` : ""}</div>` : ""}
       ${meta.analysisDepth ? `<div>Mode analyse: ${escapeHtml(meta.analysisDepth)}</div>` : ""}
+      ${mtfConsensus ? `<div>Consensus MTF: ${escapeHtml(mtfConsensus.summary || "n/a")}${mtfConsensus.conflict ? " · conflit détecté" : ""}</div>` : ""}
       ${Array.isArray(meta.multiTimeframe) && meta.multiTimeframe.length ? `<div>Multi-timeframe: ${escapeHtml(meta.multiTimeframe.map((tf) => `${tf.timeframe}:${tf.trend || "n/a"}`).join(" · "))}</div>` : ""}
       ${news ? `<div>News/API: ${news.enabled ? (news.activeRisk ? "risque macro actif" : "contexte consulté") : "désactivé"} · ${escapeHtml(news.headlines?.[0]?.title || news.summary || "aucun titre")}</div>` : ""}
       ${meta.strategy ? `<div>Stratégie: ${escapeHtml(meta.strategy)}</div>` : ""}

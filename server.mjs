@@ -1440,7 +1440,9 @@ function buildDeterministicSignals(prices, histories) {
 
     if (!price.open) return inactive("Marché fermé · analyse auto suspendue jusqu'à la réouverture.");
     if (!isUsableLivePrice(price)) return inactive("Analyse auto suspendue · donnée non fiable ou fallback.");
-    if (history.length < 30) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
+    const dataQuality = assessSignalDataQuality(price, history);
+    if (dataQuality.score < 70) return cautiousSignal(symbol, price, base, `Fiabilité données insuffisante (${dataQuality.score}%, grade ${dataQuality.grade}) · aucun signal direct validé.`, history);
+    if (history.length < 50) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
 
     const closes = history.map((bar) => bar.close);
     const last = Number(price.price);
@@ -1460,12 +1462,13 @@ function buildDeterministicSignals(prices, histories) {
       return cautiousSignal(symbol, price, base, "Indicateurs incomplets · aucun signal direct validé.", history);
     }
 
-    if (strength < 0.18 || confluence < 2 || !trendAligned) {
+    if (strength < 0.18 || confluence < 3 || !trendAligned) {
       return cautiousSignal(symbol, price, base, `Momentum faible · setup non validé, confluence ${confluence}/4.`, history);
     }
 
     const direction = momentum >= 0 ? "ACHAT" : "VENTE";
-    const risk = Math.max(atr * 1.2, last * 0.0025);
+    const spreadBuffer = executionCostBuffer(symbol, "Swing Trading");
+    const risk = Math.max(atr * 1.2, last * 0.0025, spreadBuffer * 3);
     const entry = last;
     const sl = direction === "ACHAT" ? entry - risk : entry + risk;
     const tp1 = direction === "ACHAT" ? entry + risk * 1.6 : entry - risk * 1.6;
@@ -1482,7 +1485,7 @@ function buildDeterministicSignals(prices, histories) {
       tp1: roundLevel(tp1),
       tp2: roundLevel(tp2),
       rr: "1:2.0",
-      confiance: confidence,
+      confiance: Math.min(confidence, dataQuality.score),
       technique,
       raison: `Signal calculé: SMA10 ${direction === "ACHAT" ? ">" : "<"} SMA30, RSI ${rsi.toFixed(0)}, confluence ${confluence}/4.`,
       open: true,
@@ -1543,17 +1546,57 @@ function deterministicConfidence(body) {
 }
 
 function qualityPayload(price, history, valid, reason) {
+  const reliability = assessSignalDataQuality(price, history);
   return {
-    valid,
+    valid: Boolean(valid && reliability.score >= 65),
     reason,
     source: price.source,
     stale: Boolean(price.stale),
     open: Boolean(price.open),
     reliability: price.reliability || 0,
+    dataScore: reliability.score,
+    grade: reliability.grade,
+    blockers: reliability.blockers,
     historySource: history._meta?.source || (history.length ? "twelve_data" : "none"),
     historyStale: Boolean(history._meta?.stale),
     bars: history.length,
     asOf: price.asOf,
+  };
+}
+
+function assessSignalDataQuality(price = {}, history = []) {
+  const blockers = [];
+  let score = 100;
+  if (!price.open) {
+    score -= 35;
+    blockers.push("marché fermé");
+  }
+  if (!isLivePriceSource(price.source)) {
+    score -= 35;
+    blockers.push("source non-live");
+  }
+  if (price.stale) {
+    score -= 25;
+    blockers.push("prix différé");
+  }
+  const reliability = Number(price.reliability || 0);
+  if (reliability < 80) {
+    score -= Math.round((80 - reliability) * 0.45);
+    blockers.push(`fiabilité source ${reliability}%`);
+  }
+  if (!Array.isArray(history) || history.length < 50) {
+    score -= history.length >= 30 ? 12 : 28;
+    blockers.push(`${history.length || 0} bougies`);
+  }
+  if (history._meta?.stale) {
+    score -= 22;
+    blockers.push("historique différé");
+  }
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  return {
+    score,
+    grade: score >= 85 ? "A" : score >= 70 ? "B" : score >= 55 ? "C" : "D",
+    blockers,
   };
 }
 
@@ -2398,6 +2441,13 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   const livePrice = context.livePrice;
   const chartContext = context.chartContext || {};
   const live = Number(livePrice?.price);
+  const mtfConsensus = analyzeMultiTimeframeConsensus(context.multiTimeframe || []);
+  const dataReliability = assessAnalysisDataReliability({
+    livePrice,
+    technicalSnapshot: context.technicalSnapshot,
+    multiTimeframe: context.multiTimeframe || [],
+    hasChartImages,
+  });
   const meta = {
     pair: body.pair || "EUR/USD",
     timeframe: body.timeframe || "H1",
@@ -2412,6 +2462,8 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     technicalSnapshot: context.technicalSnapshot || null,
     newsContext: context.newsContext || null,
     multiTimeframe: context.multiTimeframe || [],
+    mtfConsensus,
+    dataReliability,
     styleComparison: validation.styleComparison,
   };
   const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
@@ -2716,6 +2768,14 @@ function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = 
     score += 28;
     reasons.push("news rouge proche");
   }
+  if (meta.mtfConsensus?.conflict) {
+    score += 16;
+    reasons.push("timeframes en conflit");
+  }
+  if (Number(meta.dataReliability?.score || 0) < 65) {
+    score += 22;
+    reasons.push("fiabilité données faible");
+  }
   if (Number(image.images || 0) > 0 && Number(image.score || 0) < 45) {
     score += 18;
     reasons.push("image peu lisible");
@@ -2748,6 +2808,48 @@ function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = 
   };
 }
 
+function assessAnalysisDataReliability({ livePrice = {}, technicalSnapshot = {}, multiTimeframe = [], hasChartImages = false }) {
+  const blockers = [];
+  let score = hasChartImages ? 76 : 62;
+  if (Number.isFinite(Number(livePrice?.price))) score += 12;
+  else blockers.push("prix live absent");
+  if (isLivePriceSource(livePrice?.source) && !livePrice?.stale) score += 12;
+  else blockers.push("prix non-live ou différé");
+  if (technicalSnapshot?.valid) score += 16;
+  else blockers.push("snapshot technique faible");
+  if (Number(technicalSnapshot?.bars || 0) >= 50) score += 8;
+  else blockers.push(`${Number(technicalSnapshot?.bars || 0)} bougies`);
+  if (technicalSnapshot?.stale) {
+    score -= 18;
+    blockers.push("historique différé");
+  }
+  const usableMtf = multiTimeframe.filter((item) => item && item.trend && !/indisponible|n\/a/i.test(String(item.trend)));
+  if (usableMtf.length >= 2) score += 8;
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  return {
+    score,
+    grade: score >= 85 ? "A" : score >= 70 ? "B" : score >= 55 ? "C" : "D",
+    blockers,
+  };
+}
+
+function analyzeMultiTimeframeConsensus(items = []) {
+  const usable = items.filter((item) => item && item.trend && !/indisponible|n\/a/i.test(String(item.trend)));
+  const bullish = usable.filter((item) => /haussi/i.test(item.trend)).length;
+  const bearish = usable.filter((item) => /baissi/i.test(item.trend)).length;
+  const neutral = usable.length - bullish - bearish;
+  const dominant = bullish > bearish && bullish >= neutral ? "haussière" : bearish > bullish && bearish >= neutral ? "baissière" : "mixte";
+  const conflict = bullish > 0 && bearish > 0;
+  const score = usable.length ? Math.round((Math.max(bullish, bearish, neutral) / usable.length) * 100) : 0;
+  return {
+    usable: usable.length,
+    dominant,
+    conflict,
+    score,
+    summary: usable.length ? `${dominant}, consensus ${score}% sur ${usable.length} timeframes` : "multi-timeframe indisponible",
+  };
+}
+
 function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger = {}, hasChartImages = false }) {
   const checks = [
     {
@@ -2759,6 +2861,16 @@ function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger 
       name: "Historique",
       ok: meta.technicalSnapshot?.valid !== false,
       detail: meta.technicalSnapshot?.source || "source inconnue",
+    },
+    {
+      name: "Fiabilité données",
+      ok: Number(meta.dataReliability?.score || 0) >= 65,
+      detail: `${Number(meta.dataReliability?.score || 0)}% · ${meta.dataReliability?.grade || "n/a"}`,
+    },
+    {
+      name: "Multi-timeframe",
+      ok: !meta.mtfConsensus?.conflict,
+      detail: meta.mtfConsensus?.summary || "non requis",
     },
     {
       name: "News",
@@ -2943,6 +3055,15 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy })
   const rr = rewardRisk(direction, entry, sl, tp);
   const minRr = isScalpingStrategy(strategy) ? 0.75 : 1.2;
   if (!Number.isFinite(rr) || rr < minRr) return { valid: false, score: 35, reason: `R/R trop faible (${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}).` };
+  const riskDistance = Math.abs(entry - sl);
+  const executionBuffer = executionCostBuffer(pair, strategy);
+  if (riskDistance < executionBuffer * 3) {
+    return {
+      valid: false,
+      score: 30,
+      reason: `SL trop serré après spread/slippage estimé (${formatLevel(riskDistance, pair)} < ${formatLevel(executionBuffer * 3, pair)}).`,
+    };
+  }
   const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair });
   if (suspicious.risky) return { valid: false, score: 28, reason: `Trade risqué: ${suspicious.reason}` };
   if (Number.isFinite(live)) {
@@ -3019,13 +3140,26 @@ function targetMultipliers(strategy = "") {
 
 function assistedRiskDistance(price, pair = "", strategy = "") {
   const scalp = isScalpingStrategy(strategy);
-  if (/BTC/i.test(pair)) return scalp ? Math.max(price * 0.0022, 80) : Math.max(price * 0.006, 250);
-  if (/ETH/i.test(pair)) return scalp ? Math.max(price * 0.003, 4) : Math.max(price * 0.008, 12);
-  if (/XAU/i.test(pair)) return scalp ? Math.max(price * 0.00045, 1.2) : Math.max(price * 0.0025, 8);
-  if (/XAG/i.test(pair)) return scalp ? Math.max(price * 0.0025, 0.06) : Math.max(price * 0.006, 0.18);
-  if (/US500|NAS|SPX/i.test(pair)) return scalp ? Math.max(price * 0.0012, 6) : Math.max(price * 0.0035, 18);
-  if (/JPY/i.test(pair)) return scalp ? Math.max(price * 0.00028, 0.03) : Math.max(price * 0.0025, 0.25);
-  return scalp ? Math.max(price * 0.00025, 0.00025) : Math.max(price * 0.0018, 0.0018);
+  const buffer = executionCostBuffer(pair, strategy) * 3;
+  if (/BTC/i.test(pair)) return scalp ? Math.max(price * 0.0022, 80, buffer) : Math.max(price * 0.006, 250, buffer);
+  if (/ETH/i.test(pair)) return scalp ? Math.max(price * 0.003, 4, buffer) : Math.max(price * 0.008, 12, buffer);
+  if (/XAU/i.test(pair)) return scalp ? Math.max(price * 0.00045, 1.2, buffer) : Math.max(price * 0.0025, 8, buffer);
+  if (/XAG/i.test(pair)) return scalp ? Math.max(price * 0.0025, 0.06, buffer) : Math.max(price * 0.006, 0.18, buffer);
+  if (/US500|NAS|SPX/i.test(pair)) return scalp ? Math.max(price * 0.0012, 6, buffer) : Math.max(price * 0.0035, 18, buffer);
+  if (/JPY/i.test(pair)) return scalp ? Math.max(price * 0.00028, 0.03, buffer) : Math.max(price * 0.0025, 0.25, buffer);
+  return scalp ? Math.max(price * 0.00025, 0.00025, buffer) : Math.max(price * 0.0018, 0.0018, buffer);
+}
+
+function executionCostBuffer(pair = "", strategy = "") {
+  const scalp = isScalpingStrategy(strategy);
+  if (/BTC/i.test(pair)) return scalp ? 35 : 60;
+  if (/ETH/i.test(pair)) return scalp ? 1.8 : 3.5;
+  if (/XAU/i.test(pair)) return scalp ? 0.35 : 0.8;
+  if (/XAG/i.test(pair)) return scalp ? 0.015 : 0.035;
+  if (/US500|SPX/i.test(pair)) return scalp ? 1.8 : 3.5;
+  if (/NAS/i.test(pair)) return scalp ? 4 : 8;
+  if (/JPY/i.test(pair)) return scalp ? 0.012 : 0.025;
+  return scalp ? 0.00008 : 0.00016;
 }
 
 function levelTolerance(pair = "", strategy = "") {
@@ -3327,8 +3461,14 @@ async function saveStateDocument(id, payload) {
 
 function healthRecommendations() {
   const tips = [];
+  const providers = providerHealthSnapshot();
   if (!mongoUri) tips.push("Ajouter MONGODB_URI dans secret.dev pour persister caches, analyses et résultats sur MongoDB.");
   if (mongoLastError) tips.push(`MongoDB indisponible: ${mongoLastError}. Le serveur utilise le fallback fichier local.`);
+  for (const [name, health] of Object.entries(providers)) {
+    if (["down", "degraded"].includes(health.status) && name !== "mongodb") {
+      tips.push(`${name} ${health.status}: ${health.lastError || "erreur inconnue"}. Kronos bascule sur les sources alternatives et bloque les signaux trop faibles.`);
+    }
+  }
   if (!ALPHA_VANTAGE_KEYS.length) tips.push("Ajouter ALPHA_VANTAGE_API_KEY ou ALPHA_VANTAGE_API_KEY_1..8 dans secret.dev pour un fallback prix Forex/Crypto.");
   if (!MASSIVE_KEYS.length) tips.push("Ajouter MASSIVE_API_KEY dans secret.dev pour remplacer Polygon avec un fallback prix/historique plus propre.");
   tips.push("Fallbacks sans clé actifs: Binance pour crypto, Coinbase pour BTC/ETH spot, Stooq/Frankfurter pour Forex indicatif.");
