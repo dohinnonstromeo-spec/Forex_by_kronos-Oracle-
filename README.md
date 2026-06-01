@@ -26,6 +26,7 @@ FINNHUB_API_KEY=...
 NEWS_API_KEY=...
 MONGODB_URI=mongodb+srv://USER:PASSWORD@cluster.mongodb.net/oracle_forex?retryWrites=true&w=majority
 MONGODB_DB=oracle_forex
+MONGODB_TIMEOUT_MS=5000
 ADMIN_TOKEN=une_phrase_secrete_longue
 ```
 

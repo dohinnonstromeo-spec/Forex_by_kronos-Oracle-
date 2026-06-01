@@ -3489,9 +3489,10 @@ async function mongoDb() {
   if (!mongoUri || mongoUnavailable) return null;
   try {
     if (!mongoClientPromise) {
+      const mongoTimeout = Number(env.MONGODB_TIMEOUT_MS || env.MONGO_TIMEOUT_MS || 5000);
       const client = new MongoClient(mongoUri, {
-        serverSelectionTimeoutMS: 900,
-        connectTimeoutMS: 900,
+        serverSelectionTimeoutMS: mongoTimeout,
+        connectTimeoutMS: mongoTimeout,
       });
       mongoClientPromise = client.connect();
     }
