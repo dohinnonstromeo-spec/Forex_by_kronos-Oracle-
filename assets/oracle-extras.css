@@ -557,7 +557,8 @@ body {
   text-transform: uppercase;
 }
 
-.analysis-field select {
+.analysis-field select,
+.analysis-field input {
   width: 100%;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 10px;
@@ -1039,6 +1040,7 @@ body {
 
 .danger-panel,
 .quality-gate,
+.capital-risk-panel,
 .beginner-plan {
   margin-top: 14px;
   border: 1px solid rgba(255, 255, 255, .12);
@@ -1048,9 +1050,48 @@ body {
 }
 
 .danger-panel p,
-.quality-gate p {
+.quality-gate p,
+.capital-risk-panel p {
   margin: 8px 0 0;
   color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.capital-risk-panel {
+  border-color: rgba(255, 176, 0, .32);
+  background: linear-gradient(135deg, rgba(255, 176, 0, .1), rgba(0, 255, 136, .05));
+}
+
+.risk-mini-grid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.risk-mini-grid div {
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .24);
+  padding: 9px;
+}
+
+.risk-mini-grid span,
+.risk-mini-grid strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+}
+
+.risk-mini-grid span {
+  color: var(--muted-foreground);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.risk-mini-grid strong {
+  margin-top: 4px;
+  color: var(--amber-neon);
   font-size: 12px;
 }
 

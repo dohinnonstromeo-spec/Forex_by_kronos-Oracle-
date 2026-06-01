@@ -384,6 +384,7 @@
         </div>
         ${renderDangerScore(result)}
         ${renderQualityGate(result)}
+        ${renderRiskPanel(result)}
         ${renderTradePlan(result)}
         ${renderBeginnerPlan(result)}
         ${renderAnalysisMeta(result)}
@@ -624,6 +625,24 @@
           ${renderCopyValue("TP2", result.tp2)}
         </div>
         <pre class="trade-plan-copy">${escapeHtml(plan)}</pre>
+      </div>
+    `;
+  }
+
+  function renderRiskPanel(result) {
+    const risk = result.meta?.riskPlan || result.meta?.riskProfile;
+    if (!risk) return "";
+    const maxLoss = Number.isFinite(Number(risk.maxLoss)) ? `${Number(risk.maxLoss).toFixed(2)} unité(s)` : `${risk.percent || 0.5}% du capital`;
+    const closeAtTp1 = Number.isFinite(Number(risk.closeAtTp1)) ? `${risk.closeAtTp1}%` : "une partie";
+    return `
+      <div class="capital-risk-panel">
+        <div class="signal-bottom"><span>Protection du capital</span><strong>${escapeHtml(risk.label || "Protection maximale")}</strong></div>
+        <div class="risk-mini-grid">
+          <div><span>Perte max au SL</span><strong>${escapeHtml(maxLoss)}</strong></div>
+          <div><span>TP1</span><strong>Fermer ${escapeHtml(closeAtTp1)}</strong></div>
+          <div><span>Après TP1</span><strong>SL breakeven</strong></div>
+        </div>
+        <p>${escapeHtml(risk.instruction || risk.warning || "Ajuster le lot avant toute entrée.")}</p>
       </div>
     `;
   }

@@ -142,7 +142,8 @@ R:R minimum: 1:1.5. Optimal: 1:2 ou 1:3. Évite toute entrée sous 1:1.5.
 R:R > 10 = niveaux suspects: marque "Trade risqué" et ne présente pas le plan comme directement tradable.
 TP1 trop rond/fallback évident (1.0000, 2.0000, 100.0000) = niveaux suspects: marque "Trade risqué".
 SL trop proche (< 2 pips sur Forex, < 0.02 sur JPY, < 0.20 sur XAU) = niveaux suspects: marque "Trade risqué".
-Risk par trade: Conservateur 1%, Standard 2%, Agressif 3% uniquement si score très fort, pas de news rouge et confluences solides.
+Risk par trade: Protection maximale 0.5% par défaut pour débutants/petits comptes. Conservateur 1%, Standard 2%, Agressif 3% uniquement si l'utilisateur le choisit, score très fort, pas de news rouge et confluences solides.
+La taille de lot doit être calculée pour que la perte au SL ne dépasse jamais le pourcentage choisi. Ne promets jamais de "récupérer vite" un petit compte.
 SL toujours structurel: sous support/demand/OB/FVG pour achat, au-dessus résistance/supply/OB/FVG pour vente. Jamais un nombre arbitraire.
 Corrélation: signale les expositions doublées, par exemple long EUR/USD + long GBP/USD = double risque USD.
 Si événement macro fort proche, données faibles, MTF contradictoire ou image mauvaise, baisse le score ou bloque.
@@ -647,7 +648,8 @@ CONTEXTE:
 - Timeframe final d'exécution: ${selectedTimeframe}
 - Style demandé: ${body.style || "Mixte"}
 - Stratégie demandée: ${body.strategy || "Swing Trading"}
-- Gestion du risque: ${body.risk || "Standard 2%"}
+- Gestion du risque: ${body.risk || defaultRiskMode()}
+- Capital indiqué: ${body.capital ? `${body.capital} unité(s) de compte` : "non indiqué"}
 - Mode d'analyse: ${analysisDepth}
 - Prix live validé: ${livePrice?.price ?? "indisponible"} (${livePrice?.source || "aucune source"})
 - Historique API: ${technicalSnapshot.bars} bougies (${technicalSnapshot.source}, ${technicalSnapshot.stale ? "indicatif/différé" : "frais"})
@@ -666,6 +668,7 @@ Si le style demandé n'est pas "Mixte" et que sa structure n'est pas clairement 
 Tu dois citer les éléments techniques visibles qui justifient le style retenu.
 Adapte les niveaux à la stratégie demandée: Scalping = entrée proche du prix live, SL court, TP1 proche/prudent et TP2 moyen; Swing Trading = structure H1/H4/D1; Position Trading = niveaux majeurs; Breakout = attendre clôture/retest; Reversal = confirmer rejet/CHOCH/divergence avant entrée.
 En scalping, TP1 doit souvent être autour de 0.8R à 1.2R et TP2 autour de 1.4R à 2.0R. N'étire pas les profits comme un swing trade.
+En mode Protection maximale, privilégie une prise partielle forte à TP1, un déplacement du SL à breakeven après TP1, et rappelle que la taille de lot doit limiter la perte à 0.5% du capital.
 Si la détection automatique est désactivée, utilise la paire et le timeframe du formulaire comme contexte confirmé.
 Si le setup n'est pas confirmé, retourne AUCUN SIGNAL au lieu de forcer une opportunité. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
@@ -683,6 +686,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         style: body.style || "Mixte",
         strategy: body.strategy || "Swing Trading",
         livePrice,
+        risk: body.risk,
       });
     }
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe });
@@ -2332,7 +2336,7 @@ STYLE_EFFICACITE:Price Action=45`;
   return { answer: text, score: extractScore(text, seed), technique: extractTechnique(text) };
 }
 
-function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice }) {
+function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, risk }) {
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;
@@ -2346,6 +2350,7 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
     live: price,
     pair,
     strategy,
+    risk,
   });
   const technique = style === "Mixte" ? "Price Action" : style;
   const strategyLine = strategyGuide(strategy, timeframe);
@@ -2526,7 +2531,8 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     timeframe: body.timeframe || "H1",
     style: body.style || "Mixte",
     strategy: body.strategy || "Swing Trading",
-    risk: body.risk || "Standard 2%",
+    risk: body.risk || defaultRiskMode(),
+    capital: body.capital || null,
     analysisDepth: body.analysisDepth || "Profonde",
     livePrice: Number.isFinite(live) ? live : null,
     imageQuality,
@@ -2572,14 +2578,14 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   let sl = extractLevel(text, /(?:stop loss|sl)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp = extractLevel(text, /(?:take profit\s*1|tp1|take profit|tp)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp2 = extractLevel(text, /(?:take profit\s*2|tp2)\s*:?\s*([0-9.,]+)/i, NaN);
-  let assistedLevels = buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair: body.pair, strategy: body.strategy });
+  let assistedLevels = buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
   if (assistedLevels.used) {
     entry = assistedLevels.entry;
     sl = assistedLevels.sl;
     tp = assistedLevels.tp;
     tp2 = assistedLevels.tp2;
   }
-  let targetConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy });
+  let targetConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy, risk: body.risk });
   if (targetConstraint.used) {
     tp = targetConstraint.tp;
     tp2 = targetConstraint.tp2;
@@ -2593,22 +2599,22 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta,
     });
   }
-  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy });
+  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
   if (!levelCheck.valid) {
-    const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair, strategy: body.strategy });
+    const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
     if (repairedLevels.used) {
       entry = repairedLevels.entry;
       sl = repairedLevels.sl;
       tp = repairedLevels.tp;
       tp2 = repairedLevels.tp2;
-      const repairedConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy });
+      const repairedConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy, risk: body.risk });
       if (repairedConstraint.used) {
         tp = repairedConstraint.tp;
         tp2 = repairedConstraint.tp2;
         targetConstraint = repairedConstraint;
       }
       assistedLevels = repairedLevels;
-      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy });
+      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
     }
   }
   if (!levelCheck.valid) {
@@ -2631,7 +2637,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
     });
   }
-  const danger = computeDangerScore({ meta, validation, levelCheck, rr, live, entry, strategy: body.strategy });
+  const danger = computeDangerScore({ meta, validation, levelCheck, rr, live, entry, strategy: body.strategy, risk: body.risk });
   const qualityGate = buildQualityGate({ meta, validation, levelCheck, danger, hasChartImages });
   if (!qualityGate.valid) {
     return blockAnalysis(normalized, {
@@ -2642,6 +2648,8 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr, dangerScore: danger.score, danger, qualityGate },
     });
   }
+  const profile = riskProfile(body.risk);
+  const riskPlan = buildRiskPlan({ capital: body.capital, profile });
   const effectiveImageScore = hasChartImages ? imageQuality.score : 65;
   const calibratedScore = Math.max(0, Math.min(100, Math.round(
     normalized.score * 0.42 + validation.score * 0.18 + effectiveImageScore * 0.2 + levelCheck.score * 0.2 + calibration.adjustment,
@@ -2655,7 +2663,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr },
     });
   }
-  const beginnerPlan = buildBeginnerPlan({ direction, entry, sl, tp1: tp, tp2, pair: body.pair, strategy: body.strategy });
+  const beginnerPlan = buildBeginnerPlan({ direction, entry, sl, tp1: tp, tp2, pair: body.pair, strategy: body.strategy, risk: body.risk, capital: body.capital });
   return {
     ...normalized,
     direction,
@@ -2667,7 +2675,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     score: calibratedScore,
     dangerScore: danger.score,
     beginnerPlan,
-    explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. ${calibration.message}`,
+    explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. Gestion du risque: ${profile.label}, perte maximale visée ${profile.percent}% si la taille de lot est correctement ajustée. ${calibration.message}`,
     validation,
     meta: {
       ...meta,
@@ -2676,6 +2684,8 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       dangerScore: danger.score,
       danger,
       qualityGate,
+      riskProfile: profile,
+      riskPlan,
       styleComparison: validation.styleComparison,
       assistedLevels: assistedLevels.used ? assistedLevels.reason : null,
       targetConstraint: targetConstraint.used ? targetConstraint.reason : null,
@@ -2819,9 +2829,77 @@ function buildNoSignalDiagnostic(details = {}) {
   };
 }
 
-function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = null, live = null, entry = null, strategy = "" }) {
+function defaultRiskMode() {
+  return "Protection maximale 0.5%";
+}
+
+function riskProfile(value = "") {
+  const text = normalizeForSearch(value || defaultRiskMode());
+  if (/agressif|3/.test(text)) {
+    return {
+      label: "Agressif 3%",
+      percent: 3,
+      closeAtTp1: 50,
+      breakeven: true,
+      minScore: 82,
+      warning: "Réservé aux comptes solides et aux setups très confirmés.",
+    };
+  }
+  if (/standard|2/.test(text)) {
+    return {
+      label: "Standard 2%",
+      percent: 2,
+      closeAtTp1: 60,
+      breakeven: true,
+      minScore: 72,
+      warning: "À utiliser seulement si l'utilisateur comprend la taille de lot.",
+    };
+  }
+  if (/conservateur|1/.test(text)) {
+    return {
+      label: "Conservateur 1%",
+      percent: 1,
+      closeAtTp1: 70,
+      breakeven: true,
+      minScore: 62,
+      warning: "Profil prudent pour limiter les pertes en série.",
+    };
+  }
+  return {
+    label: defaultRiskMode(),
+    percent: 0.5,
+    closeAtTp1: 80,
+    breakeven: true,
+    minScore: 55,
+    warning: "Mode débutant: priorité à la survie du capital.",
+  };
+}
+
+function riskAmountForCapital(capital, percent) {
+  const amount = parseFormattedNumber(capital);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return amount * (Number(percent) / 100);
+}
+
+function buildRiskPlan({ capital, profile }) {
+  const maxLoss = riskAmountForCapital(capital, profile.percent);
+  return {
+    label: profile.label,
+    percent: profile.percent,
+    closeAtTp1: profile.closeAtTp1,
+    maxLoss: Number.isFinite(maxLoss) ? Number(maxLoss.toFixed(2)) : null,
+    capital: Number.isFinite(parseFormattedNumber(capital)) ? parseFormattedNumber(capital) : null,
+    warning: profile.warning,
+    instruction: Number.isFinite(maxLoss)
+      ? `Régler le lot pour perdre au maximum ${maxLoss.toFixed(2)} unité(s) si le SL est touché.`
+      : `Régler le lot pour perdre au maximum ${profile.percent}% du capital si le SL est touché.`,
+  };
+}
+
+function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = null, live = null, entry = null, strategy = "", risk = "" }) {
   const reasons = [];
   let score = 12;
+  const profile = riskProfile(risk || meta.risk);
   const technical = meta.technicalSnapshot || {};
   const news = meta.newsContext || {};
   const image = meta.imageQuality || {};
@@ -2874,6 +2952,10 @@ function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = 
       reasons.push("entrée éloignée");
     }
   }
+  if (profile.percent >= 3) {
+    score += 10;
+    reasons.push("profil agressif");
+  }
   return {
     score: Math.max(0, Math.min(100, Math.round(score))),
     label: score >= 70 ? "Élevé" : score >= 40 ? "Moyen" : "Faible",
@@ -2924,6 +3006,7 @@ function analyzeMultiTimeframeConsensus(items = []) {
 }
 
 function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger = {}, hasChartImages = false }) {
+  const profile = riskProfile(meta.risk);
   const checks = [
     {
       name: "Prix live",
@@ -2965,6 +3048,11 @@ function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger 
       ok: Number(danger.score || 0) < 65,
       detail: `${Number(danger.score || 0)}%`,
     },
+    {
+      name: "Risque compte",
+      ok: profile.percent < 3 || (Number(validation.score || 0) >= profile.minScore && Number(danger.score || 0) < 45),
+      detail: `${profile.label} · score requis ${profile.minScore}%`,
+    },
   ];
   if (hasChartImages) {
     checks.push({
@@ -2981,22 +3069,30 @@ function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger 
   };
 }
 
-function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy }) {
+function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, risk, capital }) {
+  const profile = riskProfile(risk);
+  const riskAmount = riskAmountForCapital(capital, profile.percent);
+  const riskLine = riskAmount
+    ? `Risque max: ${profile.percent}% du capital, soit environ ${riskAmount.toFixed(2)} unité(s) si le capital indiqué est correct.`
+    : `Risque max: ${profile.percent}% du capital. Ajuster le lot pour que la perte au SL respecte cette limite.`;
   return {
     title: isScalpingStrategy(strategy) ? "Plan scalping débutant" : "Plan débutant",
     steps: [
+      riskLine,
       `Entrée seulement si le prix confirme ${formatLevel(entry, pair)}.`,
       `Stop Loss à ${formatLevel(sl, pair)} sans l'élargir après entrée.`,
-      `TP1 prudent à ${formatLevel(tp1, pair)}: fermer 50% ou sécuriser une partie.`,
+      `TP1 prudent à ${formatLevel(tp1, pair)}: fermer ${profile.closeAtTp1}% ou sécuriser une partie.`,
       `Après TP1, déplacer le SL vers breakeven si la plateforme le permet.`,
       `TP2 moyen à ${formatLevel(tp2, pair)}: laisser courir uniquement si le momentum reste propre.`,
+      "Ne pas augmenter le lot après une perte: attendre un nouveau setup validé.",
     ],
     copy: [
       `ENTREE: ${formatLevel(entry, pair)}`,
       `SL: ${formatLevel(sl, pair)}`,
       `TP1 PRUDENT: ${formatLevel(tp1, pair)}`,
       `TP2 MOYEN: ${formatLevel(tp2, pair)}`,
-      "GESTION: Fermer 50% à TP1 puis protéger le reste.",
+      `RISQUE MAX: ${profile.percent}% du capital`,
+      `GESTION: Fermer ${profile.closeAtTp1}% à TP1 puis protéger le reste.`,
     ].join("\n"),
   };
 }
@@ -3120,13 +3216,14 @@ function assessImageQuality(images) {
   return { score, reason, images: images.length, averageBytes: Math.round(avg) };
 }
 
-function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy }) {
+function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy, risk }) {
   if (![entry, sl, tp].every(Number.isFinite)) return { valid: false, score: 0, reason: "Niveaux numériques invalides." };
   const buy = direction === "ACHAT";
   if (buy && !(sl < entry && tp > entry)) return { valid: false, score: 20, reason: "Pour un achat, SL doit être sous l'entrée et TP au-dessus." };
   if (!buy && !(sl > entry && tp < entry)) return { valid: false, score: 20, reason: "Pour une vente, SL doit être au-dessus de l'entrée et TP sous l'entrée." };
   const rr = rewardRisk(direction, entry, sl, tp);
-  const minRr = isScalpingStrategy(strategy) ? 0.75 : 1.2;
+  const profile = riskProfile(risk);
+  const minRr = isScalpingStrategy(strategy) ? 0.75 : profile.percent <= 0.5 ? 1.0 : 1.2;
   if (!Number.isFinite(rr) || rr < minRr) return { valid: false, score: 35, reason: `R/R trop faible (${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}).` };
   const riskDistance = Math.abs(entry - sl);
   const executionBuffer = executionCostBuffer(pair, strategy);
@@ -3154,7 +3251,7 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy })
   return { valid: true, score: Math.max(55, Math.min(100, Math.round(55 + rr * 12))), reason: "Niveaux cohérents avec direction, R/R et prix live." };
 }
 
-function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strategy }) {
+function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strategy, risk }) {
   if ([entry, sl, tp].every(Number.isFinite)) {
     return { used: false, entry, sl, tp, tp2 };
   }
@@ -3162,12 +3259,12 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strate
     return { used: false, entry, sl, tp, tp2 };
   }
   const buy = direction !== "VENTE";
-  const risk = assistedRiskDistance(live, pair, strategy);
-  const targets = targetMultipliers(strategy);
+  const riskDistance = assistedRiskDistance(live, pair, strategy);
+  const targets = targetMultipliers(strategy, risk);
   const finalEntry = Number.isFinite(entry) ? entry : live;
-  const finalSl = Number.isFinite(sl) ? sl : buy ? finalEntry - risk : finalEntry + risk;
-  const finalTp = Number.isFinite(tp) ? tp : buy ? finalEntry + risk * targets.tp1 : finalEntry - risk * targets.tp1;
-  const finalTp2 = Number.isFinite(tp2) ? tp2 : buy ? finalEntry + risk * targets.tp2 : finalEntry - risk * targets.tp2;
+  const finalSl = Number.isFinite(sl) ? sl : buy ? finalEntry - riskDistance : finalEntry + riskDistance;
+  const finalTp = Number.isFinite(tp) ? tp : buy ? finalEntry + riskDistance * targets.tp1 : finalEntry - riskDistance * targets.tp1;
+  const finalTp2 = Number.isFinite(tp2) ? tp2 : buy ? finalEntry + riskDistance * targets.tp2 : finalEntry - riskDistance * targets.tp2;
   return {
     used: true,
     entry: finalEntry,
@@ -3178,20 +3275,20 @@ function buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair, strate
   };
 }
 
-function constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy }) {
+function constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy, risk }) {
   if (![entry, sl, tp].every(Number.isFinite)) return { used: false, tp, tp2 };
-  const targets = targetMultipliers(strategy);
-  const risk = Math.abs(entry - sl);
-  if (!risk) return { used: false, tp, tp2 };
+  const targets = targetMultipliers(strategy, risk);
+  const riskDistance = Math.abs(entry - sl);
+  if (!riskDistance) return { used: false, tp, tp2 };
   const buy = direction !== "VENTE";
-  const rr1 = Math.abs(tp - entry) / risk;
-  const rr2 = Number.isFinite(tp2) ? Math.abs(tp2 - entry) / risk : NaN;
+  const rr1 = Math.abs(tp - entry) / riskDistance;
+  const rr2 = Number.isFinite(tp2) ? Math.abs(tp2 - entry) / riskDistance : NaN;
   const clampRr = (value, min, max, fallback) => Math.max(min, Math.min(max, Number.isFinite(value) ? value : fallback));
   const safeRr1 = clampRr(rr1, targets.minTp1, targets.maxTp1, targets.tp1);
   const safeRr2 = clampRr(rr2, targets.minTp2, targets.maxTp2, targets.tp2);
-  const finalTp = buy ? entry + risk * safeRr1 : entry - risk * safeRr1;
-  const finalTp2 = buy ? entry + risk * Math.max(safeRr2, safeRr1 + 0.25) : entry - risk * Math.max(safeRr2, safeRr1 + 0.25);
-  const changed = Math.abs(finalTp - tp) > risk * 0.05 || !Number.isFinite(tp2) || Math.abs(finalTp2 - tp2) > risk * 0.05;
+  const finalTp = buy ? entry + riskDistance * safeRr1 : entry - riskDistance * safeRr1;
+  const finalTp2 = buy ? entry + riskDistance * Math.max(safeRr2, safeRr1 + 0.25) : entry - riskDistance * Math.max(safeRr2, safeRr1 + 0.25);
+  const changed = Math.abs(finalTp - tp) > riskDistance * 0.05 || !Number.isFinite(tp2) || Math.abs(finalTp2 - tp2) > riskDistance * 0.05;
   return {
     used: changed,
     tp: changed ? finalTp : tp,
@@ -3202,7 +3299,16 @@ function constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy })
   };
 }
 
-function targetMultipliers(strategy = "") {
+function targetMultipliers(strategy = "", risk = "") {
+  const profile = riskProfile(risk);
+  if (profile.percent <= 0.5) {
+    if (isScalpingStrategy(strategy)) return { tp1: 0.85, tp2: 1.35, minTp1: 0.75, maxTp1: 1.05, minTp2: 1.2, maxTp2: 1.65 };
+    return { tp1: 1.05, tp2: 1.65, minTp1: 0.9, maxTp1: 1.35, minTp2: 1.4, maxTp2: 2.2 };
+  }
+  if (profile.percent <= 1) {
+    if (isScalpingStrategy(strategy)) return { tp1: 0.9, tp2: 1.5, minTp1: 0.75, maxTp1: 1.15, minTp2: 1.25, maxTp2: 1.85 };
+    return { tp1: 1.2, tp2: 1.9, minTp1: 1.0, maxTp1: 1.6, minTp2: 1.55, maxTp2: 2.6 };
+  }
   if (isScalpingStrategy(strategy)) {
     return { tp1: 0.95, tp2: 1.65, minTp1: 0.75, maxTp1: 1.2, minTp2: 1.35, maxTp2: 2.0 };
   }
@@ -3995,7 +4101,8 @@ async function recordLearningAnalysis(result, body, context) {
     timeframe: body.timeframe || "H1",
     style: body.style || "Hybride SMC+Chartiste",
     strategy: body.strategy || "Swing Trading",
-    risk: body.risk || "Standard 2%",
+    risk: body.risk || defaultRiskMode(),
+    capital: body.capital || null,
     analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
     direction: result.direction,
     entry,

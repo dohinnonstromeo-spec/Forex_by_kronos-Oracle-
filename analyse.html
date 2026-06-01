@@ -151,8 +151,15 @@
             <div class="analysis-field">
               <label for="risk">Gestion du risque</label>
               <select id="risk" name="risk">
-                <option>Standard 2%</option><option>Conservateur 1%</option><option>Agressif 3%</option>
+                <option selected>Protection maximale 0.5%</option>
+                <option>Conservateur 1%</option>
+                <option>Standard 2%</option>
+                <option>Agressif 3%</option>
               </select>
+            </div>
+            <div class="analysis-field">
+              <label for="capital">Capital disponible</label>
+              <input id="capital" name="capital" type="number" min="0" step="1" placeholder="Ex: 50">
             </div>
             <div class="analysis-field">
               <label for="analysisDepth">Mode d'analyse</label>
