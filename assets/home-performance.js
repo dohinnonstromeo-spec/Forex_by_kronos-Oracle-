@@ -3,7 +3,7 @@
 
   async function refreshHomeMetrics() {
     try {
-      const response = await fetch("/api/performance", { signal: AbortSignal.timeout(9000) });
+      const response = await fetch("/api/performance", { signal: AbortSignal.timeout(3500) });
       if (!response.ok) return;
       const data = await response.json();
       const publishablePrecision = data.precisionAudited && Number(data.precision) >= 55;
