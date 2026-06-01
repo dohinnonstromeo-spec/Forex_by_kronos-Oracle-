@@ -3822,9 +3822,9 @@ function nextQuotaReset() {
 }
 
 async function requireAdmin(req) {
-  const expectedToken = env.ADMIN_TOKEN || env.ADMIN_ACCESS_TOKEN || "";
-  const providedToken = String(req.headers["x-admin-token"] || "").trim()
-    || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  const expectedToken = normalizeAdminToken(env.ADMIN_TOKEN || env.ADMIN_ACCESS_TOKEN || "");
+  const providedToken = normalizeAdminToken(String(req.headers["x-admin-token"] || "")
+    || String(req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
   if (expectedToken && providedToken && timingSafeStringEqual(providedToken, expectedToken)) {
     return { ok: true, via: "token" };
   }
@@ -3893,6 +3893,10 @@ function timingSafeStringEqual(a, b) {
   const left = Buffer.from(String(a));
   const right = Buffer.from(String(b));
   return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function normalizeAdminToken(value = "") {
+  return String(value).trim().replace(/^["']+|["']+$/g, "");
 }
 
 function hashPassword(password) {
