@@ -4,7 +4,6 @@ import { createReadStream, existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
-import { MongoClient } from "mongodb";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
@@ -13,11 +12,12 @@ const dataDir = join(root, "data");
 const learningPath = join(dataDir, "learning-log.json");
 const marketCachePath = join(dataDir, "market-cache.json");
 const authPath = join(dataDir, "auth-store.json");
-const mongoUri = env.MONGODB_URI || env.MONGO_URI || "";
-const mongoDbName = env.MONGODB_DB || env.MONGO_DB || inferMongoDbName(mongoUri) || "oracle_forex";
-let mongoClientPromise = null;
-let mongoUnavailable = false;
-let mongoLastError = null;
+const supabaseUrl = normalizeSupabaseUrl(env.SUPABASE_URL || env.SUPABASE_PROJECT_URL || "");
+const supabaseProjectRef = env.SUPABASE_PROJECT_REF || inferSupabaseProjectRef(supabaseUrl);
+const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY || "";
+const supabaseStateTable = env.SUPABASE_STATE_TABLE || "oracle_app_state";
+let supabaseUnavailable = false;
+let supabaseLastError = null;
 const providerHealth = new Map();
 const anonymousUsage = new Map();
 const memoryCache = {
@@ -334,7 +334,7 @@ async function handleApi(req, res, url) {
       alphaVantage: ALPHA_VANTAGE_KEYS.length > 0,
       exchangeRateApi: EXCHANGERATE_KEYS.length > 0,
       binanceFallback: true,
-      mongoDb: Boolean(mongoUri),
+      supabase: hasSupabaseConfig(),
       stooqFallback: true,
       dukascopyHistorical: true,
       coinbaseFallback: true,
@@ -625,6 +625,7 @@ Réponds en JSON strict:
     const history = await getHistoryForSymbol(selectedPair, livePrice, {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Swing Trading",
+      historyBudgetMs: deepAnalysis ? 9000 : 4500,
     });
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
@@ -678,7 +679,14 @@ Si le contexte news/API est activé, croise le setup avec les titres récents et
 Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
 
     Analyse le contexte fourni et donne un setup éducatif exploitable avec prudence.`;
-    let answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 500, 0.3);
+    const aiBudgetMs = images.length
+      ? deepAnalysis ? 52000 : 26000
+      : deepAnalysis ? 26000 : 14000;
+    let answer = await promiseWithTimeout(
+      images.length ? analyzeChartImage(prompt, images) : groq(prompt, 500, 0.3),
+      aiBudgetMs,
+      "",
+    );
     if (!answer) {
       answer = buildDeterministicAnalysisText({
         pair: selectedPair,
@@ -1101,8 +1109,10 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const preferredIntervals = historyIntervals(symbol, options);
   if (cached.length >= 30 && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
   if (!price?.open || !isUsableLivePrice(price)) return cached;
-  const deadline = Date.now() + 12000;
+  const budget = Number.isFinite(Number(options.historyBudgetMs)) ? Number(options.historyBudgetMs) : 12000;
+  const deadline = Date.now() + Math.max(2500, Math.min(12000, budget));
   const errors = [];
+  let fallbackHistory = cached.length >= 30 ? cached : [];
   const attempts = [
     ["binance", fetchBinanceHistory],
     ["massive", fetchMassiveHistory],
@@ -1113,18 +1123,23 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     for (const interval of preferredIntervals) {
       if (Date.now() > deadline) {
         errors.push("history_budget_exceeded");
-        return cached;
+        return fallbackHistory;
       }
       try {
         const bars = await loader(symbol, interval);
         if (bars.length >= 30) {
           tagHistory(bars, `${source}:${interval}`, false);
-          await saveMarketCache({
-            ...cache,
-            histories: mergeCachedHistories(cache.histories || {}, { [symbol]: bars }),
-          });
-          recordProviderHealth(`${source}_history_single`, true);
-          return bars;
+          if (isHistoryCompatible(bars, options)) {
+            await saveMarketCache({
+              ...cache,
+              histories: mergeCachedHistories(cache.histories || {}, { [symbol]: bars }),
+            });
+            recordProviderHealth(`${source}_history_single`, true);
+            return bars;
+          }
+          if (!fallbackHistory.length || fallbackHistory._meta?.stale) fallbackHistory = bars;
+          errors.push(`${source}_${interval}:not_timeframe_compatible`);
+          continue;
         }
         if (bars.length) errors.push(`${source}_${interval}:insufficient_bars`);
       } catch (error) {
@@ -1146,7 +1161,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     }
   }
   recordProviderHealth("history_single", false, errors.join(" | ") || "no_history");
-  return cached;
+  return fallbackHistory;
 }
 
 async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
@@ -2149,6 +2164,13 @@ async function fetchText(url, timeoutMs = 2200) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
   return response.text();
+}
+
+function promiseWithTimeout(promise, timeoutMs, fallbackValue = null) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallbackValue), timeoutMs)),
+  ]);
 }
 
 function parseCsv(text) {
@@ -3433,13 +3455,13 @@ function projectTp2(direction, entry, sl, tp1) {
 }
 
 async function loadMarketCache() {
-  const fromMongo = await loadStateDocument("market-cache");
-  if (fromMongo) {
+  const fromState = await loadStateDocument("market-cache");
+  if (fromState) {
     return {
       version: 1,
-      prices: fromMongo.prices && typeof fromMongo.prices === "object" ? fromMongo.prices : {},
-      histories: fromMongo.histories && typeof fromMongo.histories === "object" ? fromMongo.histories : {},
-      updatedAt: fromMongo.updatedAt || null,
+      prices: fromState.prices && typeof fromState.prices === "object" ? fromState.prices : {},
+      histories: fromState.histories && typeof fromState.histories === "object" ? fromState.histories : {},
+      updatedAt: fromState.updatedAt || null,
     };
   }
   try {
@@ -3591,75 +3613,91 @@ function getApiStatus() {
   };
 }
 
-async function mongoDb() {
-  if (!mongoUri || mongoUnavailable) return null;
-  try {
-    if (!mongoClientPromise) {
-      const mongoTimeout = Number(env.MONGODB_TIMEOUT_MS || env.MONGO_TIMEOUT_MS || 5000);
-      const client = new MongoClient(mongoUri, {
-        serverSelectionTimeoutMS: mongoTimeout,
-        connectTimeoutMS: mongoTimeout,
-      });
-      mongoClientPromise = client.connect();
-    }
-    const client = await mongoClientPromise;
-    mongoLastError = null;
-    recordProviderHealth("mongodb", true);
-    return client.db(mongoDbName);
-  } catch (error) {
-    mongoUnavailable = true;
-    mongoClientPromise = null;
-    mongoLastError = sanitizeError(error.message);
-    recordProviderHealth("mongodb", false, mongoLastError);
-    console.warn(`MongoDB indisponible, fallback fichier local: ${mongoLastError}`);
-    return null;
-  }
-}
-
-async function stateCollection() {
-  const db = await mongoDb();
-  return db ? db.collection("app_state") : null;
-}
-
 async function loadStateDocument(id) {
-  const collection = await stateCollection();
-  if (!collection) return null;
+  if (!hasSupabaseConfig() || supabaseUnavailable) return null;
   try {
-    const doc = await collection.findOne({ _id: id });
-    return doc?.payload || null;
+    const rows = await supabaseRequest(
+      `${supabaseStateTable}?id=eq.${encodeURIComponent(id)}&select=payload&limit=1`,
+      { method: "GET" },
+    );
+    supabaseLastError = null;
+    recordProviderHealth("supabase", true);
+    return Array.isArray(rows) ? rows[0]?.payload || null : null;
   } catch (error) {
-    mongoUnavailable = true;
-    mongoLastError = sanitizeError(error.message);
-    recordProviderHealth("mongodb", false, mongoLastError);
+    supabaseUnavailable = true;
+    supabaseLastError = sanitizeError(error.message);
+    recordProviderHealth("supabase", false, supabaseLastError);
     return null;
   }
 }
 
 async function saveStateDocument(id, payload) {
-  const collection = await stateCollection();
-  if (!collection) return false;
+  if (!hasSupabaseConfig() || supabaseUnavailable) return false;
   try {
-    await collection.updateOne(
-      { _id: id },
-      { $set: { payload, updatedAt: new Date() } },
-      { upsert: true },
-    );
+    await supabaseRequest(`${supabaseStateTable}?on_conflict=id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates" },
+      body: JSON.stringify({ id, payload, updated_at: new Date().toISOString() }),
+    });
+    supabaseLastError = null;
+    recordProviderHealth("supabase", true);
     return true;
   } catch (error) {
-    mongoUnavailable = true;
-    mongoLastError = sanitizeError(error.message);
-    recordProviderHealth("mongodb", false, mongoLastError);
+    supabaseUnavailable = true;
+    supabaseLastError = sanitizeError(error.message);
+    recordProviderHealth("supabase", false, supabaseLastError);
     return false;
   }
+}
+
+function hasSupabaseConfig() {
+  return Boolean(supabaseUrl && supabaseKey);
+}
+
+async function checkSupabaseConnection() {
+  if (!hasSupabaseConfig()) return false;
+  try {
+    await supabaseRequest(`${supabaseStateTable}?select=id&limit=1`, { method: "GET" });
+    supabaseUnavailable = false;
+    supabaseLastError = null;
+    recordProviderHealth("supabase", true);
+    return true;
+  } catch (error) {
+    supabaseUnavailable = true;
+    supabaseLastError = sanitizeError(error.message);
+    recordProviderHealth("supabase", false, supabaseLastError);
+    return false;
+  }
+}
+
+async function supabaseRequest(path, options = {}) {
+  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: supabaseKey,
+      Authorization: `Bearer ${supabaseKey}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+    signal: AbortSignal.timeout(Number(env.SUPABASE_TIMEOUT_MS || 5000)),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`supabase_${response.status}: ${text.slice(0, 220)}`);
+  }
+  if (response.status === 204) return null;
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
 }
 
 function healthRecommendations() {
   const tips = [];
   const providers = providerHealthSnapshot();
-  if (!mongoUri) tips.push("Ajouter MONGODB_URI dans secret.dev pour persister caches, analyses et résultats sur MongoDB.");
-  if (mongoLastError) tips.push(`MongoDB indisponible: ${mongoLastError}. Le serveur utilise le fallback fichier local.`);
+  if (!supabaseUrl) tips.push("Ajouter SUPABASE_URL dans secret.dev pour connecter le stockage Supabase.");
+  if (!supabaseKey) tips.push("Ajouter SUPABASE_SERVICE_ROLE_KEY dans secret.dev pour autoriser la persistance serveur Supabase.");
+  if (supabaseLastError) tips.push(`Supabase indisponible: ${supabaseLastError}. Le serveur utilise le fallback fichier local.`);
   for (const [name, health] of Object.entries(providers)) {
-    if (["down", "degraded"].includes(health.status) && name !== "mongodb") {
+    if (["down", "degraded"].includes(health.status) && name !== "supabase") {
       tips.push(`${name} ${health.status}: ${health.lastError || "erreur inconnue"}. Kronos bascule sur les sources alternatives et bloque les signaux trop faibles.`);
     }
   }
@@ -3675,27 +3713,28 @@ function healthRecommendations() {
 }
 
 async function databaseSummary() {
-  if (!mongoUri) {
+  if (!hasSupabaseConfig()) {
     return { configured: false, connected: false, storage: "file", dbName: null, lastError: null };
   }
-  const db = await mongoDb();
+  const connected = await checkSupabaseConnection();
   return {
     configured: true,
-    connected: Boolean(db),
-    storage: db ? "mongodb" : "file_fallback",
-    dbName: mongoDbName,
-    lastError: mongoLastError,
+    connected,
+    storage: connected ? "supabase" : "file_fallback",
+    dbName: supabaseProjectRef,
+    table: supabaseStateTable,
+    lastError: supabaseLastError,
   };
 }
 
 async function loadAuthStore() {
-  const fromMongo = await loadStateDocument("auth-store");
-  if (fromMongo) {
+  const fromState = await loadStateDocument("auth-store");
+  if (fromState) {
     return {
       version: 1,
-      users: Array.isArray(fromMongo.users) ? fromMongo.users : [],
-      sessions: Array.isArray(fromMongo.sessions) ? fromMongo.sessions : [],
-      updatedAt: fromMongo.updatedAt || null,
+      users: Array.isArray(fromState.users) ? fromState.users : [],
+      sessions: Array.isArray(fromState.sessions) ? fromState.sessions : [],
+      updatedAt: fromState.updatedAt || null,
     };
   }
   try {
@@ -4049,13 +4088,13 @@ function clearSessionCookie(res) {
 }
 
 async function loadLearningLog() {
-  const fromMongo = await loadStateDocument("learning-log");
-  if (fromMongo) {
+  const fromState = await loadStateDocument("learning-log");
+  if (fromState) {
     return {
       version: 1,
-      analyses: Array.isArray(fromMongo.analyses) ? fromMongo.analyses : [],
-      outcomes: Array.isArray(fromMongo.outcomes) ? fromMongo.outcomes : [],
-      updatedAt: fromMongo.updatedAt || null,
+      analyses: Array.isArray(fromState.analyses) ? fromState.analyses : [],
+      outcomes: Array.isArray(fromState.outcomes) ? fromState.outcomes : [],
+      updatedAt: fromState.updatedAt || null,
     };
   }
   try {
@@ -4382,8 +4421,25 @@ function cleanLine(text) {
 
 function sanitizeError(message) {
   return String(message || "")
-    .replace(/mongodb(?:\+srv)?:\/\/[^"'\s]+/gi, "mongodb://<redacted>")
+    .replace(/https:\/\/[a-z0-9-]+\.supabase\.co/gi, "https://<supabase-project>.supabase.co")
     .replace(/(Bearer|key|token|password|pwd)\s+[^"'\s]+/gi, "$1 <redacted>");
+}
+
+function normalizeSupabaseUrl(value = "") {
+  const raw = String(value || "").trim().replace(/\/+$/, "").replace(/\/rest\/v1$/i, "");
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (/^[a-z0-9-]+$/i.test(raw)) return `https://${raw}.supabase.co`;
+  return raw;
+}
+
+function inferSupabaseProjectRef(url = "") {
+  try {
+    const host = new URL(url).hostname;
+    return host.endsWith(".supabase.co") ? host.split(".")[0] : null;
+  } catch {
+    return null;
+  }
 }
 
 async function loadEnv(path) {
@@ -4393,26 +4449,11 @@ async function loadEnv(path) {
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
-    if (/^mongodb(?:\+srv)?:\/\//i.test(trimmed) && !out.MONGODB_URI) {
-      out.MONGODB_URI = trimmed;
-      continue;
-    }
     const match = trimmed.match(/^([\w.-]+)\s*=\s*(.*)$/);
     if (!match) continue;
     out[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
   }
   return out;
-}
-
-function inferMongoDbName(uri) {
-  if (!uri) return null;
-  try {
-    const url = new URL(uri);
-    const db = url.pathname.replace(/^\//, "").trim();
-    return db || null;
-  } catch {
-    return null;
-  }
 }
 
 async function serveStatic(res, pathname) {

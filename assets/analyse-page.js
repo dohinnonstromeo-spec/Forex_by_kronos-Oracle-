@@ -763,7 +763,22 @@
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(65000),
       });
-      return response.ok ? response.json() : null;
+      if (response.ok) return response.json();
+      let message = `Erreur serveur ${response.status}`;
+      try {
+        const payload = await response.json();
+        message = payload.error || payload.message || message;
+      } catch {}
+      return {
+        direction: "AUCUN SIGNAL",
+        score: 0,
+        technique: "Diagnostic",
+        explanation: message,
+        noSignal: true,
+        statusLabel: "Analyse interrompue",
+        userMessage: "Le serveur a refusé ou interrompu l'analyse avant de renvoyer un setup exploitable.",
+        nextActions: ["Réessayer avec 1 graphe net.", "Vérifier que le serveur local est lancé.", "Réduire le mode profond si les APIs répondent lentement."],
+      };
     } catch (error) {
       if (error?.name === "TimeoutError" || error?.name === "AbortError") {
         return {
@@ -777,7 +792,16 @@
           nextActions: ["Réessayer avec 1 seul graphe net.", "Désactiver temporairement le contexte news/API si besoin.", "Relancer l'analyse après quelques secondes."],
         };
       }
-      return null;
+      return {
+        direction: "AUCUN SIGNAL",
+        score: 0,
+        technique: "Diagnostic",
+        explanation: error?.message || "Erreur réseau inconnue pendant l'analyse.",
+        noSignal: true,
+        statusLabel: "Réponse non reçue",
+        userMessage: "Le navigateur n'a pas pu lire la réponse de Kronos.",
+        nextActions: ["Vérifier la console serveur.", "Relancer le serveur local.", "Réessayer avec une seule image."],
+      };
     }
   }
 

@@ -7,8 +7,5 @@
   },
   "scripts": {
     "start": "node server.mjs"
-  },
-  "dependencies": {
-    "mongodb": "^6.0.0"
   }
 }

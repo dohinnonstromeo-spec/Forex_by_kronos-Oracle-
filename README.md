@@ -24,13 +24,24 @@ GROQ_MODEL=llama-3.3-70b-versatile
 TWELVE_DATA_API_KEY=...
 FINNHUB_API_KEY=...
 NEWS_API_KEY=...
-MONGODB_URI=mongodb+srv://USER:PASSWORD@cluster.mongodb.net/oracle_forex?retryWrites=true&w=majority
-MONGODB_DB=oracle_forex
-MONGODB_TIMEOUT_MS=5000
+SUPABASE_URL=https://PROJECT_REF.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...
+SUPABASE_STATE_TABLE=oracle_app_state
+SUPABASE_TIMEOUT_MS=5000
 ADMIN_TOKEN=une_phrase_secrete_longue
 ```
 
 Le navigateur appelle seulement `/api/...`; les cles restent cote serveur local.
+
+Table Supabase attendue pour la persistance serveur:
+
+```sql
+create table if not exists public.oracle_app_state (
+  id text primary key,
+  payload jsonb not null,
+  updated_at timestamptz not null default now()
+);
+```
 
 Le serveur accepte aussi les cles en rotation:
 
@@ -50,8 +61,6 @@ Voir l'etat des rotations avec:
 ```txt
 http://127.0.0.1:4174/api/provider-status
 ```
-
-Si le mot de passe MongoDB contient des caracteres speciaux comme `@`, encodez-les dans l'URI (`@` devient `%40`).
 
 ## Acces premium manuel
 
