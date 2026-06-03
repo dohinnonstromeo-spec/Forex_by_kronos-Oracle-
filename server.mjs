@@ -614,7 +614,6 @@ Réponds en JSON strict:
       });
       return;
     }
-    const prices = await getPrices();
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
     const includeNewsContext = body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true";
     const analysisDepth = normalizeAnalysisDepth(body.analysisDepth);
@@ -622,7 +621,7 @@ Réponds en JSON strict:
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
-    const livePrice = prices[selectedPair] || await getExternalPrice(selectedPair);
+    const livePrice = await getAnalysisPrice(selectedPair);
     const history = await getHistoryForSymbol(selectedPair, livePrice, {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Swing Trading",
@@ -640,7 +639,7 @@ Réponds en JSON strict:
       })
       : [];
     const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
-    const learning = await updateLearningOutcomes(prices);
+    const learning = await loadLearningLog();
     const calibration = calibrationFor(learning, body);
     const apiOnlySetup = !images.length && includeNewsContext && shouldUseApiOnlySetup({
       livePrice,
@@ -805,6 +804,19 @@ async function getExternalPrice(symbol) {
   } catch {
     return null;
   }
+}
+
+async function getAnalysisPrice(symbol) {
+  if (!symbol) return null;
+  const cache = await loadMarketCache();
+  const price = await fetchBestPrice(symbol, cache.prices?.[symbol]);
+  if (price && Number.isFinite(Number(price.price)) && isLivePriceSource(price.source)) {
+    await saveMarketCache({
+      ...cache,
+      prices: mergeCachedPrices(cache.prices || {}, { [symbol]: price }),
+    });
+  }
+  return price;
 }
 
 function collectEnvKeys(...baseNames) {
@@ -2972,7 +2984,9 @@ function buildNoSignalDiagnostic(details = {}) {
     };
   }
 
-  if (meta.newsContext?.activeRisk || /news économique forte|news rouge|signal suspendu/.test(explanation)) {
+  const hasNewsRiskText = /news économique forte|news rouge proche|signal suspendu/.test(explanation)
+    && !/aucune news rouge proche|pas de blocage macro/.test(explanation);
+  if (meta.newsContext?.activeRisk || hasNewsRiskText) {
     return {
       status: "NEWS_ROUGE",
       statusLabel: "News rouge proche",
@@ -3837,6 +3851,10 @@ function hasSupabaseConfig() {
   return Boolean(supabaseUrl && supabaseKey);
 }
 
+function authPersistenceRequired() {
+  return hasSupabaseConfig() && env.AUTH_ALLOW_FILE_FALLBACK !== "true";
+}
+
 async function checkSupabaseConnection() {
   if (!hasSupabaseConfig()) return false;
   try {
@@ -3945,10 +3963,10 @@ async function saveAuthStore(store) {
       .map(({ token, ...session }) => session),
     updatedAt: now,
   };
-  if (await saveStateDocument("auth-store", trimmed)) return trimmed;
+  if (await saveStateDocument("auth-store", trimmed)) return { ...trimmed, persisted: "supabase" };
   await mkdir(dataDir, { recursive: true });
   await writeFile(authPath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
-  return trimmed;
+  return { ...trimmed, persisted: "file" };
 }
 
 async function signupUser(body = {}) {
@@ -3978,7 +3996,10 @@ async function signupUser(body = {}) {
   const session = createSession(user.id);
   store.users.push(user);
   store.sessions.push(session);
-  await saveAuthStore(store);
+  const saved = await saveAuthStore(store);
+  if (authPersistenceRequired() && saved.persisted !== "supabase") {
+    return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+  }
   return { ok: true, user, session };
 }
 
@@ -3992,7 +4013,10 @@ async function loginUser(body = {}) {
   store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
   store.sessions.push(session);
   user.lastLoginAt = new Date().toISOString();
-  await saveAuthStore(store);
+  const saved = await saveAuthStore(store);
+  if (authPersistenceRequired() && saved.persisted !== "supabase") {
+    return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+  }
   return { ok: true, user, session };
 }
 
