@@ -2278,7 +2278,14 @@ body {
 }
 
 @media (max-width: 900px) {
-  .home-links { display: none; }
+  .home-nav { gap: 10px; }
+  .home-links {
+    display: flex;
+    margin-left: auto;
+  }
+  .home-links a:not([href="/tester-gratuitement"]):not([href="/login"]) {
+    display: none;
+  }
   .home-hero { padding-top: 116px; }
   .home-metrics,
   .home-market-grid,
@@ -2292,7 +2299,15 @@ body {
 
 @media (max-width: 640px) {
   .home-nav { min-height: 68px; }
-  .home-nav-cta { display: none; }
+  .home-brand span:last-child { display: none; }
+  .home-links a[href="/tester-gratuitement"] { display: none; }
+  .home-links { gap: 8px; }
+  .home-links a,
+  .home-nav-cta {
+    min-height: 36px;
+    padding: 0 10px;
+    font-size: .68rem;
+  }
   .home-hero h1 { font-size: 3rem; }
   .home-chart-body { height: 340px; }
   .home-chart-foot,

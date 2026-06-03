@@ -349,10 +349,11 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/health") {
     const learning = await loadLearningLog();
+    const database = await databaseSummary();
     sendJson(res, 200, {
       market: marketStatus(),
+      database,
       providers: providerHealthSnapshot(),
-      database: await databaseSummary(),
       cache: await marketCacheSummary(),
       runtimeCache: runtimeCacheSummary(),
       learning: learningSummary(learning),
@@ -625,7 +626,7 @@ Réponds en JSON strict:
     const history = await getHistoryForSymbol(selectedPair, livePrice, {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Swing Trading",
-      historyBudgetMs: deepAnalysis ? 9000 : 4500,
+      historyBudgetMs: deepAnalysis ? 12000 : 7000,
     });
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
@@ -635,11 +636,21 @@ Réponds en JSON strict:
       ? await buildMultiTimeframeContext(selectedPair, livePrice, {
         timeframe: selectedTimeframe,
         strategy: body.strategy || "Swing Trading",
+        historyBudgetMs: images.length ? 7000 : 9000,
       })
       : [];
     const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
     const learning = await updateLearningOutcomes(prices);
     const calibration = calibrationFor(learning, body);
+    const apiOnlySetup = !images.length && includeNewsContext && shouldUseApiOnlySetup({
+      livePrice,
+      technicalSnapshot,
+      newsContext,
+      multiTimeframe,
+    });
+    const apiOnlyBlockReason = !images.length && includeNewsContext && !apiOnlySetup
+      ? apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, multiTimeframe })
+      : null;
     const prompt = `${KRONOS_SYSTEM_PROMPT}
 
 CONTEXTE:
@@ -680,13 +691,37 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
 
     Analyse le contexte fourni et donne un setup éducatif exploitable avec prudence.`;
     const aiBudgetMs = images.length
-      ? deepAnalysis ? 52000 : 26000
-      : deepAnalysis ? 26000 : 14000;
-    let answer = await promiseWithTimeout(
-      images.length ? analyzeChartImage(prompt, images) : groq(prompt, 500, 0.3),
-      aiBudgetMs,
-      "",
-    );
+      ? deepAnalysis ? 115000 : 65000
+      : deepAnalysis ? 55000 : 28000;
+    let answer = apiOnlySetup
+      ? buildApiOnlyAnalysisText({
+        pair: selectedPair,
+        timeframe: selectedTimeframe,
+        style: body.style || "Mixte",
+        strategy: body.strategy || "Swing Trading",
+        risk: body.risk,
+        livePrice,
+        technicalSnapshot,
+        newsContext,
+        multiTimeframe,
+      })
+      : apiOnlyBlockReason
+        ? buildApiOnlyNoSignalText({
+          pair: selectedPair,
+          timeframe: selectedTimeframe,
+          style: body.style || "Mixte",
+          strategy: body.strategy || "Swing Trading",
+          livePrice,
+          technicalSnapshot,
+          newsContext,
+          multiTimeframe,
+          reason: apiOnlyBlockReason,
+        })
+      : await promiseWithTimeout(
+        images.length ? analyzeChartImage(prompt, images) : groq(prompt, 700, 0.25),
+        aiBudgetMs,
+        "",
+      );
     if (!answer) {
       answer = buildDeterministicAnalysisText({
         pair: selectedPair,
@@ -697,7 +732,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         risk: body.risk,
       });
     }
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe });
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup });
     if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null });
     sendJson(res, 200, result);
     return;
@@ -1171,6 +1206,7 @@ async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
     const history = await getHistoryForSymbol(symbol, livePrice, {
       timeframe,
       strategy: options.strategy,
+      historyBudgetMs: options.historyBudgetMs || 4500,
     });
     const snapshot = buildTechnicalSnapshot(symbol, history, livePrice, {
       timeframe,
@@ -2007,7 +2043,7 @@ async function groqOnce(key, model, prompt, maxTokens, temperature) {
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(18000),
+    signal: AbortSignal.timeout(35000),
     body: JSON.stringify({
       model,
       messages: [{ role: "user", content: prompt }],
@@ -2029,7 +2065,7 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
         const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: AbortSignal.timeout(18000),
+          signal: AbortSignal.timeout(35000),
           body: JSON.stringify({
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             generationConfig: { temperature, maxOutputTokens: maxTokens },
@@ -2070,7 +2106,7 @@ async function groqVision(prompt, images) {
         const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
           method: "POST",
           headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-          signal: AbortSignal.timeout(22000),
+          signal: AbortSignal.timeout(45000),
           body: JSON.stringify({
             model,
             messages: [{
@@ -2123,7 +2159,7 @@ async function geminiVision(prompt, images) {
         const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: AbortSignal.timeout(22000),
+          signal: AbortSignal.timeout(45000),
           body: JSON.stringify({
             contents: [{
               role: "user",
@@ -2358,6 +2394,141 @@ STYLE_EFFICACITE:Price Action=45`;
   return { answer: text, score: extractScore(text, seed), technique: extractTechnique(text) };
 }
 
+function shouldUseApiOnlySetup({ livePrice, technicalSnapshot, newsContext, multiTimeframe = [] }) {
+  if (!Number.isFinite(Number(livePrice?.price)) || !isUsableLivePrice(livePrice)) return false;
+  if (!technicalSnapshot?.valid) return false;
+  if (newsContext?.activeRisk) return false;
+  const consensus = analyzeMultiTimeframeConsensus(multiTimeframe);
+  if (consensus.conflict && consensus.usable >= 2) return false;
+  const executionTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""));
+  const strongMtfTrend = /haussi|baissi/i.test(String(consensus.dominant || "")) && consensus.usable >= 2 && consensus.score >= 75;
+  if (executionTrend && strongMtfTrend && trendDirection(technicalSnapshot.trend) !== trendDirection(consensus.dominant)) return false;
+  if (!executionTrend && !strongMtfTrend) return false;
+  return Number(technicalSnapshot.confirmations || 0) >= 4;
+}
+
+function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, multiTimeframe = [] }) {
+  if (!Number.isFinite(Number(livePrice?.price)) || !isUsableLivePrice(livePrice)) {
+    return "Prix live absent ou source trop faible.";
+  }
+  if (!technicalSnapshot?.valid) {
+    return "Historique API insuffisant ou non aligné avec le timeframe.";
+  }
+  if (newsContext?.activeRisk) {
+    return "News économique forte proche: signal suspendu.";
+  }
+  const consensus = analyzeMultiTimeframeConsensus(multiTimeframe);
+  if (consensus.conflict && consensus.usable >= 2) {
+    return `Conflit multi-timeframe: ${consensus.summary}.`;
+  }
+  const executionDirection = trendDirection(technicalSnapshot.trend);
+  const mtfDirection = trendDirection(consensus.dominant);
+  if (executionDirection && mtfDirection && executionDirection !== mtfDirection && consensus.score >= 75) {
+    return `Conflit timeframe: exécution ${technicalSnapshot.trend}, contexte supérieur ${consensus.summary}.`;
+  }
+  if (!executionDirection && !(mtfDirection && consensus.usable >= 2 && consensus.score >= 75)) {
+    return `Marché sans tendance exploitable: ${technicalSnapshot.trend || "neutre"}; ${consensus.summary}.`;
+  }
+  return "Confluence insuffisante pour proposer un plan sans screenshot.";
+}
+
+function buildApiOnlyNoSignalText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
+  const technique = style === "Mixte" ? "Price Action" : style;
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  return `📸 LECTURE DES GRAPHIQUES :
+Analyse sans screenshot — utilise uniquement prix live + historique API + calendrier/news.
+
+📡 DONNÉES LIVE :
+- Prix live: ${formatLevel(livePrice?.price, pair)} | Source: ${livePrice?.source || "API"} | Fiabilité: ${livePrice?.reliability || "n/a"}
+- Historique: ${technicalSnapshot.bars || 0} bougies | SMA10/SMA30: ${technicalSnapshot.sma10 ?? "n/a"} / ${technicalSnapshot.sma30 ?? "n/a"} | RSI: ${technicalSnapshot.rsi ?? "n/a"} | ATR: ${technicalSnapshot.atr ?? "n/a"}
+
+📐 TECHNIQUE UTILISÉE : ${technique}
+📊 ANALYSE :
+- Tendance : ${technicalSnapshot.trend || "Neutre"}
+- Signal détecté : AUCUN SIGNAL — ${reason}
+- Zone d'entrée : —
+- Stop Loss : —
+- Take Profit 1 : —
+- Take Profit 2 : —
+- R/R ratio : —
+✅ CONFLUENCE : ${technicalSnapshot.text || "snapshot technique disponible"} | MTF: ${mtf.summary} | News/API: ${newsContext?.summary || "non consulté"}
+⚠️ RISQUE : Ce n'est pas un conseil financier. Kronos bloque le plan pour éviter une entrée faible ou contradictoire.
+SCORE_CONFIANCE:45
+TECHNIQUE_UTILISEE:${technique}
+STYLE_EFFICACITE:${technique}=45`;
+}
+
+function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
+    ? String(technicalSnapshot.trend)
+    : mtf.dominant;
+  const trend = /baissi/i.test(String(rawTrend || "")) ? "baissière" : "haussière";
+  const direction = trend === "baissière" ? "VENTE" : "ACHAT";
+  const live = Number(livePrice?.price);
+  const support = Number(technicalSnapshot.support);
+  const resistance = Number(technicalSnapshot.resistance);
+  const entry = Number.isFinite(live) ? live : direction === "ACHAT" ? support : resistance;
+  const structuralSl = direction === "ACHAT" && Number.isFinite(support) && support < entry
+    ? support
+    : direction === "VENTE" && Number.isFinite(resistance) && resistance > entry
+      ? resistance
+      : NaN;
+  const levels = buildAssistedLevels({
+    direction,
+    entry,
+    sl: structuralSl,
+    tp: NaN,
+    tp2: NaN,
+    live,
+    pair,
+    strategy,
+    risk,
+  });
+  const rr = rewardRisk(direction, levels.entry, levels.sl, levels.tp);
+  const technique = style === "Mixte" ? "Price Action" : style;
+  const newsLine = newsContext?.enabled
+    ? newsContext.activeRisk ? "risque macro actif détecté" : "aucune news rouge proche détectée"
+    : "contexte news non demandé";
+  const confidence = Math.max(62, Math.min(78, 58 + Number(technicalSnapshot.confirmations || 0) * 3 + (mtf.usable >= 2 ? 4 : 0)));
+  return `📸 LECTURE DES GRAPHIQUES :
+Analyse sans screenshot — utilise uniquement prix live + historique API + calendrier/news.
+
+📡 DONNÉES LIVE :
+- Prix live: ${formatLevel(live, pair)} | Source: ${livePrice?.source || "API"} | Fiabilité: ${livePrice?.reliability || "n/a"}
+- Historique: ${technicalSnapshot.bars || 0} bougies | SMA10/SMA30: ${technicalSnapshot.sma10 ?? "n/a"} / ${technicalSnapshot.sma30 ?? "n/a"} | RSI: ${technicalSnapshot.rsi ?? "n/a"} | ATR: ${technicalSnapshot.atr ?? "n/a"}
+
+📐 TECHNIQUE UTILISÉE : ${technique}
+Lecture Price Action API: tendance ${trend}, support ${formatLevel(support, pair)}, résistance ${formatLevel(resistance, pair)}, cassure/retest à confirmer avant exécution.
+
+📊 ANALYSE :
+- Tendance : ${trend === "baissière" ? "Baissière" : "Haussière"}
+- Signal détecté : ${direction} prudent basé sur prix live, structure API et gestion du risque
+- Zone d'entrée : ${formatLevel(levels.entry, pair)}
+- Stop Loss : ${formatLevel(levels.sl, pair)}
+- Take Profit 1 : ${formatLevel(levels.tp, pair)}
+- Take Profit 2 : ${formatLevel(levels.tp2, pair)}
+- R/R ratio : 1:${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}
+✅ CONFLUENCE : ${technicalSnapshot.text || "snapshot technique disponible"} | MTF: ${mtf.summary} | News/API: ${newsLine}
+⚠️ RISQUE : Ce n'est pas un conseil financier. Sans screenshot, Kronos exige confirmation visuelle du rejet, retest ou momentum avant entrée réelle.
+SCORE_CONFIANCE:${confidence}
+TECHNIQUE_UTILISEE:${technique}
+STYLE_EFFICACITE:${technique}=${confidence}`;
+}
+
+function trendDirection(value = "") {
+  if (/baissi|vente/i.test(String(value))) return "VENTE";
+  if (/haussi|achat/i.test(String(value))) return "ACHAT";
+  return null;
+}
+
+function extractTradeDirection(text = "") {
+  const signalLine = String(text).match(/Signal détecté\s*:\s*([^\n\r]+)/i)?.[1] || "";
+  const direct = trendDirection(signalLine);
+  if (direct) return direct;
+  return trendDirection(text) || "ACHAT";
+}
+
 function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, risk }) {
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
@@ -2539,6 +2710,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   const hasChartImages = Number(imageQuality.images || 0) > 0;
   const calibration = context.calibration || { adjustment: 0, message: "Aucune calibration." };
   const livePrice = context.livePrice;
+  const apiOnlySetup = Boolean(context.apiOnlySetup);
   const chartContext = context.chartContext || {};
   const live = Number(livePrice?.price);
   const mtfConsensus = analyzeMultiTimeframeConsensus(context.multiTimeframe || []);
@@ -2586,7 +2758,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta,
     });
   }
-  if (!hasChartImages && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
+  if (!hasChartImages && !apiOnlySetup && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 42),
       technique: validation.technique,
@@ -2595,7 +2767,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta,
     });
   }
-  const direction = /vente|baissi/i.test(text) ? "VENTE" : /achat|haussi/i.test(text) ? "ACHAT" : "ACHAT";
+  const direction = extractTradeDirection(text);
   let entry = extractLevel(text, /(?:zone d'entrée|entrée|entry)\s*:?\s*([0-9.,]+)/i, NaN);
   let sl = extractLevel(text, /(?:stop loss|sl)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp = extractLevel(text, /(?:take profit\s*1|tp1|take profit|tp)\s*:?\s*([0-9.,]+)/i, NaN);
@@ -2672,7 +2844,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   }
   const profile = riskProfile(body.risk);
   const riskPlan = buildRiskPlan({ capital: body.capital, profile });
-  const effectiveImageScore = hasChartImages ? imageQuality.score : 65;
+  const effectiveImageScore = hasChartImages ? imageQuality.score : apiOnlySetup ? 78 : 65;
   const calibratedScore = Math.max(0, Math.min(100, Math.round(
     normalized.score * 0.42 + validation.score * 0.18 + effectiveImageScore * 0.2 + levelCheck.score * 0.2 + calibration.adjustment,
   )));
@@ -2796,6 +2968,19 @@ function buildNoSignalDiagnostic(details = {}) {
         "Vérifier les clés Groq/Gemini dans secret.dev ou sur Render.",
         "Relancer le serveur après modification des variables.",
         "Utiliser temporairement une analyse texte/prix live.",
+      ],
+    };
+  }
+
+  if (meta.newsContext?.activeRisk || /news économique forte|news rouge|signal suspendu/.test(explanation)) {
+    return {
+      status: "NEWS_ROUGE",
+      statusLabel: "News rouge proche",
+      userMessage: "Kronos bloque le trade car un événement macro fort peut fausser les niveaux et accélérer la volatilité.",
+      nextActions: [
+        "Attendre que la news soit publiée et que le spread se stabilise.",
+        "Relancer l'analyse après 30 à 60 minutes.",
+        "Ne pas entrer juste avant une annonce high impact.",
       ],
     };
   }
@@ -3614,7 +3799,7 @@ function getApiStatus() {
 }
 
 async function loadStateDocument(id) {
-  if (!hasSupabaseConfig() || supabaseUnavailable) return null;
+  if (!hasSupabaseConfig()) return null;
   try {
     const rows = await supabaseRequest(
       `${supabaseStateTable}?id=eq.${encodeURIComponent(id)}&select=payload&limit=1`,
@@ -3624,7 +3809,6 @@ async function loadStateDocument(id) {
     recordProviderHealth("supabase", true);
     return Array.isArray(rows) ? rows[0]?.payload || null : null;
   } catch (error) {
-    supabaseUnavailable = true;
     supabaseLastError = sanitizeError(error.message);
     recordProviderHealth("supabase", false, supabaseLastError);
     return null;
@@ -3632,7 +3816,7 @@ async function loadStateDocument(id) {
 }
 
 async function saveStateDocument(id, payload) {
-  if (!hasSupabaseConfig() || supabaseUnavailable) return false;
+  if (!hasSupabaseConfig()) return false;
   try {
     await supabaseRequest(`${supabaseStateTable}?on_conflict=id`, {
       method: "POST",
@@ -3643,7 +3827,6 @@ async function saveStateDocument(id, payload) {
     recordProviderHealth("supabase", true);
     return true;
   } catch (error) {
-    supabaseUnavailable = true;
     supabaseLastError = sanitizeError(error.message);
     recordProviderHealth("supabase", false, supabaseLastError);
     return false;

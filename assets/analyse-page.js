@@ -73,7 +73,7 @@
       body.images = images;
       body.autoDetect = isAutoDetectEnabled();
       body.detectedContext = isAutoDetectEnabled() ? detectedContext : null;
-      const response = await postJson("/api/analyze-chart", body);
+      const response = await postJson("/api/analyze-chart", body, deep ? 180000 : 120000);
       finishAnalysisProgress(progress, Boolean(response));
       renderAnalysisResult(result, response);
       submit.disabled = false;
@@ -603,11 +603,45 @@
 
   async function filesToDataUrls(items, limit = MAX_CHART_IMAGES) {
     const valid = items.filter((file) => /image\/(png|jpe?g|webp)/i.test(file.type)).slice(0, limit);
-    return Promise.all(valid.map((file) => new Promise((resolve) => {
+    return Promise.all(valid.map((file) => imageFileToOptimizedDataUrl(file)));
+  }
+
+  async function imageFileToOptimizedDataUrl(file) {
+    const original = await readFileAsDataUrl(file);
+    try {
+      const image = await loadImage(original);
+      const maxSide = 1800;
+      const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+      const width = Math.max(1, Math.round(image.width * scale));
+      const height = Math.max(1, Math.round(image.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(image, 0, 0, width, height);
+      return canvas.toDataURL("image/jpeg", 0.88);
+    } catch {
+      return original;
+    }
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
       reader.readAsDataURL(file);
-    })));
+    });
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = reject;
+      image.src = src;
+    });
   }
 
   function renderTradePlan(result) {
@@ -755,13 +789,13 @@
     }
   }
 
-  async function postJson(url, body) {
+  async function postJson(url, body, timeoutMs = 120000) {
     try {
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(65000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (response.ok) return response.json();
       let message = `Erreur serveur ${response.status}`;
