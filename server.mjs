@@ -642,12 +642,13 @@ Réponds en JSON strict:
     const learning = await loadLearningLog();
     const calibration = calibrationFor(learning, body);
     const quickApiSetup = !deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice);
-    const apiOnlySetup = !images.length && includeNewsContext && shouldUseApiOnlySetup({
+    const deepAssistedSetup = deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice) && !newsContext?.activeRisk && technicalSnapshot?.valid;
+    const apiOnlySetup = deepAssistedSetup || (!images.length && includeNewsContext && shouldUseApiOnlySetup({
       livePrice,
       technicalSnapshot,
       newsContext,
       multiTimeframe,
-    });
+    }));
     const apiOnlyBlockReason = !images.length && includeNewsContext && !apiOnlySetup
       ? apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, multiTimeframe })
       : null;
@@ -674,7 +675,7 @@ CONTEXTE:
 RÈGLE STRICTE:
 Nombre de graphes fournis: ${images.length}.
 ${deepAnalysis
-  ? "Mode Profonde: réfléchis comme un analyste trading expérimenté. Tu dois lier explicitement paire, timeframe, capital, stratégie, style, risque, prix live, historique, MTF et news. Si une donnée contredit le setup, bloque ou baisse le score. Donne un raisonnement utile, pas seulement des niveaux."
+  ? "Mode Profonde: réfléchis comme un analyste trading expérimenté. Tu dois lier explicitement paire, timeframe, capital, stratégie, style, risque, prix live, historique, MTF et news. Si une donnée contredit vraiment le setup, baisse le score ou rends le plan conditionnel. Ne retourne AUCUN SIGNAL que si prix live absent, news rouge active, niveaux incohérents ou risque structurel dangereux. Donne un raisonnement utile, pas seulement des niveaux."
   : "Mode Rapide: fais court, direct et exploitable. Reprends le comportement rapide classique: lecture du graphe ou du prix live, niveaux cohérents, validation prudente, sans analyse macro/MTF longue."}
 Si aucun graphe n'est fourni, ne prétends jamais voir des chandeliers, order blocks, FVG, nuage Ichimoku, vagues Elliott ou structures visibles. Dans ce cas, écris clairement "Analyse sans screenshot", utilise seulement prix live/contexte formulaire, et plafonne le score à 70.
 Si un ou plusieurs graphes sont fournis, distingue ce qui est réellement visible sur les images de ce qui vient du prix live/API.
@@ -747,6 +748,19 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         livePrice,
         risk: body.risk,
         capital: body.capital,
+        technicalSnapshot,
+        newsContext,
+        multiTimeframe,
+      });
+    }
+    if (deepAnalysis && isUnproductiveAnalysis(answer) && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice) && !newsContext?.activeRisk) {
+      answer = buildApiOnlyAnalysisText({
+        pair: selectedPair,
+        timeframe: selectedTimeframe,
+        style: body.style || "Mixte",
+        strategy: body.strategy || "Swing Trading",
+        risk: body.risk,
+        livePrice,
         technicalSnapshot,
         newsContext,
         multiTimeframe,
@@ -2425,6 +2439,10 @@ SCORE_CONFIANCE:45
 TECHNIQUE_UTILISEE:Price Action
 STYLE_EFFICACITE:Price Action=45`;
   return { answer: text, score: extractScore(text, seed), technique: extractTechnique(text) };
+}
+
+function isUnproductiveAnalysis(answer = "") {
+  return /aucun signal|pas de signal|setup non confirm|signal non valid|niveaux? non exploit|entrée non exploit|entree non exploit|impossible de proposer|ne pas entrer/i.test(String(answer || ""));
 }
 
 function shouldUseApiOnlySetup({ livePrice, technicalSnapshot, newsContext, multiTimeframe = [] }) {
@@ -4785,7 +4803,7 @@ async function loadEnv(path) {
 }
 
 async function serveStatic(res, pathname) {
-  if ((pathname === "/admin" || pathname === "/admin-health" || pathname === "/admin-health.html") && env.ADMIN_HEALTH_PUBLIC !== "true") {
+  if ((pathname === "/admin-health" || pathname === "/admin-health.html") && env.ADMIN_HEALTH_PUBLIC !== "true") {
     sendJson(res, 404, { error: "not_found" });
     return;
   }
@@ -4803,7 +4821,7 @@ async function serveStatic(res, pathname) {
     "/premium-admin": "/premium-admin.html",
     "/admin-premium": "/premium-admin.html",
     "/admin-health": "/admin-health.html",
-    "/admin": "/admin-health.html",
+    "/admin": "/premium-admin.html",
     "/legal": "/legal.html",
     "/cgu": "/legal.html",
     "/confidentialite": "/legal.html",

@@ -371,12 +371,12 @@
           </div>
         </div>
         <div class="levels-table result-level-grid">
-          <div class="level-card entry"><span>Entrée</span><strong>${result.entry}</strong></div>
-          <div class="level-card sl"><span>Stop Loss</span><strong>${result.sl}</strong></div>
-          <div class="level-card tp"><span>Take Profit 1</span><strong>${result.tp1}</strong></div>
-          <div class="level-card tp"><span>Take Profit 2</span><strong>${result.tp2}</strong></div>
-          <div class="level-card rr"><span>R/R ratio</span><strong>${result.rr}</strong></div>
-          <div class="level-card tech"><span>Technique</span><strong>${result.technique}</strong></div>
+          ${renderCopyValue("Entrée", result.entry, "entry")}
+          ${renderCopyValue("Stop Loss", result.sl, "sl")}
+          ${renderCopyValue("Take Profit 1", result.tp1, "tp")}
+          ${renderCopyValue("Take Profit 2", result.tp2, "tp")}
+          ${renderCopyValue("R/R ratio", result.rr, "rr")}
+          <div class="level-card tech"><span>Technique</span><strong>${escapeHtml(result.technique)}</strong></div>
         </div>
         <div class="score-line">
           <div class="signal-bottom"><span>Score d'efficacité</span><strong>${result.score}%</strong></div>
@@ -722,9 +722,9 @@
     `;
   }
 
-  function renderCopyValue(label, value) {
+  function renderCopyValue(label, value, className = "") {
     if (!value || value === "—") return "";
-    return `<button type="button" data-copy-value="${escapeHtml(value)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></button>`;
+    return `<button class="level-card ${escapeHtml(className)}" type="button" data-copy-value="${escapeHtml(value)}" title="Copier ${escapeHtml(label)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></button>`;
   }
 
   async function copyTradePlan(container) {
