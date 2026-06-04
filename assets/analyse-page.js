@@ -73,7 +73,7 @@
       body.images = images;
       body.autoDetect = isAutoDetectEnabled();
       body.detectedContext = isAutoDetectEnabled() ? detectedContext : null;
-      const response = await postJson("/api/analyze-chart", body, deep ? 180000 : 120000);
+      const response = await postJson("/api/analyze-chart", body, deep ? 120000 : 45000);
       finishAnalysisProgress(progress, Boolean(response));
       renderAnalysisResult(result, response);
       submit.disabled = false;
@@ -801,7 +801,19 @@
       let message = `Erreur serveur ${response.status}`;
       try {
         const payload = await response.json();
-        message = payload.error || payload.message || message;
+        message = payload.userMessage || payload.message || payload.error || message;
+        if (payload?.error?.includes("quota")) {
+          return {
+            direction: "AUCUN SIGNAL",
+            score: 0,
+            technique: "Quota",
+            explanation: message,
+            noSignal: true,
+            statusLabel: "Limite atteinte",
+            userMessage: message,
+            nextActions: Array.isArray(payload.nextActions) ? payload.nextActions : ["Revenir à l'heure de réinitialisation indiquée.", "Activer Premium pour supprimer la limite."],
+          };
+        }
       } catch {}
       return {
         direction: "AUCUN SIGNAL",
@@ -815,15 +827,22 @@
       };
     } catch (error) {
       if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        const deep = body?.analysisDepth !== "Rapide";
         return {
           direction: "AUCUN SIGNAL",
           score: 0,
-          technique: "Analyse profonde",
-          explanation: "L'analyse profonde a dépassé le délai côté navigateur. Les APIs ou le modèle IA répondent trop lentement; relancez ou réduisez le nombre d'images/news.",
+          technique: deep ? "Analyse profonde" : "Analyse rapide",
+          explanation: deep
+            ? "L'analyse profonde a dépassé le délai côté navigateur. Les APIs ou le modèle IA répondent trop lentement; relancez ou réduisez le nombre d'images/news."
+            : "L'analyse rapide n'a pas répondu dans le délai prévu. Relancez avec moins d'images ou sans détection automatique.",
           noSignal: true,
           statusLabel: "Analyse trop longue",
-          userMessage: "Kronos prend trop de temps à croiser toutes les sources. Ce n'est pas forcément une panne, mais le résultat n'est pas arrivé dans le délai.",
-          nextActions: ["Réessayer avec 1 seul graphe net.", "Désactiver temporairement le contexte news/API si besoin.", "Relancer l'analyse après quelques secondes."],
+          userMessage: deep
+            ? "Kronos prend trop de temps à croiser toutes les sources. Ce n'est pas forcément une panne, mais le résultat n'est pas arrivé dans le délai."
+            : "Le mode rapide doit répondre vite; le navigateur a coupé l'attente avant réception.",
+          nextActions: deep
+            ? ["Réessayer avec 1 seul graphe net.", "Désactiver temporairement le contexte news/API si besoin.", "Relancer l'analyse après quelques secondes."]
+            : ["Réessayer sans détection automatique.", "Utiliser 1 seul graphe net.", "Relancer dans quelques secondes."],
         };
       }
       return {

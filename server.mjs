@@ -253,7 +253,7 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const result = await signupUser(body);
     if (!result.ok) return sendJson(res, 400, result);
-    setSessionCookie(res, result.session.token);
+    setSessionCookie(res, result.session.token, req);
     sendJson(res, 200, { ok: true, user: publicUser(result.user) });
     return;
   }
@@ -263,7 +263,7 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const result = await loginUser(body);
     if (!result.ok) return sendJson(res, 401, result);
-    setSessionCookie(res, result.session.token);
+    setSessionCookie(res, result.session.token, req);
     sendJson(res, 200, { ok: true, user: publicUser(result.user) });
     return;
   }
@@ -615,9 +615,9 @@ Réponds en JSON strict:
       return;
     }
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
-    const includeNewsContext = body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true";
     const analysisDepth = normalizeAnalysisDepth(body.analysisDepth);
     const deepAnalysis = analysisDepth === "Profonde";
+    const includeNewsContext = deepAnalysis && (body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true");
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
@@ -625,7 +625,7 @@ Réponds en JSON strict:
     const history = await getHistoryForSymbol(selectedPair, livePrice, {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Swing Trading",
-      historyBudgetMs: deepAnalysis ? 12000 : 7000,
+      historyBudgetMs: deepAnalysis ? 11000 : 3500,
     });
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
@@ -672,6 +672,9 @@ CONTEXTE:
 
 RÈGLE STRICTE:
 Nombre de graphes fournis: ${images.length}.
+${deepAnalysis
+  ? "Mode Profonde: réfléchis comme un analyste trading expérimenté. Tu dois lier explicitement paire, timeframe, capital, stratégie, style, risque, prix live, historique, MTF et news. Si une donnée contredit le setup, bloque ou baisse le score. Donne un raisonnement utile, pas seulement des niveaux."
+  : "Mode Rapide: fais court, direct et exploitable. Reprends le comportement rapide classique: lecture du graphe ou du prix live, niveaux cohérents, validation prudente, sans analyse macro/MTF longue."}
 Si aucun graphe n'est fourni, ne prétends jamais voir des chandeliers, order blocks, FVG, nuage Ichimoku, vagues Elliott ou structures visibles. Dans ce cas, écris clairement "Analyse sans screenshot", utilise seulement prix live/contexte formulaire, et plafonne le score à 70.
 Si un ou plusieurs graphes sont fournis, distingue ce qui est réellement visible sur les images de ce qui vient du prix live/API.
 Si le style demandé est "Mixte", compare ICT, SMC, Wyckoff, Elliott, Price Action et Ichimoku, puis retiens uniquement le style avec la meilleure efficacité visible.
@@ -690,9 +693,22 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
 
     Analyse le contexte fourni et donne un setup éducatif exploitable avec prudence.`;
     const aiBudgetMs = images.length
-      ? deepAnalysis ? 115000 : 65000
-      : deepAnalysis ? 55000 : 28000;
-    let answer = apiOnlySetup
+      ? deepAnalysis ? 85000 : 35000
+      : deepAnalysis ? 32000 : 9000;
+    let answer = !deepAnalysis && !images.length
+      ? buildDeterministicAnalysisText({
+        pair: selectedPair,
+        timeframe: selectedTimeframe,
+        style: body.style || "Mixte",
+        strategy: body.strategy || "Swing Trading",
+        livePrice,
+        risk: body.risk,
+        capital: body.capital,
+        technicalSnapshot,
+        newsContext,
+        multiTimeframe,
+      })
+      : apiOnlySetup
       ? buildApiOnlyAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
@@ -729,6 +745,10 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         strategy: body.strategy || "Swing Trading",
         livePrice,
         risk: body.risk,
+        capital: body.capital,
+        technicalSnapshot,
+        newsContext,
+        multiTimeframe,
       });
     }
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup });
@@ -2541,11 +2561,14 @@ function extractTradeDirection(text = "") {
   return trendDirection(text) || "ACHAT";
 }
 
-function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, risk }) {
+function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;
-  const direction = Number(livePrice?.change) < 0 ? "VENTE" : "ACHAT";
+  const snapshotDirection = trendDirection(technicalSnapshot.trend);
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const mtfDirection = trendDirection(mtf.dominant);
+  const direction = snapshotDirection || mtfDirection || (Number(livePrice?.change) < 0 ? "VENTE" : "ACHAT");
   const levels = buildAssistedLevels({
     direction,
     entry: Number.isFinite(price) ? price : NaN,
@@ -2558,21 +2581,55 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
     risk,
   });
   const technique = style === "Mixte" ? "Price Action" : style;
+  const evidence = styleEvidenceLine(technique);
   const strategyLine = strategyGuide(strategy, timeframe);
-  return `📐 TECHNIQUE UTILISÉE : ${technique} + prix live, car la vision IA n'a pas fourni un setup complet.
+  const rr = rewardRisk(direction, levels.entry, levels.sl, levels.tp);
+  const profile = riskProfile(risk);
+  const riskPlan = buildRiskPlan({ capital, profile });
+  const technicalLine = technicalSnapshot?.text || "snapshot technique indisponible: lecture prudente par prix live.";
+  const newsLine = newsContext?.enabled
+    ? newsContext.activeRisk ? "news rouge proche: prudence maximale" : "pas de blocage macro détecté"
+    : "news désactivées en mode rapide";
+  const confidence = Math.max(52, Math.min(72,
+    48
+    + (technicalSnapshot?.valid ? 10 : 0)
+    + (Number(technicalSnapshot?.confirmations || 0) * 2)
+    + (Number.isFinite(Number(livePrice?.price)) ? 6 : 0)
+    - (newsContext?.activeRisk ? 16 : 0),
+  ));
+  return `📸 LECTURE DES GRAPHIQUES :
+Analyse sans screenshot — ou fallback API si la vision IA a dépassé le délai. Ne pas prétendre lire des éléments visuels non confirmés.
+
+📡 DONNÉES LIVE :
+- Prix live: ${formatLevel(price, pair)} | Source: ${livePrice?.source || "fallback"} | Fiabilité: ${livePrice?.reliability || "n/a"}
+- Historique: ${technicalSnapshot.bars || 0} bougies | SMA10/SMA30: ${technicalSnapshot.sma10 ?? "n/a"} / ${technicalSnapshot.sma30 ?? "n/a"} | RSI: ${technicalSnapshot.rsi ?? "n/a"} | ATR: ${technicalSnapshot.atr ?? "n/a"}
+
+📐 TECHNIQUE UTILISÉE : ${technique} + prix live/API, car l'IA n'a pas fourni un setup complet.
+${evidence}
 📊 ANALYSE :
 - Tendance : ${direction === "ACHAT" ? "Haussière indicative" : "Baissière indicative"}
-- Signal détecté : AUCUN SIGNAL — ${strategyLine}
+- Signal détecté : ${direction} prudent — ${strategyLine}
 - Zone d'entrée : ${formatLevel(levels.entry, pair)}
 - Stop Loss : ${formatLevel(levels.sl, pair)}
 - Take Profit 1 : ${formatLevel(levels.tp, pair)}
 - Take Profit 2 : ${formatLevel(levels.tp2, pair)}
-✅ CONFLUENCE : Prix live ${pair} à confirmer sur le graphe
-⚠️ RISQUE : Ce n'est pas un conseil financier.
+- R/R ratio : 1:${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}
+✅ CONFLUENCE : ${technicalLine} | MTF: ${mtf.summary} | News/API: ${newsLine}
+⚠️ RISQUE : Ce n'est pas un conseil financier. ${riskPlan.instruction}
 ⚠️ NIVEAUX INDICATIFS UNIQUEMENT — Kronos n'a pas pu lire le graphique. Ne pas trader ces niveaux directement.
-SCORE_CONFIANCE:45
+SCORE_CONFIANCE:${confidence}
 TECHNIQUE_UTILISEE:${technique}
-STYLE_EFFICACITE:${technique}=45`;
+STYLE_EFFICACITE:${technique}=${confidence}`;
+}
+
+function styleEvidenceLine(style = "Price Action") {
+  const normalized = normalizeForSearch(style);
+  if (normalized.includes("ict")) return "Lecture ICT prudente: liquidité, OTE et kill zone à confirmer visuellement avant entrée.";
+  if (normalized.includes("smc")) return "Lecture SMC prudente: order block, FVG, BOS/CHOCH et liquidité à confirmer visuellement avant entrée.";
+  if (normalized.includes("wyckoff")) return "Lecture Wyckoff prudente: accumulation/distribution, spring/UTAD et effort/résultat à confirmer visuellement.";
+  if (normalized.includes("elliott")) return "Lecture Elliott prudente: impulsion 1-5 ou correction ABC à confirmer visuellement avant entrée.";
+  if (normalized.includes("ichimoku")) return "Lecture Ichimoku prudente: Kumo, Tenkan/Kijun et Chikou à confirmer visuellement.";
+  return "Lecture Price Action prudente: tendance, support/résistance, cassure/retest et rejet à confirmer visuellement.";
 }
 
 function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
@@ -4068,7 +4125,9 @@ function publicUser(user) {
 
 async function consumeQuota(user, feature, req = null) {
   if (!user) return consumeAnonymousQuota(req, feature);
-  if (hasPremiumAccess(user)) {
+  const store = await loadAuthStore();
+  const stored = store.users.find((item) => item.id === user.id) || user;
+  if (hasPremiumAccess(stored)) {
     return { ok: true, unlimited: true, feature };
   }
   const limits = {
@@ -4078,22 +4137,19 @@ async function consumeQuota(user, feature, req = null) {
   };
   const limit = limits[feature] ?? 10;
   const today = new Date().toISOString().slice(0, 10);
-  const store = await loadAuthStore();
-  const stored = store.users.find((item) => item.id === user.id);
   if (!stored) return { ok: false, error: "session_invalid" };
   stored.usage = normalizeUsage(stored.usage, today);
   const used = Number(stored.usage[feature] || 0);
   if (used >= limit) {
-    return {
-      ok: false,
+    return quotaExceededPayload({
       error: "quota_exceeded",
       feature,
       plan: effectivePlan(stored),
       limit,
       used,
-      resetsAt: nextQuotaReset().toISOString(),
-      message: "Quota gratuit atteint pour aujourd'hui. Passe en premium ou réessaie demain.",
-    };
+      message: "Quota gratuit atteint pour aujourd'hui.",
+      upgradeHint: "Passe en premium pour débloquer les analyses illimitées.",
+    });
   }
   stored.usage[feature] = used + 1;
   stored.updatedAt = new Date().toISOString();
@@ -4113,16 +4169,15 @@ function consumeAnonymousQuota(req, feature) {
   const usage = normalizeUsage(anonymousUsage.get(key), today);
   const used = Number(usage[feature] || 0);
   if (used >= limit) {
-    return {
-      ok: false,
+    return quotaExceededPayload({
       error: "visitor_quota_exceeded",
       feature,
       plan: "visitor",
       limit,
       used,
-      resetsAt: nextQuotaReset().toISOString(),
-      message: "Limite visiteur atteinte. Crée un compte gratuit ou demande un accès premium test.",
-    };
+      message: "Limite visiteur atteinte.",
+      upgradeHint: "Crée un compte gratuit ou demande un accès premium test.",
+    });
   }
   usage[feature] = used + 1;
   anonymousUsage.set(key, usage);
@@ -4172,6 +4227,50 @@ function nextQuotaReset() {
   const next = new Date();
   next.setUTCHours(24, 0, 0, 0);
   return next;
+}
+
+function quotaExceededPayload({ error, feature, plan, limit, used, message, upgradeHint }) {
+  const reset = nextQuotaReset();
+  const localReset = formatResetTime(reset);
+  const fullMessage = `${message} ${upgradeHint} Tu peux revenir à ${localReset}.`;
+  return {
+    ok: false,
+    error,
+    feature,
+    plan,
+    limit,
+    used,
+    resetsAt: reset.toISOString(),
+    resetsAtLocal: localReset,
+    message: fullMessage,
+    userMessage: fullMessage,
+    nextActions: [
+      `Revenir à ${localReset}, heure de réinitialisation du quota.`,
+      plan === "visitor" ? "Créer un compte gratuit pour obtenir plus d'essais." : "Activer Premium pour supprimer la limite.",
+    ],
+  };
+}
+
+function formatResetTime(date) {
+  const timeZone = env.APP_TIMEZONE || env.TZ || "Africa/Porto-Novo";
+  try {
+    return new Intl.DateTimeFormat("fr-FR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      day: "2-digit",
+      month: "2-digit",
+      timeZone,
+      timeZoneName: "short",
+    }).format(date);
+  } catch {
+    return new Intl.DateTimeFormat("fr-FR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      day: "2-digit",
+      month: "2-digit",
+      timeZoneName: "short",
+    }).format(date);
+  }
 }
 
 async function requireAdmin(req) {
@@ -4285,8 +4384,9 @@ function cookieValue(req, name) {
   return found ? decodeURIComponent(found.slice(prefix.length)) : "";
 }
 
-function setSessionCookie(res, token) {
-  const secure = env.COOKIE_SECURE === "true" ? "; Secure" : "";
+function setSessionCookie(res, token, req = null) {
+  const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  const secure = env.COOKIE_SECURE === "true" || forwardedProto === "https" || env.NODE_ENV === "production" ? "; Secure" : "";
   res.setHeader("Set-Cookie", `oracle_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${14 * 24 * 60 * 60}${secure}`);
 }
 
@@ -4650,9 +4750,9 @@ function inferSupabaseProjectRef(url = "") {
 }
 
 async function loadEnv(path) {
-  if (!existsSync(path)) return {};
-  const raw = await readFile(path, "utf8");
   const out = {};
+  if (!existsSync(path)) return { ...process.env };
+  const raw = await readFile(path, "utf8");
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -4660,7 +4760,7 @@ async function loadEnv(path) {
     if (!match) continue;
     out[match[1]] = match[2].trim().replace(/^["']|["']$/g, "");
   }
-  return out;
+  return { ...out, ...process.env };
 }
 
 async function serveStatic(res, pathname) {
