@@ -641,6 +641,7 @@ Réponds en JSON strict:
     const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
     const learning = await loadLearningLog();
     const calibration = calibrationFor(learning, body);
+    const quickApiSetup = !deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice);
     const apiOnlySetup = !images.length && includeNewsContext && shouldUseApiOnlySetup({
       livePrice,
       technicalSnapshot,
@@ -751,7 +752,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         multiTimeframe,
       });
     }
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup });
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup });
     if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null });
     sendJson(res, 200, result);
     return;
@@ -2780,6 +2781,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   const calibration = context.calibration || { adjustment: 0, message: "Aucune calibration." };
   const livePrice = context.livePrice;
   const apiOnlySetup = Boolean(context.apiOnlySetup);
+  const quickMode = body.analysisDepth === "Rapide";
   const chartContext = context.chartContext || {};
   const live = Number(livePrice?.price);
   const mtfConsensus = analyzeMultiTimeframeConsensus(context.multiTimeframe || []);
@@ -2827,7 +2829,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta,
     });
   }
-  if (!hasChartImages && !apiOnlySetup && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
+  if (!quickMode && !hasChartImages && !apiOnlySetup && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 42),
       technique: validation.technique,
@@ -2901,7 +2903,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     });
   }
   const danger = computeDangerScore({ meta, validation, levelCheck, rr, live, entry, strategy: body.strategy, risk: body.risk });
-  const qualityGate = buildQualityGate({ meta, validation, levelCheck, danger, hasChartImages });
+  const qualityGate = buildQualityGate({ meta, validation, levelCheck, danger, hasChartImages, quickMode });
   if (!qualityGate.valid) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, normalized.score, 58),
@@ -3283,18 +3285,19 @@ function analyzeMultiTimeframeConsensus(items = []) {
   };
 }
 
-function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger = {}, hasChartImages = false }) {
+function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger = {}, hasChartImages = false, quickMode = false }) {
   const profile = riskProfile(meta.risk);
+  const hasLivePrice = Number.isFinite(Number(meta.livePrice));
   const checks = [
     {
       name: "Prix live",
-      ok: Number.isFinite(Number(meta.livePrice)),
-      detail: Number.isFinite(Number(meta.livePrice)) ? "prix disponible" : "prix indisponible",
+      ok: hasLivePrice,
+      detail: hasLivePrice ? "prix disponible" : "prix indisponible",
     },
     {
       name: "Historique",
-      ok: meta.technicalSnapshot?.valid !== false,
-      detail: meta.technicalSnapshot?.source || "source inconnue",
+      ok: quickMode && hasLivePrice ? true : meta.technicalSnapshot?.valid !== false,
+      detail: quickMode && hasLivePrice ? "mode rapide: prix live prioritaire" : meta.technicalSnapshot?.source || "source inconnue",
     },
     {
       name: "Fiabilité données",
@@ -3323,8 +3326,8 @@ function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger 
     },
     {
       name: "Danger",
-      ok: Number(danger.score || 0) < 65,
-      detail: `${Number(danger.score || 0)}%`,
+      ok: quickMode && hasLivePrice ? Number(danger.score || 0) < 92 : Number(danger.score || 0) < 65,
+      detail: quickMode && hasLivePrice ? `${Number(danger.score || 0)}% · tolérance rapide` : `${Number(danger.score || 0)}%`,
     },
     {
       name: "Risque compte",
@@ -4034,7 +4037,22 @@ async function signupUser(body = {}) {
   if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
   if (password.length < 8) return { ok: false, error: "Mot de passe trop court: 8 caractères minimum." };
   const store = await loadAuthStore();
-  if (store.users.some((user) => user.email === email)) return { ok: false, error: "Un compte existe déjà avec cet email." };
+  const existing = store.users.find((user) => user.email === email);
+  if (existing) {
+    if (!verifyPassword(password, existing.passwordHash)) {
+      return { ok: false, error: "Ce compte existe déjà. Connecte-toi avec le bon mot de passe." };
+    }
+    const session = createSession(existing.id);
+    store.sessions = store.sessions.filter((item) => item.userId !== existing.id || new Date(item.expiresAt).getTime() > Date.now());
+    store.sessions.push(session);
+    existing.lastLoginAt = new Date().toISOString();
+    existing.updatedAt = new Date().toISOString();
+    const saved = await saveAuthStore(store);
+    if (authPersistenceRequired() && saved.persisted !== "supabase") {
+      return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+    }
+    return { ok: true, user: existing, session, reused: true };
+  }
   const now = new Date().toISOString();
   const user = {
     id: `usr_${Date.now()}_${randomBytes(4).toString("hex")}`,
@@ -4202,13 +4220,16 @@ function hasPremiumAccess(user = {}) {
   if (user.role === "admin") return true;
   const plan = String(user.plan || "").toLowerCase();
   if (["pro", "admin"].includes(plan)) return true;
-  if (plan !== "premium") return false;
+  const manualPremium = user.manualPremium === true || user.manualPremium === "true";
+  if (!["premium", "prenium"].includes(plan) && !manualPremium) return false;
   if (!user.premiumUntil) return true;
   return new Date(user.premiumUntil).getTime() > Date.now();
 }
 
 function effectivePlan(user = {}) {
-  return hasPremiumAccess(user) ? String(user.plan || "premium").toLowerCase() : "free";
+  if (!hasPremiumAccess(user)) return "free";
+  const plan = String(user.plan || "premium").toLowerCase();
+  return ["premium", "prenium", "pro", "admin"].includes(plan) ? (plan === "prenium" ? "premium" : plan) : "premium";
 }
 
 function clientFingerprint(req) {
@@ -4305,7 +4326,7 @@ async function grantPremiumAccess(body = {}) {
   user.manualPremium = true;
   user.premiumSource = "manual_admin";
   user.updatedAt = new Date().toISOString();
-  user.usage = normalizeUsage(user.usage);
+  user.usage = { date: new Date().toISOString().slice(0, 10), analysis: 0, chat: 0, detection: 0 };
   await saveAuthStore(store);
   return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
 }
