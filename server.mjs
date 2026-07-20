@@ -4,6 +4,7 @@ import { createReadStream, existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
+import pg from "pg";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
@@ -15,6 +16,23 @@ const authPath = join(dataDir, "auth-store.json");
 const supabaseUrl = normalizeSupabaseUrl(env.SUPABASE_URL || env.SUPABASE_PROJECT_URL || "");
 const supabaseProjectRef = env.SUPABASE_PROJECT_REF || inferSupabaseProjectRef(supabaseUrl);
 const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY || "";
+const { Pool } = pg;
+const databaseUrl = env.DATABASE_URL || "";
+const pgPool = databaseUrl ? new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } }) : null;
+let pgTableReady = false;
+
+async function ensureStateTable() {
+  if (!pgPool || pgTableReady) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS ${supabaseStateTable} (
+      id text PRIMARY KEY,
+      payload jsonb,
+      updated_at timestamptz DEFAULT now()
+    )
+  `);
+  pgTableReady = true;
+}
+
 const supabaseStateTable = env.SUPABASE_STATE_TABLE || "oracle_app_state";
 let supabaseUnavailable = false;
 let supabaseLastError = null;
@@ -3891,42 +3909,45 @@ function getApiStatus() {
 }
 
 async function loadStateDocument(id) {
-  if (!hasSupabaseConfig()) return null;
+  if (!pgPool) return null;
   try {
-    const rows = await supabaseRequest(
-      `${supabaseStateTable}?id=eq.${encodeURIComponent(id)}&select=payload&limit=1`,
-      { method: "GET" },
+    await ensureStateTable();
+    const { rows } = await pgPool.query(
+      `SELECT payload FROM ${supabaseStateTable} WHERE id = $1 LIMIT 1`,
+      [id],
     );
     supabaseLastError = null;
-    recordProviderHealth("supabase", true);
-    return Array.isArray(rows) ? rows[0]?.payload || null : null;
+    recordProviderHealth("database", true);
+    return rows[0]?.payload || null;
   } catch (error) {
     supabaseLastError = sanitizeError(error.message);
-    recordProviderHealth("supabase", false, supabaseLastError);
+    recordProviderHealth("database", false, supabaseLastError);
     return null;
   }
 }
 
 async function saveStateDocument(id, payload) {
-  if (!hasSupabaseConfig()) return false;
+  if (!pgPool) return false;
   try {
-    await supabaseRequest(`${supabaseStateTable}?on_conflict=id`, {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates" },
-      body: JSON.stringify({ id, payload, updated_at: new Date().toISOString() }),
-    });
+    await ensureStateTable();
+    await pgPool.query(
+      `INSERT INTO ${supabaseStateTable} (id, payload, updated_at)
+       VALUES ($1, $2::jsonb, now())
+       ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
+      [id, JSON.stringify(payload)],
+    );
     supabaseLastError = null;
-    recordProviderHealth("supabase", true);
+    recordProviderHealth("database", true);
     return true;
   } catch (error) {
     supabaseLastError = sanitizeError(error.message);
-    recordProviderHealth("supabase", false, supabaseLastError);
+    recordProviderHealth("database", false, supabaseLastError);
     return false;
   }
 }
 
 function hasSupabaseConfig() {
-  return Boolean(supabaseUrl && supabaseKey);
+  return Boolean(pgPool);
 }
 
 function authPersistenceRequired() {
@@ -3934,39 +3955,20 @@ function authPersistenceRequired() {
 }
 
 async function checkSupabaseConnection() {
-  if (!hasSupabaseConfig()) return false;
+  if (!pgPool) return false;
   try {
-    await supabaseRequest(`${supabaseStateTable}?select=id&limit=1`, { method: "GET" });
+    await ensureStateTable();
+    await pgPool.query("SELECT 1");
     supabaseUnavailable = false;
     supabaseLastError = null;
-    recordProviderHealth("supabase", true);
+    recordProviderHealth("database", true);
     return true;
   } catch (error) {
     supabaseUnavailable = true;
     supabaseLastError = sanitizeError(error.message);
-    recordProviderHealth("supabase", false, supabaseLastError);
+    recordProviderHealth("database", false, supabaseLastError);
     return false;
   }
-}
-
-async function supabaseRequest(path, options = {}) {
-  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: supabaseKey,
-      Authorization: `Bearer ${supabaseKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-    signal: AbortSignal.timeout(Number(env.SUPABASE_TIMEOUT_MS || 5000)),
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`supabase_${response.status}: ${text.slice(0, 220)}`);
-  }
-  if (response.status === 204) return null;
-  const text = await response.text();
-  return text ? JSON.parse(text) : null;
 }
 
 function healthRecommendations() {
