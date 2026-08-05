@@ -2,9 +2,14 @@
   "name": "oracle-forex",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.mjs" },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
   "dependencies": {
+    "image-size": "^2.0.2",
     "pg": "^8.11.5"
   }
 }

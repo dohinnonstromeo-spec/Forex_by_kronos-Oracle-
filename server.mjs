@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import { createGzip, createBrotliCompress } from "node:zlib";
 import pg from "pg";
+import { imageSize } from "image-size";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
@@ -800,7 +801,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
           reason: apiOnlyBlockReason,
         })
       : await promiseWithTimeout(
-        images.length ? analyzeChartImage(prompt, images) : groq(prompt, 700, 0.25),
+        images.length ? analyzeChartImage(prompt, images, deepAnalysis ? 1800 : 1000) : groq(prompt, 700, 0.25),
         aiBudgetMs,
         "",
       );
@@ -1313,8 +1314,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
 
 async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
   const timeframes = analysisTimeframes(options.timeframe, options.strategy);
-  const items = [];
-  for (const timeframe of timeframes) {
+  return Promise.all(timeframes.map(async (timeframe) => {
     const history = await getHistoryForSymbol(symbol, livePrice, {
       timeframe,
       strategy: options.strategy,
@@ -1324,7 +1324,7 @@ async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
       timeframe,
       strategy: options.strategy,
     });
-    items.push({
+    return {
       timeframe,
       source: snapshot.source,
       bars: snapshot.bars,
@@ -1335,9 +1335,8 @@ async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
       resistance: snapshot.resistance,
       volatility: snapshot.volatility,
       timeframeCompatible: snapshot.timeframeCompatible,
-    });
-  }
-  return items;
+    };
+  }));
 }
 
 function analysisTimeframes(timeframe = "H1", strategy = "") {
@@ -1690,7 +1689,7 @@ function buildDeterministicSignals(prices, histories) {
     const sma30 = average(closes.slice(-30));
     const atr = average(history.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.004;
     const momentum = ((sma10 - sma30) / sma30) * 100;
-    const rsi = calculateRsi(closes.slice(-15));
+    const rsi = calculateRsi(closes.slice(-100));
     const move = Number(price.change) || 0;
     const trendAligned = momentum >= 0 ? rsi >= 52 : rsi <= 48;
     const volatilityOk = atr / last >= 0.0008;
@@ -1845,17 +1844,29 @@ function average(values) {
   return usable.length ? usable.reduce((sum, value) => sum + value, 0) / usable.length : NaN;
 }
 
-function calculateRsi(closes) {
-  if (!Array.isArray(closes) || closes.length < 15) return NaN;
-  let gains = 0;
-  let losses = 0;
-  for (let i = 1; i < closes.length; i++) {
+function calculateRsi(closes, period = 14) {
+  if (!Array.isArray(closes) || closes.length < period + 1) return NaN;
+  // Wilder's smoothed RSI (the formula TradingView/MT4/MT5 use), not a plain
+  // moving average: seeded with a simple average, then smoothed recursively
+  // over the rest of the series so it matches what's visible on a chart screenshot.
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
     const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses += Math.abs(diff);
+    if (diff >= 0) avgGain += diff;
+    else avgLoss += Math.abs(diff);
   }
-  if (losses === 0) return 100;
-  const rs = gains / losses;
+  avgGain /= period;
+  avgLoss /= period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
   return 100 - (100 / (1 + rs));
 }
 
@@ -2202,7 +2213,7 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
   return "";
 }
 
-async function groqVision(prompt, images) {
+async function groqVision(prompt, images, maxTokens = 1000) {
   if (!GROQ_KEYS.length) return "";
   const groqVisionModels = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -2226,7 +2237,7 @@ async function groqVision(prompt, images) {
               content: [{ type: "text", text: prompt }, ...imageContent],
             }],
             temperature: 0.25,
-            max_tokens: 1000,
+            max_tokens: maxTokens,
           }),
         });
         if (!response.ok) {
@@ -2248,22 +2259,22 @@ async function groqVision(prompt, images) {
   return "";
 }
 
-async function analyzeChartImage(prompt, images) {
+async function analyzeChartImage(prompt, images, maxTokens = 1000) {
   if (!images?.length) return "";
   if (GROQ_KEYS.length) {
-    const result = await groqVision(prompt, images);
+    const result = await groqVision(prompt, images, maxTokens);
     if (result && result.length > 50) return result;
     console.warn("Groq Vision insufficient, falling back to Gemini Vision.");
   }
   if (GEMINI_KEYS.length) {
-    const result = await geminiVision(prompt, images);
+    const result = await geminiVision(prompt, images, Math.round(maxTokens * 0.7));
     if (result && result.length > 50) return result;
     console.warn("Gemini Vision insufficient.");
   }
   return "";
 }
 
-async function geminiVision(prompt, images) {
+async function geminiVision(prompt, images, maxTokens = 700) {
   if (!GEMINI_KEYS.length) return "";
   for (const model of GEMINI_FALLBACK_MODELS) {
     try {
@@ -2280,7 +2291,7 @@ async function geminiVision(prompt, images) {
                 ...images.map((image) => ({ inline_data: { mime_type: image.mimeType, data: image.data } })),
               ],
             }],
-            generationConfig: { temperature: 0.25, maxOutputTokens: 700 },
+            generationConfig: { temperature: 0.25, maxOutputTokens: maxTokens },
           }),
         });
         if (!response.ok) {
@@ -2503,7 +2514,13 @@ function normalizeAiAnswer(answer, seed = "") {
 SCORE_CONFIANCE:45
 TECHNIQUE_UTILISEE:Price Action
 STYLE_EFFICACITE:Price Action=45`;
-  return { answer: text, score: extractScore(text, seed), technique: extractTechnique(text) };
+  const parsedScore = extractScore(text);
+  return {
+    answer: text,
+    score: Number.isFinite(parsedScore) ? parsedScore : 40,
+    scoreParsed: Number.isFinite(parsedScore),
+    technique: extractTechnique(text),
+  };
 }
 
 function isUnproductiveAnalysis(answer = "") {
@@ -2642,7 +2659,7 @@ function extractTradeDirection(text = "") {
   const signalLine = String(text).match(/Signal détecté\s*:\s*([^\n\r]+)/i)?.[1] || "";
   const direct = trendDirection(signalLine);
   if (direct) return direct;
-  return trendDirection(text) || "ACHAT";
+  return trendDirection(text);
 }
 
 function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
@@ -2744,7 +2761,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   }
   const sma10 = average(closes.slice(-10));
   const sma30 = closes.length >= 30 ? average(closes.slice(-30)) : NaN;
-  const rsi = closes.length >= 15 ? calculateRsi(closes.slice(-15)) : NaN;
+  const rsi = closes.length >= 15 ? calculateRsi(closes.slice(-100)) : NaN;
   const atr = average(bars.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.004;
   const recent = bars.slice(-30);
   const support = Math.min(...recent.map((bar) => Number(bar.low)).filter(Number.isFinite));
@@ -2893,6 +2910,15 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     dataReliability,
     styleComparison: validation.styleComparison,
   };
+  if (!normalized.scoreParsed) {
+    return blockAnalysis(normalized, {
+      score: Math.min(normalized.score, 35),
+      technique: validation.technique,
+      explanation: `${text}\n\nVALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) — signal bloqué par prudence plutôt que d'inventer un score.`,
+      validation: { ...validation, valid: false, reason: "Score de confiance non détecté dans la réponse IA." },
+      meta,
+    });
+  }
   const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
   if (explicitNoSignal) {
     return blockAnalysis(normalized, {
@@ -2922,6 +2948,15 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     });
   }
   const direction = extractTradeDirection(text);
+  if (!direction) {
+    return blockAnalysis(normalized, {
+      score: Math.min(normalized.score, validation.score, 35),
+      technique: validation.technique,
+      explanation: `${text}\n\nVALIDATION KRONOS: direction achat/vente non détectée dans la réponse IA — signal bloqué par prudence plutôt que de supposer un achat par défaut.`,
+      validation: { ...validation, valid: false, reason: "Direction non détectée dans la réponse IA." },
+      meta,
+    });
+  }
   let entry = extractLevel(text, /(?:zone d'entrée|entrée|entry)\s*:?\s*([0-9.,]+)/i, NaN);
   let sl = extractLevel(text, /(?:stop loss|sl)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp = extractLevel(text, /(?:take profit\s*1|tp1|take profit|tp)\s*:?\s*([0-9.,]+)/i, NaN);
@@ -3500,21 +3535,47 @@ const styleRules = {
 
 function crossCheckStructuralClaims(text, { technicalSnapshot, entry, pair }) {
   if (!technicalSnapshot?.valid) return { checked: false };
+  const issues = [];
+  let checked = false;
+
   const mentionsZone = /\bsupport\b|r[ée]sistance|order block|\bfvg\b|zone de (?:demande|offre)/i.test(text);
-  if (!mentionsZone) return { checked: false };
   const support = Number(technicalSnapshot.support);
   const resistance = Number(technicalSnapshot.resistance);
-  if (!Number.isFinite(support) || !Number.isFinite(resistance) || !Number.isFinite(entry) || resistance <= support) {
-    return { checked: false };
+  if (mentionsZone && Number.isFinite(support) && Number.isFinite(resistance) && Number.isFinite(entry) && resistance > support) {
+    checked = true;
+    const tolerance = (resistance - support) * 0.35;
+    const withinRange = entry >= support - tolerance && entry <= resistance + tolerance;
+    if (!withinRange) {
+      issues.push(`zone citée éloignée du support ${formatLevel(support, pair)} / résistance ${formatLevel(resistance, pair)} calculés côté serveur`);
+    }
   }
-  const tolerance = (resistance - support) * 0.35;
-  const withinRange = entry >= support - tolerance && entry <= resistance + tolerance;
+
+  const rsiMatch = String(text).match(/RSI\D{0,6}(\d{1,3})/i);
+  const serverRsi = Number(technicalSnapshot.rsi);
+  if (rsiMatch && Number.isFinite(serverRsi)) {
+    checked = true;
+    const citedRsi = Number(rsiMatch[1]);
+    if (Number.isFinite(citedRsi) && Math.abs(citedRsi - serverRsi) > 15) {
+      issues.push(`RSI cité (${citedRsi}) éloigné du RSI calculé côté serveur (${serverRsi})`);
+    }
+  }
+
+  const trendMatch = String(text).match(/Tendance\s*:?\s*(haussi[eè]re|baissi[eè]re|neutre)/i);
+  if (trendMatch && (technicalSnapshot.trend === "haussière" || technicalSnapshot.trend === "baissière")) {
+    checked = true;
+    const cited = /haussi/i.test(trendMatch[1]) ? "haussière" : /baissi/i.test(trendMatch[1]) ? "baissière" : "neutre";
+    if (cited !== "neutre" && cited !== technicalSnapshot.trend) {
+      issues.push(`tendance annoncée (${cited}) opposée à la tendance calculée côté serveur (${technicalSnapshot.trend})`);
+    }
+  }
+
+  if (!checked) return { checked: false };
   return {
     checked: true,
-    aligned: withinRange,
-    note: withinRange
-      ? `Zone citée cohérente avec support ${formatLevel(support, pair)} / résistance ${formatLevel(resistance, pair)}.`
-      : `Zone citée (support/résistance/order block) éloignée du support ${formatLevel(support, pair)} / résistance ${formatLevel(resistance, pair)} calculés côté serveur.`,
+    aligned: issues.length === 0,
+    note: issues.length
+      ? `Incohérence(s) détectée(s) avec les données serveur: ${issues.join("; ")}.`
+      : "Claims IA cohérents avec les données techniques calculées côté serveur.",
   };
 }
 
@@ -3593,17 +3654,39 @@ function scoreStyleRule(text, selected) {
 
 function assessImageQuality(images) {
   if (!images.length) return { score: 0, reason: "aucune image" };
-  const sizes = images.map((image) => Math.round((image.data.length * 3) / 4));
-  const total = sizes.reduce((sum, size) => sum + size, 0);
-  const avg = total / images.length;
-  let score = 45;
-  if (images.length >= 2) score += 12;
-  if (avg > 120000) score += 15;
-  if (avg > 300000) score += 10;
-  if (avg < 45000) score -= 22;
-  score = Math.max(0, Math.min(100, Math.round(score)));
-  const reason = `${images.length} image(s), taille moyenne ${Math.round(avg / 1024)}KB`;
-  return { score, reason, images: images.length, averageBytes: Math.round(avg) };
+  const details = [];
+  let totalScore = 0;
+  for (const image of images) {
+    const bytes = Math.round((image.data.length * 3) / 4);
+    let dimensions = null;
+    try {
+      dimensions = imageSize(Buffer.from(image.data, "base64"));
+    } catch {
+      dimensions = null;
+    }
+    if (dimensions?.width && dimensions?.height) {
+      const minSide = Math.min(dimensions.width, dimensions.height);
+      let imgScore = 40;
+      if (minSide >= 500) imgScore += 20;
+      if (minSide >= 800) imgScore += 15;
+      if (minSide >= 1200) imgScore += 10;
+      if (minSide < 300) imgScore -= 30;
+      totalScore += Math.max(0, Math.min(100, imgScore));
+      details.push(`${dimensions.width}x${dimensions.height}`);
+    } else {
+      let imgScore = 45;
+      if (bytes > 120000) imgScore += 15;
+      if (bytes > 300000) imgScore += 10;
+      if (bytes < 45000) imgScore -= 22;
+      totalScore += Math.max(0, Math.min(100, imgScore));
+      details.push(`${Math.round(bytes / 1024)}KB (résolution non détectée)`);
+    }
+  }
+  let score = Math.round(totalScore / images.length);
+  if (images.length >= 2) score = Math.min(100, score + 8);
+  score = Math.max(0, Math.min(100, score));
+  const reason = `${images.length} image(s): ${details.join(", ")}`;
+  return { score, reason, images: images.length };
 }
 
 function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy, risk }) {
@@ -4843,10 +4926,10 @@ function normalizeForSearch(value) {
     .replace(/\p{Diacritic}/gu, "");
 }
 
-function extractScore(text, seed = "") {
+function extractScore(text) {
   const match = String(text).match(/SCORE_CONFIANCE\s*:?\s*(\d{1,3})/i);
-  if (match) return Math.max(0, Math.min(100, Number(match[1])));
-  return 64 + (seed.length % 24);
+  if (!match) return NaN;
+  return Math.max(0, Math.min(100, Number(match[1])));
 }
 
 function extractTechnique(text) {
