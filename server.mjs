@@ -38,6 +38,9 @@ let supabaseUnavailable = false;
 let supabaseLastError = null;
 const providerHealth = new Map();
 const anonymousUsage = new Map();
+const loginAttempts = new Map();
+const LOGIN_MAX_ATTEMPTS = Number(env.LOGIN_MAX_ATTEMPTS || 5);
+const LOGIN_WINDOW_MS = Number(env.LOGIN_WINDOW_MINUTES || 15) * 60 * 1000;
 const memoryCache = {
   prices: { value: null, expiresAt: 0 },
   histories: { key: "", value: null, expiresAt: 0 },
@@ -263,7 +266,23 @@ createServer(async (req, res) => {
   }
 }).listen(port, () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
+  startLearningOutcomesScheduler();
 });
+
+const LEARNING_OUTCOMES_INTERVAL_MS = Number(env.LEARNING_OUTCOMES_INTERVAL_SECONDS || 90) * 1000;
+
+function startLearningOutcomesScheduler() {
+  const tick = async () => {
+    try {
+      const prices = await getPrices();
+      await updateLearningOutcomes(prices);
+    } catch (error) {
+      console.warn(`Learning outcomes sync failed: ${error.message}`);
+    }
+  };
+  tick();
+  setInterval(tick, LEARNING_OUTCOMES_INTERVAL_MS);
+}
 
 async function handleApi(req, res, url) {
   if (url.pathname === "/api/signup") {
@@ -279,8 +298,8 @@ async function handleApi(req, res, url) {
   if (url.pathname === "/api/login") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const body = await readBody(req);
-    const result = await loginUser(body);
-    if (!result.ok) return sendJson(res, 401, result);
+    const result = await loginUser(body, req);
+    if (!result.ok) return sendJson(res, result.error === "too_many_attempts" ? 429 : 401, result);
     setSessionCookie(res, result.session.token, req);
     sendJson(res, 200, { ok: true, user: publicUser(result.user) });
     return;
@@ -4098,12 +4117,58 @@ async function signupUser(body = {}) {
   return { ok: true, user, session };
 }
 
-async function loginUser(body = {}) {
+function loginRateLimitKey(req, email) {
+  return `${clientFingerprint(req)}:${normalizeEmail(email)}`;
+}
+
+function checkLoginRateLimit(req, email) {
+  const key = loginRateLimitKey(req, email);
+  const entry = loginAttempts.get(key);
+  if (!entry) return { ok: true };
+  if (Date.now() - entry.firstAttemptAt > LOGIN_WINDOW_MS) {
+    loginAttempts.delete(key);
+    return { ok: true };
+  }
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((entry.firstAttemptAt + LOGIN_WINDOW_MS - Date.now()) / 1000));
+    return { ok: false, retryAfterSeconds };
+  }
+  return { ok: true };
+}
+
+function registerLoginFailure(req, email) {
+  const key = loginRateLimitKey(req, email);
+  const entry = loginAttempts.get(key);
+  if (!entry || Date.now() - entry.firstAttemptAt > LOGIN_WINDOW_MS) {
+    loginAttempts.set(key, { count: 1, firstAttemptAt: Date.now() });
+    return;
+  }
+  entry.count += 1;
+}
+
+function clearLoginAttempts(req, email) {
+  loginAttempts.delete(loginRateLimitKey(req, email));
+}
+
+async function loginUser(body = {}, req = null) {
   const email = normalizeEmail(body.email);
   const password = String(body.password || "");
+  const rateLimit = req ? checkLoginRateLimit(req, email) : { ok: true };
+  if (!rateLimit.ok) {
+    return {
+      ok: false,
+      error: "too_many_attempts",
+      message: `Trop de tentatives. Réessaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
+      retryAfterSeconds: rateLimit.retryAfterSeconds,
+    };
+  }
   const store = await loadAuthStore();
   const user = store.users.find((item) => item.email === email);
-  if (!user || !verifyPassword(password, user.passwordHash)) return { ok: false, error: "Email ou mot de passe incorrect." };
+  if (!user || !verifyPassword(password, user.passwordHash)) {
+    if (req) registerLoginFailure(req, email);
+    return { ok: false, error: "Email ou mot de passe incorrect." };
+  }
+  if (req) clearLoginAttempts(req, email);
   const session = createSession(user.id);
   store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
   store.sessions.push(session);
