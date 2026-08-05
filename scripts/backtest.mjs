@@ -27,19 +27,25 @@ const LOOKAHEAD_BARS = 20; // ~1 trading month on daily bars: how long a signal 
 const COST_DRAG_R = 0.05; // flat spread/slippage haircut applied to every trade's realized R, in R units
 const TRAIN_RATIO = 0.7; // first 70% of each symbol's history = train (used to pick a variant), last 30% = held-out test (used only to confirm)
 
-const BASELINE_PARAMS = {
-  name: "baseline (production actuelle)",
+const PRE_FIX_PARAMS = {
+  name: "pré-correctif (avant ce backtest)",
   rsiUp: 52,
   rsiDown: 48,
-  momentumMin: 0, // no floor today: any momentum sign + RSI alignment counts, however tiny
+  momentumMin: 0, // no floor: any momentum sign + RSI alignment counted, however tiny
   volatilityMin: 0.0008,
   confluenceMin: 3,
   strengthMin: 0.18,
 };
 
+// What buildDeterministicSignals() actually ships today -- confluence 4/4 and a 0.04
+// momentum floor, both validated against this same held-out test split. Used as the
+// base for further research below (e.g. the GBP/JPY section) so those tests build on
+// top of production, not on the older config.
+const BASELINE_PARAMS = { ...PRE_FIX_PARAMS, name: "production actuelle (momentum 0.04 + confluence 4/4)", momentumMin: 0.04, confluenceMin: 4 };
+
 const VARIANTS = [
+  PRE_FIX_PARAMS,
   BASELINE_PARAMS,
-  { ...BASELINE_PARAMS, name: "SHIPPED: momentum floor 0.04 + confluence 4/4", momentumMin: 0.04, confluenceMin: 4 },
 ];
 
 async function fetchYahooDaily(yahooSymbol, range = "5y") {
@@ -124,12 +130,14 @@ function evaluateSignalAt(bars, i, params) {
   if (!Number.isFinite(last) || !Number.isFinite(momentum) || !Number.isFinite(rsi)) return null;
   const momentumOk = Math.abs(momentum) >= params.momentumMin;
   const trendAligned = momentumOk && (momentum >= 0 ? rsi >= params.rsiUp : rsi <= params.rsiDown);
-  const volatilityOk = atr / last >= params.volatilityMin;
+  const volatilityPct = atr / last;
+  const volatilityOk = volatilityPct >= params.volatilityMin;
+  if (volatilityPct > (params.volatilityMax ?? Infinity)) return null; // skip signals during abnormal volatility spikes (e.g. news whipsaws)
   const confluence = [trendAligned, volatilityOk, true, Math.abs(move) >= 0.05].filter(Boolean).length;
   const strength = Math.abs(momentum) + Math.min(Math.abs(move), 2) * 0.35 + confluence * 0.08;
   if (strength < params.strengthMin || confluence < params.confluenceMin || !trendAligned) return null;
   const direction = momentum >= 0 ? "ACHAT" : "VENTE";
-  const risk = Math.max(atr * 1.2, last * 0.0025);
+  const risk = Math.max(atr * (params.riskAtrMultiplier ?? 1.2), last * 0.0025);
   const entry = last;
   const sl = direction === "ACHAT" ? entry - risk : entry + risk;
   const tp1 = direction === "ACHAT" ? entry + risk * 1.6 : entry - risk * 1.6;
@@ -240,6 +248,25 @@ async function main() {
   console.log("est du sur-apprentissage sur cette fenêtre historique précise, pas un vrai edge.");
   console.log("\nLimites: échantillon borné par l'historique gratuit disponible, pas de gestion de portefeuille");
   console.log("(trades évalués indépendamment), coûts approximés par un haircut fixe plutôt qu'un carnet d'ordres réel.");
+
+  const gbpjpy = datasets.find((d) => d.pair === "GBP/JPY");
+  if (gbpjpy) {
+    console.log("\n\n=== Recherche ciblée GBP/JPY (n=1 paire JPY dans l'échantillon -- ne pas généraliser à toutes les paires JPY) ===");
+    const jpyVariants = [
+      { ...BASELINE_PARAMS, name: "baseline (SL atr*1.2)", riskAtrMultiplier: 1.2 },
+      { ...BASELINE_PARAMS, name: "SL plus large (atr*1.6)", riskAtrMultiplier: 1.6 },
+      { ...BASELINE_PARAMS, name: "SL plus large (atr*2.0)", riskAtrMultiplier: 2.0 },
+      { ...BASELINE_PARAMS, name: "plafond volatilité (skip si ATR>1.5%)", volatilityMax: 0.015 },
+      { ...BASELINE_PARAMS, name: "SL atr*1.6 + plafond volatilité 1.5%", riskAtrMultiplier: 1.6, volatilityMax: 0.015 },
+    ];
+    for (const variant of jpyVariants) {
+      const trades = backtestSymbol("GBP/JPY", gbpjpy.bars, variant);
+      const train = trades.filter((t) => t.split === "train");
+      const test = trades.filter((t) => t.split === "test");
+      console.log(`  ${variant.name.padEnd(42)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
+    }
+    console.log("\n  (baseline ci-dessus utilise déjà confluence 4/4 + momentum floor 0.04, la config expédiée en prod)");
+  }
 }
 
 main();

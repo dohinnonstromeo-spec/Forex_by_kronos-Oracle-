@@ -79,6 +79,14 @@ const rotationCounters = {
 const exhaustedKeys = new Map();
 const symbols = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD"];
 
+// Pairs where scripts/backtest.mjs found no positive-expectancy variant for the
+// deterministic SMA+RSI momentum strategy (confluence, RSI, momentum-floor, SL-width
+// and volatility-ceiling variants all tested negative on held-out data). Routed to a
+// cautious/non-direct signal instead of silently shipping a known-losing setup. Not a
+// verdict on the pair itself -- a different strategy family (mean-reversion, range,
+// volatility-breakout) might still work there; that's unresearched, not ruled out.
+const PAIRS_WITHOUT_VALIDATED_EDGE = new Set(["GBP/JPY"]);
+
 // Static fallback only: emergency display values when every live source fails.
 // They are intentionally low-reliability and must never validate a direct setup.
 const fallbackPrices = {
@@ -117,6 +125,7 @@ Les sources à clés utilisent une rotation automatique multi-clés. Une clé é
 - Binance: crypto uniquement, sans clé; fiabilité cible 90. Ne l'utilise pas pour l'or, les indices ou le Forex fiat.
 - Alpha Vantage: fallback Forex/crypto; fiabilité cible 80.
 - Coinbase: fallback crypto spot BTC/ETH; fiabilité cible 78.
+- Yahoo Finance: fallback Forex/métaux/indices sans clé, fiabilité cible 74.
 - Stooq: fallback historique/indicatif, souvent différé; fiabilité cible 72.
 - ExchangeRate-API: taux fiat indicatifs uniquement; fiabilité cible 62. Ne valide jamais un setup direct avec cette seule source.
 - Frankfurter/BCE: taux quotidiens de dernier recours; ne sert pas à produire un signal intraday.
@@ -893,9 +902,9 @@ async function fetchBestPrice(symbol, cached) {
 
 function providersForSymbol(symbol) {
   if (/BTC|ETH/i.test(symbol)) return [fetchBinancePrice, fetchTwelveDataPrice, fetchMassivePrice, fetchCoinbasePrice];
-  if (/US500|NAS|SPX/i.test(symbol)) return [fetchMassivePrice, fetchTwelveDataPrice, fetchStooqPrice];
-  if (/XAU|XAG|XPT|XPD/i.test(symbol)) return [fetchTwelveDataPrice, fetchMassivePrice, fetchStooqPrice];
-  return [fetchTwelveDataPrice, fetchMassivePrice, fetchAlphaVantagePrice, fetchStooqPrice, fetchExchangeRatePrice, fetchFrankfurterPrice];
+  if (/US500|NAS|SPX/i.test(symbol)) return [fetchMassivePrice, fetchTwelveDataPrice, fetchYahooPrice, fetchStooqPrice];
+  if (/XAU|XAG|XPT|XPD/i.test(symbol)) return [fetchTwelveDataPrice, fetchMassivePrice, fetchYahooPrice, fetchStooqPrice];
+  return [fetchTwelveDataPrice, fetchMassivePrice, fetchAlphaVantagePrice, fetchYahooPrice, fetchStooqPrice, fetchExchangeRatePrice, fetchFrankfurterPrice];
 }
 
 async function getExternalPrice(symbol) {
@@ -1155,6 +1164,46 @@ async function fetchStooqPrice(symbol) {
   }
 }
 
+// Stooq sits behind a JS proof-of-work bot challenge from a lot of cloud/hosting IPs
+// (it returns an HTML challenge page instead of CSV -- confirmed while building
+// scripts/backtest.mjs), so it can silently stop working depending on where this is
+// hosted. Yahoo's unofficial chart endpoint is a free, keyless backup for the same
+// FX/metals/index symbols; it requires a real User-Agent header or it 429s.
+async function fetchYahooJson(yahooSymbol, range, interval) {
+  const api = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`);
+  api.searchParams.set("range", range);
+  api.searchParams.set("interval", interval);
+  const response = await fetch(api, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!response.ok) throw new Error(`yahoo_http_${response.status}`);
+  const data = await response.json();
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error(data?.chart?.error?.description || "yahoo_no_data");
+  return result;
+}
+
+async function fetchYahooPrice(symbol) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  if (!yahooSymbol) return null;
+  try {
+    const result = await fetchYahooJson(yahooSymbol, "5d", "1d");
+    const closes = result.indicators?.quote?.[0]?.close?.filter(Number.isFinite) || [];
+    const price = Number(result.meta?.regularMarketPrice ?? closes.at(-1));
+    const prevClose = Number(closes.at(-2));
+    const change = Number.isFinite(price) && Number.isFinite(prevClose) && prevClose > 0
+      ? ((price - prevClose) / prevClose) * 100
+      : 0;
+    if (!Number.isFinite(price)) throw new Error("invalid_price");
+    recordProviderHealth("yahoo_price", true);
+    return pricePayload(symbol, { price, change }, "yahoo", null, { reliability: 74 });
+  } catch (error) {
+    recordProviderHealth("yahoo_price", false, error.message);
+    throw error;
+  }
+}
+
 async function getHistories(prices) {
   const usableKey = symbols.map((symbol) => `${symbol}:${prices[symbol]?.source || "none"}:${prices[symbol]?.asOf || ""}`).join("|");
   if (memoryCache.histories.value && memoryCache.histories.key === usableKey && Date.now() < memoryCache.histories.expiresAt) {
@@ -1265,6 +1314,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     ["binance", fetchBinanceHistory],
     ["massive", fetchMassiveHistory],
     ["twelve_data", fetchTwelveDataHistory],
+    ["yahoo", fetchYahooHistory],
     ["stooq", fetchStooqHistory],
   ];
   for (const [source, loader] of attempts) {
@@ -1369,6 +1419,19 @@ async function fetchFreeHistories(cache, prices) {
         if (bars.length) errors.push(`binance_${interval}:insufficient_bars`);
       } catch (error) {
         errors.push(`binance_${interval}:${error.message}`);
+      }
+    }
+    for (const interval of historyIntervals(symbol)) {
+      try {
+        const bars = await fetchYahooHistory(symbol, interval);
+        if (bars.length >= 30) {
+          tagHistory(bars, `yahoo:${interval}`, false);
+          recordProviderHealth("yahoo_history", true);
+          return [symbol, bars];
+        }
+        if (bars.length) errors.push(`yahoo_${interval}:insufficient_bars`);
+      } catch (error) {
+        errors.push(`yahoo_${interval}:${error.message}`);
       }
     }
     for (const interval of historyIntervals(symbol)) {
@@ -1495,6 +1558,23 @@ async function fetchStooqHistory(symbol, interval) {
   return bars.slice(-80);
 }
 
+async function fetchYahooHistory(symbol, interval) {
+  const yahooSymbol = toYahooSymbol(symbol);
+  const yahooInterval = toYahooInterval(interval);
+  if (!yahooSymbol || !yahooInterval) return [];
+  const result = await fetchYahooJson(yahooSymbol, yahooRangeFor(yahooInterval), yahooInterval);
+  const timestamps = result.timestamp || [];
+  const quote = result.indicators?.quote?.[0] || {};
+  const bars = timestamps.map((ts, i) => ({
+    close: Number(quote.close?.[i]),
+    high: Number(quote.high?.[i]),
+    low: Number(quote.low?.[i]),
+    datetime: new Date(ts * 1000).toISOString(),
+  })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
+  if (!bars.length) throw new Error("invalid_history");
+  return bars.slice(-80);
+}
+
 async function fetchDukascopyHistory(symbol) {
   const stooqSymbol = toStooqSymbol(symbol);
   if (!stooqSymbol || /US500|NAS|SPX/i.test(symbol)) return [];
@@ -1579,6 +1659,49 @@ function toStooqSymbol(symbol = "") {
   if (aliases[normalized]) return aliases[normalized];
   if (/^[A-Z]{3}\/[A-Z]{3}$/.test(normalized)) return normalized.replace("/", "").toLowerCase();
   return null;
+}
+
+function toYahooSymbol(symbol = "") {
+  const normalized = String(symbol).toUpperCase().replace(/[^A-Z0-9/]/g, "");
+  const aliases = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "USD/CHF": "USDCHF=X",
+    "USD/CAD": "USDCAD=X",
+    "AUD/USD": "AUDUSD=X",
+    "NZD/USD": "NZDUSD=X",
+    "GBP/JPY": "GBPJPY=X",
+    "EUR/JPY": "EURJPY=X",
+    "XAU/USD": "GC=F", // gold futures used as a spot-XAU/USD proxy: no free spot-gold ticker on Yahoo
+    "XAG/USD": "SI=F",
+    "BTC/USD": "BTC-USD",
+    "ETH/USD": "ETH-USD",
+    US500: "^GSPC",
+    NAS100: "^NDX",
+  };
+  if (aliases[normalized]) return aliases[normalized];
+  if (/^[A-Z]{3}\/[A-Z]{3}$/.test(normalized)) return `${normalized.replace("/", "")}=X`;
+  return null;
+}
+
+function toYahooInterval(interval = "") {
+  return ({
+    "1min": "1m",
+    "5min": "5m",
+    "15min": "15m",
+    "30min": "30m",
+    "1h": "60m",
+    "1day": "1d",
+    "1week": "1wk",
+  })[interval] || null;
+}
+
+function yahooRangeFor(yahooInterval = "") {
+  if (yahooInterval === "1m") return "5d";
+  if (["5m", "15m", "30m"].includes(yahooInterval)) return "1mo";
+  if (yahooInterval === "60m") return "3mo";
+  return "2y";
 }
 
 function toBinanceSymbol(symbol = "") {
@@ -1682,6 +1805,9 @@ function buildDeterministicSignals(prices, histories) {
     const dataQuality = assessSignalDataQuality(price, history);
     if (dataQuality.score < 70) return cautiousSignal(symbol, price, base, `Fiabilité données insuffisante (${dataQuality.score}%, grade ${dataQuality.grade}) · aucun signal direct validé.`, history);
     if (history.length < 50) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
+    if (PAIRS_WITHOUT_VALIDATED_EDGE.has(symbol)) {
+      return cautiousSignal(symbol, price, base, "Backtest (scripts/backtest.mjs) : cette logique n'a pas d'edge validé sur cette paire (R moyen négatif sur ~8 variantes testées, confluence/RSI/momentum/SL) · signal direct désactivé par prudence.", history);
+    }
 
     const closes = history.map((bar) => bar.close);
     const last = Number(price.price);
@@ -1911,7 +2037,7 @@ function pricePayload(symbol, value, source, error, options = {}) {
 }
 
 function isLivePriceSource(source = "") {
-  return ["twelve_data", "massive", "alpha_vantage", "coinbase", "stooq", "binance"].includes(source);
+  return ["twelve_data", "massive", "alpha_vantage", "coinbase", "stooq", "binance", "yahoo"].includes(source);
 }
 
 function isUsableLivePrice(price) {
@@ -4083,6 +4209,7 @@ function getApiStatus() {
     coinbase: { status: "unlimited", noKey: true },
     frankfurter: { status: "unlimited", noKey: true },
     stooq: { status: "unlimited", noKey: true },
+    yahoo: { status: "unlimited", noKey: true },
     exhaustedKeys: exhaustedKeys.size,
     blacklistTtlMinutes: 60,
   };
@@ -4796,10 +4923,28 @@ function evaluateOutcome(analysis, price) {
 
 // A raw win rate on a handful of trades is mostly noise (at n=5, one flipped
 // result swings it by 20 points). Instead of trusting it past a hard cutoff,
-// shrink it toward the neutral prior in proportion to sample size (Bayesian/
-// Beta-binomial-style shrinkage) so small samples barely move the score and
-// only a genuinely large sample earns its full weight.
-const CALIBRATION_PRIOR_WIN_RATE = 0.55;
+// shrink it toward a prior in proportion to sample size (Bayesian/Beta-binomial
+// -style shrinkage) so small samples barely move the score and only a genuinely
+// large sample earns its full weight.
+//
+// The shrinkage TARGET is pair-specific, seeded from scripts/backtest.mjs's
+// held-out test results for the deterministic SMA+RSI strategy (~5y EUR/USD,
+// XAU/USD, GBP/JPY, US500; ~2.7y BTC/USD, ETH/USD -- see that script's git
+// history for the exact run). It is a "this pair's general character" prior
+// (some pairs trend-follow more cleanly than others), NOT a measurement of the
+// LLM chart-reading engine's accuracy on that pair -- those are different
+// mechanisms. As real per-bucket (style+strategy+pair+timeframe) outcomes
+// accumulate, `trust` shifts weight from this backtested guess to what the LLM
+// path is actually producing for that specific bucket.
+const PAIR_WIN_RATE_PRIOR = {
+  "EUR/USD": 0.34,
+  "XAU/USD": 0.55,
+  "GBP/JPY": 0.30,
+  US500: 0.41,
+  "BTC/USD": 0.36,
+  "ETH/USD": 0.34,
+};
+const CALIBRATION_REFERENCE_WIN_RATE = 0.55; // anchor the +-15/+12 adjustment range was tuned against
 const CALIBRATION_SHRINKAGE_K = 40;
 
 function winRateConfidenceLabel(samples) {
@@ -4814,6 +4959,7 @@ function calibrationFor(log, body = {}) {
   const timeframe = body.timeframe || "H1";
   const style = body.style || "Mixte";
   const strategy = body.strategy || "Swing Trading";
+  const prior = PAIR_WIN_RATE_PRIOR[pair] ?? CALIBRATION_REFERENCE_WIN_RATE;
   const buckets = [
     (item) => item.style === style && (item.strategy || "Swing Trading") === strategy && item.pair === pair && item.timeframe === timeframe,
     (item) => item.style === style && item.pair === pair,
@@ -4826,8 +4972,8 @@ function calibrationFor(log, body = {}) {
       const wins = sample.filter((item) => item.result === "win").length;
       const rawWinRate = wins / sample.length;
       const trust = sample.length / (sample.length + CALIBRATION_SHRINKAGE_K);
-      const shrunkWinRate = trust * rawWinRate + (1 - trust) * CALIBRATION_PRIOR_WIN_RATE;
-      const adjustment = Math.max(-15, Math.min(12, Math.round((shrunkWinRate - CALIBRATION_PRIOR_WIN_RATE) * 35)));
+      const shrunkWinRate = trust * rawWinRate + (1 - trust) * prior;
+      const adjustment = Math.max(-15, Math.min(12, Math.round((shrunkWinRate - CALIBRATION_REFERENCE_WIN_RATE) * 35)));
       const confidenceLabel = winRateConfidenceLabel(sample.length);
       return {
         samples: sample.length,
@@ -4835,11 +4981,18 @@ function calibrationFor(log, body = {}) {
         shrunkWinRate: Math.round(shrunkWinRate * 100),
         confidenceLabel,
         adjustment,
-        message: `${sample.length} résultats (${confidenceLabel}), winrate observé ${Math.round(rawWinRate * 100)}% ramené à ${Math.round(shrunkWinRate * 100)}% après pondération par la taille d'échantillon, ajustement ${adjustment}.`,
+        message: `${sample.length} résultats (${confidenceLabel}), winrate observé ${Math.round(rawWinRate * 100)}% ramené à ${Math.round(shrunkWinRate * 100)}% après pondération par la taille d'échantillon (prior ${pair} ${Math.round(prior * 100)}%), ajustement ${adjustment}.`,
       };
     }
   }
-  return { samples: 0, winRate: null, confidenceLabel: "aucune donnée", adjustment: -3, message: "Pas assez d'historique: prudence automatique -3." };
+  const noDataAdjustment = Math.max(-15, Math.min(12, Math.round((prior - CALIBRATION_REFERENCE_WIN_RATE) * 35)));
+  return {
+    samples: 0,
+    winRate: null,
+    confidenceLabel: "aucune donnée",
+    adjustment: noDataAdjustment,
+    message: `Pas d'historique réel pour ce contexte: départ sur le prior backtesté ${pair} (${Math.round(prior * 100)}%), ajustement ${noDataAdjustment}.`,
+  };
 }
 
 function winRateBucket(items) {
