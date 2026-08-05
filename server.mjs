@@ -465,7 +465,7 @@ async function handleApi(req, res, url) {
     }
     const prices = await getPrices();
     const learning = await updateLearningOutcomes(prices);
-    const payload = performancePayload(learning);
+    const payload = await performancePayload(learning);
     memoryCache.performance = { value: payload, expiresAt: Date.now() + 5 * 60 * 1000 };
     sendJson(res, 200, payload);
     return;
@@ -2872,6 +2872,21 @@ function normalizeChatAnswer(answer, intent, seed = "") {
   };
 }
 
+function scoreConfidenceBand(score, dataReliability, calibration) {
+  let spread = 8;
+  if (dataReliability?.grade === "C") spread = 14;
+  if (dataReliability?.grade === "D") spread = 20;
+  const weakCalibration = !calibration || ["aucune donnée", "échantillon trop petit", "indicatif"].includes(calibration.confidenceLabel);
+  if (weakCalibration) spread += 5;
+  const low = Math.max(0, Math.round(score - spread));
+  const high = Math.min(100, Math.round(score + spread));
+  return {
+    low,
+    high,
+    note: `Score indicatif ${low}-${high}, pas un chiffre exact — fiabilité données ${dataReliability?.grade || "n/a"}, calibration ${calibration?.confidenceLabel || "aucune donnée"}.`,
+  };
+}
+
 function normalizeAnalysis(answer, body = {}, context = {}) {
   const normalized = normalizeAiAnswer(answer, body.pair || "");
   const text = normalized.answer;
@@ -3062,6 +3077,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     tp2: formatLevel(Number.isFinite(tp2) ? tp2 : projectTp2(direction, entry, sl, tp), body.pair),
     rr: `1:${rr.toFixed(1)}`,
     score: calibratedScore,
+    scoreRange: scoreConfidenceBand(calibratedScore, dataReliability, calibration),
     dangerScore: danger.score,
     beginnerPlan,
     explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. Gestion du risque: ${profile.label}, perte maximale visée ${profile.percent}% si la taille de lot est correctement ajustée. ${calibration.message}`,
@@ -4770,6 +4786,21 @@ function evaluateOutcome(analysis, price) {
   return null;
 }
 
+// A raw win rate on a handful of trades is mostly noise (at n=5, one flipped
+// result swings it by 20 points). Instead of trusting it past a hard cutoff,
+// shrink it toward the neutral prior in proportion to sample size (Bayesian/
+// Beta-binomial-style shrinkage) so small samples barely move the score and
+// only a genuinely large sample earns its full weight.
+const CALIBRATION_PRIOR_WIN_RATE = 0.55;
+const CALIBRATION_SHRINKAGE_K = 40;
+
+function winRateConfidenceLabel(samples) {
+  if (samples >= 300) return "fiable";
+  if (samples >= 100) return "provisoire";
+  if (samples >= 20) return "indicatif";
+  return "échantillon trop petit";
+}
+
 function calibrationFor(log, body = {}) {
   const pair = body.pair || "EUR/USD";
   const timeframe = body.timeframe || "H1";
@@ -4782,84 +4813,91 @@ function calibrationFor(log, body = {}) {
     (item) => item.style === style,
   ];
   for (const matches of buckets) {
-    const sample = log.outcomes.filter((item) => matches(item) && ["win", "loss"].includes(item.result)).slice(-50);
-    if (sample.length >= 5) {
+    const sample = log.outcomes.filter((item) => matches(item) && ["win", "loss"].includes(item.result)).slice(-200);
+    if (sample.length >= 8) {
       const wins = sample.filter((item) => item.result === "win").length;
-      const winRate = wins / sample.length;
-      const adjustment = Math.round((winRate - 0.55) * 35);
+      const rawWinRate = wins / sample.length;
+      const trust = sample.length / (sample.length + CALIBRATION_SHRINKAGE_K);
+      const shrunkWinRate = trust * rawWinRate + (1 - trust) * CALIBRATION_PRIOR_WIN_RATE;
+      const adjustment = Math.max(-15, Math.min(12, Math.round((shrunkWinRate - CALIBRATION_PRIOR_WIN_RATE) * 35)));
+      const confidenceLabel = winRateConfidenceLabel(sample.length);
       return {
         samples: sample.length,
-        winRate: Math.round(winRate * 100),
-        adjustment: Math.max(-15, Math.min(12, adjustment)),
-        message: `${sample.length} résultats historiques, winrate ${Math.round(winRate * 100)}%, ajustement ${Math.max(-15, Math.min(12, adjustment))}.`,
+        winRate: Math.round(rawWinRate * 100),
+        shrunkWinRate: Math.round(shrunkWinRate * 100),
+        confidenceLabel,
+        adjustment,
+        message: `${sample.length} résultats (${confidenceLabel}), winrate observé ${Math.round(rawWinRate * 100)}% ramené à ${Math.round(shrunkWinRate * 100)}% après pondération par la taille d'échantillon, ajustement ${adjustment}.`,
       };
     }
   }
-  return { samples: 0, winRate: null, adjustment: -3, message: "Pas assez d'historique: prudence automatique -3." };
+  return { samples: 0, winRate: null, confidenceLabel: "aucune donnée", adjustment: -3, message: "Pas assez d'historique: prudence automatique -3." };
+}
+
+function winRateBucket(items) {
+  const wins = items.filter((item) => item.result === "win").length;
+  const samples = items.length;
+  return {
+    samples,
+    winRate: samples ? Math.round((wins / samples) * 100) : null,
+    confidenceLabel: samples ? winRateConfidenceLabel(samples) : "aucune donnée",
+  };
 }
 
 function learningSummary(log) {
   const closed = log.outcomes.filter((item) => ["win", "loss"].includes(item.result));
-  const wins = closed.filter((item) => item.result === "win").length;
-  const byStyle = Object.fromEntries(Object.keys(styleRules).map((style) => {
-    const items = closed.filter((item) => item.style === style);
-    const styleWins = items.filter((item) => item.result === "win").length;
-    return [style, {
-      samples: items.length,
-      winRate: items.length ? Math.round((styleWins / items.length) * 100) : null,
-    }];
-  }));
+  const global = winRateBucket(closed);
+  const byStyle = Object.fromEntries(Object.keys(styleRules).map((style) => [
+    style,
+    winRateBucket(closed.filter((item) => item.style === style)),
+  ]));
   const strategies = ["Scalping", "Swing Trading", "Position Trading", "Breakout", "Reversal"];
-  const byStrategy = Object.fromEntries(strategies.map((strategy) => {
-    const items = closed.filter((item) => (item.strategy || "Swing Trading") === strategy);
-    const strategyWins = items.filter((item) => item.result === "win").length;
-    return [strategy, {
-      samples: items.length,
-      winRate: items.length ? Math.round((strategyWins / items.length) * 100) : null,
-    }];
-  }));
-  const byPair = Object.fromEntries(symbols.map((pair) => {
-    const items = closed.filter((item) => item.pair === pair);
-    const pairWins = items.filter((item) => item.result === "win").length;
-    return [pair, {
-      samples: items.length,
-      winRate: items.length >= 20 ? Math.round((pairWins / items.length) * 100) : null,
-    }];
-  }));
+  const byStrategy = Object.fromEntries(strategies.map((strategy) => [
+    strategy,
+    winRateBucket(closed.filter((item) => (item.strategy || "Swing Trading") === strategy)),
+  ]));
+  const byPair = Object.fromEntries(symbols.map((pair) => [
+    pair,
+    winRateBucket(closed.filter((item) => item.pair === pair)),
+  ]));
   return {
     updatedAt: log.updatedAt,
     totalAnalyses: log.analyses.length,
     openAnalyses: log.analyses.filter((item) => item.status === "OPEN").length,
     blockedAnalyses: log.analyses.filter((item) => item.status === "BLOCKED").length,
     closedAnalyses: closed.length,
-    globalWinRate: closed.length ? Math.round((wins / closed.length) * 100) : null,
+    globalWinRate: global.winRate,
+    globalConfidenceLabel: global.confidenceLabel,
     byStyle,
     byStrategy,
     byPair,
-    note: "Apprentissage contrôlé: Kronos calibre ses scores avec les résultats, sans modifier le code automatiquement.",
+    note: "Apprentissage contrôlé: Kronos calibre ses scores avec les résultats, sans modifier le code automatiquement. Les winrates affichés restent indicatifs tant que l'échantillon (n) est petit — voir confidenceLabel.",
   };
 }
 
-function performancePayload(log) {
+async function performancePayload(log) {
   const summary = learningSummary(log);
   const closed = log.outcomes.filter((item) => ["win", "loss"].includes(item.result));
   const recent = closed.slice(-12).reverse();
   const totalSignals = log.analyses.filter((item) => item.active).length;
-  const precisionLabel = summary.closedAnalyses >= 20 && summary.globalWinRate !== null
-    ? `${summary.globalWinRate}%`
-    : "À auditer";
+  const authStore = await loadAuthStore();
+  const memberCount = Array.isArray(authStore.users) ? authStore.users.length : 0;
+  const precisionLabel = summary.globalWinRate !== null
+    ? `${summary.globalWinRate}% (${summary.globalConfidenceLabel}, n=${summary.closedAnalyses})`
+    : "Pas encore de données";
   return {
     updatedAt: summary.updatedAt,
     precision: summary.globalWinRate,
     precisionLabel,
-    precisionAudited: summary.closedAnalyses >= 20,
+    precisionConfidenceLabel: summary.globalConfidenceLabel,
+    precisionAudited: summary.closedAnalyses >= 100,
     closedAnalyses: summary.closedAnalyses,
     totalAnalyses: summary.totalAnalyses,
     activeSignals: totalSignals,
     blockedAnalyses: summary.blockedAnalyses,
     openAnalyses: summary.openAnalyses,
     instrumentsTracked: symbols.length,
-    membersLabel: "500+",
+    membersLabel: String(memberCount),
     byStyle: summary.byStyle,
     byStrategy: summary.byStrategy,
     byPair: summary.byPair,
@@ -4872,7 +4910,7 @@ function performancePayload(log) {
       score: item.score,
       closedAt: item.closedAt,
     })),
-    disclaimer: summary.closedAnalyses >= 20
+    disclaimer: summary.closedAnalyses >= 100
       ? "Performance calculée sur les signaux clôturés enregistrés par Kronos."
       : "Échantillon encore trop petit: la précision publique doit rester non auditée.",
   };
