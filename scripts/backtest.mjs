@@ -1,9 +1,12 @@
-// Walk-forward backtest of the exact signal logic used in buildDeterministicSignals()
+// Walk-forward backtest of the signal logic used in buildDeterministicSignals()
 // (server.mjs), replayed against real historical bars pulled from free, no-API-key
-// sources (Stooq daily CSV for FX/metals/indices, Binance public klines for crypto).
+// sources (Yahoo Finance daily chart for FX/metals/index, Binance public klines for
+// crypto). Also doubles as a parameter-search harness: pass variants below and it
+// reports train vs. held-out test performance for each, so a threshold change only
+// ships if it generalizes instead of just curve-fitting this one historical window.
 //
-// This is deliberately standalone (does not import server.mjs, which starts an HTTP
-// server as a side effect on load) so it can be run on demand with `node scripts/backtest.mjs`.
+// Standalone on purpose (does not import server.mjs, which starts an HTTP server as
+// a side effect on load). Run with: node scripts/backtest.mjs
 //
 // What this is: a signal-quality check on one strategy variant, on the history that
 // happens to be reachable without paid data. What this is NOT: a claim about future
@@ -22,12 +25,23 @@ const SYMBOLS = [
 
 const LOOKAHEAD_BARS = 20; // ~1 trading month on daily bars: how long a signal is given to hit TP/SL before being marked "expired"
 const COST_DRAG_R = 0.05; // flat spread/slippage haircut applied to every trade's realized R, in R units
+const TRAIN_RATIO = 0.7; // first 70% of each symbol's history = train (used to pick a variant), last 30% = held-out test (used only to confirm)
 
-// Stooq now sits behind a JS proof-of-work bot challenge from most cloud/sandbox IPs
-// (confirmed while building this script -- it returns an HTML challenge page instead
-// of CSV). That's also the server's fallback #4 provider for live data, so production
-// may hit the same wall intermittently. Yahoo's unofficial chart endpoint is used here
-// instead: no key required, real OHLC, multi-year range.
+const BASELINE_PARAMS = {
+  name: "baseline (production actuelle)",
+  rsiUp: 52,
+  rsiDown: 48,
+  momentumMin: 0, // no floor today: any momentum sign + RSI alignment counts, however tiny
+  volatilityMin: 0.0008,
+  confluenceMin: 3,
+  strengthMin: 0.18,
+};
+
+const VARIANTS = [
+  BASELINE_PARAMS,
+  { ...BASELINE_PARAMS, name: "SHIPPED: momentum floor 0.04 + confluence 4/4", momentumMin: 0.04, confluenceMin: 4 },
+];
+
 async function fetchYahooDaily(yahooSymbol, range = "5y") {
   const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`);
   url.searchParams.set("range", range);
@@ -69,8 +83,7 @@ function average(values) {
   return finite.length ? finite.reduce((sum, v) => sum + v, 0) / finite.length : NaN;
 }
 
-// Wilder's smoothed RSI, identical formula to the one now used in server.mjs
-// (calculateRsi), so this backtest tests what production actually computes.
+// Wilder's smoothed RSI, identical formula to calculateRsi() in server.mjs.
 function calculateRsi(closes, period = 14) {
   if (!Array.isArray(closes) || closes.length < period + 1) return NaN;
   let avgGain = 0;
@@ -94,9 +107,9 @@ function calculateRsi(closes, period = 14) {
   return 100 - (100 / (1 + rs));
 }
 
-// Faithful replay of buildDeterministicSignals()'s decision logic in server.mjs,
-// using only bars up to (and including) `i` -- no lookahead.
-function evaluateSignalAt(bars, i) {
+// Same decision structure as buildDeterministicSignals() in server.mjs, but with the
+// threshold values pulled out into `params` so variants can be tested honestly.
+function evaluateSignalAt(bars, i, params) {
   if (i < 60) return null; // need enough history for SMA30 + a converged Wilder RSI
   const window = bars.slice(0, i + 1);
   const closes = window.map((bar) => bar.close);
@@ -109,11 +122,12 @@ function evaluateSignalAt(bars, i) {
   const prevClose = closes.at(-2);
   const move = Number.isFinite(prevClose) && prevClose ? ((last - prevClose) / prevClose) * 100 : 0;
   if (!Number.isFinite(last) || !Number.isFinite(momentum) || !Number.isFinite(rsi)) return null;
-  const trendAligned = momentum >= 0 ? rsi >= 52 : rsi <= 48;
-  const volatilityOk = atr / last >= 0.0008;
+  const momentumOk = Math.abs(momentum) >= params.momentumMin;
+  const trendAligned = momentumOk && (momentum >= 0 ? rsi >= params.rsiUp : rsi <= params.rsiDown);
+  const volatilityOk = atr / last >= params.volatilityMin;
   const confluence = [trendAligned, volatilityOk, true, Math.abs(move) >= 0.05].filter(Boolean).length;
   const strength = Math.abs(momentum) + Math.min(Math.abs(move), 2) * 0.35 + confluence * 0.08;
-  if (strength < 0.18 || confluence < 3 || !trendAligned) return null;
+  if (strength < params.strengthMin || confluence < params.confluenceMin || !trendAligned) return null;
   const direction = momentum >= 0 ? "ACHAT" : "VENTE";
   const risk = Math.max(atr * 1.2, last * 0.0025);
   const entry = last;
@@ -143,41 +157,42 @@ function simulateForward(bars, signalIndex, signal) {
   return { result: "expired", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
 }
 
-function backtestSymbol(pair, bars) {
+function backtestSymbol(pair, bars, params) {
+  const trainCutoff = Math.round(bars.length * TRAIN_RATIO);
   const trades = [];
   for (let i = 60; i < bars.length - 1; i++) {
-    const signal = evaluateSignalAt(bars, i);
+    const signal = evaluateSignalAt(bars, i, params);
     if (!signal) continue;
-    trades.push({ pair, date: bars[i].date, direction: signal.direction, ...simulateForward(bars, i, signal) });
+    trades.push({
+      pair,
+      date: bars[i].date,
+      split: i < trainCutoff ? "train" : "test",
+      direction: signal.direction,
+      ...simulateForward(bars, i, signal),
+    });
   }
   return trades;
 }
 
 function summarize(trades) {
-  if (!trades.length) return { count: 0 };
+  if (!trades.length) return { count: 0, winRate: null, avgR: null, totalR: null };
   const wins = trades.filter((t) => t.result === "win").length;
-  const losses = trades.filter((t) => t.result === "loss").length;
-  const expired = trades.filter((t) => t.result === "expired").length;
   const totalR = trades.reduce((sum, t) => sum + t.rMultiple, 0);
-  const avgR = totalR / trades.length;
-  const avgHold = trades.reduce((sum, t) => sum + t.barsHeld, 0) / trades.length;
   return {
     count: trades.length,
-    wins,
-    losses,
-    expired,
     winRate: Math.round((wins / trades.length) * 1000) / 10,
-    avgR: Math.round(avgR * 1000) / 1000,
+    avgR: Math.round((totalR / trades.length) * 1000) / 1000,
     totalR: Math.round(totalR * 100) / 100,
-    avgHoldBars: Math.round(avgHold * 10) / 10,
   };
 }
 
-async function main() {
-  console.log("Backtest walk-forward de buildDeterministicSignals() -- données réelles, sans clé API.");
-  console.log(`Lookahead max: ${LOOKAHEAD_BARS} bougies · haircut coûts: ${COST_DRAG_R}R par trade\n`);
+function fmt(stats) {
+  if (!stats.count) return "0 trade";
+  return `${stats.count} trades | winrate ${stats.winRate}% | R moyen ${stats.avgR >= 0 ? "+" : ""}${stats.avgR}`;
+}
 
-  const allTrades = [];
+async function loadAllData() {
+  const datasets = [];
   for (const symbol of SYMBOLS) {
     try {
       const bars = symbol.kind === "yahoo"
@@ -187,32 +202,44 @@ async function main() {
         console.log(`${symbol.pair}: historique insuffisant (${bars.length} bougies) -- ignoré.`);
         continue;
       }
-      const trades = backtestSymbol(symbol.pair, bars);
-      allTrades.push(...trades);
-      const stats = summarize(trades);
-      console.log(
-        `${symbol.pair.padEnd(8)} | ${bars.length} bougies (${bars[0].date} -> ${bars.at(-1).date}) | `
-        + `${stats.count} signaux | winrate ${stats.winRate ?? "n/a"}% | R moyen ${stats.avgR ?? "n/a"} | R total ${stats.totalR ?? "n/a"}`,
-      );
+      datasets.push({ pair: symbol.pair, bars });
     } catch (error) {
       console.log(`${symbol.pair}: échec de récupération des données (${error.message}) -- ignoré.`);
     }
   }
+  return datasets;
+}
 
-  console.log("\n=== Global ===");
-  const global = summarize(allTrades);
-  if (!global.count) {
-    console.log("Aucun trade simulé -- vérifie la connectivité réseau vers stooq.com / api.binance.com.");
+async function main() {
+  console.log("Backtest walk-forward de buildDeterministicSignals() -- données réelles, sans clé API.");
+  console.log(`Split train/test: ${Math.round(TRAIN_RATIO * 100)}%/${Math.round((1 - TRAIN_RATIO) * 100)}% par paire (le test n'est jamais utilisé pour choisir un seuil).\n`);
+
+  const datasets = await loadAllData();
+  if (!datasets.length) {
+    console.log("Aucune donnée récupérée -- vérifie la connectivité réseau.");
     return;
   }
-  console.log(`Trades: ${global.count} (${global.wins} gagnants, ${global.losses} perdants, ${global.expired} expirés)`);
-  console.log(`Winrate brut: ${global.winRate}%`);
-  console.log(`R moyen par trade (expectancy): ${global.avgR}`);
-  console.log(`Durée de détention moyenne: ${global.avgHoldBars} bougies`);
-  console.log("\nLimites à garder en tête: échantillon limité par l'historique gratuit disponible, pas de");
-  console.log("gestion de portefeuille (positions concurrentes non modélisées), coûts approximés par un");
-  console.log("haircut fixe plutôt qu'un vrai carnet d'ordres. Traiter ce chiffre comme un indicateur de");
-  console.log("direction (edge positif ou négatif), pas comme une performance garantie.");
+
+  for (const variant of VARIANTS) {
+    console.log(`\n=== Variante: ${variant.name} ===`);
+    const allTrain = [];
+    const allTest = [];
+    for (const { pair, bars } of datasets) {
+      const trades = backtestSymbol(pair, bars, variant);
+      const train = trades.filter((t) => t.split === "train");
+      const test = trades.filter((t) => t.split === "test");
+      allTrain.push(...train);
+      allTest.push(...test);
+      console.log(`  ${pair.padEnd(8)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
+    }
+    console.log(`  ${"GLOBAL".padEnd(8)} | train: ${fmt(summarize(allTrain))}  ||  test: ${fmt(summarize(allTest))}`);
+  }
+
+  console.log("\nLecture: une variante ne vaut la peine d'être expédiée que si le R moyen s'améliore (ou reste");
+  console.log("stable) À LA FOIS sur train ET sur test hors-échantillon. Une amélioration seulement sur train");
+  console.log("est du sur-apprentissage sur cette fenêtre historique précise, pas un vrai edge.");
+  console.log("\nLimites: échantillon borné par l'historique gratuit disponible, pas de gestion de portefeuille");
+  console.log("(trades évalués indépendamment), coûts approximés par un haircut fixe plutôt qu'un carnet d'ordres réel.");
 }
 
 main();

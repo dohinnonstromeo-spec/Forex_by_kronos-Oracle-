@@ -1691,7 +1691,11 @@ function buildDeterministicSignals(prices, histories) {
     const momentum = ((sma10 - sma30) / sma30) * 100;
     const rsi = calculateRsi(closes.slice(-100));
     const move = Number(price.change) || 0;
-    const trendAligned = momentum >= 0 ? rsi >= 52 : rsi <= 48;
+    // Same 0.04 momentum floor as buildTechnicalSnapshot()'s "neutre/range" cutoff,
+    // so a signal never fires while the technical snapshot text shown to the user
+    // says the trend is neutral. Backtested neutral-to-slightly-negative on R (not a
+    // performance fix), applied for narrative consistency.
+    const trendAligned = Math.abs(momentum) >= 0.04 && (momentum >= 0 ? rsi >= 52 : rsi <= 48);
     const volatilityOk = atr / last >= 0.0008;
     const historyFresh = !history._meta?.stale;
     const confluence = [trendAligned, volatilityOk, historyFresh, Math.abs(move) >= 0.05].filter(Boolean).length;
@@ -1701,7 +1705,11 @@ function buildDeterministicSignals(prices, histories) {
       return cautiousSignal(symbol, price, base, "Indicateurs incomplets · aucun signal direct validé.", history);
     }
 
-    if (strength < 0.18 || confluence < 3 || !trendAligned) {
+    // Backtested on ~5y real history (scripts/backtest.mjs): requiring full 4/4
+    // confluence instead of 3/4 improved average R both in-sample and on held-out
+    // data (+0.043->+0.045 train, +0.057->+0.070 test); a 3/4 bar let too much
+    // noise through.
+    if (strength < 0.18 || confluence < 4 || !trendAligned) {
       return cautiousSignal(symbol, price, base, `Momentum faible · setup non validé, confluence ${confluence}/4.`, history);
     }
 
