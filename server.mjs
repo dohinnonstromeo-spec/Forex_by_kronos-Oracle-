@@ -1,9 +1,10 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
+import { createGzip, createBrotliCompress } from "node:zlib";
 import pg from "pg";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -253,14 +254,41 @@ const mime = {
   ".webp": "image/webp",
 };
 
+const SECURITY_CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "script-src 'self'",
+  "style-src 'self' https://fonts.googleapis.com",
+  "img-src 'self' data:",
+  "font-src 'self' https://fonts.gstatic.com data:",
+  "connect-src 'self'",
+  "frame-src https://s.tradingview.com",
+  "frame-ancestors 'self'",
+  "object-src 'none'",
+  "form-action 'self'",
+].join("; ");
+
+function applySecurityHeaders(res, req) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()");
+  res.setHeader("Content-Security-Policy", SECURITY_CSP);
+  const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  if (env.NODE_ENV === "production" || forwardedProto === "https") {
+    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  }
+}
+
 createServer(async (req, res) => {
   try {
+    applySecurityHeaders(res, req);
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
     if (url.pathname.startsWith("/api/")) {
       await handleApi(req, res, url);
       return;
     }
-    await serveStatic(res, url.pathname);
+    await serveStatic(res, url.pathname, req);
   } catch (error) {
     sendJson(res, 500, { error: "server_error", message: error.message });
   }
@@ -2957,6 +2985,12 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
     });
   }
+  const structuralCheck = crossCheckStructuralClaims(text, { technicalSnapshot: meta.technicalSnapshot, entry, pair: body.pair });
+  if (structuralCheck.checked && !structuralCheck.aligned) {
+    validation.score = Math.max(0, validation.score - 15);
+    validation.reason = `${validation.reason} ${structuralCheck.note}`;
+  }
+  meta.structuralCheck = structuralCheck;
   const danger = computeDangerScore({ meta, validation, levelCheck, rr, live, entry, strategy: body.strategy, risk: body.risk });
   const qualityGate = buildQualityGate({ meta, validation, levelCheck, danger, hasChartImages, quickMode });
   if (!qualityGate.valid) {
@@ -3463,6 +3497,26 @@ const styleRules = {
     groups: [["bos", "choch", "liquidité", "order block", "smc"], ["support", "résistance", "cassure", "retest"], ["confluence", "confirmation"]],
   },
 };
+
+function crossCheckStructuralClaims(text, { technicalSnapshot, entry, pair }) {
+  if (!technicalSnapshot?.valid) return { checked: false };
+  const mentionsZone = /\bsupport\b|r[ée]sistance|order block|\bfvg\b|zone de (?:demande|offre)/i.test(text);
+  if (!mentionsZone) return { checked: false };
+  const support = Number(technicalSnapshot.support);
+  const resistance = Number(technicalSnapshot.resistance);
+  if (!Number.isFinite(support) || !Number.isFinite(resistance) || !Number.isFinite(entry) || resistance <= support) {
+    return { checked: false };
+  }
+  const tolerance = (resistance - support) * 0.35;
+  const withinRange = entry >= support - tolerance && entry <= resistance + tolerance;
+  return {
+    checked: true,
+    aligned: withinRange,
+    note: withinRange
+      ? `Zone citée cohérente avec support ${formatLevel(support, pair)} / résistance ${formatLevel(resistance, pair)}.`
+      : `Zone citée (support/résistance/order block) éloignée du support ${formatLevel(support, pair)} / résistance ${formatLevel(resistance, pair)} calculés côté serveur.`,
+  };
+}
 
 function validateAnalysisStyle(text, style) {
   if (style === "Mixte") return validateMixedStyle(text);
@@ -4681,6 +4735,14 @@ function learningSummary(log) {
       winRate: items.length ? Math.round((strategyWins / items.length) * 100) : null,
     }];
   }));
+  const byPair = Object.fromEntries(symbols.map((pair) => {
+    const items = closed.filter((item) => item.pair === pair);
+    const pairWins = items.filter((item) => item.result === "win").length;
+    return [pair, {
+      samples: items.length,
+      winRate: items.length >= 20 ? Math.round((pairWins / items.length) * 100) : null,
+    }];
+  }));
   return {
     updatedAt: log.updatedAt,
     totalAnalyses: log.analyses.length,
@@ -4690,6 +4752,7 @@ function learningSummary(log) {
     globalWinRate: closed.length ? Math.round((wins / closed.length) * 100) : null,
     byStyle,
     byStrategy,
+    byPair,
     note: "Apprentissage contrôlé: Kronos calibre ses scores avec les résultats, sans modifier le code automatiquement.",
   };
 }
@@ -4716,6 +4779,7 @@ function performancePayload(log) {
     membersLabel: "500+",
     byStyle: summary.byStyle,
     byStrategy: summary.byStrategy,
+    byPair: summary.byPair,
     recent: recent.map((item) => ({
       pair: item.pair,
       style: item.style,
@@ -4869,7 +4933,18 @@ async function loadEnv(path) {
   return { ...out, ...process.env };
 }
 
-async function serveStatic(res, pathname) {
+const COMPRESSIBLE_EXT = new Set([".html", ".js", ".css", ".json", ".svg"]);
+const HASHED_ASSET_RE = /-[A-Za-z0-9_]{6,}\.(?:js|css)$/;
+
+function cacheControlFor(pathname, ext) {
+  if (ext === ".html" || pathname === "/") return "no-cache";
+  if (HASHED_ASSET_RE.test(pathname)) return "public, max-age=31536000, immutable";
+  if (ext === ".js" || ext === ".css") return "public, max-age=300, must-revalidate";
+  if ([".png", ".jpg", ".jpeg", ".webp", ".svg"].includes(ext)) return "public, max-age=86400";
+  return "no-cache";
+}
+
+async function serveStatic(res, pathname, req = null) {
   if ((pathname === "/admin-health" || pathname === "/admin-health.html") && env.ADMIN_HEALTH_PUBLIC !== "true") {
     sendJson(res, 404, { error: "not_found" });
     return;
@@ -4897,13 +4972,32 @@ async function serveStatic(res, pathname) {
   };
   pathname = aliases[pathname] || pathname;
   const safe = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, "");
-  let file = join(root, safe === "/" ? "index.html" : safe);
+  let file = join(root, pathname === "/" ? "index.html" : safe);
+  if (existsSync(file) && statSync(file).isDirectory()) file = join(root, "index.html");
   if (!existsSync(file) && !extname(file)) file = join(root, "index.html");
-  if (!existsSync(file)) {
+  if (!existsSync(file) || statSync(file).isDirectory()) {
     sendJson(res, 404, { error: "not_found" });
     return;
   }
-  res.writeHead(200, { "Content-Type": mime[extname(file)] || "application/octet-stream" });
+  const ext = extname(file);
+  res.setHeader("Content-Type", mime[ext] || "application/octet-stream");
+  res.setHeader("Cache-Control", cacheControlFor(pathname, ext));
+  const compressible = COMPRESSIBLE_EXT.has(ext);
+  if (compressible) res.setHeader("Vary", "Accept-Encoding");
+  const acceptEncoding = String(req?.headers?.["accept-encoding"] || "");
+  if (compressible && /\bbr\b/.test(acceptEncoding)) {
+    res.setHeader("Content-Encoding", "br");
+    res.writeHead(200);
+    createReadStream(file).pipe(createBrotliCompress()).pipe(res);
+    return;
+  }
+  if (compressible && /\bgzip\b/.test(acceptEncoding)) {
+    res.setHeader("Content-Encoding", "gzip");
+    res.writeHead(200);
+    createReadStream(file).pipe(createGzip()).pipe(res);
+    return;
+  }
+  res.writeHead(200);
   createReadStream(file).pipe(res);
 }
 
