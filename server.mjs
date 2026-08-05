@@ -268,7 +268,12 @@ const SECURITY_CSP = [
   "default-src 'self'",
   "base-uri 'self'",
   "script-src 'self'",
-  "style-src 'self' https://fonts.googleapis.com",
+  // 'unsafe-inline' is required here: the React bundle (assets/index-*.js) sets inline
+  // styles at runtime (charts, dynamic positioning) -- confirmed by a real browser
+  // walkthrough that showed hundreds of blocked style-src violations without this.
+  // script-src stays 'self'-only, which is what actually matters for XSS protection;
+  // inline *style* injection is a much lower-severity risk than inline *script*.
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "img-src 'self' data:",
   "font-src 'self' https://fonts.gstatic.com data:",
   "connect-src 'self'",
