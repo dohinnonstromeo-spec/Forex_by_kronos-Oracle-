@@ -315,7 +315,7 @@ function startLearningOutcomesScheduler() {
       const prices = await getPrices();
       await updateLearningOutcomes(prices);
     } catch (error) {
-      console.warn(`Learning outcomes sync failed: ${error.message}`);
+      logOnce("scheduler", `sync outcomes échoué (${error.message})`);
     }
   };
   tick();
@@ -2290,7 +2290,7 @@ async function groq(prompt, maxTokens = 150, temperature = 0.3) {
       return await fetchWithRotation("groq", GROQ_KEYS, (key) => groqOnce(key, model, prompt, maxTokens, temperature));
     } catch (error) {
       recordProviderHealth("groq", false, error.message);
-      console.warn(`Groq failed with ${model}: ${error.message}`);
+      logOnce("groq", `${model} indisponible (${error.message})`);
     }
   }
   return geminiText(prompt, maxTokens, temperature);
@@ -2341,7 +2341,7 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
       }
     } catch (error) {
       recordProviderHealth("gemini_text", false, error.message);
-      console.warn(`Gemini text failed with ${model}: ${error.message}`);
+      logOnce("gemini", `${model} indisponible (${error.message})`);
     }
   }
   return "";
@@ -2387,7 +2387,7 @@ async function groqVision(prompt, images, maxTokens = 1000) {
       }
     } catch (error) {
       recordProviderHealth("groq_vision", false, error.message);
-      console.warn(`Groq Vision failed with ${model}: ${error.message}`);
+      logOnce("groq_vision", `${model} indisponible (${error.message})`);
     }
   }
   return "";
@@ -2398,12 +2398,12 @@ async function analyzeChartImage(prompt, images, maxTokens = 1000) {
   if (GROQ_KEYS.length) {
     const result = await groqVision(prompt, images, maxTokens);
     if (result && result.length > 50) return result;
-    console.warn("Groq Vision insufficient, falling back to Gemini Vision.");
+    logOnce("vision", "Groq Vision insuffisant, bascule Gemini Vision.");
   }
   if (GEMINI_KEYS.length) {
     const result = await geminiVision(prompt, images, Math.round(maxTokens * 0.7));
     if (result && result.length > 50) return result;
-    console.warn("Gemini Vision insufficient.");
+    logOnce("vision", "Gemini Vision insuffisant.");
   }
   return "";
 }
@@ -2441,7 +2441,7 @@ async function geminiVision(prompt, images, maxTokens = 700) {
       }
     } catch (error) {
       recordProviderHealth("gemini_vision", false, error.message);
-      console.warn(`Gemini failed with ${model}: ${error.message}`);
+      logOnce("gemini_vision", `${model} indisponible (${error.message})`);
     }
   }
   return "";
@@ -3624,16 +3624,48 @@ function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger 
   };
 }
 
+// Rough, broker-agnostic money illustration for a 0.01 lot (micro-lot) position:
+// P&L = price distance x units-per-0.01-lot, using widely-cited conventions per
+// instrument class. Real contract specs (lot size, tick value) vary by broker --
+// this is a teaching example, not a precise quote, and says so.
+function microLotUnits(pair = "") {
+  const symbol = String(pair).toUpperCase();
+  if (/XAU|XAG|XPT|XPD/.test(symbol)) return { units: 1, currency: "USD", note: "1 once pour 0.01 lot (convention courante)" };
+  if (/BTC|ETH/.test(symbol)) return { units: 0.01, currency: "USD", note: "0.01 unité pour 0.01 lot (convention courante crypto CFD)" };
+  if (/US500|NAS|SPX/.test(symbol)) return { units: 0.01, currency: "USD", note: "convention approximative: varie beaucoup selon le broker pour les indices" };
+  if (/JPY/.test(symbol)) return { units: 1000, currency: "JPY", note: "1000 unités pour 0.01 lot" };
+  return { units: 1000, currency: "USD", note: "1000 unités pour 0.01 lot" };
+}
+
+function microLotMoneyExample({ entry, sl, tp1, tp2, pair }) {
+  if (![entry, sl, tp1, tp2].every(Number.isFinite)) return null;
+  const { units, currency, note } = microLotUnits(pair);
+  const round2 = (value) => Math.round(value * 100) / 100;
+  return {
+    lot: 0.01,
+    currency,
+    lossAtSl: round2(Math.abs(entry - sl) * units),
+    gainAtTp1: round2(Math.abs(tp1 - entry) * units),
+    gainAtTp2: round2(Math.abs(tp2 - entry) * units),
+    note: `Estimation pour 0.01 lot (${note}). Valeur indicative: vérifie les spécifications de lot exactes de ton broker avant de trader en réel.`,
+  };
+}
+
 function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, risk, capital }) {
   const profile = riskProfile(risk);
   const riskAmount = riskAmountForCapital(capital, profile.percent);
   const riskLine = riskAmount
     ? `Risque max: ${profile.percent}% du capital, soit environ ${riskAmount.toFixed(2)} unité(s) si le capital indiqué est correct.`
     : `Risque max: ${profile.percent}% du capital. Ajuster le lot pour que la perte au SL respecte cette limite.`;
+  const money = microLotMoneyExample({ entry, sl, tp1, tp2, pair });
+  const moneyLine = money
+    ? `Astuce débutant (0.01 lot): perte ≈ ${money.lossAtSl} ${money.currency} si le SL est touché · gain ≈ ${money.gainAtTp1} ${money.currency} à TP1 · ≈ ${money.gainAtTp2} ${money.currency} à TP2. ${money.note}`
+    : null;
   return {
     title: isScalpingStrategy(strategy) ? "Plan scalping débutant" : "Plan débutant",
     steps: [
       riskLine,
+      ...(moneyLine ? [moneyLine] : []),
       `Entrée seulement si le prix confirme ${formatLevel(entry, pair)}.`,
       `Stop Loss à ${formatLevel(sl, pair)} sans l'élargir après entrée.`,
       `TP1 prudent à ${formatLevel(tp1, pair)}: fermer ${profile.closeAtTp1}% ou sécuriser une partie.`,
@@ -3641,6 +3673,7 @@ function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, ris
       `TP2 moyen à ${formatLevel(tp2, pair)}: laisser courir uniquement si le momentum reste propre.`,
       "Ne pas augmenter le lot après une perte: attendre un nouveau setup validé.",
     ],
+    microLotExample: money,
     copy: [
       `ENTREE: ${formatLevel(entry, pair)}`,
       `SL: ${formatLevel(sl, pair)}`,
@@ -3648,6 +3681,7 @@ function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, ris
       `TP2 MOYEN: ${formatLevel(tp2, pair)}`,
       `RISQUE MAX: ${profile.percent}% du capital`,
       `GESTION: Fermer ${profile.closeAtTp1}% à TP1 puis protéger le reste.`,
+      ...(money ? [`EXEMPLE 0.01 LOT: perte ~${money.lossAtSl} ${money.currency} au SL, gain ~${money.gainAtTp1} ${money.currency} au TP1`] : []),
     ].join("\n"),
   };
 }
@@ -4170,6 +4204,20 @@ function runtimeCacheSummary() {
     performance: item(memoryCache.performance),
     calendar: item(memoryCache.calendar),
   };
+}
+
+// Throttled, single-line, consistently formatted logging for things that can repeat
+// on every request (a provider being down, a scheduler tick failing) -- without this,
+// a single missing/expired API key spams the console with the same warning on every
+// single analysis request.
+const recentLogs = new Map();
+function logOnce(scope, message, throttleMs = 5 * 60 * 1000) {
+  const key = `${scope}:${message}`;
+  const now = Date.now();
+  const last = recentLogs.get(key);
+  if (last && now - last < throttleMs) return;
+  recentLogs.set(key, now);
+  console.warn(`[${new Date(now).toISOString().slice(11, 19)}] ${scope}: ${message}`);
 }
 
 function recordProviderHealth(provider, ok, error = null) {

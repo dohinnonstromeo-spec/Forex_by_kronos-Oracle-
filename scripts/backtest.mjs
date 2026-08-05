@@ -147,6 +147,8 @@ function evaluateSignalAt(bars, i, params) {
 
 function simulateForward(bars, signalIndex, signal) {
   const buy = signal.direction === "ACHAT";
+  const tp1R = Math.abs(signal.tp1 - signal.entry) / signal.risk;
+  const tp2R = Math.abs(signal.tp2 - signal.entry) / signal.risk;
   for (let j = signalIndex + 1; j <= Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1); j++) {
     const bar = bars[j];
     const hitSl = buy ? bar.low <= signal.sl : bar.high >= signal.sl;
@@ -154,8 +156,8 @@ function simulateForward(bars, signalIndex, signal) {
     const hitTp1 = buy ? bar.high >= signal.tp1 : bar.low <= signal.tp1;
     // Conservative ordering when both could technically fall inside the same bar: SL first.
     if (hitSl) return { result: "loss", rMultiple: -1 - COST_DRAG_R, barsHeld: j - signalIndex };
-    if (hitTp2) return { result: "win", rMultiple: 2.5 - COST_DRAG_R, barsHeld: j - signalIndex };
-    if (hitTp1) return { result: "win", rMultiple: 1.6 - COST_DRAG_R, barsHeld: j - signalIndex };
+    if (hitTp2) return { result: "win", rMultiple: tp2R - COST_DRAG_R, barsHeld: j - signalIndex };
+    if (hitTp1) return { result: "win", rMultiple: tp1R - COST_DRAG_R, barsHeld: j - signalIndex };
   }
   const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
   const expiryClose = bars[expiryIndex].close;
@@ -165,11 +167,11 @@ function simulateForward(bars, signalIndex, signal) {
   return { result: "expired", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
 }
 
-function backtestSymbol(pair, bars, params) {
+function backtestSymbol(pair, bars, params, evaluator = evaluateSignalAt) {
   const trainCutoff = Math.round(bars.length * TRAIN_RATIO);
   const trades = [];
   for (let i = 60; i < bars.length - 1; i++) {
-    const signal = evaluateSignalAt(bars, i, params);
+    const signal = evaluator(bars, i, params);
     if (!signal) continue;
     trades.push({
       pair,
@@ -181,6 +183,39 @@ function backtestSymbol(pair, bars, params) {
   }
   return trades;
 }
+
+// Mean-reversion alternative: fade RSI extremes stretched away from the SMA30 mean,
+// betting on a snap-back instead of following momentum. Classic counter-strategy to
+// try when a trend-following approach has no edge on a choppy/volatile instrument.
+function evaluateMeanReversionSignalAt(bars, i, params) {
+  if (i < 60) return null;
+  const window = bars.slice(0, i + 1);
+  const closes = window.map((bar) => bar.close);
+  const last = closes.at(-1);
+  const sma30 = average(closes.slice(-30));
+  const atr = average(window.slice(-14).map((bar) => Math.max(0, bar.high - bar.low))) || last * 0.004;
+  const rsi = calculateRsi(closes.slice(-100));
+  if (!Number.isFinite(last) || !Number.isFinite(rsi) || !Number.isFinite(sma30) || !sma30) return null;
+  const stretchPct = Math.abs((last - sma30) / sma30) * 100;
+  let direction = null;
+  if (rsi <= params.oversold && stretchPct >= params.minStretch) direction = "ACHAT"; // oversold + stretched below mean: bet on a bounce
+  if (rsi >= params.overbought && stretchPct >= params.minStretch) direction = "VENTE"; // overbought + stretched above mean: bet on a pullback
+  if (!direction) return null;
+  if (atr / last < params.volatilityMin) return null;
+  const risk = Math.max(atr * (params.riskAtrMultiplier ?? 1.0), last * 0.0025);
+  const entry = last;
+  const sl = direction === "ACHAT" ? entry - risk : entry + risk;
+  const tp1 = direction === "ACHAT" ? entry + risk * params.tp1R : entry - risk * params.tp1R;
+  const tp2 = direction === "ACHAT" ? entry + risk * params.tp2R : entry - risk * params.tp2R;
+  return { direction, entry, sl, tp1, tp2, risk };
+}
+
+const MEAN_REVERSION_VARIANTS = [
+  { name: "MR: RSI 25/75, tp 1.2R/2.0R", oversold: 25, overbought: 75, minStretch: 0.3, volatilityMin: 0.0008, riskAtrMultiplier: 1.0, tp1R: 1.2, tp2R: 2.0 },
+  { name: "MR: RSI 20/80, tp 1.2R/2.0R", oversold: 20, overbought: 80, minStretch: 0.3, volatilityMin: 0.0008, riskAtrMultiplier: 1.0, tp1R: 1.2, tp2R: 2.0 },
+  { name: "MR: RSI 25/75, tp 1.0R/1.6R (sortie rapide)", oversold: 25, overbought: 75, minStretch: 0.3, volatilityMin: 0.0008, riskAtrMultiplier: 1.0, tp1R: 1.0, tp2R: 1.6 },
+  { name: "MR: RSI 25/75, stretch min 0.6%", oversold: 25, overbought: 75, minStretch: 0.6, volatilityMin: 0.0008, riskAtrMultiplier: 1.0, tp1R: 1.2, tp2R: 2.0 },
+];
 
 function summarize(trades) {
   if (!trades.length) return { count: 0, winRate: null, avgR: null, totalR: null };
@@ -249,24 +284,48 @@ async function main() {
   console.log("\nLimites: échantillon borné par l'historique gratuit disponible, pas de gestion de portefeuille");
   console.log("(trades évalués indépendamment), coûts approximés par un haircut fixe plutôt qu'un carnet d'ordres réel.");
 
-  const gbpjpy = datasets.find((d) => d.pair === "GBP/JPY");
-  if (gbpjpy) {
-    console.log("\n\n=== Recherche ciblée GBP/JPY (n=1 paire JPY dans l'échantillon -- ne pas généraliser à toutes les paires JPY) ===");
-    const jpyVariants = [
-      { ...BASELINE_PARAMS, name: "baseline (SL atr*1.2)", riskAtrMultiplier: 1.2 },
-      { ...BASELINE_PARAMS, name: "SL plus large (atr*1.6)", riskAtrMultiplier: 1.6 },
-      { ...BASELINE_PARAMS, name: "SL plus large (atr*2.0)", riskAtrMultiplier: 2.0 },
-      { ...BASELINE_PARAMS, name: "plafond volatilité (skip si ATR>1.5%)", volatilityMax: 0.015 },
-      { ...BASELINE_PARAMS, name: "SL atr*1.6 + plafond volatilité 1.5%", riskAtrMultiplier: 1.6, volatilityMax: 0.015 },
-    ];
-    for (const variant of jpyVariants) {
-      const trades = backtestSymbol("GBP/JPY", gbpjpy.bars, variant);
+  console.log("\n\n=== Recherche cross JPY: retour à la moyenne vs suivi de tendance ===");
+  const jpyPairs = [
+    { pair: "GBP/JPY", yahooSymbol: "GBPJPY=X" },
+    { pair: "EUR/JPY", yahooSymbol: "EURJPY=X" },
+    { pair: "USD/JPY", yahooSymbol: "USDJPY=X" },
+  ];
+  const jpyDatasets = [];
+  for (const { pair, yahooSymbol } of jpyPairs) {
+    const existing = datasets.find((d) => d.pair === pair);
+    if (existing) { jpyDatasets.push(existing); continue; }
+    try {
+      const bars = await fetchYahooDaily(yahooSymbol);
+      if (bars.length >= 90) jpyDatasets.push({ pair, bars });
+      else console.log(`  ${pair}: historique insuffisant -- ignoré.`);
+    } catch (error) {
+      console.log(`  ${pair}: échec de récupération (${error.message}) -- ignoré.`);
+    }
+  }
+
+  console.log("\n-- Suivi de tendance (production actuelle) --");
+  for (const { pair, bars } of jpyDatasets) {
+    const trades = backtestSymbol(pair, bars, BASELINE_PARAMS);
+    const train = trades.filter((t) => t.split === "train");
+    const test = trades.filter((t) => t.split === "test");
+    console.log(`  ${pair.padEnd(10)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
+  }
+
+  for (const mrVariant of MEAN_REVERSION_VARIANTS) {
+    console.log(`\n-- ${mrVariant.name} --`);
+    const allTrain = [];
+    const allTest = [];
+    for (const { pair, bars } of jpyDatasets) {
+      const trades = backtestSymbol(pair, bars, mrVariant, evaluateMeanReversionSignalAt);
       const train = trades.filter((t) => t.split === "train");
       const test = trades.filter((t) => t.split === "test");
-      console.log(`  ${variant.name.padEnd(42)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
+      allTrain.push(...train);
+      allTest.push(...test);
+      console.log(`  ${pair.padEnd(10)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
     }
-    console.log("\n  (baseline ci-dessus utilise déjà confluence 4/4 + momentum floor 0.04, la config expédiée en prod)");
+    console.log(`  ${"GLOBAL".padEnd(10)} | train: ${fmt(summarize(allTrain))}  ||  test: ${fmt(summarize(allTest))}`);
   }
+  console.log("\n  n=3 paires JPY seulement -- indicatif, pas une preuve statistique définitive sur \"les cross JPY\" en général.");
 }
 
 main();
