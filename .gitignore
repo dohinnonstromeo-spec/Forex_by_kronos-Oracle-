@@ -3,3 +3,4 @@ secret.dev
 node_modules/
 .DS_Store
 data/*.json
+backups/

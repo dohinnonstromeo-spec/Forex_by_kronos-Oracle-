@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Syntax check server and scripts
+        run: |
+          node --check server.mjs
+          for f in scripts/*.mjs; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+      # No API keys are configured in CI on purpose: this exercises the exact
+      # no-credentials fallback path (static prices, deterministic analysis
+      # text, vision disabled) that a fresh clone or a degraded production
+      # environment hits, so a crash here means a real crash for users too.
+      - name: Boot smoke test (no API keys configured)
+        run: |
+          PORT=4174 node server.mjs &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:4174/ > /dev/null; then break; fi
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:4174/ > /dev/null || (echo "Homepage did not respond" && kill $SERVER_PID && exit 1)
+          curl -sf http://127.0.0.1:4174/api/health > /dev/null || (echo "/api/health did not respond" && kill $SERVER_PID && exit 1)
+          curl -sf http://127.0.0.1:4174/api/signals > /dev/null || (echo "/api/signals did not respond" && kill $SERVER_PID && exit 1)
+          curl -sf -X POST http://127.0.0.1:4174/api/analyze-chart -H "Content-Type: application/json" -d '{"pair":"EUR/USD","timeframe":"H1","style":"Mixte","strategy":"Swing Trading","analysisDepth":"Rapide"}' > /dev/null \
+            || (echo "/api/analyze-chart did not respond" && kill $SERVER_PID && exit 1)
+          kill $SERVER_PID
+          echo "Smoke test passed."
