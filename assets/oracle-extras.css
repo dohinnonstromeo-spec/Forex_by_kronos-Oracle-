@@ -1563,11 +1563,14 @@ body {
   .oracle-chat-toggle {
     right: 16px;
     bottom: 16px;
+    width: 48px;
+    height: 48px;
+    font-size: 22px;
   }
 
   .oracle-chat-online {
     right: 14px;
-    bottom: 82px;
+    bottom: 70px;
   }
 
   .copy-level-grid {
@@ -1608,9 +1611,28 @@ body {
     width: calc(100vw - 24px);
   }
 
+  .oracle-nav-inner {
+    gap: 10px;
+    padding: 14px 16px;
+  }
+
   .oracle-links {
     gap: 12px;
     font-size: 12px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    justify-content: flex-start;
+  }
+
+  .oracle-links::-webkit-scrollbar { display: none; }
+
+  .oracle-links a,
+  .oracle-links button {
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   .analysis-card {
@@ -1782,6 +1804,7 @@ body {
   font-size: clamp(3rem, 8vw, 7rem);
   line-height: .94;
   letter-spacing: 0;
+  overflow-wrap: break-word;
 }
 
 .home-hero h1 span {
@@ -2317,7 +2340,12 @@ body {
     padding: 0 10px;
     font-size: .68rem;
   }
-  .home-hero h1 { font-size: 3rem; }
+  .home-hero h1 { font-size: 2.25rem; }
+  .home-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .home-button { min-width: 0; width: 100%; }
   .home-chart-body { height: 340px; }
   .home-chart-foot,
   .home-chart-head,
