@@ -310,6 +310,7 @@ createServer(async (req, res) => {
 }).listen(port, () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
   startLearningOutcomesScheduler();
+  startSignalsBroadcastScheduler();
 });
 
 const LEARNING_OUTCOMES_INTERVAL_MS = Number(env.LEARNING_OUTCOMES_INTERVAL_SECONDS || 90) * 1000;
@@ -325,6 +326,38 @@ function startLearningOutcomesScheduler() {
   };
   tick();
   setInterval(tick, LEARNING_OUTCOMES_INTERVAL_MS);
+}
+
+async function computeSignalsPayload() {
+  const prices = await getPrices();
+  const market = marketStatus();
+  const histories = await getHistories(prices);
+  await updateLearningOutcomes(prices);
+  const newsRisk = await economicRiskWindow();
+  const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
+  const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
+  memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
+  return payload;
+}
+
+const signalStreamClients = new Set();
+const MAX_SIGNAL_STREAM_CLIENTS = Number(env.MAX_SIGNAL_STREAM_CLIENTS || 500);
+const SIGNALS_BROADCAST_INTERVAL_MS = Number(env.SIGNALS_BROADCAST_INTERVAL_SECONDS || 60) * 1000;
+
+function startSignalsBroadcastScheduler() {
+  const tick = async () => {
+    if (!signalStreamClients.size) return; // no one listening: don't burn provider quota
+    try {
+      const cached = memoryCache.signals.value;
+      const stale = !cached || Date.now() >= memoryCache.signals.expiresAt;
+      const payload = stale ? await computeSignalsPayload() : cached;
+      const message = `data: ${JSON.stringify(payload)}\n\n`;
+      for (const client of signalStreamClients) client.write(message);
+    } catch (error) {
+      logOnce("signals_stream", `diffusion échouée (${error.message})`);
+    }
+  };
+  setInterval(tick, SIGNALS_BROADCAST_INTERVAL_MS);
 }
 
 async function handleApi(req, res, url) {
@@ -453,15 +486,30 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, { ...cached, cached: true, cacheTtlSeconds: Math.max(0, Math.round((memoryCache.signals.expiresAt - Date.now()) / 1000)) });
       return;
     }
-    const prices = await getPrices();
-    const market = marketStatus();
-    const histories = await getHistories(prices);
-    await updateLearningOutcomes(prices);
-    const newsRisk = await economicRiskWindow();
-    const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
-    const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
-    memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
-    sendJson(res, 200, payload);
+    sendJson(res, 200, await computeSignalsPayload());
+    return;
+  }
+
+  // Server-Sent Events: pushes fresh signals to connected clients instead of
+  // making every browser tab poll on its own timer. Backed by the same cache
+  // /api/signals uses (signalCacheTtlMs), so this doesn't call the price/
+  // history providers any more often than a single active poller already did.
+  if (url.pathname === "/api/signals/stream") {
+    if (signalStreamClients.size >= MAX_SIGNAL_STREAM_CLIENTS) {
+      sendJson(res, 503, { error: "stream_capacity_reached" });
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.write(": connected\n\n");
+    const cached = memoryCache.signals.value;
+    if (cached) res.write(`data: ${JSON.stringify(cached)}\n\n`);
+    signalStreamClients.add(res);
+    req.on("close", () => signalStreamClients.delete(res));
     return;
   }
 

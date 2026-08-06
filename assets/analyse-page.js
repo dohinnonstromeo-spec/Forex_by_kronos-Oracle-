@@ -19,9 +19,33 @@
       if (isAutoDetectEnabled()) detectChartContext();
     });
     renderSignals(staticSignals);
-    refreshSignals();
-    setInterval(refreshSignals, 15 * 60 * 1000);
+    setupSignalsStream();
   });
+
+  // Live signals used to mean "poll every 15 minutes", which doesn't match a
+  // page badged "Live". Server-Sent Events push a fresh payload as soon as
+  // the shared cache refreshes (see /api/signals/stream + signalCacheTtlMs
+  // in server.mjs) instead of every open tab guessing on its own timer.
+  function setupSignalsStream() {
+    refreshSignals(); // fastest possible first paint, before the stream connects
+    if (typeof EventSource === "undefined") {
+      setInterval(refreshSignals, 60 * 1000);
+      return;
+    }
+    const source = new EventSource("/api/signals/stream");
+    source.onmessage = (event) => {
+      try {
+        applySignalsPayload(JSON.parse(event.data));
+      } catch {
+        // malformed frame: ignore, the next push (or EventSource's built-in
+        // auto-reconnect on a dropped connection) will self-correct
+      }
+    };
+    // No explicit onerror handling needed: EventSource retries the
+    // connection on its own with backoff. A slow safety-net poll covers the
+    // gap between "connection dropped" and "browser reconnected".
+    setInterval(() => { if (source.readyState !== EventSource.OPEN) refreshSignals(); }, 90 * 1000);
+  }
 
   function setupUpload() {
     const drop = document.querySelector(".drop-zone");
@@ -300,7 +324,13 @@
       renderMarketNotice(market, "Connexion marché en synchronisation · vérifiez que le serveur local est lancé.");
       return;
     }
-    const signals = Array.isArray(data?.signals) ? data.signals.map((signal, index) => ({
+    applySignalsPayload(data);
+  }
+
+  // Shared by the initial fetch, the manual refresh button and every SSE
+  // push, so all three render through the exact same path.
+  function applySignalsPayload(data) {
+    const signals = Array.isArray(data?.signals) ? data.signals.map((signal) => ({
       pair: signal.paire,
       type: inferType(signal.paire),
       direction: signal.direction,
@@ -310,7 +340,7 @@
       sl: signal.sl,
       rr: signal.rr,
       score: signal.confiance,
-      age: index === 0 ? "à l'instant" : `${index * 7 + 4} min`,
+      age: relativeAge(data.generatedAt),
       tech: signal.technique,
       direct: signal.direct,
       open: signal.open,
@@ -325,6 +355,16 @@
     const status = data?.market?.forex?.open ? "Forex ouvert" : "Forex fermé";
     if (badge) badge.textContent = `${status} · ${data?.market?.forex?.open ? "signaux uniquement si qualité validée" : "analyses suspendues"}`;
     renderMarketNotice(data?.market);
+  }
+
+  // Was a fabricated "index * 7 + 4 min" before -- looked live, meant
+  // nothing. This reflects how old the payload actually is.
+  function relativeAge(generatedAt) {
+    const seconds = generatedAt ? Math.max(0, Math.round((Date.now() - new Date(generatedAt).getTime()) / 1000)) : null;
+    if (seconds === null) return "à l'instant";
+    if (seconds < 45) return "à l'instant";
+    if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+    return `${Math.round(seconds / 3600)} h`;
   }
 
   function renderAnalysisResult(container, data) {
