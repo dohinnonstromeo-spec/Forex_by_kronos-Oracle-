@@ -26,6 +26,24 @@
   --oracle-panel: rgba(14, 19, 34, .78);
   --oracle-border: rgba(180, 230, 255, .13);
   --oracle-gradient: linear-gradient(135deg, oklch(85% .18 210), oklch(55% .25 295));
+
+  /* Spacing/radius scale -- introduced to stop new components from picking
+     one-off magic numbers (an audit found 8 distinct border-radius values
+     and ~19 distinct padding combos across this file with no pattern).
+     Not a retroactive rewrite of every existing declaration: applied to the
+     highest-visibility shared components first (buttons, nav). */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-pill: 999px;
 }
 
 body {
@@ -171,7 +189,7 @@ body {
   width: 34px;
   height: 34px;
   border: 1px solid rgba(255, 255, 255, .22);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   background: rgba(0, 0, 0, .18);
   color: white;
@@ -270,7 +288,7 @@ body {
 .oracle-upload-btn,
 .oracle-send-btn {
   border: 1px solid rgba(255, 255, 255, .12);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   background: rgba(255, 255, 255, .06);
   color: var(--foreground);
@@ -285,7 +303,7 @@ body {
 .oracle-chat-input {
   min-width: 0;
   border: 1px solid rgba(255, 255, 255, .12);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, .06);
   color: var(--foreground);
   padding: 0 12px;
@@ -294,7 +312,6 @@ body {
 
 .oracle-page {
   min-height: 100vh;
-  background: transparent;
   color: var(--foreground);
 }
 
@@ -508,7 +525,7 @@ body {
   width: 100%;
   height: 420px;
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(255,255,255,.04);
 }
 
@@ -528,7 +545,7 @@ body {
   aspect-ratio: 16 / 10;
   object-fit: cover;
   border: 1px solid rgba(255, 255, 255, .1);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
 }
 
 .preview-remove {
@@ -570,7 +587,7 @@ body {
 .analysis-field input {
   width: 100%;
   border: 1px solid rgba(255, 255, 255, .12);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: #070b16;
   color: var(--foreground);
   padding: 12px;
@@ -626,7 +643,7 @@ body {
 .new-analysis {
   width: 100%;
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   cursor: pointer;
   background: var(--oracle-gradient);
   color: var(--primary-foreground);
@@ -910,7 +927,7 @@ body {
 
 .levels-table div {
   border: 1px solid rgba(255,255,255,.08);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 10px;
   background: rgba(0,0,0,.25);
 }
@@ -1021,7 +1038,7 @@ body {
 .copy-level-grid button {
   min-width: 0;
   border: 1px solid rgba(0, 255, 136, .22);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(0, 255, 136, .08);
   color: var(--foreground);
   cursor: pointer;
@@ -1080,7 +1097,7 @@ body {
 
 .risk-mini-grid div {
   border: 1px solid rgba(255, 255, 255, .1);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(0, 0, 0, .24);
   padding: 9px;
 }
@@ -1195,7 +1212,7 @@ body {
 .auth-form input {
   width: 100%;
   border: 1px solid rgba(255, 255, 255, .14);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(0, 0, 0, .28);
   color: var(--foreground);
   padding: 12px 14px;
@@ -1299,7 +1316,7 @@ body {
 
 .dashboard-metrics div {
   border: 1px solid rgba(255, 255, 255, .1);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, .04);
   padding: 14px;
 }
@@ -1317,7 +1334,7 @@ body {
   gap: 12px;
   align-items: center;
   border: 1px solid rgba(255, 255, 255, .1);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, .04);
   padding: 14px;
 }
@@ -1473,7 +1490,7 @@ body {
   height: 46px;
   display: grid;
   place-items: center;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(0, 255, 136, .12);
   color: var(--neon-green);
   font-family: var(--font-display);
@@ -1500,7 +1517,7 @@ body {
   display: inline-flex;
   width: 100%;
   justify-content: center;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: var(--oracle-gradient);
   color: var(--primary-foreground);
   padding: 12px 14px;
@@ -1713,7 +1730,7 @@ body {
 .home-nav-cta,
 .home-button,
 .home-pricing-card a {
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   font-weight: 800;
   text-align: center;
   transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
@@ -1835,9 +1852,9 @@ body {
 
 .home-button.primary,
 .home-pricing-card a {
-  background: linear-gradient(135deg, #8a5b17, #d7a63b);
-  color: #120b03;
-  box-shadow: 0 0 28px rgba(195, 145, 47, .24);
+  background: var(--oracle-gradient);
+  color: var(--primary-foreground);
+  box-shadow: var(--shadow-glow-amber);
 }
 
 .home-button.secondary {
