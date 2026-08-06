@@ -1,0 +1,43 @@
+name: Database backup
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily -- low-traffic window
+  workflow_dispatch: {} # manual "Run workflow" button in the Actions tab
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run backup
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_STATE_TABLE: ${{ secrets.SUPABASE_STATE_TABLE }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set. Add it under Settings > Secrets and variables > Actions > New repository secret, using the same connection string the production server uses."
+            exit 1
+          fi
+          node scripts/backup.mjs
+
+      # This is what actually makes it a backup instead of a script that ran
+      # once: the file leaves the app server's disk and lands in GitHub's
+      # storage, independent of the production host. Every scheduled run
+      # produces its own artifact, so this also gives a 90-day rolling
+      # history for free, not just the latest snapshot.
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-forex-backup-${{ github.run_id }}
+          path: backups/*.json
+          retention-days: 90
+          if-no-files-found: error
