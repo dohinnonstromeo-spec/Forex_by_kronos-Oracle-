@@ -4982,6 +4982,7 @@ async function updateLearningOutcomes(prices = null) {
         status: "EXPIRED",
         result: "neutral",
         price,
+        rMultiple: markToMarketRMultiple(analysis, price),
         reason: "Ni TP1 ni SL touché après 24h.",
       };
       analysis.status = finalOutcome.status;
@@ -5000,6 +5001,7 @@ async function updateLearningOutcomes(prices = null) {
         score: analysis.score,
         result: finalOutcome.result,
         status: finalOutcome.status,
+        rMultiple: Number.isFinite(finalOutcome.rMultiple) ? finalOutcome.rMultiple : null,
         closedAt: analysis.closedAt,
       });
       changed = true;
@@ -5011,15 +5013,28 @@ async function updateLearningOutcomes(prices = null) {
 function evaluateOutcome(analysis, price) {
   const buy = analysis.direction === "ACHAT";
   if (![analysis.entry, analysis.sl, analysis.tp1].every(Number.isFinite)) return null;
+  const risk = Math.abs(analysis.entry - analysis.sl);
+  const rMultipleAt = (level) => (risk > 0 ? Math.round((Math.abs(level - analysis.entry) / risk) * 1000) / 1000 : null);
   if (Number.isFinite(analysis.tp2)) {
-    if (buy && price >= analysis.tp2) return { status: "TP2_HIT", result: "win", price, reason: "TP2 touché." };
-    if (!buy && price <= analysis.tp2) return { status: "TP2_HIT", result: "win", price, reason: "TP2 touché." };
+    if (buy && price >= analysis.tp2) return { status: "TP2_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché." };
+    if (!buy && price <= analysis.tp2) return { status: "TP2_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché." };
   }
-  if (buy && price >= analysis.tp1) return { status: "TP1_HIT", result: "win", price, reason: "TP1 touché." };
-  if (buy && price <= analysis.sl) return { status: "SL_HIT", result: "loss", price, reason: "Stop Loss touché." };
-  if (!buy && price <= analysis.tp1) return { status: "TP1_HIT", result: "win", price, reason: "TP1 touché." };
-  if (!buy && price >= analysis.sl) return { status: "SL_HIT", result: "loss", price, reason: "Stop Loss touché." };
+  if (buy && price >= analysis.tp1) return { status: "TP1_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché." };
+  if (buy && price <= analysis.sl) return { status: "SL_HIT", result: "loss", price, rMultiple: -1, reason: "Stop Loss touché." };
+  if (!buy && price <= analysis.tp1) return { status: "TP1_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché." };
+  if (!buy && price >= analysis.sl) return { status: "SL_HIT", result: "loss", price, rMultiple: -1, reason: "Stop Loss touché." };
   return null;
+}
+
+// Mark-to-market R for a signal that expired without hitting TP or SL --
+// same convention scripts/backtest.mjs uses for its "expired" bucket, so
+// live results and backtested results are computed the same way.
+function markToMarketRMultiple(analysis, price) {
+  const risk = Math.abs(analysis.entry - analysis.sl);
+  if (!(risk > 0) || !Number.isFinite(price)) return 0;
+  const buy = analysis.direction === "ACHAT";
+  const signedMove = buy ? price - analysis.entry : analysis.entry - price;
+  return Math.round((signedMove / risk) * 1000) / 1000;
 }
 
 // A raw win rate on a handful of trades is mostly noise (at n=5, one flipped
@@ -5099,11 +5114,34 @@ function calibrationFor(log, body = {}) {
 function winRateBucket(items) {
   const wins = items.filter((item) => item.result === "win").length;
   const samples = items.length;
+  const withR = items.filter((item) => Number.isFinite(item.rMultiple));
+  const totalR = withR.reduce((sum, item) => sum + item.rMultiple, 0);
   return {
     samples,
     winRate: samples ? Math.round((wins / samples) * 100) : null,
+    avgR: withR.length ? Math.round((totalR / withR.length) * 1000) / 1000 : null,
     confidenceLabel: samples ? winRateConfidenceLabel(samples) : "aucune donnée",
   };
+}
+
+// Chronological cumulative R, the same convention scripts/backtest.mjs uses
+// for its "R total" -- this is what an equity curve actually is: not a
+// price chart, a running sum of risk-adjusted outcomes.
+function buildEquityCurve(outcomes) {
+  const withR = outcomes
+    .filter((item) => ["win", "loss", "neutral"].includes(item.result) && Number.isFinite(item.rMultiple) && item.closedAt)
+    .slice()
+    .sort((a, b) => new Date(a.closedAt) - new Date(b.closedAt));
+  let cumulative = 0;
+  return withR.map((item) => {
+    cumulative += item.rMultiple;
+    return {
+      closedAt: item.closedAt,
+      pair: item.pair,
+      rMultiple: item.rMultiple,
+      cumulativeR: Math.round(cumulative * 1000) / 1000,
+    };
+  });
 }
 
 function learningSummary(log) {
@@ -5129,10 +5167,12 @@ function learningSummary(log) {
     blockedAnalyses: log.analyses.filter((item) => item.status === "BLOCKED").length,
     closedAnalyses: closed.length,
     globalWinRate: global.winRate,
+    globalAvgR: global.avgR,
     globalConfidenceLabel: global.confidenceLabel,
     byStyle,
     byStrategy,
     byPair,
+    equityCurve: buildEquityCurve(log.outcomes),
     note: "Apprentissage contrôlé: Kronos calibre ses scores avec les résultats, sans modifier le code automatiquement. Les winrates affichés restent indicatifs tant que l'échantillon (n) est petit — voir confidenceLabel.",
   };
 }
@@ -5160,6 +5200,8 @@ async function performancePayload(log) {
     openAnalyses: summary.openAnalyses,
     instrumentsTracked: symbols.length,
     membersLabel: String(memberCount),
+    avgR: summary.globalAvgR,
+    equityCurve: summary.equityCurve,
     byStyle: summary.byStyle,
     byStrategy: summary.byStrategy,
     byPair: summary.byPair,
@@ -5170,6 +5212,7 @@ async function performancePayload(log) {
       result: item.result,
       status: item.status,
       score: item.score,
+      rMultiple: Number.isFinite(item.rMultiple) ? item.rMultiple : null,
       closedAt: item.closedAt,
     })),
     disclaimer: summary.closedAnalyses >= 100

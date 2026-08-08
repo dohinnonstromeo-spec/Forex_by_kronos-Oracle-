@@ -2080,6 +2080,12 @@ body {
   margin-top: 16px;
 }
 
+.home-equity-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
 .home-spark-line {
   fill: none;
   stroke-width: 3;
