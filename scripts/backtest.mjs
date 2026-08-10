@@ -44,8 +44,13 @@ const PRE_FIX_PARAMS = {
 const BASELINE_PARAMS = { ...PRE_FIX_PARAMS, name: "production actuelle (momentum 0.04 + confluence 4/4)", momentumMin: 0.04, confluenceMin: 4 };
 
 const VARIANTS = [
-  PRE_FIX_PARAMS,
   BASELINE_PARAMS,
+  { ...BASELINE_PARAMS, name: "+ volume soft (confluence facultative)", volumeMode: "soft" },
+  { ...BASELINE_PARAMS, name: "+ volume hard (bloque si volume faible)", volumeMode: "hard" },
+  { ...BASELINE_PARAMS, name: "+ MTF hebdo soft (confluence facultative)", mtfMode: "soft" },
+  { ...BASELINE_PARAMS, name: "+ MTF hebdo hard (bloque si conflit)", mtfMode: "hard" },
+  { ...BASELINE_PARAMS, name: "+ volume hard + MTF hard (combiné)", volumeMode: "hard", mtfMode: "hard" },
+  { ...BASELINE_PARAMS, name: "+ volume soft + MTF soft (combiné)", volumeMode: "soft", mtfMode: "soft" },
 ];
 
 async function fetchYahooDaily(yahooSymbol, range = "5y") {
@@ -64,6 +69,7 @@ async function fetchYahooDaily(yahooSymbol, range = "5y") {
     close: Number(quote.close?.[i]),
     high: Number(quote.high?.[i]),
     low: Number(quote.low?.[i]),
+    volume: Number(quote.volume?.[i]),
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
 }
 
@@ -81,7 +87,33 @@ async function fetchBinanceDaily(binanceSymbol) {
     close: Number(bar[4]),
     high: Number(bar[2]),
     low: Number(bar[3]),
+    volume: Number(bar[5]),
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
+}
+
+// Monday-anchored weekly resample, used for the multi-timeframe filter. Only ever
+// called on bars[0..i] (the same lookahead-safe window evaluateSignalAt already
+// uses), so the last weekly bucket is naturally "this week so far" -- real
+// compounding, not a peek at the future.
+function resampleWeekly(dailyBars) {
+  const weeks = new Map();
+  for (const bar of dailyBars) {
+    const d = new Date(`${bar.date}T00:00:00Z`);
+    const day = d.getUTCDay();
+    const mondayOffset = day === 0 ? -6 : 1 - day;
+    const monday = new Date(d);
+    monday.setUTCDate(d.getUTCDate() + mondayOffset);
+    const key = monday.toISOString().slice(0, 10);
+    const existing = weeks.get(key);
+    if (!existing) {
+      weeks.set(key, { date: key, close: bar.close, high: bar.high, low: bar.low });
+    } else {
+      existing.close = bar.close;
+      existing.high = Math.max(existing.high, bar.high);
+      existing.low = Math.min(existing.low, bar.low);
+    }
+  }
+  return [...weeks.values()];
 }
 
 function average(values) {
@@ -113,6 +145,33 @@ function calculateRsi(closes, period = 14) {
   return 100 - (100 / (1 + rs));
 }
 
+// volumeMode: "off" (default, no change from shipped behavior) | "soft" (one more
+// confluence vote, confluenceMin unchanged so it's easier to satisfy) | "hard"
+// (must be confirmed or the signal is dropped, independent of confluence count).
+function volumeConfirmed(window) {
+  const sample = window.slice(-21);
+  if (sample.length < 21) return null; // not enough volume history to judge yet
+  const volumes = sample.map((bar) => Number(bar.volume));
+  if (!volumes.every(Number.isFinite) || volumes.some((v) => v <= 0)) return null; // provider didn't give real volume (e.g. most FX spot feeds)
+  const current = volumes.at(-1);
+  const priorAvg = average(volumes.slice(0, -1));
+  return priorAvg > 0 ? current >= priorAvg * 1.0 : null;
+}
+
+// mtfMode: "off" | "soft" (confluence vote) | "hard" (block on outright weekly
+// disagreement, neutral/insufficient weekly data does not block).
+function weeklyDirection(window) {
+  const weekly = resampleWeekly(window);
+  if (weekly.length < 30) return null;
+  const closes = weekly.map((w) => w.close);
+  const sma10 = average(closes.slice(-10));
+  const sma30 = average(closes.slice(-30));
+  if (!(sma30 > 0)) return null;
+  const momentum = ((sma10 - sma30) / sma30) * 100;
+  if (Math.abs(momentum) < 0.1) return "neutral";
+  return momentum >= 0 ? "ACHAT" : "VENTE";
+}
+
 // Same decision structure as buildDeterministicSignals() in server.mjs, but with the
 // threshold values pulled out into `params` so variants can be tested honestly.
 function evaluateSignalAt(bars, i, params) {
@@ -133,10 +192,24 @@ function evaluateSignalAt(bars, i, params) {
   const volatilityPct = atr / last;
   const volatilityOk = volatilityPct >= params.volatilityMin;
   if (volatilityPct > (params.volatilityMax ?? Infinity)) return null; // skip signals during abnormal volatility spikes (e.g. news whipsaws)
-  const confluence = [trendAligned, volatilityOk, true, Math.abs(move) >= 0.05].filter(Boolean).length;
+  const direction = momentum >= 0 ? "ACHAT" : "VENTE";
+
+  const volMode = params.volumeMode || "off";
+  const volOk = volMode === "off" ? null : volumeConfirmed(window);
+  if (volMode === "hard" && volOk === false) return null;
+
+  const mtfMode = params.mtfMode || "off";
+  const weekly = mtfMode === "off" ? null : weeklyDirection(window);
+  const mtfConflict = weekly && weekly !== "neutral" && weekly !== direction;
+  if (mtfMode === "hard" && mtfConflict) return null;
+
+  const confluenceFactors = [trendAligned, volatilityOk, true, Math.abs(move) >= 0.05];
+  if (volMode === "soft" && volOk !== null) confluenceFactors.push(volOk);
+  if (mtfMode === "soft" && weekly !== null) confluenceFactors.push(!mtfConflict);
+  const confluence = confluenceFactors.filter(Boolean).length;
+
   const strength = Math.abs(momentum) + Math.min(Math.abs(move), 2) * 0.35 + confluence * 0.08;
   if (strength < params.strengthMin || confluence < params.confluenceMin || !trendAligned) return null;
-  const direction = momentum >= 0 ? "ACHAT" : "VENTE";
   const risk = Math.max(atr * (params.riskAtrMultiplier ?? 1.2), last * 0.0025);
   const entry = last;
   const sl = direction === "ACHAT" ? entry - risk : entry + risk;

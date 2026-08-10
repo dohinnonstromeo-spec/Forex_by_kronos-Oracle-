@@ -1537,6 +1537,7 @@ async function fetchTwelveDataHistory(symbol, interval) {
       close: Number(bar.close),
       high: Number(bar.high),
       low: Number(bar.low),
+      volume: Number(bar.volume),
       datetime: bar.datetime,
     })).filter((bar) => Number.isFinite(bar.close)).reverse();
   });
@@ -1565,6 +1566,7 @@ async function fetchBinanceHistory(symbol, interval) {
     close: Number(bar[4]),
     high: Number(bar[2]),
     low: Number(bar[3]),
+    volume: Number(bar[5]),
     datetime: bar[0] ? new Date(bar[0]).toISOString() : null,
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
 }
@@ -1588,6 +1590,7 @@ async function fetchMassiveHistory(symbol, interval) {
       close: Number(bar.c),
       high: Number(bar.h),
       low: Number(bar.l),
+      volume: Number(bar.v),
       datetime: bar.t ? new Date(bar.t).toISOString() : null,
     })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low)).slice(-80);
   });
@@ -1605,6 +1608,7 @@ async function fetchStooqHistory(symbol, interval) {
     close: Number(row.Close || row.close),
     high: Number(row.High || row.high),
     low: Number(row.Low || row.low),
+    volume: Number(row.Volume || row.volume),
     datetime: `${row.Date || row.date || ""} ${row.Time || row.time || ""}`.trim(),
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
   if (!bars.length) throw new Error("invalid_history");
@@ -1622,6 +1626,7 @@ async function fetchYahooHistory(symbol, interval) {
     close: Number(quote.close?.[i]),
     high: Number(quote.high?.[i]),
     low: Number(quote.low?.[i]),
+    volume: Number(quote.volume?.[i]),
     datetime: new Date(ts * 1000).toISOString(),
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
   if (!bars.length) throw new Error("invalid_history");
@@ -1639,6 +1644,7 @@ async function fetchDukascopyHistory(symbol) {
     close: Number(row.Close || row.close),
     high: Number(row.High || row.high),
     low: Number(row.Low || row.low),
+    volume: Number(row.Volume || row.volume),
     datetime: row.Date || row.date,
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
   if (!bars.length) throw new Error("invalid_history");
@@ -2962,6 +2968,20 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
         ? "baissière"
         : "neutre/range";
   const volatility = Number.isFinite(atr) && last ? (atr / last) * 100 : 0;
+  // Informational only, not a gating factor: scripts/backtest.mjs tested a volume
+  // confirmation filter on the deterministic signal engine (soft AND hard variants)
+  // and neither beat the shipped baseline on held-out data (hard: +0.051 train but
+  // +0.000 test -- overfit). Kept here for the LLM cross-check (VSA/Wyckoff claims)
+  // and future research, not to change buildDeterministicSignals()'s validated logic.
+  const volumeSample = bars.slice(-21).map((bar) => Number(bar.volume));
+  const volumeUsable = volumeSample.length >= 21 && volumeSample.every(Number.isFinite) && volumeSample.some((v) => v > 0);
+  const volumeRatio = volumeUsable
+    ? (() => {
+      const current = volumeSample.at(-1);
+      const priorAvg = average(volumeSample.slice(0, -1));
+      return priorAvg > 0 ? Number((current / priorAvg).toFixed(2)) : null;
+    })()
+    : null;
   const confirmations = [
     closes.length >= 30,
     !meta.stale,
@@ -2988,6 +3008,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     trend,
     momentum: Number(momentum.toFixed(3)),
     volatility: Number(volatility.toFixed(3)),
+    volumeRatio,
     confirmations,
     text: [
       `${closes.length} bougies ${meta.source || livePrice?.source || "API"}`,
@@ -2996,6 +3017,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       Number.isFinite(rsi) ? `RSI ${Math.round(rsi)}` : "RSI indisponible",
       `ATR ${formatLevel(atr, pair)}`,
       Number.isFinite(support) && Number.isFinite(resistance) ? `support ${formatLevel(support, pair)}, résistance ${formatLevel(resistance, pair)}` : "zones S/R insuffisantes",
+      Number.isFinite(volumeRatio) ? `volume ${volumeRatio}x la moyenne 20 bougies` : "volume indisponible pour cette source",
       `confirmations ${confirmations}/6`,
       compatible ? "timeframe cohérent avec la stratégie" : "historique non aligné avec le timeframe demandé",
       meta.stale ? "historique indicatif/différé" : "historique frais ou cache récent",
@@ -3803,6 +3825,22 @@ function crossCheckStructuralClaims(text, { technicalSnapshot, entry, pair }) {
     const cited = /haussi/i.test(trendMatch[1]) ? "haussière" : /baissi/i.test(trendMatch[1]) ? "baissière" : "neutre";
     if (cited !== "neutre" && cited !== technicalSnapshot.trend) {
       issues.push(`tendance annoncée (${cited}) opposée à la tendance calculée côté serveur (${technicalSnapshot.trend})`);
+    }
+  }
+
+  // Volume is not a gating factor for the deterministic engine (tested and rejected
+  // in scripts/backtest.mjs), but a VSA/Wyckoff claim ("effort vs résultat") citing
+  // volume the server can actually measure is worth catching if it contradicts data.
+  const highVolumeClaim = /volume\s+(?:fort|élevé|important|en hausse|anormal)|spike de volume|forte activité/i.test(text);
+  const lowVolumeClaim = /volume\s+(?:faible|bas|en baisse|réduit)|no supply|no demand|absence de volume/i.test(text);
+  const volumeRatio = Number(technicalSnapshot.volumeRatio);
+  if ((highVolumeClaim || lowVolumeClaim) && Number.isFinite(volumeRatio)) {
+    checked = true;
+    if (highVolumeClaim && volumeRatio < 1.15) {
+      issues.push(`volume "fort" annoncé mais volume mesuré ${volumeRatio}x la moyenne 20 bougies (pas de confirmation)`);
+    }
+    if (lowVolumeClaim && volumeRatio > 0.85) {
+      issues.push(`volume "faible" annoncé mais volume mesuré ${volumeRatio}x la moyenne 20 bougies (pas de confirmation)`);
     }
   }
 
