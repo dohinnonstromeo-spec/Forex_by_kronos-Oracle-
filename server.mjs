@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,6 +43,14 @@ const anonymousUsage = new Map();
 const loginAttempts = new Map();
 const LOGIN_MAX_ATTEMPTS = Number(env.LOGIN_MAX_ATTEMPTS || 5);
 const LOGIN_WINDOW_MS = Number(env.LOGIN_WINDOW_MINUTES || 15) * 60 * 1000;
+// /api/signup had no rate limit at all -- confirmed live, 10 accounts created back
+// to back with no throttling, each starting with a fresh free-tier quota. This
+// doesn't add email verification (no email-sending infra exists here), but it does
+// close the "just sign up again when the quota runs out" bypass by making repeated
+// signups from the same source expensive in time, same mechanism as the login limiter.
+const signupAttempts = new Map();
+const SIGNUP_MAX_ATTEMPTS = Number(env.SIGNUP_MAX_ATTEMPTS || 5);
+const SIGNUP_WINDOW_MS = Number(env.SIGNUP_WINDOW_MINUTES || 60) * 60 * 1000;
 const memoryCache = {
   prices: { value: null, expiresAt: 0 },
   histories: { key: "", value: null, expiresAt: 0 },
@@ -305,13 +313,44 @@ createServer(async (req, res) => {
     }
     await serveStatic(res, url.pathname, req);
   } catch (error) {
-    sendJson(res, 500, { error: "server_error", message: error.message });
+    // The socket may still have unread oversized-body bytes buffered on it for a
+    // 413; "Connection: close" tells Node to close it after this response instead
+    // of reusing it for a next keep-alive request (which would misread those
+    // leftover bytes as a new request line).
+    if (error.statusCode === 413) res.setHeader("Connection", "close");
+    sendJson(res, error.statusCode || 500, { error: error.statusCode === 413 ? "payload_too_large" : "server_error", message: error.message });
   }
 }).listen(port, () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
   startLearningOutcomesScheduler();
   startSignalsBroadcastScheduler();
+  startRateLimitMapSweeper();
 });
+
+// anonymousUsage, loginAttempts and signupAttempts are only ever added to, never
+// swept -- confirmed by reading every call site, no delete() exists for
+// anonymousUsage at all. On real traffic that's one permanent Map entry per unique
+// visitor per day, forever, for the life of the process. Not an immediate crash,
+// but a slow, unbounded leak that gets worse specifically as more users visit over
+// time -- exactly the kind of thing that's invisible in short-lived local testing.
+const RATE_LIMIT_SWEEP_INTERVAL_MS = Number(env.RATE_LIMIT_SWEEP_INTERVAL_MINUTES || 30) * 60 * 1000;
+
+function startRateLimitMapSweeper() {
+  const sweep = () => {
+    const now = Date.now();
+    const today = new Date().toISOString().slice(0, 10);
+    for (const [key, entry] of loginAttempts) {
+      if (now - entry.firstAttemptAt > LOGIN_WINDOW_MS) loginAttempts.delete(key);
+    }
+    for (const [key, entry] of signupAttempts) {
+      if (now - entry.firstAttemptAt > SIGNUP_WINDOW_MS) signupAttempts.delete(key);
+    }
+    for (const [key, usage] of anonymousUsage) {
+      if (usage?.date !== today) anonymousUsage.delete(key);
+    }
+  };
+  setInterval(sweep, RATE_LIMIT_SWEEP_INTERVAL_MS);
+}
 
 const LEARNING_OUTCOMES_INTERVAL_MS = Number(env.LEARNING_OUTCOMES_INTERVAL_SECONDS || 90) * 1000;
 
@@ -328,20 +367,40 @@ function startLearningOutcomesScheduler() {
   setInterval(tick, LEARNING_OUTCOMES_INTERVAL_MS);
 }
 
+// Without dedup, every concurrent request that saw an expired cache fired its own
+// full recompute (price + history fetches against external providers) at once --
+// wasted work that gets worse specifically under concurrent multi-user load, and
+// burns through the same API key quota the rotation fix earlier was trying to
+// stretch further. Concurrent callers now share the one in-flight computation.
+let signalsComputeInFlight = null;
+
 async function computeSignalsPayload() {
-  const prices = await getPrices();
-  const market = marketStatus();
-  const histories = await getHistories(prices);
-  await updateLearningOutcomes(prices);
-  const newsRisk = await economicRiskWindow();
-  const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
-  const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
-  memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
-  return payload;
+  if (signalsComputeInFlight) return signalsComputeInFlight;
+  signalsComputeInFlight = (async () => {
+    try {
+      const prices = await getPrices();
+      const market = marketStatus();
+      const histories = await getHistories(prices);
+      await updateLearningOutcomes(prices);
+      const newsRisk = await economicRiskWindow();
+      const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
+      const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
+      memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
+      return payload;
+    } finally {
+      signalsComputeInFlight = null;
+    }
+  })();
+  return signalsComputeInFlight;
 }
 
 const signalStreamClients = new Set();
 const MAX_SIGNAL_STREAM_CLIENTS = Number(env.MAX_SIGNAL_STREAM_CLIENTS || 500);
+// The global cap alone meant a single unauthenticated script could open all 500
+// slots itself and lock every real visitor out of the live feed with a 503. This
+// caps how many of those slots any one source can hold at once.
+const signalStreamByClient = new Map();
+const MAX_SIGNAL_STREAM_PER_CLIENT = Number(env.MAX_SIGNAL_STREAM_PER_CLIENT || 3);
 const SIGNALS_BROADCAST_INTERVAL_MS = Number(env.SIGNALS_BROADCAST_INTERVAL_SECONDS || 60) * 1000;
 
 function startSignalsBroadcastScheduler() {
@@ -363,7 +422,18 @@ function startSignalsBroadcastScheduler() {
 async function handleApi(req, res, url) {
   if (url.pathname === "/api/signup") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const rateLimit = checkSignupRateLimit(req);
+    if (!rateLimit.ok) {
+      sendJson(res, 429, {
+        ok: false,
+        error: "too_many_signups",
+        message: `Trop de comptes créés récemment depuis cette connexion. Réessaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
     const body = await readBody(req);
+    registerSignupAttempt(req);
     const result = await signupUser(body);
     if (!result.ok) return sendJson(res, 400, result);
     setSessionCookie(res, result.session.token, req);
@@ -434,6 +504,10 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/provider-status") {
+    if (env.ADMIN_HEALTH_PUBLIC !== "true") {
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
     sendJson(res, 200, getApiStatus());
     return;
   }
@@ -461,6 +535,17 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/health") {
+    // /admin-health.html is gated behind this same flag (serveStatic()), but the API
+    // it fetches from wasn't -- confirmed live: this returned full internals
+    // (database status, provider error history, cache state, learning metrics) to
+    // an unauthenticated direct request even with the HTML page correctly 404ing.
+    // /api/provider-status below had the identical gap. Matches the page's own
+    // access model (env-controlled, not a login flow) rather than requireAdmin(),
+    // since the admin-health.js frontend never attaches an admin token/session today.
+    if (env.ADMIN_HEALTH_PUBLIC !== "true") {
+      sendJson(res, 404, { error: "not_found" });
+      return;
+    }
     const learning = await loadLearningLog();
     const database = await databaseSummary();
     sendJson(res, 200, {
@@ -499,6 +584,13 @@ async function handleApi(req, res, url) {
       sendJson(res, 503, { error: "stream_capacity_reached" });
       return;
     }
+    const fingerprint = clientFingerprint(req);
+    const currentForClient = signalStreamByClient.get(fingerprint) || 0;
+    if (currentForClient >= MAX_SIGNAL_STREAM_PER_CLIENT) {
+      sendJson(res, 429, { error: "too_many_streams", message: "Trop de connexions temps réel actives depuis cette adresse." });
+      return;
+    }
+    signalStreamByClient.set(fingerprint, currentForClient + 1);
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -509,7 +601,12 @@ async function handleApi(req, res, url) {
     const cached = memoryCache.signals.value;
     if (cached) res.write(`data: ${JSON.stringify(cached)}\n\n`);
     signalStreamClients.add(res);
-    req.on("close", () => signalStreamClients.delete(res));
+    req.on("close", () => {
+      signalStreamClients.delete(res);
+      const remaining = (signalStreamByClient.get(fingerprint) || 1) - 1;
+      if (remaining <= 0) signalStreamByClient.delete(fingerprint);
+      else signalStreamByClient.set(fingerprint, remaining);
+    });
     return;
   }
 
@@ -545,7 +642,18 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // /api/comment, /api/news-summary and /api/briefing used to call the paid Groq API
+  // with no authentication and no quota check at all -- confirmed live, scriptable
+  // in an unbounded loop at zero cost to the caller. They now share the same "chat"
+  // quota bucket as /api/chat: same order of cost per call, no reason for a separate
+  // limit config just for these decorative endpoints.
   if (url.pathname === "/api/comment") {
+    const session = await currentSession(req);
+    const quota = await consumeQuota(session?.user, "chat", req);
+    if (!quota.ok) {
+      sendJson(res, 429, quota);
+      return;
+    }
     const body = await readBody(req);
     const prompt = `${body.pair} vient de passer de ${body.previous} à ${body.current} (${body.changePercent}%). 1 phrase d'analyse trader en français. Maximum 12 mots.`;
     const comment = await groq(prompt, 40, 0.3);
@@ -554,6 +662,12 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/news-summary") {
+    const session = await currentSession(req);
+    const quota = await consumeQuota(session?.user, "chat", req);
+    if (!quota.ok) {
+      sendJson(res, 429, quota);
+      return;
+    }
     const body = await readBody(req);
     const prompt = `Actualité : ${body.title}
 Résume en 8 mots max style trader.
@@ -577,6 +691,12 @@ Format : PAIRE DIRECTION · résumé court`;
   }
 
   if (url.pathname === "/api/briefing") {
+    const session = await currentSession(req);
+    const quota = await consumeQuota(session?.user, "chat", req);
+    if (!quota.ok) {
+      sendJson(res, 429, quota);
+      return;
+    }
     const body = await readBody(req);
     const prompt = `Événement dans 15min : ${body.name}
 Précédent: ${body.previous} / Prévu: ${body.forecast}
@@ -2550,9 +2670,36 @@ function splitCsvLine(line) {
   return cells;
 }
 
+// No limit here used to mean literally none: readBody would buffer a request body
+// of any size before even looking at it. Confirmed live -- a 40MB junk payload to
+// /api/analyze-chart was accepted and fully processed with a 200. Every concurrent
+// request holding one of these in memory multiplies the exposure; this is what
+// actually threatens the whole process (and therefore every other connected user),
+// not just the requester. 25MB is generous for two base64 chart screenshots (real
+// uploads assessed by assessImageQuality() run well under 1MB each in practice).
+const MAX_BODY_BYTES = Number(env.MAX_BODY_BYTES || 25 * 1024 * 1024);
+
+function bodyTooLargeError() {
+  const error = new Error("payload_too_large");
+  error.statusCode = 413;
+  return error;
+}
+
 async function readBody(req) {
+  const declaredLength = Number(req.headers["content-length"]);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) throw bodyTooLargeError();
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    // Don't req.destroy() here: on a connection using "Expect: 100-continue" that
+    // aborts the socket before our own 413 response goes out, leaving the client
+    // with a bare connection reset instead of a readable error. Just stop
+    // buffering and let the caller's error response close the connection cleanly
+    // (see the top-level catch: 413 responses set Connection: close).
+    if (total > MAX_BODY_BYTES) throw bodyTooLargeError();
+    chunks.push(chunk);
+  }
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : {};
 }
@@ -4178,6 +4325,32 @@ function projectTp2(direction, entry, sl, tp1) {
   return direction === "ACHAT" ? entry + risk * Math.min(rr2 + 0.8, 4) : entry - risk * Math.min(rr2 + 0.8, 4);
 }
 
+// Every store here (auth, learning-log) follows a load-whole-document -> mutate in
+// JS -> overwrite-whole-document pattern, with no DB-level locking (confirmed: even
+// the Postgres path is a plain INSERT ... ON CONFLICT DO UPDATE with no optimistic
+// lock). Two concurrent requests hitting the same store used to both load the same
+// snapshot and the second save silently discarded the first's change -- reproduced
+// live with two concurrent signups where one account vanished after both returned
+// 200 OK. This serializes every load+modify+save sequence for the same logical
+// store so they can never interleave, regardless of how many requests arrive at once.
+const fileLocks = new Map();
+function withFileLock(key, fn) {
+  const tail = fileLocks.get(key) || Promise.resolve();
+  const run = tail.then(fn, fn);
+  fileLocks.set(key, run.then(() => {}, () => {}));
+  return run;
+}
+
+// Write to a temp file then rename over the target: a crash mid-write can no longer
+// leave a truncated/corrupt JSON file that loadX() would silently treat as "no data"
+// on next boot (rename is atomic on the same filesystem/directory).
+async function atomicWriteFile(filePath, content) {
+  await mkdir(dataDir, { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, content, "utf8");
+  await rename(tempPath, filePath);
+}
+
 async function loadMarketCache() {
   const fromState = await loadStateDocument("market-cache");
   if (fromState) {
@@ -4214,8 +4387,7 @@ async function saveMarketCache(cache) {
     updatedAt: new Date().toISOString(),
   };
   if (await saveStateDocument("market-cache", trimmed)) return trimmed;
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(marketCachePath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
+  await atomicWriteFile(marketCachePath, `${JSON.stringify(trimmed, null, 2)}\n`);
   return trimmed;
 }
 
@@ -4478,18 +4650,24 @@ async function loadAuthStore() {
 
 async function saveAuthStore(store) {
   const now = new Date().toISOString();
+  // 5000/10000 was a blunt "keep last N by insertion order" cap: once the site ever
+  // accumulated more than 5000 accounts total, every save would silently drop the
+  // OLDEST ones -- including active paying users, just because they signed up early.
+  // Raised well past any realistic near-term scale; still not a real fix (that would
+  // be per-record storage instead of one whole-document blob), just pushes the
+  // landmine much further out and logs if we're getting close.
+  if (store.users.length > 40000) logOnce("auth-store", `${store.users.length} comptes: approche de la limite de troncature (50000), migrer vers un stockage par ligne devient nécessaire`);
   const trimmed = {
     version: 1,
-    users: store.users.slice(-5000),
+    users: store.users.slice(-50000),
     sessions: store.sessions
       .filter((session) => new Date(session.expiresAt).getTime() > Date.now())
-      .slice(-10000)
+      .slice(-50000)
       .map(({ token, ...session }) => session),
     updatedAt: now,
   };
   if (await saveStateDocument("auth-store", trimmed)) return { ...trimmed, persisted: "supabase" };
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(authPath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
+  await atomicWriteFile(authPath, `${JSON.stringify(trimmed, null, 2)}\n`);
   return { ...trimmed, persisted: "file" };
 }
 
@@ -4500,46 +4678,48 @@ async function signupUser(body = {}) {
   if (name.length < 2) return { ok: false, error: "Nom trop court." };
   if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
   if (password.length < 8) return { ok: false, error: "Mot de passe trop court: 8 caractères minimum." };
-  const store = await loadAuthStore();
-  const existing = store.users.find((user) => user.email === email);
-  if (existing) {
-    if (!verifyPassword(password, existing.passwordHash)) {
-      return { ok: false, error: "Ce compte existe déjà. Connecte-toi avec le bon mot de passe." };
+  return withFileLock("auth-store", async () => {
+    const store = await loadAuthStore();
+    const existing = store.users.find((user) => user.email === email);
+    if (existing) {
+      if (!verifyPassword(password, existing.passwordHash)) {
+        return { ok: false, error: "Ce compte existe déjà. Connecte-toi avec le bon mot de passe." };
+      }
+      const session = createSession(existing.id);
+      store.sessions = store.sessions.filter((item) => item.userId !== existing.id || new Date(item.expiresAt).getTime() > Date.now());
+      store.sessions.push(session);
+      existing.lastLoginAt = new Date().toISOString();
+      existing.updatedAt = new Date().toISOString();
+      const saved = await saveAuthStore(store);
+      if (authPersistenceRequired() && saved.persisted !== "supabase") {
+        return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+      }
+      return { ok: true, user: existing, session, reused: true };
     }
-    const session = createSession(existing.id);
-    store.sessions = store.sessions.filter((item) => item.userId !== existing.id || new Date(item.expiresAt).getTime() > Date.now());
+    const now = new Date().toISOString();
+    const user = {
+      id: `usr_${Date.now()}_${randomBytes(4).toString("hex")}`,
+      name,
+      email,
+      passwordHash: hashPassword(password),
+      plan: "free",
+      role: "user",
+      createdAt: now,
+      updatedAt: now,
+      preferences: {
+        level: "débutant",
+        favoritePairs: ["EUR/USD", "XAU/USD"],
+      },
+    };
+    const session = createSession(user.id);
+    store.users.push(user);
     store.sessions.push(session);
-    existing.lastLoginAt = new Date().toISOString();
-    existing.updatedAt = new Date().toISOString();
     const saved = await saveAuthStore(store);
     if (authPersistenceRequired() && saved.persisted !== "supabase") {
       return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
     }
-    return { ok: true, user: existing, session, reused: true };
-  }
-  const now = new Date().toISOString();
-  const user = {
-    id: `usr_${Date.now()}_${randomBytes(4).toString("hex")}`,
-    name,
-    email,
-    passwordHash: hashPassword(password),
-    plan: "free",
-    role: "user",
-    createdAt: now,
-    updatedAt: now,
-    preferences: {
-      level: "débutant",
-      favoritePairs: ["EUR/USD", "XAU/USD"],
-    },
-  };
-  const session = createSession(user.id);
-  store.users.push(user);
-  store.sessions.push(session);
-  const saved = await saveAuthStore(store);
-  if (authPersistenceRequired() && saved.persisted !== "supabase") {
-    return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
-  }
-  return { ok: true, user, session };
+    return { ok: true, user, session };
+  });
 }
 
 function loginRateLimitKey(req, email) {
@@ -4575,6 +4755,31 @@ function clearLoginAttempts(req, email) {
   loginAttempts.delete(loginRateLimitKey(req, email));
 }
 
+function checkSignupRateLimit(req) {
+  const key = clientFingerprint(req);
+  const entry = signupAttempts.get(key);
+  if (!entry) return { ok: true };
+  if (Date.now() - entry.firstAttemptAt > SIGNUP_WINDOW_MS) {
+    signupAttempts.delete(key);
+    return { ok: true };
+  }
+  if (entry.count >= SIGNUP_MAX_ATTEMPTS) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((entry.firstAttemptAt + SIGNUP_WINDOW_MS - Date.now()) / 1000));
+    return { ok: false, retryAfterSeconds };
+  }
+  return { ok: true };
+}
+
+function registerSignupAttempt(req) {
+  const key = clientFingerprint(req);
+  const entry = signupAttempts.get(key);
+  if (!entry || Date.now() - entry.firstAttemptAt > SIGNUP_WINDOW_MS) {
+    signupAttempts.set(key, { count: 1, firstAttemptAt: Date.now() });
+    return;
+  }
+  entry.count += 1;
+}
+
 async function loginUser(body = {}, req = null) {
   const email = normalizeEmail(body.email);
   const password = String(body.password || "");
@@ -4587,22 +4792,24 @@ async function loginUser(body = {}, req = null) {
       retryAfterSeconds: rateLimit.retryAfterSeconds,
     };
   }
-  const store = await loadAuthStore();
-  const user = store.users.find((item) => item.email === email);
-  if (!user || !verifyPassword(password, user.passwordHash)) {
-    if (req) registerLoginFailure(req, email);
-    return { ok: false, error: "Email ou mot de passe incorrect." };
-  }
-  if (req) clearLoginAttempts(req, email);
-  const session = createSession(user.id);
-  store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
-  store.sessions.push(session);
-  user.lastLoginAt = new Date().toISOString();
-  const saved = await saveAuthStore(store);
-  if (authPersistenceRequired() && saved.persisted !== "supabase") {
-    return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
-  }
-  return { ok: true, user, session };
+  return withFileLock("auth-store", async () => {
+    const store = await loadAuthStore();
+    const user = store.users.find((item) => item.email === email);
+    if (!user || !verifyPassword(password, user.passwordHash)) {
+      if (req) registerLoginFailure(req, email);
+      return { ok: false, error: "Email ou mot de passe incorrect." };
+    }
+    if (req) clearLoginAttempts(req, email);
+    const session = createSession(user.id);
+    store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
+    store.sessions.push(session);
+    user.lastLoginAt = new Date().toISOString();
+    const saved = await saveAuthStore(store);
+    if (authPersistenceRequired() && saved.persisted !== "supabase") {
+      return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+    }
+    return { ok: true, user, session };
+  });
 }
 
 async function currentSession(req) {
@@ -4619,9 +4826,11 @@ async function currentSession(req) {
 
 async function destroySession(token) {
   const tokenHash = sessionHash(token);
-  const store = await loadAuthStore();
-  store.sessions = store.sessions.filter((item) => item.tokenHash !== tokenHash);
-  await saveAuthStore(store);
+  return withFileLock("auth-store", async () => {
+    const store = await loadAuthStore();
+    store.sessions = store.sessions.filter((item) => item.tokenHash !== tokenHash);
+    await saveAuthStore(store);
+  });
 }
 
 function createSession(userId) {
@@ -4653,36 +4862,38 @@ function publicUser(user) {
 
 async function consumeQuota(user, feature, req = null) {
   if (!user) return consumeAnonymousQuota(req, feature);
-  const store = await loadAuthStore();
-  const stored = store.users.find((item) => item.id === user.id) || user;
-  if (hasPremiumAccess(stored)) {
-    return { ok: true, unlimited: true, feature };
-  }
-  const limits = {
-    analysis: Number(env.FREE_DAILY_ANALYSES || 3),
-    chat: Number(env.FREE_DAILY_CHAT || 25),
-    detection: Number(env.FREE_DAILY_DETECTIONS || 8),
-  };
-  const limit = limits[feature] ?? 10;
-  const today = new Date().toISOString().slice(0, 10);
-  if (!stored) return { ok: false, error: "session_invalid" };
-  stored.usage = normalizeUsage(stored.usage, today);
-  const used = Number(stored.usage[feature] || 0);
-  if (used >= limit) {
-    return quotaExceededPayload({
-      error: "quota_exceeded",
-      feature,
-      plan: effectivePlan(stored),
-      limit,
-      used,
-      message: "Quota gratuit atteint pour aujourd'hui.",
-      upgradeHint: "Passe en premium pour débloquer les analyses illimitées.",
-    });
-  }
-  stored.usage[feature] = used + 1;
-  stored.updatedAt = new Date().toISOString();
-  await saveAuthStore(store);
-  return { ok: true, feature, plan: effectivePlan(stored), limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
+  return withFileLock("auth-store", async () => {
+    const store = await loadAuthStore();
+    const stored = store.users.find((item) => item.id === user.id) || user;
+    if (hasPremiumAccess(stored)) {
+      return { ok: true, unlimited: true, feature };
+    }
+    const limits = {
+      analysis: Number(env.FREE_DAILY_ANALYSES || 3),
+      chat: Number(env.FREE_DAILY_CHAT || 25),
+      detection: Number(env.FREE_DAILY_DETECTIONS || 8),
+    };
+    const limit = limits[feature] ?? 10;
+    const today = new Date().toISOString().slice(0, 10);
+    if (!stored) return { ok: false, error: "session_invalid" };
+    stored.usage = normalizeUsage(stored.usage, today);
+    const used = Number(stored.usage[feature] || 0);
+    if (used >= limit) {
+      return quotaExceededPayload({
+        error: "quota_exceeded",
+        feature,
+        plan: effectivePlan(stored),
+        limit,
+        used,
+        message: "Quota gratuit atteint pour aujourd'hui.",
+        upgradeHint: "Passe en premium pour débloquer les analyses illimitées.",
+      });
+    }
+    stored.usage[feature] = used + 1;
+    stored.updatedAt = new Date().toISOString();
+    await saveAuthStore(store);
+    return { ok: true, feature, plan: effectivePlan(stored), limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
+  });
 }
 
 function consumeAnonymousQuota(req, feature) {
@@ -4742,9 +4953,23 @@ function effectivePlan(user = {}) {
   return ["premium", "prenium", "pro", "admin"].includes(plan) ? (plan === "prenium" ? "premium" : plan) : "premium";
 }
 
+// X-Forwarded-For is a plain client-supplied header -- trusting it unconditionally
+// (as this used to) meant every quota and rate-limit in this file keyed on it could
+// be bypassed just by sending a different value per request. Confirmed live: 429
+// on request 2 from the same header, 200 on request 3 with the header changed to a
+// different fake IP, for both the visitor quota and the login brute-force limiter.
+// Default is now the actual TCP connection IP, which the client cannot spoof. Only
+// trust X-Forwarded-For (last hop, the one closest to us, harder for the client to
+// control than the first) when TRUST_PROXY=true is explicitly set -- i.e. once
+// you've confirmed your host's edge proxy sets/overwrites this header itself rather
+// than passing through whatever the client sent.
+const TRUST_PROXY = env.TRUST_PROXY === "true";
 function clientFingerprint(req) {
-  const forwarded = String(req?.headers?.["x-forwarded-for"] || "").split(",")[0].trim();
-  const ip = forwarded || req?.socket?.remoteAddress || "local";
+  let ip = req?.socket?.remoteAddress || "local";
+  if (TRUST_PROXY) {
+    const chain = String(req?.headers?.["x-forwarded-for"] || "").split(",").map((part) => part.trim()).filter(Boolean);
+    if (chain.length) ip = chain[chain.length - 1];
+  }
   return String(ip).replace(/[^a-zA-Z0-9:._-]/g, "_").slice(0, 80);
 }
 
@@ -4827,33 +5052,37 @@ async function grantPremiumAccess(body = {}) {
   const email = normalizeEmail(body.email);
   const days = Math.max(1, Math.min(730, Number(body.days || body.durationDays || 30)));
   if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
-  const store = await loadAuthStore();
-  const user = store.users.find((item) => item.email === email);
-  if (!user) return { ok: false, error: "Utilisateur introuvable. La personne doit d'abord créer un compte." };
-  const premiumUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-  user.plan = "premium";
-  user.premiumUntil = premiumUntil;
-  user.manualPremium = true;
-  user.premiumSource = "manual_admin";
-  user.updatedAt = new Date().toISOString();
-  user.usage = { date: new Date().toISOString().slice(0, 10), analysis: 0, chat: 0, detection: 0 };
-  await saveAuthStore(store);
-  return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
+  return withFileLock("auth-store", async () => {
+    const store = await loadAuthStore();
+    const user = store.users.find((item) => item.email === email);
+    if (!user) return { ok: false, error: "Utilisateur introuvable. La personne doit d'abord créer un compte." };
+    const premiumUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    user.plan = "premium";
+    user.premiumUntil = premiumUntil;
+    user.manualPremium = true;
+    user.premiumSource = "manual_admin";
+    user.updatedAt = new Date().toISOString();
+    user.usage = { date: new Date().toISOString().slice(0, 10), analysis: 0, chat: 0, detection: 0 };
+    await saveAuthStore(store);
+    return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
+  });
 }
 
 async function revokePremiumAccess(body = {}) {
   const email = normalizeEmail(body.email);
   if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
-  const store = await loadAuthStore();
-  const user = store.users.find((item) => item.email === email);
-  if (!user) return { ok: false, error: "Utilisateur introuvable." };
-  user.plan = "free";
-  user.premiumUntil = null;
-  user.manualPremium = false;
-  user.premiumSource = null;
-  user.updatedAt = new Date().toISOString();
-  await saveAuthStore(store);
-  return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
+  return withFileLock("auth-store", async () => {
+    const store = await loadAuthStore();
+    const user = store.users.find((item) => item.email === email);
+    if (!user) return { ok: false, error: "Utilisateur introuvable." };
+    user.plan = "free";
+    user.premiumUntil = null;
+    user.manualPremium = false;
+    user.premiumSource = null;
+    user.updatedAt = new Date().toISOString();
+    await saveAuthStore(store);
+    return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
+  });
 }
 
 function adminUserPayload(user = {}) {
@@ -4952,98 +5181,109 @@ async function loadLearningLog() {
 async function saveLearningLog(log) {
   const trimmed = {
     version: 1,
-    analyses: log.analyses.slice(-600),
-    outcomes: log.outcomes.slice(-1000),
+    // Same truncation-at-scale issue as auth-store, raised the same way -- see the
+    // comment there. This data also backs the public performance/equity-curve
+    // numbers, so silently dropping old records would quietly corrupt those too.
+    analyses: log.analyses.slice(-20000),
+    outcomes: log.outcomes.slice(-20000),
     updatedAt: new Date().toISOString(),
   };
   if (await saveStateDocument("learning-log", trimmed)) return trimmed;
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(learningPath, `${JSON.stringify(trimmed, null, 2)}\n`, "utf8");
+  await atomicWriteFile(learningPath, `${JSON.stringify(trimmed, null, 2)}\n`);
   return trimmed;
 }
 
 async function recordLearningAnalysis(result, body, context) {
-  const log = await loadLearningLog();
-  const id = `ana_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const active = !result.noSignal && result.direction !== "AUCUN SIGNAL";
-  const entry = parseFormattedNumber(result.entry);
-  const sl = parseFormattedNumber(result.sl);
-  const tp1 = parseFormattedNumber(result.tp1);
-  const tp2 = parseFormattedNumber(result.tp2);
-  log.analyses.push({
-    id,
-    createdAt: new Date().toISOString(),
-    userId: context.user?.id || null,
-    pair: body.pair || "EUR/USD",
-    timeframe: body.timeframe || "H1",
-    style: body.style || "Hybride SMC+Chartiste",
-    strategy: body.strategy || "Swing Trading",
-    risk: body.risk || defaultRiskMode(),
-    capital: body.capital || null,
-    analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
-    direction: result.direction,
-    entry,
-    sl,
-    tp1,
-    tp2,
-    rr: result.rr,
-    score: Number(result.score) || 0,
-    active,
-    status: active ? "OPEN" : "BLOCKED",
-    blockReason: active ? null : result.validation?.reason || "Signal bloqué",
-    livePriceAtSignal: context.livePrice?.price ?? null,
-    imageQuality: context.imageQuality,
-    calibration: context.calibration,
-    validation: result.validation,
-    technicalSnapshot: context.technicalSnapshot || null,
-    multiTimeframe: context.multiTimeframe || [],
+  return withFileLock("learning-log", async () => {
+    const log = await loadLearningLog();
+    const id = `ana_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const active = !result.noSignal && result.direction !== "AUCUN SIGNAL";
+    const entry = parseFormattedNumber(result.entry);
+    const sl = parseFormattedNumber(result.sl);
+    const tp1 = parseFormattedNumber(result.tp1);
+    const tp2 = parseFormattedNumber(result.tp2);
+    log.analyses.push({
+      id,
+      createdAt: new Date().toISOString(),
+      userId: context.user?.id || null,
+      pair: body.pair || "EUR/USD",
+      timeframe: body.timeframe || "H1",
+      style: body.style || "Hybride SMC+Chartiste",
+      strategy: body.strategy || "Swing Trading",
+      risk: body.risk || defaultRiskMode(),
+      capital: body.capital || null,
+      analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
+      direction: result.direction,
+      entry,
+      sl,
+      tp1,
+      tp2,
+      rr: result.rr,
+      score: Number(result.score) || 0,
+      active,
+      status: active ? "OPEN" : "BLOCKED",
+      blockReason: active ? null : result.validation?.reason || "Signal bloqué",
+      livePriceAtSignal: context.livePrice?.price ?? null,
+      imageQuality: context.imageQuality,
+      calibration: context.calibration,
+      validation: result.validation,
+      technicalSnapshot: context.technicalSnapshot || null,
+      multiTimeframe: context.multiTimeframe || [],
+    });
+    await saveLearningLog(log);
+    result.learningId = id;
+    return id;
   });
-  await saveLearningLog(log);
-  result.learningId = id;
-  return id;
 }
 
 async function updateLearningOutcomes(prices = null) {
-  const log = await loadLearningLog();
-  const livePrices = prices || await getPrices();
-  let changed = false;
-  for (const analysis of log.analyses) {
-    if (analysis.status !== "OPEN" || !analysis.active) continue;
-    const price = Number(livePrices[analysis.pair]?.price);
-    if (!Number.isFinite(price)) continue;
-    const outcome = evaluateOutcome(analysis, price);
-    const ageHours = (Date.now() - new Date(analysis.createdAt).getTime()) / 3600000;
-    if (outcome || ageHours >= 24) {
-      const finalOutcome = outcome || {
-        status: "EXPIRED",
-        result: "neutral",
-        price,
-        rMultiple: markToMarketRMultiple(analysis, price),
-        reason: "Ni TP1 ni SL touché après 24h.",
-      };
-      analysis.status = finalOutcome.status;
-      analysis.closedAt = new Date().toISOString();
-      analysis.closePrice = price;
-      analysis.outcome = finalOutcome.result;
-      analysis.outcomeReason = finalOutcome.reason;
-      log.outcomes.push({
-        id: analysis.id,
-        userId: analysis.userId || null,
-        pair: analysis.pair,
-        timeframe: analysis.timeframe,
-        style: analysis.style,
-        strategy: analysis.strategy || "Swing Trading",
-        analysisDepth: analysis.analysisDepth || "Profonde",
-        score: analysis.score,
-        result: finalOutcome.result,
-        status: finalOutcome.status,
-        rMultiple: Number.isFinite(finalOutcome.rMultiple) ? finalOutcome.rMultiple : null,
-        closedAt: analysis.closedAt,
-      });
-      changed = true;
+  // Called from several endpoints plus the 90s scheduler tick, so it's the most
+  // frequent learning-log consumer -- wrapped in the same lock as
+  // recordLearningAnalysis() anyway, since the race is in the load-mutate-save
+  // sequence, not just the final write. getPrices() has its own cache, so most
+  // calls here don't hit the network and the lock is held only briefly.
+  return withFileLock("learning-log", async () => {
+    const log = await loadLearningLog();
+    const livePrices = prices || await getPrices();
+    let changed = false;
+    for (const analysis of log.analyses) {
+      if (analysis.status !== "OPEN" || !analysis.active) continue;
+      const price = Number(livePrices[analysis.pair]?.price);
+      if (!Number.isFinite(price)) continue;
+      const outcome = evaluateOutcome(analysis, price);
+      const ageHours = (Date.now() - new Date(analysis.createdAt).getTime()) / 3600000;
+      if (outcome || ageHours >= 24) {
+        const finalOutcome = outcome || {
+          status: "EXPIRED",
+          result: "neutral",
+          price,
+          rMultiple: markToMarketRMultiple(analysis, price),
+          reason: "Ni TP1 ni SL touché après 24h.",
+        };
+        analysis.status = finalOutcome.status;
+        analysis.closedAt = new Date().toISOString();
+        analysis.closePrice = price;
+        analysis.outcome = finalOutcome.result;
+        analysis.outcomeReason = finalOutcome.reason;
+        log.outcomes.push({
+          id: analysis.id,
+          userId: analysis.userId || null,
+          pair: analysis.pair,
+          timeframe: analysis.timeframe,
+          style: analysis.style,
+          strategy: analysis.strategy || "Swing Trading",
+          analysisDepth: analysis.analysisDepth || "Profonde",
+          score: analysis.score,
+          result: finalOutcome.result,
+          status: finalOutcome.status,
+          rMultiple: Number.isFinite(finalOutcome.rMultiple) ? finalOutcome.rMultiple : null,
+          closedAt: analysis.closedAt,
+        });
+        changed = true;
+      }
     }
-  }
-  return changed ? saveLearningLog(log) : log;
+    return changed ? saveLearningLog(log) : log;
+  });
 }
 
 function evaluateOutcome(analysis, price) {
