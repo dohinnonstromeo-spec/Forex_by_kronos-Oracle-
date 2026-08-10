@@ -1024,24 +1024,22 @@ function isQuotaError(errorOrData) {
 
 async function fetchWithRotation(apiName, keys, fetchFn) {
   if (!keys?.length) return null;
-  const start = rotationCounters[apiName] || 0;
   let lastError = null;
   for (let attempt = 0; attempt < keys.length; attempt += 1) {
-    const index = (start + attempt) % keys.length;
+    // Claim the slot synchronously, before the first await: two calls started
+    // back-to-back (near-simultaneous HTTP requests) both read rotationCounters
+    // before either write happened, so without this they pile onto the same key
+    // instead of spreading across the pool. Confirmed empirically before this fix.
+    const start = rotationCounters[apiName] || 0;
+    const index = start % keys.length;
+    rotationCounters[apiName] = (start + 1) % keys.length;
     const key = keys[index];
     if (isKeyExhausted(key)) continue;
     try {
-      const result = await fetchFn(key, index);
-      rotationCounters[apiName] = (index + 1) % keys.length;
-      return result;
+      return await fetchFn(key, index);
     } catch (error) {
       lastError = error;
-      if (isQuotaError(error.message)) {
-        markKeyExhausted(key);
-        rotationCounters[apiName] = (index + 1) % keys.length;
-        continue;
-      }
-      rotationCounters[apiName] = (index + 1) % keys.length;
+      if (isQuotaError(error.message)) markKeyExhausted(key);
     }
   }
   if (lastError) throw lastError;
