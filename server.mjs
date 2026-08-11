@@ -1043,6 +1043,11 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     const aiBudgetMs = images.length
       ? deepAnalysis ? 85000 : 35000
       : deepAnalysis ? 32000 : 9000;
+    // Fired now, alongside the main vision call below, so this only costs an extra
+    // API call, not extra latency (both resolve around the same time; awaited once
+    // `answer` is already settled). No-ops instantly (checked: false) unless both
+    // GROQ_KEYS and GEMINI_KEYS are configured.
+    const visionConsensusPromise = images.length ? visionConsensusCheck(images) : Promise.resolve({ checked: false });
     let answer = !deepAnalysis && !images.length
       ? buildDeterministicAnalysisText({
         pair: selectedPair,
@@ -1112,7 +1117,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         multiTimeframe,
       });
     }
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup });
+    const visionConsensus = await visionConsensusPromise;
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup, visionConsensus });
     if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null });
     sendJson(res, 200, result);
     return;
@@ -2683,6 +2689,50 @@ async function analyzeChartImage(prompt, images, maxTokens = 1000) {
   return "";
 }
 
+const VISION_CONSENSUS_PROMPT = `Regarde uniquement ce(s) graphe(s) de trading, sans aucun autre contexte.
+Réponds en JSON strict uniquement, sans texte autour:
+{"pair":"paire détectée ou null","bias":"haussier|baissier|neutre","keyLevel":niveau_numérique_le_plus_visible_ou_null}`;
+
+// Ordinary analyzeChartImage() is a fallback chain: Groq first, Gemini only if Groq's
+// answer is too short. That means the two providers never actually check each other --
+// whichever answers first is trusted alone. crossCheckStructuralClaims() catches a
+// model contradicting data it was already handed in its own prompt, but can't catch a
+// model inventing a pattern that simply isn't on the chart. Querying both providers
+// independently on the SAME image, in parallel (so latency stays ~1 call, only cost
+// doubles), and comparing their raw reads is the one mechanism here that can.
+async function visionConsensusCheck(images) {
+  if (!images?.length || !GROQ_KEYS.length || !GEMINI_KEYS.length) return { checked: false };
+  const [groqAnswer, geminiAnswer] = await Promise.all([
+    promiseWithTimeout(groqVision(VISION_CONSENSUS_PROMPT, images, 120), 12000, ""),
+    promiseWithTimeout(geminiVision(VISION_CONSENSUS_PROMPT, images, 120), 12000, ""),
+  ]);
+  const a = parseJson(groqAnswer, null);
+  const b = parseJson(geminiAnswer, null);
+  if (!a || !b) return { checked: false };
+  const biasA = String(a.bias || "").toLowerCase();
+  const biasB = String(b.bias || "").toLowerCase();
+  const biasAgree = !biasA || !biasB || biasA === biasB || biasA === "neutre" || biasB === "neutre";
+  const levelA = Number(a.keyLevel);
+  const levelB = Number(b.keyLevel);
+  let levelAgree = true;
+  let levelDeltaPct = null;
+  if (Number.isFinite(levelA) && Number.isFinite(levelB) && levelA > 0 && levelB > 0) {
+    levelDeltaPct = Math.abs(levelA - levelB) / Math.max(levelA, levelB);
+    levelAgree = levelDeltaPct < 0.02;
+  }
+  const agree = biasAgree && levelAgree;
+  return {
+    checked: true,
+    agree,
+    groq: { pair: a.pair || null, bias: biasA || null, keyLevel: Number.isFinite(levelA) ? levelA : null },
+    gemini: { pair: b.pair || null, bias: biasB || null, keyLevel: Number.isFinite(levelB) ? levelB : null },
+    levelDeltaPct,
+    note: agree
+      ? "Lecture visuelle confirmée indépendamment par Groq Vision et Gemini Vision."
+      : `Désaccord entre Groq Vision et Gemini Vision sur cette image (${!biasAgree ? `biais ${biasA || "?"} vs ${biasB || "?"}` : ""}${!biasAgree && !levelAgree ? ", " : ""}${!levelAgree ? `niveau clé écarté de ${(levelDeltaPct * 100).toFixed(1)}%` : ""}).`,
+  };
+}
+
 async function geminiVision(prompt, images, maxTokens = 700) {
   if (!GEMINI_KEYS.length) return "";
   for (const model of GEMINI_FALLBACK_MODELS) {
@@ -3487,12 +3537,24 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
     });
   }
-  const structuralCheck = crossCheckStructuralClaims(text, { technicalSnapshot: meta.technicalSnapshot, entry, pair: body.pair });
+  const structuralCheck = crossCheckStructuralClaims(text, { technicalSnapshot: meta.technicalSnapshot, entry, pair: body.pair, hasChartImages });
   if (structuralCheck.checked && !structuralCheck.aligned) {
     validation.score = Math.max(0, validation.score - 15);
     validation.reason = `${validation.reason} ${structuralCheck.note}`;
   }
   meta.structuralCheck = structuralCheck;
+  const visionConsensus = context.visionConsensus || { checked: false };
+  if (visionConsensus.checked && !visionConsensus.agree) {
+    // Both vision providers looked at the *same* image independently -- unlike the
+    // structural cross-check above (which mostly re-checks the model against numbers
+    // it was already handed in its own prompt, see crossCheckStructuralClaims), a
+    // disagreement here means two separate models genuinely read the chart
+    // differently. That's the strongest hallucination signal available without doing
+    // real computer vision server-side.
+    validation.score = Math.max(0, validation.score - 20);
+    validation.reason = `${validation.reason} ${visionConsensus.note}`;
+  }
+  meta.visionConsensus = visionConsensus;
   const danger = computeDangerScore({ meta, validation, levelCheck, rr, live, entry, strategy: body.strategy, risk: body.risk });
   const qualityGate = buildQualityGate({ meta, validation, levelCheck, danger, hasChartImages, quickMode });
   if (!qualityGate.valid) {
@@ -4035,10 +4097,38 @@ const styleRules = {
   },
 };
 
-function crossCheckStructuralClaims(text, { technicalSnapshot, entry, pair }) {
-  if (!technicalSnapshot?.valid) return { checked: false };
+// Pulls the "📸 LECTURE DES GRAPHIQUES" block's "Structure visible:" field out of the
+// answer. This field is mandated by KRONOS_OUTPUT_POLICY but was never actually read
+// back anywhere -- a model could satisfy the format while writing something generic
+// ("RAS", "—") and nothing downstream would notice it never engaged with the image.
+function extractVisualReading(text) {
+  const section = String(text).match(/📸[^\n]*\n([\s\S]*?)(?:\n📡|\n\n📐|$)/);
+  const block = section ? section[1] : "";
+  const structureMatch = block.match(/structure visible\s*:?\s*(.+)/i);
+  return { structure: structureMatch ? structureMatch[1].trim() : "" };
+}
+
+const WEAK_VISUAL_READING_RE = /^(non pr[ée]cis[ée]?|n\/?a|aucune?( structure)?( notable)?|rien( de notable)?|ras|—|-|non visible|indisponible|inconnue?)\.?$/i;
+
+function crossCheckStructuralClaims(text, { technicalSnapshot, entry, pair, hasChartImages = false }) {
   const issues = [];
   let checked = false;
+
+  // The numbers checked below (support/résistance/RSI/tendance) are handed to the
+  // model directly in its own prompt (technicalSnapshot.text) -- so a model that
+  // simply parrots them back always "passes" this part, whether or not it actually
+  // looked at the image. This check doesn't have that blind spot: "Structure
+  // visible" is never given to the model, only requested, so a missing/generic
+  // answer here is real evidence the image wasn't genuinely read.
+  if (hasChartImages) {
+    checked = true;
+    const visual = extractVisualReading(text);
+    if (!visual.structure || visual.structure.length < 15 || WEAK_VISUAL_READING_RE.test(visual.structure)) {
+      issues.push('un graphe a été fourni mais le champ "Structure visible" est vide ou générique -- rien n\'indique que l\'image a réellement été lue');
+    }
+  }
+
+  if (!technicalSnapshot?.valid) return { checked, aligned: issues.length === 0, note: issues.length ? `Incohérence(s) détectée(s): ${issues.join("; ")}.` : undefined };
 
   const mentionsZone = /\bsupport\b|r[ée]sistance|order block|\bfvg\b|zone de (?:demande|offre)/i.test(text);
   const support = Number(technicalSnapshot.support);
