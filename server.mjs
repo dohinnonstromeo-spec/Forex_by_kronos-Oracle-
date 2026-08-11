@@ -5,6 +5,7 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import { createGzip, createBrotliCompress } from "node:zlib";
+import { DatabaseSync } from "node:sqlite";
 import pg from "pg";
 import { imageSize } from "image-size";
 
@@ -15,6 +16,7 @@ const dataDir = join(root, "data");
 const learningPath = join(dataDir, "learning-log.json");
 const marketCachePath = join(dataDir, "market-cache.json");
 const authPath = join(dataDir, "auth-store.json");
+const sqliteDbPath = join(dataDir, "oracle.db");
 const supabaseUrl = normalizeSupabaseUrl(env.SUPABASE_URL || env.SUPABASE_PROJECT_URL || "");
 const supabaseProjectRef = env.SUPABASE_PROJECT_REF || inferSupabaseProjectRef(supabaseUrl);
 const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY || "";
@@ -22,6 +24,102 @@ const { Pool } = pg;
 const databaseUrl = env.DATABASE_URL || "";
 const pgPool = databaseUrl ? new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } }) : null;
 let pgTableReady = false;
+
+// Users/sessions/analyses live in real per-row tables (not a single JSON blob) so
+// there's no whole-document overwrite race and no silent truncation-at-scale cap.
+// Postgres in production (DATABASE_URL set), node:sqlite locally otherwise -- same
+// schema, same queries (?-placeholders, translated to $1.. for pg), so both paths
+// get identical behavior instead of maintaining a JSON-file code path that diverges
+// from production.
+let sqliteDb = null;
+function getSqliteDb() {
+  if (!pgPool && !sqliteDb) {
+    sqliteDb = new DatabaseSync(sqliteDbPath);
+  }
+  return sqliteDb;
+}
+
+function toPgPlaceholders(sql) {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
+async function sqlRun(sql, params = []) {
+  if (pgPool) {
+    await pgPool.query(toPgPlaceholders(sql), params);
+    return;
+  }
+  getSqliteDb().prepare(sql).run(...params);
+}
+
+async function sqlGet(sql, params = []) {
+  if (pgPool) {
+    const { rows } = await pgPool.query(toPgPlaceholders(sql), params);
+    return rows[0] || null;
+  }
+  return getSqliteDb().prepare(sql).get(...params) || null;
+}
+
+async function sqlAll(sql, params = []) {
+  if (pgPool) {
+    const { rows } = await pgPool.query(toPgPlaceholders(sql), params);
+    return rows;
+  }
+  return getSqliteDb().prepare(sql).all(...params);
+}
+
+let relationalTablesReady = false;
+async function ensureRelationalTables() {
+  if (relationalTablesReady) return;
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS users (
+      id text PRIMARY KEY,
+      name text NOT NULL,
+      email text NOT NULL UNIQUE,
+      password_hash text NOT NULL,
+      plan text NOT NULL DEFAULT 'free',
+      role text NOT NULL DEFAULT 'user',
+      premium_until text,
+      manual_premium integer NOT NULL DEFAULT 0,
+      premium_source text,
+      preferences text NOT NULL DEFAULT '{}',
+      usage text NOT NULL DEFAULT '{}',
+      created_at text NOT NULL,
+      updated_at text NOT NULL,
+      last_login_at text
+    )`,
+    `CREATE TABLE IF NOT EXISTS sessions (
+      id text PRIMARY KEY,
+      user_id text NOT NULL,
+      token_hash text NOT NULL UNIQUE,
+      created_at text NOT NULL,
+      expires_at text NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+    `CREATE TABLE IF NOT EXISTS analyses (
+      id text PRIMARY KEY,
+      user_id text,
+      created_at text NOT NULL,
+      pair text, timeframe text, style text, strategy text, risk text, capital text,
+      analysis_depth text,
+      direction text, entry real, sl real, tp1 real, tp2 real, rr text,
+      score real, active integer, status text, block_reason text,
+      live_price_at_signal real, image_quality text, calibration text, validation text,
+      technical_snapshot text, multi_timeframe text,
+      closed_at text, close_price real, outcome text, outcome_reason text, r_multiple real
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_analyses_user ON analyses(user_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_analyses_outcome ON analyses(outcome)`,
+  ];
+  if (pgPool) {
+    for (const statement of statements) await pgPool.query(statement);
+  } else {
+    for (const statement of statements) getSqliteDb().exec(statement);
+  }
+  relationalTablesReady = true;
+  await migrateLegacyJsonIntoRelationalTables();
+}
 
 async function ensureStateTable() {
   if (!pgPool || pgTableReady) return;
@@ -4611,7 +4709,7 @@ function healthRecommendations() {
 
 async function databaseSummary() {
   if (!hasSupabaseConfig()) {
-    return { configured: false, connected: false, storage: "file", dbName: null, lastError: null };
+    return { configured: false, connected: false, storage: "sqlite", dbName: null, lastError: null };
   }
   const connected = await checkSupabaseConnection();
   return {
@@ -4624,51 +4722,191 @@ async function databaseSummary() {
   };
 }
 
-async function loadAuthStore() {
+function safeJsonParse(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "object") return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed === null || parsed === undefined ? fallback : parsed;
+  } catch {
+    return fallback;
+  }
+}
+
+function rowToUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    passwordHash: row.password_hash,
+    plan: row.plan || "free",
+    role: row.role || "user",
+    premiumUntil: row.premium_until || null,
+    manualPremium: Boolean(Number(row.manual_premium)),
+    premiumSource: row.premium_source || null,
+    preferences: safeJsonParse(row.preferences, {}),
+    usage: safeJsonParse(row.usage, {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastLoginAt: row.last_login_at || null,
+  };
+}
+
+function rowToSession(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    tokenHash: row.token_hash,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+async function upsertUserRow(user) {
+  await sqlRun(
+    `INSERT INTO users (id, name, email, password_hash, plan, role, premium_until, manual_premium, premium_source, preferences, usage, created_at, updated_at, last_login_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name, email = excluded.email, password_hash = excluded.password_hash,
+       plan = excluded.plan, role = excluded.role, premium_until = excluded.premium_until,
+       manual_premium = excluded.manual_premium, premium_source = excluded.premium_source,
+       preferences = excluded.preferences, usage = excluded.usage,
+       updated_at = excluded.updated_at, last_login_at = excluded.last_login_at`,
+    [
+      user.id,
+      user.name,
+      user.email,
+      user.passwordHash,
+      user.plan || "free",
+      user.role || "user",
+      user.premiumUntil || null,
+      user.manualPremium ? 1 : 0,
+      user.premiumSource || null,
+      JSON.stringify(user.preferences || {}),
+      JSON.stringify(user.usage || {}),
+      user.createdAt || new Date().toISOString(),
+      user.updatedAt || new Date().toISOString(),
+      user.lastLoginAt || null,
+    ],
+  );
+}
+
+async function upsertSessionRow(session) {
+  await sqlRun(
+    `INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       user_id = excluded.user_id, token_hash = excluded.token_hash,
+       created_at = excluded.created_at, expires_at = excluded.expires_at`,
+    [session.id, session.userId, session.tokenHash, session.createdAt, session.expiresAt],
+  );
+}
+
+// One-time import: if the relational tables are still empty, pull whatever the old
+// whole-document store had (Postgres JSONB blob, or the local JSON file) so real
+// existing accounts/sessions/analyses aren't lost when this migration ships. Safe to
+// call on every startup -- it's a no-op once the tables have rows, checked via a
+// real COUNT rather than a one-off flag file, so it self-heals if a first attempt
+// only partially imported (e.g. process killed mid-way).
+async function loadLegacyAuthBlob() {
   const fromState = await loadStateDocument("auth-store");
   if (fromState) {
     return {
-      version: 1,
       users: Array.isArray(fromState.users) ? fromState.users : [],
       sessions: Array.isArray(fromState.sessions) ? fromState.sessions : [],
-      updatedAt: fromState.updatedAt || null,
     };
   }
   try {
     const raw = await readFile(authPath, "utf8");
     const parsed = JSON.parse(raw);
     return {
-      version: 1,
       users: Array.isArray(parsed.users) ? parsed.users : [],
       sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
-      updatedAt: parsed.updatedAt || null,
     };
   } catch {
-    return { version: 1, users: [], sessions: [], updatedAt: null };
+    return null;
   }
 }
 
-async function saveAuthStore(store) {
-  const now = new Date().toISOString();
-  // 5000/10000 was a blunt "keep last N by insertion order" cap: once the site ever
-  // accumulated more than 5000 accounts total, every save would silently drop the
-  // OLDEST ones -- including active paying users, just because they signed up early.
-  // Raised well past any realistic near-term scale; still not a real fix (that would
-  // be per-record storage instead of one whole-document blob), just pushes the
-  // landmine much further out and logs if we're getting close.
-  if (store.users.length > 40000) logOnce("auth-store", `${store.users.length} comptes: approche de la limite de troncature (50000), migrer vers un stockage par ligne devient nécessaire`);
-  const trimmed = {
+async function loadLegacyLearningBlob() {
+  const fromState = await loadStateDocument("learning-log");
+  if (fromState) {
+    return {
+      analyses: Array.isArray(fromState.analyses) ? fromState.analyses : [],
+      outcomes: Array.isArray(fromState.outcomes) ? fromState.outcomes : [],
+    };
+  }
+  try {
+    const raw = await readFile(learningPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      analyses: Array.isArray(parsed.analyses) ? parsed.analyses : [],
+      outcomes: Array.isArray(parsed.outcomes) ? parsed.outcomes : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function migrateLegacyJsonIntoRelationalTables() {
+  const userCount = Number((await sqlGet(`SELECT COUNT(*) AS c FROM users`))?.c ?? 0);
+  if (userCount === 0) {
+    const legacy = await loadLegacyAuthBlob();
+    if (legacy && (legacy.users.length || legacy.sessions.length)) {
+      for (const user of legacy.users) await upsertUserRow(user);
+      const activeSessions = legacy.sessions.filter((session) => new Date(session.expiresAt).getTime() > Date.now());
+      for (const session of activeSessions) await upsertSessionRow(session);
+      logOnce("migration-auth", `Import initial vers le stockage relationnel: ${legacy.users.length} compte(s), ${activeSessions.length} session(s) active(s) depuis l'ancien stockage document.`);
+    }
+  }
+  const analysisCount = Number((await sqlGet(`SELECT COUNT(*) AS c FROM analyses`))?.c ?? 0);
+  if (analysisCount === 0) {
+    const legacy = await loadLegacyLearningBlob();
+    if (legacy && legacy.analyses.length) {
+      // rMultiple was only ever attached to the separate `outcomes` entry in the old
+      // document model, never to the analysis record itself -- confirmed live (8/14
+      // real outcomes had it) that skipping this merge would silently drop it during
+      // import even though the analysis row otherwise carries everything else needed
+      // to reconstruct that outcome.
+      const rMultipleById = new Map((legacy.outcomes || []).filter((o) => Number.isFinite(o.rMultiple)).map((o) => [o.id, o.rMultiple]));
+      for (const analysis of legacy.analyses) {
+        const rMultiple = rMultipleById.has(analysis.id) ? rMultipleById.get(analysis.id) : (analysis.rMultiple ?? null);
+        await upsertAnalysisRow({ ...analysis, rMultiple });
+      }
+      logOnce("migration-learning", `Import initial vers le stockage relationnel: ${legacy.analyses.length} analyse(s) depuis l'ancien stockage document.`);
+    }
+  }
+}
+
+async function loadAuthStore() {
+  await ensureRelationalTables();
+  const [userRows, sessionRows] = await Promise.all([
+    sqlAll(`SELECT * FROM users`),
+    sqlAll(`SELECT * FROM sessions WHERE expires_at > ?`, [new Date().toISOString()]),
+  ]);
+  return {
     version: 1,
-    users: store.users.slice(-50000),
-    sessions: store.sessions
-      .filter((session) => new Date(session.expiresAt).getTime() > Date.now())
-      .slice(-50000)
-      .map(({ token, ...session }) => session),
-    updatedAt: now,
+    users: userRows.map(rowToUser),
+    sessions: sessionRows.map(rowToSession),
+    updatedAt: null,
   };
-  if (await saveStateDocument("auth-store", trimmed)) return { ...trimmed, persisted: "supabase" };
-  await atomicWriteFile(authPath, `${JSON.stringify(trimmed, null, 2)}\n`);
-  return { ...trimmed, persisted: "file" };
+}
+
+async function saveAuthStore(store) {
+  await ensureRelationalTables();
+  const activeSessions = store.sessions.filter((session) => new Date(session.expiresAt).getTime() > Date.now());
+  for (const user of store.users) await upsertUserRow(user);
+  const keepIds = activeSessions.map((session) => session.id);
+  if (keepIds.length) {
+    const placeholders = keepIds.map(() => "?").join(",");
+    await sqlRun(`DELETE FROM sessions WHERE id NOT IN (${placeholders})`, keepIds);
+  } else {
+    await sqlRun(`DELETE FROM sessions`);
+  }
+  for (const session of activeSessions) await upsertSessionRow(session);
+  return { version: 1, users: store.users, sessions: activeSessions, updatedAt: new Date().toISOString(), persisted: pgPool ? "supabase" : "sqlite" };
 }
 
 async function signupUser(body = {}) {
@@ -5154,105 +5392,176 @@ function clearSessionCookie(res) {
   res.setHeader("Set-Cookie", "oracle_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
 }
 
-async function loadLearningLog() {
-  const fromState = await loadStateDocument("learning-log");
-  if (fromState) {
-    return {
-      version: 1,
-      analyses: Array.isArray(fromState.analyses) ? fromState.analyses : [],
-      outcomes: Array.isArray(fromState.outcomes) ? fromState.outcomes : [],
-      updatedAt: fromState.updatedAt || null,
-    };
-  }
-  try {
-    const raw = await readFile(learningPath, "utf8");
-    const parsed = JSON.parse(raw);
-    return {
-      version: 1,
-      analyses: Array.isArray(parsed.analyses) ? parsed.analyses : [],
-      outcomes: Array.isArray(parsed.outcomes) ? parsed.outcomes : [],
-      updatedAt: parsed.updatedAt || null,
-    };
-  } catch {
-    return { version: 1, analyses: [], outcomes: [], updatedAt: null };
-  }
+function rowToAnalysis(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    createdAt: row.created_at,
+    userId: row.user_id || null,
+    pair: row.pair,
+    timeframe: row.timeframe,
+    style: row.style,
+    strategy: row.strategy,
+    risk: row.risk,
+    capital: row.capital,
+    analysisDepth: row.analysis_depth,
+    direction: row.direction,
+    entry: row.entry,
+    sl: row.sl,
+    tp1: row.tp1,
+    tp2: row.tp2,
+    rr: row.rr,
+    score: row.score,
+    active: Boolean(Number(row.active)),
+    status: row.status,
+    blockReason: row.block_reason || null,
+    livePriceAtSignal: row.live_price_at_signal,
+    imageQuality: safeJsonParse(row.image_quality, null),
+    calibration: safeJsonParse(row.calibration, null),
+    validation: safeJsonParse(row.validation, null),
+    technicalSnapshot: safeJsonParse(row.technical_snapshot, null),
+    multiTimeframe: safeJsonParse(row.multi_timeframe, []),
+    closedAt: row.closed_at || null,
+    closePrice: row.close_price ?? null,
+    outcome: row.outcome || null,
+    outcomeReason: row.outcome_reason || null,
+    rMultiple: row.r_multiple ?? null,
+  };
 }
 
-async function saveLearningLog(log) {
-  const trimmed = {
-    version: 1,
-    // Same truncation-at-scale issue as auth-store, raised the same way -- see the
-    // comment there. This data also backs the public performance/equity-curve
-    // numbers, so silently dropping old records would quietly corrupt those too.
-    analyses: log.analyses.slice(-20000),
-    outcomes: log.outcomes.slice(-20000),
-    updatedAt: new Date().toISOString(),
-  };
-  if (await saveStateDocument("learning-log", trimmed)) return trimmed;
-  await atomicWriteFile(learningPath, `${JSON.stringify(trimmed, null, 2)}\n`);
-  return trimmed;
+async function upsertAnalysisRow(analysis) {
+  await sqlRun(
+    `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth,
+       direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal,
+       image_quality, calibration, validation, technical_snapshot, multi_timeframe,
+       closed_at, close_price, outcome, outcome_reason, r_multiple)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       user_id = excluded.user_id, status = excluded.status, block_reason = excluded.block_reason,
+       closed_at = excluded.closed_at, close_price = excluded.close_price,
+       outcome = excluded.outcome, outcome_reason = excluded.outcome_reason, r_multiple = excluded.r_multiple`,
+    [
+      analysis.id,
+      analysis.userId || null,
+      analysis.createdAt || new Date().toISOString(),
+      analysis.pair || null,
+      analysis.timeframe || null,
+      analysis.style || null,
+      analysis.strategy || null,
+      analysis.risk ? String(analysis.risk) : null,
+      analysis.capital ? String(analysis.capital) : null,
+      analysis.analysisDepth || null,
+      analysis.direction || null,
+      Number.isFinite(analysis.entry) ? analysis.entry : null,
+      Number.isFinite(analysis.sl) ? analysis.sl : null,
+      Number.isFinite(analysis.tp1) ? analysis.tp1 : null,
+      Number.isFinite(analysis.tp2) ? analysis.tp2 : null,
+      analysis.rr ? String(analysis.rr) : null,
+      Number(analysis.score) || 0,
+      analysis.active ? 1 : 0,
+      analysis.status || "OPEN",
+      analysis.blockReason || null,
+      Number.isFinite(analysis.livePriceAtSignal) ? analysis.livePriceAtSignal : null,
+      analysis.imageQuality ? JSON.stringify(analysis.imageQuality) : null,
+      analysis.calibration ? JSON.stringify(analysis.calibration) : null,
+      analysis.validation ? JSON.stringify(analysis.validation) : null,
+      analysis.technicalSnapshot ? JSON.stringify(analysis.technicalSnapshot) : null,
+      analysis.multiTimeframe ? JSON.stringify(analysis.multiTimeframe) : null,
+      analysis.closedAt || null,
+      Number.isFinite(analysis.closePrice) ? analysis.closePrice : null,
+      analysis.outcome || null,
+      analysis.outcomeReason || null,
+      Number.isFinite(analysis.rMultiple) ? analysis.rMultiple : null,
+    ],
+  );
+}
+
+// outcomes was historically a second array, populated only when an analysis closed.
+// It's redundant with analyses itself (every field it carries also lives on the
+// analysis row once outcome is set) -- confirmed no BLOCKED analysis was ever pushed
+// there, only OPEN-then-resolved ones -- so it's derived here instead of stored as
+// its own table.
+async function loadLearningLog() {
+  await ensureRelationalTables();
+  const rows = await sqlAll(`SELECT * FROM analyses ORDER BY created_at ASC`);
+  const analyses = rows.map(rowToAnalysis);
+  const outcomes = analyses
+    .filter((item) => item.outcome)
+    .map((item) => ({
+      id: item.id,
+      userId: item.userId || null,
+      pair: item.pair,
+      timeframe: item.timeframe,
+      style: item.style,
+      strategy: item.strategy || "Swing Trading",
+      analysisDepth: item.analysisDepth || "Profonde",
+      score: item.score,
+      result: item.outcome,
+      status: item.status,
+      rMultiple: item.rMultiple,
+      closedAt: item.closedAt,
+    }));
+  return { version: 1, analyses, outcomes, updatedAt: null };
 }
 
 async function recordLearningAnalysis(result, body, context) {
-  return withFileLock("learning-log", async () => {
-    const log = await loadLearningLog();
-    const id = `ana_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const active = !result.noSignal && result.direction !== "AUCUN SIGNAL";
-    const entry = parseFormattedNumber(result.entry);
-    const sl = parseFormattedNumber(result.sl);
-    const tp1 = parseFormattedNumber(result.tp1);
-    const tp2 = parseFormattedNumber(result.tp2);
-    log.analyses.push({
-      id,
-      createdAt: new Date().toISOString(),
-      userId: context.user?.id || null,
-      pair: body.pair || "EUR/USD",
-      timeframe: body.timeframe || "H1",
-      style: body.style || "Hybride SMC+Chartiste",
-      strategy: body.strategy || "Swing Trading",
-      risk: body.risk || defaultRiskMode(),
-      capital: body.capital || null,
-      analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
-      direction: result.direction,
-      entry,
-      sl,
-      tp1,
-      tp2,
-      rr: result.rr,
-      score: Number(result.score) || 0,
-      active,
-      status: active ? "OPEN" : "BLOCKED",
-      blockReason: active ? null : result.validation?.reason || "Signal bloqué",
-      livePriceAtSignal: context.livePrice?.price ?? null,
-      imageQuality: context.imageQuality,
-      calibration: context.calibration,
-      validation: result.validation,
-      technicalSnapshot: context.technicalSnapshot || null,
-      multiTimeframe: context.multiTimeframe || [],
-    });
-    await saveLearningLog(log);
-    result.learningId = id;
-    return id;
+  await ensureRelationalTables();
+  const id = `ana_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const active = !result.noSignal && result.direction !== "AUCUN SIGNAL";
+  const entry = parseFormattedNumber(result.entry);
+  const sl = parseFormattedNumber(result.sl);
+  const tp1 = parseFormattedNumber(result.tp1);
+  const tp2 = parseFormattedNumber(result.tp2);
+  await upsertAnalysisRow({
+    id,
+    createdAt: new Date().toISOString(),
+    userId: context.user?.id || null,
+    pair: body.pair || "EUR/USD",
+    timeframe: body.timeframe || "H1",
+    style: body.style || "Hybride SMC+Chartiste",
+    strategy: body.strategy || "Swing Trading",
+    risk: body.risk || defaultRiskMode(),
+    capital: body.capital || null,
+    analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
+    direction: result.direction,
+    entry,
+    sl,
+    tp1,
+    tp2,
+    rr: result.rr,
+    score: Number(result.score) || 0,
+    active,
+    status: active ? "OPEN" : "BLOCKED",
+    blockReason: active ? null : result.validation?.reason || "Signal bloqué",
+    livePriceAtSignal: context.livePrice?.price ?? null,
+    imageQuality: context.imageQuality,
+    calibration: context.calibration,
+    validation: result.validation,
+    technicalSnapshot: context.technicalSnapshot || null,
+    multiTimeframe: context.multiTimeframe || [],
   });
+  result.learningId = id;
+  return id;
 }
 
 async function updateLearningOutcomes(prices = null) {
-  // Called from several endpoints plus the 90s scheduler tick, so it's the most
-  // frequent learning-log consumer -- wrapped in the same lock as
-  // recordLearningAnalysis() anyway, since the race is in the load-mutate-save
-  // sequence, not just the final write. getPrices() has its own cache, so most
-  // calls here don't hit the network and the lock is held only briefly.
+  // Only OPEN+active rows are pulled here (an indexed WHERE, not a full-table load
+  // like the old load-mutate-save-whole-blob version), and only the rows that
+  // actually resolve this tick get written. Still wrapped in the lock: two overlapping
+  // calls (an endpoint hit landing mid-scheduler-tick) could otherwise both evaluate
+  // the same analysis against the same price and double-process it.
   return withFileLock("learning-log", async () => {
-    const log = await loadLearningLog();
-    const livePrices = prices || await getPrices();
-    let changed = false;
-    for (const analysis of log.analyses) {
-      if (analysis.status !== "OPEN" || !analysis.active) continue;
-      const price = Number(livePrices[analysis.pair]?.price);
-      if (!Number.isFinite(price)) continue;
-      const outcome = evaluateOutcome(analysis, price);
-      const ageHours = (Date.now() - new Date(analysis.createdAt).getTime()) / 3600000;
-      if (outcome || ageHours >= 24) {
+    await ensureRelationalTables();
+    const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ?`, [1]);
+    if (openRows.length) {
+      const livePrices = prices || await getPrices();
+      for (const row of openRows) {
+        const analysis = rowToAnalysis(row);
+        const price = Number(livePrices[analysis.pair]?.price);
+        if (!Number.isFinite(price)) continue;
+        const outcome = evaluateOutcome(analysis, price);
+        const ageHours = (Date.now() - new Date(analysis.createdAt).getTime()) / 3600000;
+        if (!outcome && ageHours < 24) continue;
         const finalOutcome = outcome || {
           status: "EXPIRED",
           result: "neutral",
@@ -5265,24 +5574,11 @@ async function updateLearningOutcomes(prices = null) {
         analysis.closePrice = price;
         analysis.outcome = finalOutcome.result;
         analysis.outcomeReason = finalOutcome.reason;
-        log.outcomes.push({
-          id: analysis.id,
-          userId: analysis.userId || null,
-          pair: analysis.pair,
-          timeframe: analysis.timeframe,
-          style: analysis.style,
-          strategy: analysis.strategy || "Swing Trading",
-          analysisDepth: analysis.analysisDepth || "Profonde",
-          score: analysis.score,
-          result: finalOutcome.result,
-          status: finalOutcome.status,
-          rMultiple: Number.isFinite(finalOutcome.rMultiple) ? finalOutcome.rMultiple : null,
-          closedAt: analysis.closedAt,
-        });
-        changed = true;
+        analysis.rMultiple = Number.isFinite(finalOutcome.rMultiple) ? finalOutcome.rMultiple : null;
+        await upsertAnalysisRow(analysis);
       }
     }
-    return changed ? saveLearningLog(log) : log;
+    return loadLearningLog();
   });
 }
 

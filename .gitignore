@@ -3,4 +3,8 @@ secret.dev
 node_modules/
 .DS_Store
 data/*.json
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
 backups/
