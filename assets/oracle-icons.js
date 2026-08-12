@@ -17,4 +17,19 @@ window.OracleIcons = {
   activity: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 10.5h3.2l2-5.6 3 11.2 2-5.6H18"/></svg>',
   barChart: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 16V9"/><path d="M10 16V4"/><path d="M16 16v-6"/></svg>',
   layers: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M10 2.5 17.5 7 10 11.5 2.5 7 10 2.5Z"/><path d="M2.5 11.2 10 15.7l7.5-4.5"/></svg>',
+  smartphone: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="1.5" width="9" height="17" rx="1.8"/><path d="M8.5 15.3h3"/></svg>',
+  creditCard: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="4" width="17" height="12" rx="1.8"/><path d="M1.5 8h17"/><path d="M4.5 12.3h3.5"/></svg>',
+  coin: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M10 5.8v8.4"/><path d="M12.6 7.6c-.5-.7-1.5-1-2.6-1-1.4 0-2.6.7-2.6 1.9s1.2 1.6 2.6 1.7c1.4.1 2.6.5 2.6 1.8s-1.2 1.9-2.6 1.9c-1.1 0-2.1-.4-2.6-1.1"/></svg>',
+  user: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="6.5" r="3.5"/><path d="M2.5 17c1-3.5 4-5.5 7.5-5.5s6.5 2 7.5 5.5"/></svg>',
+  history: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 10a7.5 7.5 0 1 1 2.4 5.5"/><path d="M2.5 15v-4h4"/><path d="M10 6v4.5l3 1.7"/></svg>',
 };
+
+// Static markup can reference an icon declaratively (<span data-icon="user">Label</span>)
+// instead of embedding raw <svg> soup inline -- hydrated here on load so every page
+// using data-icon just needs this one script, no per-page wiring.
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll("[data-icon]").forEach((el) => {
+    const markup = window.OracleIcons[el.dataset.icon];
+    if (markup) el.insertAdjacentHTML("afterbegin", markup);
+  });
+});

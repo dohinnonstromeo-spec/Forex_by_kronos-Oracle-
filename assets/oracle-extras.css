@@ -1268,10 +1268,10 @@ body {
 .auth-card,
 .dashboard-card,
 .dashboard-panel {
-  border: 1px solid rgba(255, 255, 255, .12);
+  border: 1px solid var(--oracle-border);
   border-radius: 14px;
-  background: rgba(6, 10, 18, .74);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, .32);
+  background: var(--oracle-panel);
+  box-shadow: var(--shadow-card);
   backdrop-filter: blur(18px);
 }
 
@@ -1373,6 +1373,19 @@ body {
   font-weight: 800;
   letter-spacing: .08em;
   text-transform: uppercase;
+}
+
+.dashboard-card span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dashboard-card span svg {
+  width: 15px;
+  height: 15px;
+  color: var(--amber-neon);
+  flex-shrink: 0;
 }
 
 .dashboard-card strong,
@@ -1565,7 +1578,7 @@ body {
 }
 
 .payment-method-card {
-  border: 1px solid rgba(255,255,255,.08);
+  border: 1px solid var(--oracle-border);
   border-radius: 14px;
   background: linear-gradient(rgba(255,255,255,.06), rgba(255,255,255,.03));
   box-shadow: var(--shadow-card);
@@ -1580,9 +1593,11 @@ body {
   border-radius: var(--radius-md);
   background: rgba(0, 255, 136, .12);
   color: var(--neon-green);
-  font-family: var(--font-display);
-  font-weight: 900;
-  letter-spacing: .04em;
+}
+
+.payment-method-icon svg {
+  width: 22px;
+  height: 22px;
 }
 
 .payment-method-card h2 {
