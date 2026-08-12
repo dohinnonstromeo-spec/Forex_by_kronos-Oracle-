@@ -52,7 +52,7 @@
   }
 
   function stat(label, value, sub) {
-    return `<div class="rounded border border-border bg-background/40 px-3 py-2">
+    return `<div class="home-stat-cell">
       <div class="text-muted-foreground">${escapeHtml(label)}</div>
       <div class="text-base text-foreground">${escapeHtml(value)}</div>
       <div class="text-muted-foreground">${escapeHtml(sub)}</div>

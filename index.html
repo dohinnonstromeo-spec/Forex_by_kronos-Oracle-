@@ -103,25 +103,25 @@
           <h2>Prix surveillés par Kronos</h2>
         </div>
         <div class="home-market-card">
-          <div class="flex items-center gap-2 border-b border-border bg-background/40 px-4 py-2 text-xs font-mono uppercase tracking-wider text-muted-foreground">
+          <div class="home-market-header" data-market-header>
             <span class="h-2 w-2 rounded-full bg-neon-green pulse-dot"></span>Marchés en direct · sources actives
           </div>
           <div class="home-market-grid">
-            <div class="flex items-center justify-between p-4">
-              <div class="text-left"><div class="font-mono text-xs text-muted-foreground">EUR/USD</div><div class="mt-1">—</div></div>
-              <div class="font-mono text-sm text-muted-foreground">...</div>
+            <div class="home-market-row" data-market-row="EUR/USD">
+              <div class="home-market-row-left"><span class="home-market-symbol">EUR/USD</span><span class="home-market-price" data-market-price>—</span></div>
+              <span class="home-market-change" data-market-change>...</span>
             </div>
-            <div class="flex items-center justify-between p-4">
-              <div class="text-left"><div class="font-mono text-xs text-muted-foreground">XAU/USD</div><div class="mt-1">—</div></div>
-              <div class="font-mono text-sm text-muted-foreground">...</div>
+            <div class="home-market-row" data-market-row="XAU/USD">
+              <div class="home-market-row-left"><span class="home-market-symbol">XAU/USD</span><span class="home-market-price" data-market-price>—</span></div>
+              <span class="home-market-change" data-market-change>...</span>
             </div>
-            <div class="flex items-center justify-between p-4">
-              <div class="text-left"><div class="font-mono text-xs text-muted-foreground">GBP/JPY</div><div class="mt-1">—</div></div>
-              <div class="font-mono text-sm text-muted-foreground">...</div>
+            <div class="home-market-row" data-market-row="GBP/JPY">
+              <div class="home-market-row-left"><span class="home-market-symbol">GBP/JPY</span><span class="home-market-price" data-market-price>—</span></div>
+              <span class="home-market-change" data-market-change>...</span>
             </div>
-            <div class="flex items-center justify-between p-4">
-              <div class="text-left"><div class="font-mono text-xs text-muted-foreground">BTC/USD</div><div class="mt-1">—</div></div>
-              <div class="font-mono text-sm text-muted-foreground">...</div>
+            <div class="home-market-row" data-market-row="BTC/USD">
+              <div class="home-market-row-left"><span class="home-market-symbol">BTC/USD</span><span class="home-market-price" data-market-price>—</span></div>
+              <span class="home-market-change" data-market-change>...</span>
             </div>
           </div>
         </div>
@@ -170,8 +170,8 @@
         </div>
         <div class="home-performance-panel glass-card">
           <h3 class="font-display text-2xl">Performances · résultats réels</h3>
-          <div class="mt-4 grid grid-cols-2 gap-3 font-mono text-xs md:grid-cols-4 home-performance-stats">
-            <div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Chargement performance...</div>
+          <div class="home-performance-stats">
+            <div class="home-stat-cell">Chargement performance...</div>
           </div>
           <div class="mt-4 home-performance-chart"></div>
           <div class="mt-4 grid gap-2 home-performance-recent"></div>
@@ -187,9 +187,9 @@
           <p class="home-copy">Kronos ne doit pas inventer un signal. Il lit le graphe, croise le prix live, calcule RSI, ATR, supports/résistances, puis bloque si le setup n'est pas assez clair.</p>
         </div>
         <div class="home-process">
-          <div><span>01</span><strong>Lecture du graphe</strong><p>Groq Vision puis Gemini en secours.</p></div>
-          <div><span>02</span><strong>Données marché</strong><p>Twelve Data, Massive, Alpha Vantage, Binance crypto, Stooq et cache.</p></div>
-          <div><span>03</span><strong>Validation Kronos</strong><p>Entrée, SL, TP, R/R, style, score et fraîcheur API.</p></div>
+          <div><span class="home-process-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1.5 10s3-6 8.5-6 8.5 6 8.5 6-3 6-8.5 6-8.5-6-8.5-6Z"/><circle cx="10" cy="10" r="2.5"/></svg></span><strong>Lecture du graphe</strong><p>Groq Vision puis Gemini en secours.</p></div>
+          <div><span class="home-process-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 10.5h3.2l2-5.6 3 11.2 2-5.6H18"/></svg></span><strong>Données marché</strong><p>Twelve Data, Massive, Alpha Vantage, Binance crypto, Stooq et cache.</p></div>
+          <div><span class="home-process-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M6.5 10.2l2.3 2.3 4.7-5"/></svg></span><strong>Validation Kronos</strong><p>Entrée, SL, TP, R/R, style, score et fraîcheur API.</p></div>
         </div>
       </section>
 
@@ -243,6 +243,7 @@
     </footer>
   </div>
 
+  <script src="/assets/oracle-icons.js" defer></script>
   <script src="/assets/kronos-live.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>
   <script src="/assets/home-performance.js" defer></script>

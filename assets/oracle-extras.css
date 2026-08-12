@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@500;600;700;800&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Montserrat:wght@400;500;600;700;800&display=swap");
 
 .badge-start-clickable {
   justify-content: flex-start;
@@ -10,7 +10,15 @@
 }
 
 :root {
-  --font-display: "Syne", ui-sans-serif, system-ui, sans-serif;
+  /* Site-wide font swap: Montserrat replaces Syne (headings, via --font-display) and
+     the React bundle's own --font-sans (body text) -- both custom properties are
+     redefined here rather than editing the generated Tailwind bundle
+     (assets/styles-nTlncI0E.css) directly, and this file loads after that bundle in
+     both index.html and analyse.html so these definitions win the cascade. --font-mono
+     stays Space Mono: numeric columns (price grids, SL/TP levels) rely on fixed-width
+     digits for alignment, which Montserrat (not monospace) would break. */
+  --font-display: "Montserrat", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Montserrat", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --background: oklch(13% .03 265);
   --foreground: oklch(96% .01 240);
@@ -220,7 +228,14 @@ body {
   color: var(--foreground);
   font-size: 13px;
   line-height: 1.5;
-  white-space: pre-wrap;
+}
+
+.oracle-bubble p {
+  margin: 0;
+}
+
+.oracle-bubble p + p {
+  margin-top: 8px;
 }
 
 .oracle-msg.user .oracle-bubble {
@@ -982,7 +997,13 @@ body {
   padding: 14px;
 }
 
-.result-explanation span {
+.result-explanation span,
+.result-visual-reading span,
+.result-confluence span,
+.result-risk-note span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--amber-neon);
   font-family: var(--font-mono);
   font-size: 10px;
@@ -990,12 +1011,75 @@ body {
   letter-spacing: .12em;
 }
 
-.result-explanation p {
+.result-explanation p,
+.result-visual-reading p,
+.result-confluence p,
+.result-risk-note p {
   margin-top: 8px;
   color: var(--muted-foreground);
   font-size: 13px;
   line-height: 1.55;
   white-space: pre-wrap;
+}
+
+.result-visual-reading svg,
+.result-confluence svg,
+.result-risk-note svg,
+.result-advanced summary svg,
+.direction-label svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.direction-label svg {
+  display: inline-block;
+  vertical-align: -2px;
+  margin-left: 2px;
+}
+
+.result-confluence span { color: var(--neon-green); }
+.result-risk-note span { color: var(--neon-red); }
+
+.result-confluence {
+  border-color: rgba(0, 255, 136, .18) !important;
+}
+
+.result-risk-note {
+  border-color: rgba(255, 64, 64, .22) !important;
+}
+
+.result-advanced {
+  margin-top: 14px;
+}
+
+.result-advanced summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  list-style: none;
+}
+
+.result-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.result-advanced summary svg {
+  transition: transform .15s ease;
+}
+
+.result-advanced[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.result-advanced .result-explanation {
+  margin-top: 10px;
 }
 
 .trade-plan {
@@ -1067,7 +1151,10 @@ body {
 .danger-panel,
 .quality-gate,
 .capital-risk-panel,
-.beginner-plan {
+.beginner-plan,
+.result-visual-reading,
+.result-confluence,
+.result-risk-note {
   margin-top: 14px;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 12px;
@@ -2003,6 +2090,20 @@ body {
   line-height: 1;
 }
 
+.home-market-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid rgba(255,255,255,.08);
+  background: rgba(0,0,0,.2);
+  padding: var(--space-2) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--muted-foreground);
+}
+
 .home-market-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -2010,6 +2111,36 @@ body {
 
 .home-market-grid > div + div {
   border-left: 1px solid rgba(255,255,255,.08);
+}
+
+.home-market-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4);
+}
+
+.home-market-row-left {
+  text-align: left;
+}
+
+.home-market-symbol {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.home-market-price {
+  display: block;
+  margin-top: var(--space-1);
+  font-family: var(--font-mono);
+}
+
+.home-market-change {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--muted-foreground);
 }
 
 .home-spark-grid {
@@ -2222,6 +2353,29 @@ body {
   padding: 24px;
 }
 
+.home-performance-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.home-stat-cell {
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: var(--radius-md);
+  background: rgba(0,0,0,.24);
+  padding: var(--space-2) var(--space-3);
+  color: var(--muted-foreground);
+}
+
+@media (min-width: 768px) {
+  .home-performance-stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
 .split {
   display: grid;
   grid-template-columns: .9fr 1.1fr;
@@ -2237,6 +2391,16 @@ body {
 .home-process span {
   color: rgba(195, 145, 47, .35);
   font: 800 2.5rem var(--font-display);
+}
+
+.home-process .home-process-icon {
+  display: inline-flex;
+  color: var(--amber-neon);
+}
+
+.home-process-icon svg {
+  width: 32px;
+  height: 32px;
 }
 
 .home-process strong {

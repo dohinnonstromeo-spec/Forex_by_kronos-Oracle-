@@ -87,31 +87,40 @@
     }
   }
 
+  // Anchored on data-market-row/-price/-change instead of the row's visual Tailwind
+  // utility classes (as this used to be) -- those classes changed during the design
+  // pass that introduced semantic .home-market-* classes, and a selector coupled to
+  // exact utility-class strings would have silently stopped finding anything (no
+  // error, just prices frozen on the placeholder "—"/"..." forever). data-* attributes
+  // are the stable contract between markup and behavior regardless of how the row is
+  // styled going forward.
+  function marketRow(symbol) {
+    return document.querySelector(`[data-market-row="${symbol}"]`);
+  }
+
   function renderMarket(symbol, price) {
-    const pairEl = [...document.querySelectorAll(".font-mono.text-xs.text-muted-foreground")]
-      .find((node) => node.textContent.trim() === symbol);
-    if (!pairEl) return;
-    const card = pairEl.closest(".flex.items-center.justify-between");
-    const priceBox = pairEl.parentElement?.querySelector(".mt-1");
-    const changeBox = card?.lastElementChild;
+    const row = marketRow(symbol);
+    if (!row) return;
+    const priceBox = row.querySelector("[data-market-price]");
+    const changeBox = row.querySelector("[data-market-change]");
+    const left = priceBox?.parentElement;
     if (priceBox) priceBox.innerHTML = `<span class="inline-flex">${flap(formatPrice(symbol, price.price))}</span>`;
     if (changeBox) {
       const up = Number(price.change) >= 0;
-      changeBox.className = `font-mono text-sm ${up ? "text-neon-green" : "text-neon-red"}`;
+      changeBox.className = `home-market-change ${up ? "text-neon-green" : "text-neon-red"}`;
       changeBox.textContent = price.open && !price.stale ? `${up ? "▲" : "▼"} ${Number(price.change).toFixed(2)}%` : "FERMÉ";
     }
     const staleText = price.open && !price.stale ? "" : price.source === "fallback" ? "Donnée fallback" : "Marché fermé";
-    if (staleText && pairEl.parentElement && !pairEl.parentElement.querySelector(".kronos-source")) {
-      pairEl.parentElement.insertAdjacentHTML("beforeend", `<div class="kronos-source">${staleText}</div>`);
-    } else if (pairEl.parentElement?.querySelector(".kronos-source")) {
-      pairEl.parentElement.querySelector(".kronos-source").textContent = staleText;
+    if (staleText && left && !left.querySelector(".kronos-source")) {
+      left.insertAdjacentHTML("beforeend", `<div class="kronos-source">${staleText}</div>`);
+    } else if (left?.querySelector(".kronos-source")) {
+      left.querySelector(".kronos-source").textContent = staleText;
     }
   }
 
   async function renderLiveComment(symbol, previous, current) {
-    const pairEl = [...document.querySelectorAll(".font-mono.text-xs.text-muted-foreground")]
-      .find((node) => node.textContent.trim() === symbol);
-    const holder = pairEl?.parentElement;
+    const row = marketRow(symbol);
+    const holder = row?.querySelector("[data-market-price]")?.parentElement;
     if (!holder) return;
     const changePercent = (((current - previous) / previous) * 100).toFixed(2);
     const data = await postJson("/api/comment", { pair: symbol, previous, current, changePercent });
@@ -211,8 +220,7 @@
   }
 
   function updateMarketBanner(market, prices, fallbackText = "Statut marché indisponible") {
-    const liveHeaders = [...document.querySelectorAll(".border-b.border-border.bg-background\\/40, .flex.items-center.gap-2.border-b")];
-    const marketHeader = liveHeaders.find((el) => el.textContent.includes("Marchés en direct"));
+    const marketHeader = document.querySelector("[data-market-header]");
     if (marketHeader && !market?.forex) {
       marketHeader.innerHTML = `<span class="h-2 w-2 rounded-full bg-neon-red pulse-dot"></span>${fallbackText}`;
       return;

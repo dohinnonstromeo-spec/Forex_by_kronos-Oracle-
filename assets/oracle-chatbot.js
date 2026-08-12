@@ -121,13 +121,26 @@
     node.className = `oracle-msg ${role}`;
     node.innerHTML = `
       <div class="oracle-bubble">
-        ${escapeHtml(text)}
+        ${renderMessageText(text)}
         ${role === "assistant" && meta ? renderMeta(meta) : ""}
       </div>
     `;
     list.appendChild(node);
     list.scrollTop = list.scrollHeight;
     return node;
+  }
+
+  // A single escaped string with no paragraph breaks reads as one dense block on
+  // anything longer than a short reply. Split on blank lines first (how longer
+  // replies are naturally structured); if the model didn't use any, fall back to
+  // single newlines so at least list-like replies still break into readable lines.
+  function renderMessageText(text) {
+    const raw = String(text || "");
+    const paragraphs = (raw.includes("\n\n") ? raw.split(/\n{2,}/) : raw.split(/\n/))
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (!paragraphs.length) return "";
+    return paragraphs.map((part) => `<p>${escapeHtml(part)}</p>`).join("");
   }
 
   function renderMeta(meta) {

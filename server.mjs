@@ -3454,12 +3454,21 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     mtfConsensus,
     dataReliability,
     styleComparison: validation.styleComparison,
+    // The three genuinely new narrative fields (everything else the raw answer says
+    // is already available as clean structured data elsewhere in this payload) and a
+    // display-safe version of the full text with emoji section headers and raw
+    // machine tags (SCORE_CONFIANCE:, TECHNIQUE_UTILISEE:, STYLE_EFFICACITE:) removed
+    // -- those were leaking straight into `explanation` before. `text` itself is left
+    // untouched since extraction/regex logic below (direction, levels, RSI cross-
+    // check, etc.) depends on the original markers.
+    sections: extractNarrativeSections(text),
   };
+  const displayText = stripMachineTags(text);
   if (!normalized.scoreParsed) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, 35),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) — signal bloqué par prudence plutôt que d'inventer un score.`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) — signal bloqué par prudence plutôt que d'inventer un score.`,
       validation: { ...validation, valid: false, reason: "Score de confiance non détecté dans la réponse IA." },
       meta,
     });
@@ -3469,7 +3478,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 45),
       technique: normalized.technique === "Mixte" ? "Aucun style validé" : normalized.technique || validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: signal bloqué volontairement, car l'analyse IA n'a pas confirmé un setup exploitable.`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: signal bloqué volontairement, car l'analyse IA n'a pas confirmé un setup exploitable.`,
       validation: { ...validation, valid: false, reason: "Aucun signal confirmé par Kronos." },
       meta,
     });
@@ -3478,7 +3487,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, imageQuality.score),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
       validation: { ...validation, valid: false, reason: `Qualité image insuffisante: ${imageQuality.reason}` },
       meta,
     });
@@ -3487,7 +3496,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 42),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: signal bloqué car aucun screenshot n'a été fourni et l'historique API n'est pas assez aligné avec la stratégie/timeframe demandé.`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: signal bloqué car aucun screenshot n'a été fourni et l'historique API n'est pas assez aligné avec la stratégie/timeframe demandé.`,
       validation: { ...validation, valid: false, reason: "Historique API insuffisant ou non aligné sans screenshot." },
       meta,
     });
@@ -3497,7 +3506,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 35),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: direction achat/vente non détectée dans la réponse IA — signal bloqué par prudence plutôt que de supposer un achat par défaut.`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: direction achat/vente non détectée dans la réponse IA — signal bloqué par prudence plutôt que de supposer un achat par défaut.`,
       validation: { ...validation, valid: false, reason: "Direction non détectée dans la réponse IA." },
       meta,
     });
@@ -3522,7 +3531,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, 35),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: niveaux entrée/SL/TP incomplets et aucun prix live disponible pour générer un plan prudent.`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: niveaux entrée/SL/TP incomplets et aucun prix live disponible pour générer un plan prudent.`,
       validation: { ...validation, valid: false, reason: "Niveaux entrée/SL/TP incomplets." },
       meta,
     });
@@ -3549,7 +3558,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, levelCheck.score),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: ${levelCheck.reason}`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: ${levelCheck.reason}`,
       validation: { ...validation, valid: false, reason: levelCheck.reason },
       meta: { ...meta, levelCheck },
     });
@@ -3560,7 +3569,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, normalized.score, 45),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: Trade risqué — ${suspicious.reason}. Les niveaux sont indicatifs uniquement et ne doivent pas être copiés directement.`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: Trade risqué — ${suspicious.reason}. Les niveaux sont indicatifs uniquement et ne doivent pas être copiés directement.`,
       validation: { ...validation, valid: false, reason: `Trade risqué: ${suspicious.reason}` },
       meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
     });
@@ -3589,7 +3598,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, normalized.score, 58),
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: contrôle qualité non validé — ${qualityGate.reason}`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: contrôle qualité non validé — ${qualityGate.reason}`,
       validation: { ...validation, valid: false, reason: qualityGate.reason },
       meta: { ...meta, levelCheck, rr, dangerScore: danger.score, danger, qualityGate },
     });
@@ -3604,7 +3613,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: calibratedScore,
       technique: validation.technique,
-      explanation: `${text}\n\nVALIDATION KRONOS: score d'efficacité insuffisant (${calibratedScore}%).`,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: score d'efficacité insuffisant (${calibratedScore}%).`,
       validation: { ...validation, valid: false, reason: "Score d'efficacité insuffisant." },
       meta: { ...meta, levelCheck, rr },
     });
@@ -3622,7 +3631,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     scoreRange: scoreConfidenceBand(calibratedScore, dataReliability, calibration),
     dangerScore: danger.score,
     beginnerPlan,
-    explanation: `${text}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. Gestion du risque: ${profile.label}, perte maximale visée ${profile.percent}% si la taille de lot est correctement ajustée. ${calibration.message}`,
+    explanation: `${displayText}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. Gestion du risque: ${profile.label}, perte maximale visée ${profile.percent}% si la taille de lot est correctement ajustée. ${calibration.message}`,
     validation,
     meta: {
       ...meta,
@@ -4125,19 +4134,50 @@ const styleRules = {
   },
 };
 
-// Pulls the "📸 LECTURE DES GRAPHIQUES" block's "Structure visible:" field out of the
-// answer. This field is mandated by KRONOS_OUTPUT_POLICY but was never actually read
-// back anywhere -- a model could satisfy the format while writing something generic
-// ("RAS", "—") and nothing downstream would notice it never engaged with the image.
-function extractVisualReading(text) {
-  // Confirmed live: real model answers don't reliably put a literal newline between
-  // "📸 LECTURE DES GRAPHIQUES" and the next section -- one real Gemini Vision answer
-  // ran the whole thing as one flowing paragraph. A newline-anchored match against
-  // that text finds nothing and produces a false "no structure described" positive
-  // even when the field is present and detailed. Anchoring on the next known section
-  // marker instead of a newline works regardless of how the model formats whitespace.
-  const structureMatch = String(text).match(/structure visible\s*:?\s*([\s\S]*?)(?=📡|📐|📊|✅|⚠️|SCORE_CONFIANCE|TECHNIQUE_UTILISEE|STYLE_EFFICACITE|$)/i);
-  return { structure: structureMatch ? structureMatch[1].trim() : "" };
+// Pulls the narrative fields out of the raw KRONOS answer: "Structure visible" (the
+// one field never handed to the model, only requested -- see crossCheckStructuralClaims
+// for why that makes it useful for hallucination detection), "Confluence", and
+// "Risque". Everything else in the raw text (price/tendance/entry/sl/tp/rr) is already
+// available as clean structured fields elsewhere in the API response, so the frontend
+// no longer needs to parse or display the whole blob -- these three are the only
+// genuinely new narrative content in it.
+// Confirmed live: real model answers don't reliably put a literal newline between
+// section markers -- one real Gemini Vision answer ran the whole thing as one flowing
+// paragraph. A newline-anchored match against that text finds nothing and produces a
+// false "empty field" positive even when the content is present and detailed.
+// Anchoring on the NEXT known section marker instead of a newline works regardless of
+// how the model formats whitespace.
+const NARRATIVE_SECTION_BOUNDARY = "📸|📡|📐|📊|✅|⚠️|SCORE_CONFIANCE|TECHNIQUE_UTILISEE|STYLE_EFFICACITE|$";
+function extractNarrativeField(text, label) {
+  const match = String(text).match(new RegExp(`${label}\\s*:?\\s*([\\s\\S]*?)(?=${NARRATIVE_SECTION_BOUNDARY})`, "i"));
+  return match ? match[1].trim() : "";
+}
+function extractNarrativeSections(text) {
+  return {
+    visualReading: extractNarrativeField(text, "structure visible"),
+    confluence: extractNarrativeField(text, "✅ CONFLUENCE"),
+    risk: extractNarrativeField(text, "⚠️ RISQUE"),
+  };
+}
+
+// Strips the emoji section headers and raw machine tags (SCORE_CONFIANCE:,
+// TECHNIQUE_UTILISEE:, STYLE_EFFICACITE:) that KRONOS_OUTPUT_POLICY requires the model
+// to emit for parsing (score/technique extraction, style grading) but that were never
+// meant to be shown to the end user verbatim -- they were leaking straight into
+// `explanation` because nothing ever cleaned them out before display.
+function stripMachineTags(text) {
+  return String(text)
+    .replace(/📸\s*LECTURE DES GRAPHIQUES\s*:?/gi, "")
+    .replace(/📡\s*DONNÉES LIVE\s*:?/gi, "")
+    .replace(/📐\s*TECHNIQUE UTILISÉE\s*:?/gi, "")
+    .replace(/📊\s*ANALYSE\s*:?/gi, "")
+    .replace(/✅\s*CONFLUENCE\s*:?/gi, "")
+    .replace(/⚠️\s*RISQUE\s*:?/gi, "")
+    .replace(/SCORE_CONFIANCE\s*:\s*\d+/gi, "")
+    .replace(/TECHNIQUE_UTILISEE\s*:\s*[^\n]*/gi, "")
+    .replace(/STYLE_EFFICACITE\s*:\s*[^=\n]*=\s*\d+/gi, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
 }
 
 const WEAK_VISUAL_READING_RE = /^(non pr[ée]cis[ée]?|n\/?a|aucune?( structure)?( notable)?|rien( de notable)?|ras|—|-|non visible|indisponible|inconnue?)\.?$/i;
@@ -4154,8 +4194,8 @@ function crossCheckStructuralClaims(text, { technicalSnapshot, entry, pair, hasC
   // answer here is real evidence the image wasn't genuinely read.
   if (hasChartImages) {
     checked = true;
-    const visual = extractVisualReading(text);
-    if (!visual.structure || visual.structure.length < 15 || WEAK_VISUAL_READING_RE.test(visual.structure)) {
+    const visual = extractNarrativeSections(text);
+    if (!visual.visualReading || visual.visualReading.length < 15 || WEAK_VISUAL_READING_RE.test(visual.visualReading)) {
       issues.push('un graphe a été fourni mais le champ "Structure visible" est vide ou générique -- rien n\'indique que l\'image a réellement été lue');
     }
   }

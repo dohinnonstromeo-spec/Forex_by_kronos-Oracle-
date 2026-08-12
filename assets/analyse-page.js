@@ -403,7 +403,7 @@
         <div class="result-head">
           <div>
             <p class="analysis-kicker">Conclusion Kronos</p>
-            <div class="direction-label ${buy ? "buy" : "sell"}">${result.direction} ${buy ? "🟢" : "🔴"}</div>
+            <div class="direction-label ${buy ? "buy" : "sell"}">${result.direction} ${icon(buy ? "arrowUp" : "arrowDown")}</div>
           </div>
           <div class="result-confidence">
             <strong>${result.score}%</strong>
@@ -424,14 +424,13 @@
         </div>
         ${renderDangerScore(result)}
         ${renderQualityGate(result)}
+        ${renderVisualReading(result)}
+        ${renderConfluence(result)}
+        ${renderRiskNote(result)}
         ${renderRiskPanel(result)}
         ${renderTradePlan(result)}
         ${renderBeginnerPlan(result)}
-        ${renderAnalysisMeta(result)}
-        <div class="result-explanation">
-          <span>Analyse détaillée</span>
-          <p>${escapeHtml(result.explanation || result.answer || "")}</p>
-        </div>
+        ${renderAdvancedDisclosure(result)}
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>
     `;
@@ -498,11 +497,10 @@
             <ul>${actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ul>
           </div>
         ` : ""}
-        ${renderAnalysisMeta(result)}
-        <div class="result-explanation">
-          <span>Lecture de marché</span>
-          <p>${escapeHtml(result.explanation || result.answer || "Aucune explication reçue du moteur Kronos.")}</p>
-        </div>
+        ${renderVisualReading(result)}
+        ${renderConfluence(result)}
+        ${renderRiskNote(result)}
+        ${renderAdvancedDisclosure(result)}
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>
     `;
@@ -546,6 +544,66 @@
     return `<div class="mt-2 text-[10px] uppercase tracking-widest ${ok ? "text-neon-green" : "text-neon-orange"}">
       Qualité: ${ok ? "validée" : "bloquée"}${grade}${dataScore} · ${quality.source || "n/a"} · fiabilité ${quality.reliability || 0}% · ${quality.bars || 0} barres${blockers}
     </div>`;
+  }
+
+  function icon(name) {
+    return window.OracleIcons?.[name] || "";
+  }
+
+  // The three genuinely new pieces of narrative the API extracts server-side
+  // (everything else in the raw answer duplicates fields already rendered above as
+  // clean cards: price, levels, R/R, technique, score). Each renders only when the
+  // corresponding section actually has content, so a model that omits one doesn't
+  // leave an empty card on screen.
+  function renderVisualReading(result) {
+    const text = result.meta?.sections?.visualReading;
+    const hasImages = Number(result.meta?.imageQuality?.images || 0) > 0;
+    if (!hasImages || !text) return "";
+    return `
+      <div class="result-visual-reading">
+        <span>${icon("eye")} Lecture du graphe</span>
+        <p>${escapeHtml(text)}</p>
+      </div>
+    `;
+  }
+
+  function renderConfluence(result) {
+    const text = result.meta?.sections?.confluence;
+    if (!text) return "";
+    return `
+      <div class="result-confluence">
+        <span>${icon("check")} Confluence</span>
+        <p>${escapeHtml(text)}</p>
+      </div>
+    `;
+  }
+
+  function renderRiskNote(result) {
+    const text = result.meta?.sections?.risk;
+    if (!text) return "";
+    return `
+      <div class="result-risk-note">
+        <span>${icon("alertTriangle")} Risque</span>
+        <p>${escapeHtml(text)}</p>
+      </div>
+    `;
+  }
+
+  // Everything power-users might still want (the full raw AI text, plus the dense
+  // technical debug dump renderAnalysisMeta() already builds) collapsed behind one
+  // disclosure instead of always-on -- this was the other half of the "wall of text"
+  // complaint alongside the raw explanation blob.
+  function renderAdvancedDisclosure(result) {
+    const metaHtml = renderAnalysisMeta(result);
+    const rawText = result.explanation || result.answer || "";
+    if (!metaHtml && !rawText) return "";
+    return `
+      <details class="result-advanced">
+        <summary>${icon("chevronDown")} Détails avancés</summary>
+        ${rawText ? `<div class="result-explanation"><span>Raisonnement complet</span><p>${escapeHtml(rawText)}</p></div>` : ""}
+        ${metaHtml}
+      </details>
+    `;
   }
 
   function renderAnalysisMeta(result) {
