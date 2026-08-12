@@ -51,6 +51,14 @@ const VARIANTS = [
   { ...BASELINE_PARAMS, name: "+ MTF hebdo hard (bloque si conflit)", mtfMode: "hard" },
   { ...BASELINE_PARAMS, name: "+ volume hard + MTF hard (combiné)", volumeMode: "hard", mtfMode: "hard" },
   { ...BASELINE_PARAMS, name: "+ volume soft + MTF soft (combiné)", volumeMode: "soft", mtfMode: "soft" },
+  // New research this round: (1) reject entries already extended too far from SMA10
+  // (chasing filter), (2) require real swing structure (higher-low/lower-high) in
+  // the last 10 bars, not just a smooth SMA crossover. Neither has been tested before.
+  { ...BASELINE_PARAMS, name: "+ anti-chasing 1.0% (skip si étendu >1.0% de SMA10)", extensionMaxPct: 1.0 },
+  { ...BASELINE_PARAMS, name: "+ anti-chasing 0.6% (skip si étendu >0.6% de SMA10)", extensionMaxPct: 0.6 },
+  { ...BASELINE_PARAMS, name: "+ structure soft (higher-low/lower-high, confluence facultative)", structureMode: "soft" },
+  { ...BASELINE_PARAMS, name: "+ structure hard (bloque si pas de structure)", structureMode: "hard" },
+  { ...BASELINE_PARAMS, name: "+ anti-chasing 0.6% + structure hard (combiné)", extensionMaxPct: 0.6, structureMode: "hard" },
 ];
 
 async function fetchYahooDaily(yahooSymbol, range = "5y") {
@@ -172,6 +180,23 @@ function weeklyDirection(window) {
   return momentum >= 0 ? "ACHAT" : "VENTE";
 }
 
+// structureMode: "off" | "soft" (confluence vote) | "hard" (block if the last 10 bars
+// don't show real swing structure in the signal's direction, independent of
+// confluence count). Momentum/RSI alone can fire on a smooth SMA crossover with no
+// underlying higher-low (uptrend) / lower-high (downtrend) swing structure -- this
+// is the kind of confirmation a discretionary trader would actually look for on the
+// chart before trusting a crossover, and it isn't checked anywhere today.
+function structureConfirmed(window, direction) {
+  const recent = window.slice(-10);
+  if (recent.length < 10) return null;
+  const firstHalf = recent.slice(0, 5);
+  const secondHalf = recent.slice(5);
+  if (direction === "ACHAT") {
+    return Math.min(...secondHalf.map((b) => b.low)) > Math.min(...firstHalf.map((b) => b.low));
+  }
+  return Math.max(...secondHalf.map((b) => b.high)) < Math.max(...firstHalf.map((b) => b.high));
+}
+
 // Same decision structure as buildDeterministicSignals() in server.mjs, but with the
 // threshold values pulled out into `params` so variants can be tested honestly.
 function evaluateSignalAt(bars, i, params) {
@@ -194,6 +219,13 @@ function evaluateSignalAt(bars, i, params) {
   if (volatilityPct > (params.volatilityMax ?? Infinity)) return null; // skip signals during abnormal volatility spikes (e.g. news whipsaws)
   const direction = momentum >= 0 ? "ACHAT" : "VENTE";
 
+  // Chasing filter: skip entries where price has already run too far above/below its
+  // own SMA10 before the signal even fires. A pure crossover+momentum system has no
+  // opinion on entry timing within the move -- this rejects the late, already-extended
+  // end of it, where mean-reversion risk against the position is highest.
+  const extensionPct = Math.abs(((last - sma10) / sma10) * 100);
+  if (extensionPct > (params.extensionMaxPct ?? Infinity)) return null;
+
   const volMode = params.volumeMode || "off";
   const volOk = volMode === "off" ? null : volumeConfirmed(window);
   if (volMode === "hard" && volOk === false) return null;
@@ -203,9 +235,14 @@ function evaluateSignalAt(bars, i, params) {
   const mtfConflict = weekly && weekly !== "neutral" && weekly !== direction;
   if (mtfMode === "hard" && mtfConflict) return null;
 
+  const structureMode = params.structureMode || "off";
+  const structureOk = structureMode === "off" ? null : structureConfirmed(window, direction);
+  if (structureMode === "hard" && structureOk === false) return null;
+
   const confluenceFactors = [trendAligned, volatilityOk, true, Math.abs(move) >= 0.05];
   if (volMode === "soft" && volOk !== null) confluenceFactors.push(volOk);
   if (mtfMode === "soft" && weekly !== null) confluenceFactors.push(!mtfConflict);
+  if (structureMode === "soft" && structureOk !== null) confluenceFactors.push(structureOk);
   const confluence = confluenceFactors.filter(Boolean).length;
 
   const strength = Math.abs(momentum) + Math.min(Math.abs(move), 2) * 0.35 + confluence * 0.08;
