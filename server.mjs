@@ -106,7 +106,8 @@ async function ensureRelationalTables() {
       score real, active integer, status text, block_reason text,
       live_price_at_signal real, image_quality text, calibration text, validation text,
       technical_snapshot text, multi_timeframe text,
-      closed_at text, close_price real, outcome text, outcome_reason text, r_multiple real
+      closed_at text, close_price real, outcome text, outcome_reason text, r_multiple real,
+      is_test integer NOT NULL DEFAULT 0
     )`,
     `CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status)`,
     `CREATE INDEX IF NOT EXISTS idx_analyses_user ON analyses(user_id)`,
@@ -117,8 +118,23 @@ async function ensureRelationalTables() {
   } else {
     for (const statement of statements) getSqliteDb().exec(statement);
   }
+  // Tables created before this column existed need it added on top -- ALTER TABLE
+  // ADD COLUMN, not CREATE TABLE IF NOT EXISTS, actually reaches an existing table.
+  // Swallowing "already exists" makes this safe to call on every startup regardless
+  // of whether the column is already there.
+  await ensureColumn("analyses", "is_test integer NOT NULL DEFAULT 0");
   relationalTablesReady = true;
   await migrateLegacyJsonIntoRelationalTables();
+}
+
+async function ensureColumn(table, columnDef) {
+  const alterSql = `ALTER TABLE ${table} ADD COLUMN ${columnDef}`;
+  try {
+    if (pgPool) await pgPool.query(alterSql);
+    else getSqliteDb().exec(alterSql);
+  } catch (error) {
+    if (!/already exists|duplicate column/i.test(error.message)) throw error;
+  }
 }
 
 async function ensureStateTable() {
@@ -1133,7 +1149,7 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     }
     const visionConsensus = await visionConsensusPromise;
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup, visionConsensus });
-    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null });
+    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null, isTest: isTestRequest(req) });
     sendJson(res, 200, result);
     return;
   }
@@ -5448,6 +5464,18 @@ async function requireAdmin(req) {
   };
 }
 
+// Marks an analysis as QA/verification traffic so it's excluded from calibration and
+// public stats (see loadLearningLog()) instead of silently mixing in. Requires
+// TEST_MODE_TOKEN to be configured -- if it's unset, this always returns false, so a
+// real end user can never accidentally (or deliberately) get their own trades
+// excluded from calibration just by sending an arbitrary header.
+function isTestRequest(req) {
+  const expectedToken = normalizeAdminToken(env.TEST_MODE_TOKEN || "");
+  if (!expectedToken) return false;
+  const providedToken = normalizeAdminToken(String(req.headers["x-kronos-test-token"] || ""));
+  return Boolean(providedToken) && timingSafeStringEqual(providedToken, expectedToken);
+}
+
 async function grantPremiumAccess(body = {}) {
   const email = normalizeEmail(body.email);
   const days = Math.max(1, Math.min(730, Number(body.days || body.durationDays || 30)));
@@ -5588,6 +5616,7 @@ function rowToAnalysis(row) {
     outcome: row.outcome || null,
     outcomeReason: row.outcome_reason || null,
     rMultiple: row.r_multiple ?? null,
+    isTest: Boolean(Number(row.is_test)),
   };
 }
 
@@ -5596,8 +5625,8 @@ async function upsertAnalysisRow(analysis) {
     `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth,
        direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal,
        image_quality, calibration, validation, technical_snapshot, multi_timeframe,
-       closed_at, close_price, outcome, outcome_reason, r_multiple)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       closed_at, close_price, outcome, outcome_reason, r_multiple, is_test)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        user_id = excluded.user_id, status = excluded.status, block_reason = excluded.block_reason,
        closed_at = excluded.closed_at, close_price = excluded.close_price,
@@ -5634,6 +5663,7 @@ async function upsertAnalysisRow(analysis) {
       analysis.outcome || null,
       analysis.outcomeReason || null,
       Number.isFinite(analysis.rMultiple) ? analysis.rMultiple : null,
+      analysis.isTest ? 1 : 0,
     ],
   );
 }
@@ -5643,9 +5673,18 @@ async function upsertAnalysisRow(analysis) {
 // analysis row once outcome is set) -- confirmed no BLOCKED analysis was ever pushed
 // there, only OPEN-then-resolved ones -- so it's derived here instead of stored as
 // its own table.
+//
+// is_test rows (recordLearningAnalysis called with a matching X-Kronos-Test-Token
+// header, see isTestRequest()) are excluded here rather than at each individual
+// consumer -- confirmed live this session that my own QA/verification traffic
+// (Playwright runs, curl smoke tests) was silently mixing into calibrationFor()'s
+// shrinkage math and the public performance/equity-curve numbers with no way to tell
+// it apart from real signals. Filtering once here means every consumer
+// (calibration, equity curve, performance payload, personal analyses, admin) gets
+// clean data automatically instead of needing this check added at each call site.
 async function loadLearningLog() {
   await ensureRelationalTables();
-  const rows = await sqlAll(`SELECT * FROM analyses ORDER BY created_at ASC`);
+  const rows = await sqlAll(`SELECT * FROM analyses WHERE is_test = ? ORDER BY created_at ASC`, [0]);
   const analyses = rows.map(rowToAnalysis);
   const outcomes = analyses
     .filter((item) => item.outcome)
@@ -5701,6 +5740,7 @@ async function recordLearningAnalysis(result, body, context) {
     validation: result.validation,
     technicalSnapshot: context.technicalSnapshot || null,
     multiTimeframe: context.multiTimeframe || [],
+    isTest: Boolean(context.isTest),
   });
   result.learningId = id;
   return id;
