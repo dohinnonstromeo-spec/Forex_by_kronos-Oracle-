@@ -159,12 +159,26 @@ const memoryCache = {
 
 const GROQ_MODEL = env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile";
-const GEMINI_MODEL = env.GEMINI_MODEL || "gemini-2.0-flash";
+// Confirmed live (2026-08-11, both configured GROQ_KEY_* values): this Groq
+// account has zero vision-capable models available -- GET /v1/models lists 15 text
+// models and nothing matching scout/maverick/vision. meta-llama/llama-4-scout and
+// llama-4-maverick (the hardcoded IDs groqVision() tries) both 404 model_not_found
+// regardless of key. Not fixable by rotating keys -- it's an account/plan
+// restriction. Gated off here so every chart analysis doesn't pay for two guaranteed-
+// dead HTTP round trips before falling through to Gemini. Set GROQ_VISION_ENABLED=true
+// once vision access is actually available on the account again.
+const GROQ_VISION_ENABLED = env.GROQ_VISION_ENABLED === "true";
+// gemini-2.0-flash/gemini-2.5-flash/gemini-1.5-flash-latest were the previous
+// defaults here and are now dead: confirmed live (real generateContent calls, all 4
+// configured GEMINI_API_KEY_* values) that Google returns 404 "no longer available"
+// for all three on 3 of our 4 keys (2.5-flash still works on one -- an older
+// grandfathered project -- so it's kept as a second attempt, not dropped outright).
+// gemini-flash-latest is the only one that succeeded on every key tested.
+const GEMINI_MODEL = env.GEMINI_MODEL || "gemini-flash-latest";
 const GEMINI_FALLBACK_MODELS = [
   GEMINI_MODEL,
-  "gemini-2.0-flash",
+  "gemini-flash-latest",
   "gemini-2.5-flash",
-  "gemini-1.5-flash-latest",
 ].filter((model, index, list) => model && list.indexOf(model) === index);
 const TWELVE_DATA_KEYS = collectEnvKeys("TWELVE_DATA_API_KEY", "TWELVEDATA_API_KEY");
 const MASSIVE_KEYS = collectEnvKeys("MASSIVE_API_KEY", "MASSIVE_KEY");
@@ -2629,7 +2643,7 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
 }
 
 async function groqVision(prompt, images, maxTokens = 1000) {
-  if (!GROQ_KEYS.length) return "";
+  if (!GROQ_KEYS.length || !GROQ_VISION_ENABLED) return "";
   const groqVisionModels = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -2676,13 +2690,22 @@ async function groqVision(prompt, images, maxTokens = 1000) {
 
 async function analyzeChartImage(prompt, images, maxTokens = 1000) {
   if (!images?.length) return "";
-  if (GROQ_KEYS.length) {
+  if (GROQ_KEYS.length && GROQ_VISION_ENABLED) {
     const result = await groqVision(prompt, images, maxTokens);
     if (result && result.length > 50) return result;
     logOnce("vision", "Groq Vision insuffisant, bascule Gemini Vision.");
   }
   if (GEMINI_KEYS.length) {
-    const result = await geminiVision(prompt, images, Math.round(maxTokens * 0.7));
+    // The *0.7 discount here predates gemini-flash-latest and was sized for the old
+    // (now-dead) gemini-2.0-flash, which didn't spend tokens on internal reasoning.
+    // Confirmed live against the real production prompt (full KRONOS_SYSTEM_PROMPT +
+    // context, not a simplified test prompt): even maxTokens+1800 still truncated
+    // mid-answer on some runs (finishReason MAX_TOKENS, cut off before
+    // SCORE_CONFIANCE) -- the real prompt's complexity pushes reasoning overhead
+    // higher, and it varies run to run. maxOutputTokens is a ceiling, not a floor: a
+    // generous cap costs nothing when the model finishes early (finishReason STOP),
+    // so there's no real downside to erring high here.
+    const result = await geminiVision(prompt, images, maxTokens + 3000);
     if (result && result.length > 50) return result;
     logOnce("vision", "Gemini Vision insuffisant.");
   }
@@ -2701,10 +2724,15 @@ Réponds en JSON strict uniquement, sans texte autour:
 // independently on the SAME image, in parallel (so latency stays ~1 call, only cost
 // doubles), and comparing their raw reads is the one mechanism here that can.
 async function visionConsensusCheck(images) {
-  if (!images?.length || !GROQ_KEYS.length || !GEMINI_KEYS.length) return { checked: false };
+  if (!images?.length || !GROQ_VISION_ENABLED || !GROQ_KEYS.length || !GEMINI_KEYS.length) return { checked: false };
   const [groqAnswer, geminiAnswer] = await Promise.all([
-    promiseWithTimeout(groqVision(VISION_CONSENSUS_PROMPT, images, 120), 12000, ""),
-    promiseWithTimeout(geminiVision(VISION_CONSENSUS_PROMPT, images, 120), 12000, ""),
+    // 120 tokens looked generous for ~10 words of JSON but wasn't: confirmed live
+    // that gemini-flash-latest spends tokens on internal reasoning before the visible
+    // answer, and got cut off mid-JSON (finishReason MAX_TOKENS, unparseable) at both
+    // 120 and 200. 300 was the first value that reliably reached finishReason STOP
+    // with valid JSON; 400 leaves margin.
+    promiseWithTimeout(groqVision(VISION_CONSENSUS_PROMPT, images, 400), 12000, ""),
+    promiseWithTimeout(geminiVision(VISION_CONSENSUS_PROMPT, images, 400), 12000, ""),
   ]);
   const a = parseJson(groqAnswer, null);
   const b = parseJson(geminiAnswer, null);
@@ -2862,7 +2890,7 @@ function normalizeImages(images) {
 }
 
 function hasVisionProvider() {
-  return GROQ_KEYS.length > 0 || GEMINI_KEYS.length > 0;
+  return (GROQ_KEYS.length > 0 && GROQ_VISION_ENABLED) || GEMINI_KEYS.length > 0;
 }
 
 function normalizeChartDetection(value) {
@@ -4102,9 +4130,13 @@ const styleRules = {
 // back anywhere -- a model could satisfy the format while writing something generic
 // ("RAS", "—") and nothing downstream would notice it never engaged with the image.
 function extractVisualReading(text) {
-  const section = String(text).match(/📸[^\n]*\n([\s\S]*?)(?:\n📡|\n\n📐|$)/);
-  const block = section ? section[1] : "";
-  const structureMatch = block.match(/structure visible\s*:?\s*(.+)/i);
+  // Confirmed live: real model answers don't reliably put a literal newline between
+  // "📸 LECTURE DES GRAPHIQUES" and the next section -- one real Gemini Vision answer
+  // ran the whole thing as one flowing paragraph. A newline-anchored match against
+  // that text finds nothing and produces a false "no structure described" positive
+  // even when the field is present and detailed. Anchoring on the next known section
+  // marker instead of a newline works regardless of how the model formats whitespace.
+  const structureMatch = String(text).match(/structure visible\s*:?\s*([\s\S]*?)(?=📡|📐|📊|✅|⚠️|SCORE_CONFIANCE|TECHNIQUE_UTILISEE|STYLE_EFFICACITE|$)/i);
   return { structure: structureMatch ? structureMatch[1].trim() : "" };
 }
 
