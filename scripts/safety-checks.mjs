@@ -1,0 +1,175 @@
+// Regression suite for one specific, recurring bug class found and fixed on
+// 2026-08-13: code that treats "this value is a finite number" as proof that market
+// data is real/current, when a stale or hardcoded emergency fallback price is *also*
+// a finite number. Three real instances shipped bad output because of this before
+// being caught live: validateTradeLevels() silently skipped its live-price distance
+// check when the price was missing (and, separately, when it was a stale fallback),
+// assessAnalysisDataReliability() awarded reliability points for a fake price, and
+// buildQualityGate() force-passed other checks (and relaxed its danger threshold) in
+// quick mode based on the same false signal.
+//
+// Standalone on purpose, same reason as scripts/backtest.mjs: importing server.mjs
+// starts a real HTTP server as a side effect. The functions below are copied from
+// server.mjs, not imported -- if you change validateTradeLevels, pricePayload,
+// assessAnalysisDataReliability, or buildQualityGate there, update the matching copy
+// here too, then run `node scripts/safety-checks.mjs` to confirm nothing regressed.
+//
+// This is a targeted regression net for this one bug class, not a general test
+// suite -- it doesn't replace live verification against the real running server.
+
+function isScalpingStrategy(strategy = "") { return /scalp|m1|m5|m15/i.test(String(strategy)); }
+function riskProfile(risk) { return { percent: /0\.5/.test(String(risk)) ? 0.5 : /^1(\D|$)/.test(String(risk)) ? 1 : 2, minScore: 55 }; }
+function rewardRisk(direction, entry, sl, tp) {
+  const risk = Math.abs(entry - sl);
+  const reward = Math.abs(tp - entry);
+  return risk > 0 ? reward / risk : NaN;
+}
+function executionCostBuffer() { return 0.35; }
+function inspectSuspiciousLevels() { return { risky: false, reason: "", reasons: [] }; }
+function levelTolerance(pair = "", strategy = "") {
+  const scalp = isScalpingStrategy(strategy);
+  if (/XAU/i.test(pair)) return scalp ? 0.006 : 0.018;
+  return scalp ? 0.0015 : 0.0035;
+}
+function isLivePriceSource(source = "") {
+  return ["twelve_data", "massive", "alpha_vantage", "coinbase", "stooq", "binance", "yahoo"].includes(source);
+}
+
+// Copy of pricePayload() from server.mjs.
+function pricePayload(symbol, value, source, error, options = {}) {
+  const open = options.open ?? true;
+  const live = isLivePriceSource(source);
+  const stale = options.stale ?? (!live || !open);
+  const reliability = options.reliability ?? (live ? 85 : 20);
+  return {
+    ...value,
+    source,
+    error,
+    open,
+    stale,
+    reliability,
+    trustworthy: Boolean(open && !stale && live && reliability >= 70),
+    asOf: new Date().toISOString(),
+  };
+}
+
+// Copy of isUsableLivePrice() from server.mjs.
+function isUsableLivePrice(price) {
+  if (typeof price?.trustworthy === "boolean") return price.trustworthy;
+  return Boolean(price?.open && !price.stale && isLivePriceSource(price.source) && Number(price.reliability || 0) >= 70);
+}
+
+// Copy of validateTradeLevels() from server.mjs.
+function validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair, strategy, risk }) {
+  if (![entry, sl, tp].every(Number.isFinite)) return { valid: false, score: 0, reason: "Niveaux numériques invalides." };
+  const buy = direction === "ACHAT";
+  if (buy && !(sl < entry && tp > entry)) return { valid: false, score: 20, reason: "Pour un achat, SL doit être sous l'entrée et TP au-dessus." };
+  if (!buy && !(sl > entry && tp < entry)) return { valid: false, score: 20, reason: "Pour une vente, SL doit être au-dessus de l'entrée et TP sous l'entrée." };
+  const rr = rewardRisk(direction, entry, sl, tp);
+  const profile = riskProfile(risk);
+  const minRr = isScalpingStrategy(strategy) ? 0.75 : profile.percent <= 0.5 ? 1.0 : 1.2;
+  if (!Number.isFinite(rr) || rr < minRr) return { valid: false, score: 35, reason: `R/R trop faible.` };
+  const riskDistance = Math.abs(entry - sl);
+  const executionBuffer = executionCostBuffer(pair, strategy);
+  if (riskDistance < executionBuffer * 3) return { valid: false, score: 30, reason: `SL trop serré.` };
+  const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair });
+  if (suspicious.risky) return { valid: false, score: 28, reason: `Trade risqué: ${suspicious.reason}` };
+  if (!Number.isFinite(live) || !liveUsable) {
+    return { valid: false, score: 30, reason: "Prix live indisponible ou non fiable: niveaux non vérifiables contre le marché réel." };
+  }
+  const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
+  const tolerance = levelTolerance(pair, strategy);
+  if (distance > tolerance) {
+    const strict = isScalpingStrategy(strategy) || distance > tolerance * 2;
+    return { valid: !strict, score: strict ? 32 : 50, reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%).` };
+  }
+  return { valid: true, score: Math.max(55, Math.min(100, Math.round(55 + rr * 12))), reason: "Niveaux cohérents avec direction, R/R et prix live." };
+}
+
+// Copy of assessAnalysisDataReliability()'s live-price scoring, from server.mjs.
+function liveScoreContribution(livePrice) {
+  return isUsableLivePrice(livePrice) ? 24 : 0;
+}
+
+// Copy of buildQualityGate()'s hasLivePrice + the checks it gates, from server.mjs.
+function qualityGateLivePriceChecks({ meta, quickMode }) {
+  const hasLivePrice = Boolean(meta.liveUsable);
+  return {
+    prixLive: hasLivePrice,
+    historique: quickMode && hasLivePrice ? true : meta.technicalSnapshot?.valid !== false,
+    dangerThreshold: quickMode && hasLivePrice ? 92 : 65,
+  };
+}
+
+let pass = 0, fail = 0;
+function check(label, cond, extra) {
+  console.log(`${cond ? "PASS" : "FAIL"} - ${label}${extra ? ` (${extra})` : ""}`);
+  if (cond) pass++; else fail++;
+}
+
+console.log("=== validateTradeLevels: live price availability/trustworthiness ===");
+
+const realLive = { price: 4348.61, open: true, stale: false, source: "twelve_data", reliability: 95, trustworthy: true };
+const missingLive = null;
+const staleFallback = { price: 2350.0, open: true, stale: true, source: "static_fallback", reliability: 15, trustworthy: false };
+const closedMarketLive = { price: 4348.61, open: false, stale: false, source: "twelve_data", reliability: 95, trustworthy: false };
+
+function levelsFor(livePrice) {
+  const live = Number(livePrice?.price);
+  const liveUsable = isUsableLivePrice(livePrice);
+  return { live, liveUsable };
+}
+
+check(
+  "missing live price: far entry BLOCKED",
+  validateTradeLevels({ direction: "VENTE", entry: 4167, sl: 4180, tp: 4130, ...levelsFor(missingLive), pair: "XAU/USD", strategy: "Scalping", risk: "0.5" }).valid === false,
+);
+check(
+  "stale/untrustworthy fallback price: far entry BLOCKED regardless of distance math",
+  validateTradeLevels({ direction: "VENTE", entry: 4167, sl: 4180, tp: 4130, ...levelsFor(staleFallback), pair: "XAU/USD", strategy: "Scalping", risk: "0.5" }).valid === false,
+);
+check(
+  "market closed (trustworthy:false even with a real recent price): BLOCKED",
+  validateTradeLevels({ direction: "VENTE", entry: 4348, sl: 4352, tp: 4340, ...levelsFor(closedMarketLive), pair: "XAU/USD", strategy: "Scalping", risk: "0.5" }).valid === false,
+);
+check(
+  "real trustworthy live price, tight entry: VALID",
+  validateTradeLevels({ direction: "VENTE", entry: 4348, sl: 4352, tp: 4340, ...levelsFor(realLive), pair: "XAU/USD", strategy: "Scalping", risk: "0.5" }).valid === true,
+);
+check(
+  "real trustworthy live price, far entry (the original reported bug: 4348 live, 4167 entry): still BLOCKED",
+  validateTradeLevels({ direction: "VENTE", entry: 4167, sl: 4180, tp: 4130, ...levelsFor(realLive), pair: "XAU/USD", strategy: "Scalping", risk: "0.5" }).valid === false,
+);
+
+console.log("\n=== pricePayload: .trustworthy is computed correctly at the source ===");
+
+const freshLive = pricePayload("XAU/USD", { price: 4348.61, change: 0.1 }, "twelve_data", null, { stale: false, reliability: 90, open: true });
+check("fresh real provider price: trustworthy=true", freshLive.trustworthy === true);
+
+const staleCache = pricePayload("XAU/USD", { price: 4340.0, change: 0 }, "cache:twelve_data", "using_last_good", { stale: true, reliability: 55, open: true });
+check("stale cache fallback: trustworthy=false", staleCache.trustworthy === false);
+
+const emergencyFallback = pricePayload("XAU/USD", { price: 2350.0, change: 0 }, "static_fallback", "all_providers_unavailable", { stale: true, reliability: 15, open: true });
+check("hardcoded emergency fallback: trustworthy=false", emergencyFallback.trustworthy === false);
+
+const marketClosed = pricePayload("XAU/USD", { price: 4348.61, change: 0 }, "twelve_data", null, { stale: false, reliability: 90, open: false });
+check("real price but market closed: trustworthy=false", marketClosed.trustworthy === false);
+
+console.log("\n=== assessAnalysisDataReliability: no partial credit for a fake-but-finite price ===");
+
+check("fake/stale price contributes 0 (not partial credit)", liveScoreContribution(staleFallback) === 0);
+check("real trustworthy price contributes full 24", liveScoreContribution(realLive) === 24);
+
+console.log("\n=== buildQualityGate: quick-mode leniency requires a genuinely trustworthy price ===");
+
+const gateWithFakeLive = qualityGateLivePriceChecks({ meta: { liveUsable: false, technicalSnapshot: { valid: false } }, quickMode: true });
+check("fake price in quick mode: 'Prix live' check fails", gateWithFakeLive.prixLive === false);
+check("fake price in quick mode: 'Historique' NOT force-passed", gateWithFakeLive.historique === false);
+check("fake price in quick mode: danger threshold stays strict (65), not relaxed to 92", gateWithFakeLive.dangerThreshold === 65);
+
+const gateWithRealLive = qualityGateLivePriceChecks({ meta: { liveUsable: true, technicalSnapshot: { valid: false } }, quickMode: true });
+check("real price in quick mode: 'Prix live' check passes", gateWithRealLive.prixLive === true);
+check("real price in quick mode: 'Historique' correctly relaxed (by design, quick mode)", gateWithRealLive.historique === true);
+
+console.log(`\n${pass} passed, ${fail} failed.`);
+if (fail) process.exit(1);

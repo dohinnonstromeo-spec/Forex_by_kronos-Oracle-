@@ -2395,13 +2395,23 @@ function withMarketMeta(prices, source, error) {
 function pricePayload(symbol, value, source, error, options = {}) {
   const open = isSymbolOpen(symbol);
   const live = isLivePriceSource(source);
+  const stale = options.stale ?? (!live || !open);
+  const reliability = options.reliability ?? (live ? 85 : 20);
   return {
     ...value,
     source,
     error,
     open,
-    stale: options.stale ?? (!live || !open),
-    reliability: options.reliability ?? (live ? 85 : 20),
+    stale,
+    reliability,
+    // Computed once, here, at the one place every price object is constructed --
+    // rather than every consumer separately deciding whether to trust `.price`
+    // (three real bugs this session came from exactly that: a stale/fallback price
+    // is still a finite number, and Number.isFinite() alone can't tell it apart from
+    // a real one). Anything that only wants to trade/validate against a real live
+    // price should check `.trustworthy`, not just `Number.isFinite(price.price)`.
+    // See scripts/safety-checks.mjs for the regression tests covering this.
+    trustworthy: Boolean(open && !stale && live && reliability >= 70),
     assetClass: assetClass(symbol),
     asOf: new Date().toISOString(),
   };
@@ -2412,6 +2422,11 @@ function isLivePriceSource(source = "") {
 }
 
 function isUsableLivePrice(price) {
+  // price.trustworthy (set once in pricePayload()) is the same computation; recomputed
+  // here too as a fallback for any price-shaped object that didn't go through
+  // pricePayload (e.g. a manually constructed test fixture), so this still works
+  // standalone.
+  if (typeof price?.trustworthy === "boolean") return price.trustworthy;
   return Boolean(price?.open && !price.stale && isLivePriceSource(price.source) && Number(price.reliability || 0) >= 70);
 }
 
