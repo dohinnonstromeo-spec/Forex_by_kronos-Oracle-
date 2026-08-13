@@ -855,6 +855,45 @@ Génère un briefing trader en JSON : {"titre":"","paires_surveiller":[],"scenar
     }
     const chatPair = detectPairFromText(question) || body.pair || "EUR/USD";
     const intent = classifyChatIntent(question, images);
+    // Any request for an actual setup/signal -- whether the user attached chart
+    // screenshots or just asked in text -- goes through the exact same validated
+    // pipeline /api/analyze-chart uses (runKronosAnalysis), instead of the old
+    // CHATBOT_SYSTEM_PROMPT + normalizeAiAnswer() path below, which does nothing
+    // beyond extracting a score/technique label. Confirmed live: a user uploading
+    // real MT5 chart screenshots and asking for a scalping entry got a level
+    // hundreds of points from the live price with zero sanity check.
+    if (intent.type === "analyse_graphique" || intent.type === "signal_ou_setup") {
+      const result = await runKronosAnalysis({
+        body: {
+          pair: chatPair,
+          timeframe: inferTimeframeFromText(question) || "H1",
+          style: "Mixte",
+          strategy: inferStrategyFromText(question) || "Swing Trading",
+          risk: defaultRiskMode(),
+          capital: null,
+          analysisDepth: "Rapide",
+          autoDetect: false,
+        },
+        images,
+        req,
+        user: session?.user || null,
+      });
+      sendJson(res, 200, {
+        ok: true,
+        answer: result.explanation,
+        score: result.score,
+        technique: result.technique,
+        direction: result.direction,
+        entry: result.entry,
+        sl: result.sl,
+        tp1: result.tp1,
+        tp2: result.tp2,
+        rr: result.rr,
+        noSignal: result.noSignal,
+        meta: result.meta,
+      });
+      return;
+    }
     const needsMarketContext = intent.needsMarketContext;
     const prices = needsMarketContext ? await getPrices() : {};
     const livePrice = needsMarketContext ? prices[chatPair] || await getExternalPrice(chatPair) : null;
@@ -889,17 +928,9 @@ INSTRUCTIONS DE RÉPONSE:
 - Si l'utilisateur demande un signal/setup, utilise le contexte marché ci-dessus, explique les limites, et demande confirmation si les données sont insuffisantes.
 - Si l'utilisateur veut gagner vite/facilement, recadre sans moraliser et propose une voie prudente.
 - Termine par une prochaine action utile.`;
-    const answer = images.length ? await analyzeChartImage(prompt, images) : await groq(prompt, 420, 0.3);
-    if (images.length && !answer) {
-      sendJson(res, 200, {
-        ok: false,
-        offline: true,
-        answer: "Vision indisponible: impossible d'analyser ce graphique de façon fiable. Vérifie que Groq ou Gemini est configuré, ou pose une question texte.",
-        score: 0,
-        technique: "Vision indisponible",
-      });
-      return;
-    }
+    // No images reach this point: intent is always "analyse_graphique" when images
+    // are attached, handled and returned via runKronosAnalysis above.
+    const answer = await groq(prompt, 420, 0.3);
     if (!answer) {
       sendJson(res, 200, {
         ok: false,
@@ -958,9 +989,28 @@ Réponds en JSON strict:
     }
     const body = await readBody(req);
     const images = normalizeImages(body.images);
+    const result = await runKronosAnalysis({ body, images, req, user: session?.user || null });
+    sendJson(res, 200, result);
+    return;
+  }
+
+  sendJson(res, 404, { error: "not_found" });
+}
+
+// Shared by /api/analyze-chart and /api/chat's chart/setup intents. Extracted so both
+// entry points run the exact same validation pipeline (normalizeAnalysis: live-price
+// distance check, suspicious-level detection, quality gate, danger score) --
+// previously /api/chat built its own much looser response via normalizeAiAnswer(),
+// which does nothing beyond extracting a score and technique label. Confirmed live:
+// a user uploading real MT5 chart screenshots to the chatbot got an entry price
+// hundreds of points away from the live price (XAU/USD, live ~4409, suggested entry
+// 4000) with zero sanity check -- something /api/analyze-chart's validateTradeLevels
+// would have caught and blocked outright. Same underlying AI call, same hallucination
+// risk, but only one of the two paths was actually checking for it.
+async function runKronosAnalysis({ body, images, req, user }) {
     const imageQuality = assessImageQuality(images);
     if (images.length && imageQuality.score < 20) {
-      sendJson(res, 200, {
+      return {
         direction: "AUCUN SIGNAL",
         entry: "—",
         sl: "—",
@@ -972,11 +1022,10 @@ Réponds en JSON strict:
         explanation: `Qualité image trop faible (${imageQuality.reason}). Kronos bloque seulement les images quasi illisibles.`,
         meta: { imageQuality },
         noSignal: true,
-      });
-      return;
+      };
     }
     if (images.length && !hasVisionProvider()) {
-      sendJson(res, 200, {
+      return {
         direction: "AUCUN SIGNAL",
         entry: "—",
         sl: "—",
@@ -987,8 +1036,7 @@ Réponds en JSON strict:
         technique: "Vision indisponible",
         explanation: "Aucune clé Groq Vision ou Gemini Vision n'est disponible pour analyser un screenshot. Kronos bloque le signal pour éviter une analyse inventée.",
         noSignal: true,
-      });
-      return;
+      };
     }
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
     const analysisDepth = normalizeAnalysisDepth(body.analysisDepth);
@@ -1149,12 +1197,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     }
     const visionConsensus = await visionConsensusPromise;
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup, visionConsensus });
-    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user: session?.user || null, isTest: isTestRequest(req) });
-    sendJson(res, 200, result);
-    return;
-  }
-
-  sendJson(res, 404, { error: "not_found" });
+    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user, isTest: isTestRequest(req) });
+    return result;
 }
 
 async function getPrices() {
@@ -3360,6 +3404,22 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       meta.stale ? "historique indicatif/différé" : "historique frais ou cache récent",
     ].join("; "),
   };
+}
+
+function inferStrategyFromText(text = "") {
+  const normalized = String(text).toLowerCase();
+  if (/scalp|\bm1\b|\bm5\b|\bm15\b/.test(normalized)) return "Scalping";
+  if (/day trading|intraday|intrajournalier/.test(normalized)) return "Day Trading";
+  if (/position|long terme|investissement/.test(normalized)) return "Position Trading";
+  if (/breakout|cassure/.test(normalized)) return "Breakout";
+  if (/reversal|retournement/.test(normalized)) return "Reversal";
+  if (/swing/.test(normalized)) return "Swing Trading";
+  return null;
+}
+
+function inferTimeframeFromText(text = "") {
+  const match = String(text).toUpperCase().match(/\b(M1|M5|M15|M30|H1|H4|D1|W1)\b/);
+  return match ? match[1] : null;
 }
 
 function detectPairFromText(text = "") {
