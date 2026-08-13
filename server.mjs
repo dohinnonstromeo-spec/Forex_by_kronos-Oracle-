@@ -225,13 +225,22 @@ const PAIRS_WITHOUT_VALIDATED_EDGE = new Set(["GBP/JPY"]);
 
 // Static fallback only: emergency display values when every live source fails.
 // They are intentionally low-reliability and must never validate a direct setup.
+// Absolute last resort, only reached when every real provider AND the cache have
+// failed (see fetchBestPrice) -- never trusted for trade validation regardless
+// (isUsableLivePrice/liveUsable in validateTradeLevels correctly excludes this via
+// its stale:true/reliability:15 marking below), but still worth keeping roughly
+// current so it isn't visibly absurd wherever it's shown cosmetically. These WILL
+// drift out of date again over time since nothing updates them automatically --
+// re-check against real prices (e.g. /api/prices) periodically, especially for
+// volatile instruments like XAU/USD. Last refreshed 2026-08-13: XAU/USD had drifted
+// from 2350 to a real ~4348 (85% off) since these were first set.
 const fallbackPrices = {
-  "EUR/USD": { price: 1.0850, change: 0 },
-  "XAU/USD": { price: 2350.0, change: 0 },
-  "BTC/USD": { price: 65000, change: 0 },
-  "GBP/JPY": { price: 195.0, change: 0 },
-  US500: { price: 5200.0, change: 0 },
-  "ETH/USD": { price: 3000.0, change: 0 },
+  "EUR/USD": { price: 1.1531, change: 0 },
+  "XAU/USD": { price: 4348.6, change: 0 },
+  "BTC/USD": { price: 63422, change: 0 },
+  "GBP/JPY": { price: 215.12, change: 0 },
+  US500: { price: 7801.6, change: 0 },
+  "ETH/USD": { price: 1887.1, change: 0 },
 };
 
 const fallbackSignals = [
@@ -1229,7 +1238,14 @@ async function fetchBestPrice(symbol, cached) {
   }
   const providers = providersForSymbol(symbol);
   const errors = [];
-  const deadline = Date.now() + 3200;
+  // Each individual provider call times out at 2200ms (fetchJson/fetchText's
+  // default) -- a 3200ms total budget left room for barely one full-length attempt
+  // plus scraps, so a symbol with 4-7 configured fallback providers (providersForSymbol)
+  // would often only ever get to try the first one or two before this deadline cut
+  // the loop short, even though later providers might have answered fine. Widened so
+  // a real outage on the first couple of providers doesn't waste the rest of the
+  // fallback chain that's already configured for exactly this situation.
+  const deadline = Date.now() + 9000;
   for (const provider of providers) {
     if (Date.now() > deadline) break;
     try {
@@ -3505,6 +3521,12 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   const quickMode = body.analysisDepth === "Rapide";
   const chartContext = context.chartContext || {};
   const live = Number(livePrice?.price);
+  // Distinct from `Number.isFinite(live)`: a stale/emergency fallback price (e.g. the
+  // hardcoded fallbackPrices used when every real provider fails) is still a finite
+  // number, but isUsableLivePrice() already correctly excludes it (stale: true,
+  // reliability: 15). validateTradeLevels needs to fail closed on THAT too, not just
+  // on a genuinely missing price -- a wrong number is worse than no number.
+  const liveUsable = isUsableLivePrice(livePrice);
   const mtfConsensus = analyzeMultiTimeframeConsensus(context.multiTimeframe || []);
   const dataReliability = assessAnalysisDataReliability({
     livePrice,
@@ -3612,7 +3634,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       meta,
     });
   }
-  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
+  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair: body.pair, strategy: body.strategy, risk: body.risk });
   if (!levelCheck.valid) {
     const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
     if (repairedLevels.used) {
@@ -3627,7 +3649,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
         targetConstraint = repairedConstraint;
       }
       assistedLevels = repairedLevels;
-      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
+      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair: body.pair, strategy: body.strategy, risk: body.risk });
     }
   }
   if (!levelCheck.valid) {
@@ -4445,7 +4467,7 @@ function assessImageQuality(images) {
   return { score, reason, images: images.length };
 }
 
-function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy, risk }) {
+function validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair, strategy, risk }) {
   if (![entry, sl, tp].every(Number.isFinite)) return { valid: false, score: 0, reason: "Niveaux numériques invalides." };
   const buy = direction === "ACHAT";
   if (buy && !(sl < entry && tp > entry)) return { valid: false, score: 20, reason: "Pour un achat, SL doit être sous l'entrée et TP au-dessus." };
@@ -4475,8 +4497,16 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy, r
   // Failing closed instead: no live price to check against means the trade isn't
   // validated, full stop, same as every other "can't verify, don't ship it" gate in
   // this pipeline (see apiOnlyNoSignalReason's "Prix live absent" case).
-  if (!Number.isFinite(live)) {
-    return { valid: false, score: 30, reason: "Prix live indisponible: niveaux non vérifiables contre le marché réel." };
+  //
+  // Checking liveUsable (not just Number.isFinite(live)) closes a second, related gap:
+  // when every real provider fails, fetchBestPrice() still returns SOMETHING -- a
+  // stale hardcoded emergency value (fallbackPrices) that is a perfectly finite
+  // number, just not a real one (e.g. XAU/USD's fallback is a value set long ago,
+  // nowhere near where gold actually trades now). isUsableLivePrice() already
+  // correctly excludes that case (stale/low-reliability/wrong source); this check
+  // needs to respect that instead of trusting any finite number as if it were real.
+  if (!Number.isFinite(live) || !liveUsable) {
+    return { valid: false, score: 30, reason: "Prix live indisponible ou non fiable: niveaux non vérifiables contre le marché réel." };
   }
   const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
   const tolerance = levelTolerance(pair, strategy);
