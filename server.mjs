@@ -292,14 +292,14 @@ Techniques finales autorisées pour TECHNIQUE_UTILISEE: ICT, SMC, Wyckoff, Ellio
 Confluences secondaires possibles dans l'explication: Supply/Demand, VSA, Harmonic, Fibonacci, chartisme classique, chandeliers japonais, volume, psychologie du marché. Elles ne doivent pas remplacer la technique finale autorisée.
 
 Price Action: structure HH/HL ou LH/LL, range, supports/résistances, cassure/retest, measured move, chandeliers de confirmation. Le contexte prime toujours sur une bougie isolée.
-SMC: order block, FVG, BOS, CHOCH, MSB, inducement, liquidité, mitigation, premium/discount, breaker block. Un CHOCH seul est une alerte, pas une confirmation.
-ICT: kill zones, liquidity sweep, Judas swing, OTE, Power of 3, Silver Bullet et macros uniquement si l'heure/session ou le contexte est fourni.
-Wyckoff: accumulation/distribution, Selling Climax, Automatic Rally, Spring, SOS, LPS, Buying Climax, UTAD, effort/résultat. Un Spring/UTAD visible est prioritaire.
-Elliott: impulsion 1-5, correction ABC, invalidation claire, règles absolues de vague 2, vague 3 et vague 4. Ne force jamais un comptage ambigu.
+SMC: BOS = clôture au-delà d'un swing high/low existant dans le sens de la tendance en cours (continuation). CHOCH = clôture au-delà d'un swing dans le sens opposé à la tendance en cours (alerte de changement seulement, jamais une confirmation d'entrée à elle seule). Order block valide = dernière bougie opposée avant un déplacement impulsif, non mitigée au-delà de 50% de son corps. FVG = écart de prix entre la mèche de la bougie 1 et la mèche de la bougie 3 (3 bougies consécutives), non comblé par le prix depuis. Une zone déjà retestée et tenue plusieurs fois est plus fiable qu'une zone fraîche non testée.
+ICT: kill zones = Londres ~07h-10h GMT et New York ~12h-15h GMT (indicatif, pas une règle rigide hors info de session fournie); liquidity sweep = mèche qui dépasse un plus haut/bas évident puis rejette; OTE = zone de retracement Fibonacci 61.8%-79% d'un swing impulsif. Macros/Silver Bullet uniquement si l'heure/session est fournie dans le contexte, jamais suggérées à l'aveugle.
+Wyckoff: Spring = fausse cassure sous le support de la range suivie d'un retour rapide au-dessus, confirmée seulement à la clôture (pas sur la mèche seule); UTAD = symétrique au-dessus de la résistance. Effort/résultat: gros volume sans progression de prix = absorption, signal d'épuisement de la tendance en cours.
+Elliott: impulsion 1-5, correction ABC. Règles absolues à respecter strictement (jamais de comptage qui les viole): la vague 2 ne retrace jamais au-delà du point de départ de la vague 1; la vague 3 n'est jamais la plus courte des trois vagues motrices (1, 3, 5); la vague 4 ne chevauche jamais la zone de prix de la vague 1 (sauf diagonale terminale explicite). Ne force jamais un comptage ambigu.
 Ichimoku: prix vs Kumo, Tenkan/Kijun, Chikou, twist, Kijun bounce. Signal fort seulement si au moins 2-3 confirmations sont alignées.
 Supply & Demand: DBR/RBD, zones fraîches, nombre de retests. Une zone fraîche + OB/FVG au même niveau renforce la confluence.
-Harmonic: XABCD, Gartley, Bat, Butterfly, Crab, Cypher seulement si les points et ratios sont visibles; attendre confirmation au point D.
-VSA: No Supply, No Demand, Stopping Volume, Upthrust, effort/résultat seulement si volume ou spread est visible.
+Harmonic: XABCD seulement si les points et ratios Fibonacci sont réellement mesurables sur le graphe. Repères Gartley (le plus courant): AB ≈ 0.618 de XA, BC entre 0.382 et 0.886 de AB, CD entre 1.272 et 1.618 de BC, D ≈ 0.786 de XA. Toujours attendre confirmation au point D, jamais anticiper.
+VSA: No Demand = chandelier haussier à faible volume près d'un sommet (signal de faiblesse acheteuse). No Supply = chandelier baissier à faible volume près d'un creux (signal de faiblesse vendeuse). Stopping Volume/Upthrust seulement si volume ou spread est réellement visible sur l'image.
 Chartisme: H&S, double top/bottom, triangles, drapeaux, fanions, wedges, cup & handle. Attendre clôture et retest avant breakout.
 Indicateurs: RSI, MACD, Bollinger, ATR, moyennes mobiles seulement quand visibles ou fournis par le serveur.
 Mixte: compare les techniques supportées, retiens celle qui possède les preuves les plus nettes et donne STYLE_EFFICACITE.`;
@@ -332,7 +332,8 @@ GBP/JPY: paire très volatile, sensible au risque global et aux politiques BOE/B
 XAU/USD: or refuge, sensible au DXY, taux réels US, inflation, tensions géopolitiques.
 BTC/USD et ETH/USD: 24/7, corrélation fréquente avec le risque et les indices US.
 US500/NAS100: indices sensibles aux taux, earnings, inflation, Fed, sentiment risque.
-News high impact: NFP, FOMC, CPI, PPI, BCE, BOE, BOJ. Si un risque news est transmis par le serveur, respecte-le strictement.`;
+News high impact: NFP, FOMC, CPI, PPI, BCE, BOE, BOJ. Si un risque news est transmis par le serveur, respecte-le strictement.
+Si le calendrier fournit une estimation et/ou une valeur précédente pour un événement (est./préc.), utilise-les pour juger le risque de surprise: un écart estimation/précédent déjà large signale une volatilité probable même avant la publication; ne l'invente jamais si ces valeurs ne sont pas transmises.`;
 
 const KRONOS_OUTPUT_POLICY = `FORMAT OBLIGATOIRE
 📸 LECTURE DES GRAPHIQUES :
@@ -361,6 +362,31 @@ Si le signal n'est pas assez confirmé, écris explicitement AUCUN SIGNAL et n'a
 Si les niveaux sont seulement indicatifs parce que le graphique n'a pas pu être lu, écris:
 ⚠️ NIVEAUX INDICATIFS UNIQUEMENT — Kronos n'a pas pu lire le graphique. Ne pas trader ces niveaux directement.`;
 
+// One concrete worked example instead of more abstract rules -- shows the actual
+// discipline expected (every claim tied to something specifically described as
+// visible or to a server-provided number, API context confirming rather than
+// contradicting the visual read, a score that reflects genuine confluence) rather
+// than just stating it applies. Kept to a single example: a longer few-shot list
+// has diminishing returns and adds real latency/cost to every request.
+const KRONOS_EXAMPLE_POLICY = `EXEMPLE D'ANALYSE BIEN ANCRÉE (modèle de rigueur à suivre, pas un vrai signal)
+📸 LECTURE DES GRAPHIQUES : Plateforme: TradingView | Paire: EUR/USD | Timeframe: H1 | Structure visible: Deux plus hauts descendants (LH), puis cassure nette du dernier plus bas confirmée par clôture (pas par mèche seule), retest de la zone cassée avec rejet net (mèche haute visible sur la bougie de retest).
+📡 DONNÉES LIVE : - Prix live: 1.08472 | Source: twelve_data | Fiabilité: 92 - Historique: 80 bougies | SMA10/SMA30: 1.0851/1.0863 | RSI: 41 | ATR: 0.00071
+📐 TECHNIQUE UTILISÉE : SMC (BOS confirmé par clôture + retest avec rejet sur l'order block à l'origine du mouvement)
+📊 ANALYSE :
+- Tendance : Baissière
+- Signal détecté : Vente sur retest de l'order block après BOS confirmé
+- Zone d'entrée : 1.08460
+- Stop Loss : 1.08560 (au-dessus du sommet de l'order block, structurel)
+- Take Profit 1 : 1.08280
+- Take Profit 2 : 1.08120
+- R/R ratio : 1:2.2
+✅ CONFLUENCE : SMA10 sous SMA30 (alignement baissier confirmé par l'API), RSI 41 sans divergence haussière contraire, retest tenu sans nouvelle mèche haussière.
+⚠️ RISQUE : Ce n'est pas un conseil financier.
+SCORE_CONFIANCE:74
+TECHNIQUE_UTILISEE:SMC
+STYLE_EFFICACITE:SMC=80
+Pourquoi cet exemple est correct: chaque affirmation ("BOS confirmé par clôture", "rejet net") s'appuie sur un élément précisément décrit comme visible, pas une supposition générique. Les données API (SMA/RSI) confirment la lecture visuelle au lieu de la contredire. Le score (74) reflète une confluence réelle mais pas parfaite -- ni gonflé ni artificiellement bas. Si la structure réelle avait été ambiguë ou avait contredit les données API, la bonne réponse aurait été de baisser le score ou de retourner AUCUN SIGNAL, jamais de forcer une confluence qui n'existe pas.`;
+
 const KRONOS_SYSTEM_PROMPT = [
   "Tu es Kronos, le moteur IA éducatif d'Oracle Forex. Tu analyses comme un analyste senior: précis, prudent, structuré, jamais vendeur de rêve. Tu ne donnes jamais de conseil financier; tu fournis une lecture éducative du marché.",
   KRONOS_DATA_POLICY,
@@ -370,6 +396,7 @@ const KRONOS_SYSTEM_PROMPT = [
   KRONOS_RISK_POLICY,
   KRONOS_FUNDAMENTAL_POLICY,
   KRONOS_OUTPUT_POLICY,
+  KRONOS_EXAMPLE_POLICY,
 ].join("\n\n");
 
 const CHATBOT_SYSTEM_PROMPT = `Tu es ChatBot Kronos, l'assistant conversationnel trading d'Oracle Forex.
@@ -2560,7 +2587,18 @@ async function analysisNewsContext(pair = "EUR/USD") {
     .filter((item) => keywords.some((keyword) => item.title.toUpperCase().includes(keyword)))
     .slice(0, 5);
   const eventText = risk.events?.length
-    ? risk.events.map((event) => `${event.currency || "N/A"} ${event.impact}: ${event.name}`).join(" | ")
+    ? risk.events.map((event) => {
+      // Estimate/previous give the model something to actually reason about (is a
+      // beat or a miss more likely to matter here) instead of just a name + "high
+      // impact" -- neither field is guaranteed present (depends on what Finnhub has
+      // for that specific event), so only append what's real.
+      const forecastBits = [
+        event.estimate ? `est. ${event.estimate}` : null,
+        event.previous ? `préc. ${event.previous}` : null,
+        event.actual ? `actuel ${event.actual}` : null,
+      ].filter(Boolean).join(", ");
+      return `${event.currency || "N/A"} ${event.impact}: ${event.name}${forecastBits ? ` (${forecastBits})` : ""}`;
+    }).join(" | ")
     : risk.reason;
   const headlineText = compactHeadlines.length
     ? compactHeadlines.map((item) => item.title).join(" | ")
@@ -2629,6 +2667,9 @@ async function economicRiskWindow(now = new Date()) {
       currency: event.currency,
       time: event.time.toISOString(),
       impact: event.impact,
+      estimate: event.estimate,
+      previous: event.previous,
+      actual: event.actual,
     })),
     reason: relevant.length ? "News économique forte proche: signaux concernés suspendus." : "Aucune news rouge proche.",
   };
@@ -2638,11 +2679,23 @@ function normalizeCalendarEvent(event = {}) {
   const rawTime = event.time || event.datetime || event.date || event.period;
   const time = rawTime ? new Date(rawTime) : null;
   const impact = String(event.impact || event.importance || "").toLowerCase();
+  // Finnhub's economic calendar actually returns estimate/prev/actual/unit per event
+  // -- this used to discard all of it, leaving Kronos with just an event name and
+  // "high impact" with no sense of whether the outcome was likely to be a surprise
+  // (e.g. NFP consensus 180K vs previous 165K is real, useful context; "NFP: USD
+  // high" alone isn't). Surfaced here so the prompt can cite it instead of guessing.
+  const estimate = event.estimate ?? event.forecast ?? null;
+  const previous = event.prev ?? event.previous ?? null;
+  const actual = event.actual ?? null;
+  const unit = event.unit ? String(event.unit) : "";
   return {
     name: String(event.event || event.name || event.title || "Événement macro"),
     currency: String(event.country || event.currency || event.region || "").toUpperCase(),
     impact: /high|3|rouge|important/.test(impact) ? "high" : /medium|2|moyen/.test(impact) ? "medium" : "low",
     time: time && Number.isFinite(time.getTime()) ? time : null,
+    estimate: estimate !== null && estimate !== "" ? `${estimate}${unit}` : null,
+    previous: previous !== null && previous !== "" ? `${previous}${unit}` : null,
+    actual: actual !== null && actual !== "" ? `${actual}${unit}` : null,
   };
 }
 
