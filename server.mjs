@@ -4465,17 +4465,28 @@ function validateTradeLevels({ direction, entry, sl, tp, live, pair, strategy, r
   }
   const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair });
   if (suspicious.risky) return { valid: false, score: 28, reason: `Trade risqué: ${suspicious.reason}` };
-  if (Number.isFinite(live)) {
-    const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
-    const tolerance = levelTolerance(pair, strategy);
-    if (distance > tolerance) {
-      const strict = isScalpingStrategy(strategy) || distance > tolerance * 2;
-      return {
-        valid: !strict,
-        score: strict ? 32 : 50,
-        reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%, tolérance ${(tolerance * 100).toFixed(2)}%). ${strict ? "Setup bloqué: attendre un prix plus proche." : "À confirmer avant exécution."}`,
-      };
-    }
+  // Confirmed live: this used to be `if (Number.isFinite(live)) { ...distance check... }`
+  // with no else -- when live was NOT finite (a momentary price-feed hiccup), the whole
+  // distance check was skipped and execution fell through to `valid: true` at the
+  // bottom, silently approving the AI's entry regardless of how far from reality it
+  // was. That's the one gap that can let a >2x-tolerance miss (e.g. a vision misread
+  // of a chart's price scale) straight through: every other check here (R/R, SL
+  // distance, suspicious levels) has nothing to say about "is this price real."
+  // Failing closed instead: no live price to check against means the trade isn't
+  // validated, full stop, same as every other "can't verify, don't ship it" gate in
+  // this pipeline (see apiOnlyNoSignalReason's "Prix live absent" case).
+  if (!Number.isFinite(live)) {
+    return { valid: false, score: 30, reason: "Prix live indisponible: niveaux non vérifiables contre le marché réel." };
+  }
+  const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
+  const tolerance = levelTolerance(pair, strategy);
+  if (distance > tolerance) {
+    const strict = isScalpingStrategy(strategy) || distance > tolerance * 2;
+    return {
+      valid: !strict,
+      score: strict ? 32 : 50,
+      reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%, tolérance ${(tolerance * 100).toFixed(2)}%). ${strict ? "Setup bloqué: attendre un prix plus proche." : "À confirmer avant exécution."}`,
+    };
   }
   return { valid: true, score: Math.max(55, Math.min(100, Math.round(55 + rr * 12))), reason: "Niveaux cohérents avec direction, R/R et prix live." };
 }
