@@ -3543,6 +3543,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     capital: body.capital || null,
     analysisDepth: body.analysisDepth || "Profonde",
     livePrice: Number.isFinite(live) ? live : null,
+    liveUsable,
     imageQuality,
     calibration,
     chartContext,
@@ -4035,10 +4036,14 @@ function computeDangerScore({ meta = {}, validation = {}, levelCheck = {}, rr = 
 function assessAnalysisDataReliability({ livePrice = {}, technicalSnapshot = {}, multiTimeframe = [], hasChartImages = false }) {
   const blockers = [];
   let score = hasChartImages ? 76 : 62;
-  if (Number.isFinite(Number(livePrice?.price))) score += 12;
-  else blockers.push("prix live absent");
-  if (isLivePriceSource(livePrice?.source) && !livePrice?.stale) score += 12;
-  else blockers.push("prix non-live ou différé");
+  // Was two separate +12 checks: one for "is livePrice.price a finite number" and
+  // one for "is the source live and not stale". A stale hardcoded emergency fallback
+  // (see fallbackPrices) is a finite number, so it earned the first +12 on data that
+  // was never actually live -- partial credit for a fake price. isUsableLivePrice()
+  // is the same all-or-nothing gate validateTradeLevels now uses; using it here too
+  // means this score can't be inflated by data that wouldn't pass trade validation.
+  if (isUsableLivePrice(livePrice)) score += 24;
+  else blockers.push(Number.isFinite(Number(livePrice?.price)) ? "prix non-live, différé ou peu fiable" : "prix live absent");
   if (technicalSnapshot?.valid) score += 16;
   else blockers.push("snapshot technique faible");
   if (Number(technicalSnapshot?.bars || 0) >= 50) score += 8;
@@ -4076,12 +4081,21 @@ function analyzeMultiTimeframeConsensus(items = []) {
 
 function buildQualityGate({ meta = {}, validation = {}, levelCheck = {}, danger = {}, hasChartImages = false, quickMode = false }) {
   const profile = riskProfile(meta.risk);
-  const hasLivePrice = Number.isFinite(Number(meta.livePrice));
+  // Was `Number.isFinite(Number(meta.livePrice))` -- true for a stale hardcoded
+  // fallback price too (see fallbackPrices/isUsableLivePrice), which meant a fake
+  // price didn't just slip past the "Prix live" check itself: in quick mode it also
+  // force-passed the "Historique" check below regardless of real data quality, and
+  // relaxed the "Danger" threshold further down from 65% to 92%. levelCheck.valid
+  // already correctly fails in that scenario (see validateTradeLevels), so this
+  // specific leniency was never independently exploitable end to end -- but it was
+  // still wrong to report, and worth closing directly rather than depending on that
+  // other check alone.
+  const hasLivePrice = Boolean(meta.liveUsable);
   const checks = [
     {
       name: "Prix live",
       ok: hasLivePrice,
-      detail: hasLivePrice ? "prix disponible" : "prix indisponible",
+      detail: hasLivePrice ? "prix disponible" : "prix indisponible ou non fiable",
     },
     {
       name: "Historique",
