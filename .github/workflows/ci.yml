@@ -45,3 +45,16 @@ jobs:
             || (echo "/api/analyze-chart did not respond" && kill $SERVER_PID && exit 1)
           kill $SERVER_PID
           echo "Smoke test passed."
+
+      # Integration tests for auth/quota/rate-limit/admin -- the smoke test above only
+      # checks the server boots and a handful of endpoints respond, it never exercises
+      # signup, login, quotas, rate-limiting, or admin auth. Two real bugs shipped in
+      # this exact surface with zero automated coverage catching either (a quota
+      # bypass, and a signup path that skipped the login rate limiter). No secret.dev
+      # in CI on purpose (same reasoning as the smoke test above) -- tests that need
+      # ADMIN_TOKEN/TEST_MODE_TOKEN self-skip via the hasSecrets guard in the test
+      # file rather than false-failing on an environment that was never supposed to
+      # have them; the rest (signup validation, login rejection, password-reset
+      # enumeration safety) still run for real.
+      - name: Auth/quota/admin integration tests
+        run: node --test scripts/api-tests.mjs

@@ -1,0 +1,8 @@
+User-agent: *
+Disallow: /premium-admin
+Disallow: /premium-admin.html
+Disallow: /admin-premium
+Disallow: /admin
+Disallow: /admin-health
+Disallow: /admin-health.html
+Disallow: /api/
