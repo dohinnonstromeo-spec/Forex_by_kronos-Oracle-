@@ -108,7 +108,7 @@
     if (changeBox) {
       const up = Number(price.change) >= 0;
       changeBox.className = `home-market-change ${up ? "text-neon-green" : "text-neon-red"}`;
-      changeBox.textContent = price.open && !price.stale ? `${up ? "▲" : "▼"} ${Number(price.change).toFixed(2)}%` : "FERMÉ";
+      changeBox.innerHTML = price.open && !price.stale ? `${icon(up ? "arrowUp" : "arrowDown")} ${Number(price.change).toFixed(2)}%` : "FERMÉ";
     }
     const staleText = price.open && !price.stale ? "" : price.source === "fallback" ? "Donnée fallback" : "Marché fermé";
     if (staleText && left && !left.querySelector(".kronos-source")) {
@@ -148,6 +148,38 @@
     }
 
     grid.innerHTML = signals.map(signalCard).join("");
+    bindShareButtons(grid);
+  }
+
+  // Delegated so it survives grid.innerHTML being replaced on every refresh --
+  // attached once (guarded by the dataset flag) instead of re-adding a listener
+  // per render.
+  function bindShareButtons(grid) {
+    if (grid.dataset.shareBound) return;
+    grid.dataset.shareBound = "1";
+    grid.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-share-signal]");
+      if (!button) return;
+      const text = button.dataset.shareSignal;
+      if (navigator.share) {
+        try {
+          await navigator.share({ text, title: "Signal Oracle Forex" });
+          return;
+        } catch {
+          // User cancelled the native share sheet, or the browser refused --
+          // fall through to clipboard rather than leaving the click silent.
+        }
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        const original = button.textContent;
+        button.textContent = "Copié ✓";
+        setTimeout(() => { button.textContent = original; }, 1500);
+      } catch {
+        // Clipboard API unavailable (very old browser, or blocked permission) --
+        // nothing more we can do here without a manual copy fallback UI.
+      }
+    });
   }
 
   function signalCard(signal) {
@@ -160,7 +192,7 @@
       <div class="flex items-start justify-between">
         <div>
           <div class="font-mono text-lg font-bold tracking-wider">${pair}</div>
-          <div class="mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${suspended ? "bg-neon-orange/15 text-neon-orange" : buy ? "bg-neon-green/15 text-neon-green" : "bg-neon-red/15 text-neon-red"}">${suspended ? suspendLabel : `${buy ? "▲" : "▼"} ${escapeHtml(signal.direction)}`}</div>
+          <div class="mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${suspended ? "bg-neon-orange/15 text-neon-orange" : buy ? "bg-neon-green/15 text-neon-green" : "bg-neon-red/15 text-neon-red"}">${suspended ? suspendLabel : `${icon(buy ? "arrowUp" : "arrowDown")} ${escapeHtml(signal.direction)}`}</div>
         </div>
         <span data-kronos-status class="kronos-status ${suspended ? "danger" : ""}">${suspended ? "ANALYSE SUSPENDUE" : (score < 40 ? "SIGNAL FAIBLIT" : "LIVE")}</span>
       </div>
@@ -168,9 +200,14 @@
       <p class="mt-3 text-xs text-muted-foreground">${escapeHtml(signal.raison || "Signal généré par Kronos.")}</p>
       <div class="mt-4 flex items-center justify-between border-t border-border pt-3 text-[10px] uppercase tracking-widest text-muted-foreground">
         <div class="flex gap-1"><span class="rounded border border-amber-neon/30 px-1.5 py-0.5 text-amber-neon">${escapeHtml(signal.technique || "SMC")}</span></div>
-        <button class="font-medium text-foreground hover:text-amber-neon">Partager →</button>
+        ${suspended ? "" : `<button type="button" class="font-medium text-foreground hover:text-amber-neon" data-share-signal="${escapeAttr(shareText(signal))}">Partager →</button>`}
       </div>
     </article>`;
+  }
+
+  function shareText(signal) {
+    const direction = signal.direction === "ACHAT" ? "ACHAT" : "VENTE";
+    return `Signal Oracle Forex · ${signal.paire} ${direction}\nEntrée ${signal.entree} · SL ${signal.sl} · TP1 ${signal.tp1} · TP2 ${signal.tp2}\nConfiance ${Math.round(Number(signal.confiance) || 0)}% · ${signal.technique || "SMC"}`;
   }
 
   function metric(label, value, color = "text-foreground") {
@@ -303,7 +340,10 @@
   }
 
   function formatPrice(symbol, value) {
-    if (symbol.includes("BTC") || symbol === "US500") return String(Math.round(value));
+    // fr-FR grouping (space, not comma) to match home-market-effects.js's mini
+    // cards, which show the same BTC/USD price elsewhere on this same page --
+    // used to render "67840" here against "67 840" there, simultaneously.
+    if (symbol.includes("BTC") || symbol === "US500") return Math.round(value).toLocaleString("fr-FR");
     if (symbol.includes("XAU")) return Number(value).toFixed(1);
     return Number(value).toFixed(symbol.includes("JPY") ? 2 : 4);
   }
@@ -340,6 +380,10 @@
       .kronos-source { margin-top: .25rem; color: var(--neon-orange); font-family: var(--font-mono); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
     `;
     document.head.appendChild(style);
+  }
+
+  function icon(name) {
+    return window.OracleIcons?.[name] || "";
   }
 
   function escapeHtml(value) {

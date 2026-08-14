@@ -22,6 +22,10 @@ window.OracleIcons = {
   coin: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="10" r="8"/><path d="M10 5.8v8.4"/><path d="M12.6 7.6c-.5-.7-1.5-1-2.6-1-1.4 0-2.6.7-2.6 1.9s1.2 1.6 2.6 1.7c1.4.1 2.6.5 2.6 1.8s-1.2 1.9-2.6 1.9c-1.1 0-2.1-.4-2.6-1.1"/></svg>',
   user: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="6.5" r="3.5"/><path d="M2.5 17c1-3.5 4-5.5 7.5-5.5s6.5 2 7.5 5.5"/></svg>',
   history: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 10a7.5 7.5 0 1 1 2.4 5.5"/><path d="M2.5 15v-4h4"/><path d="M10 6v4.5l3 1.7"/></svg>',
+  zap: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 2 4.5 11.5h5l-1 6.5 7-10h-5l1-6Z"/></svg>',
+  paperclip: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 6v7.5a4 4 0 0 1-8 0V5.2a2.6 2.6 0 0 1 5.2 0V12a1.2 1.2 0 0 1-2.4 0V6.3"/></svg>',
+  radio: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="15.2" r="1.1" fill="currentColor" stroke="none"/><path d="M6.7 12a4.7 4.7 0 0 1 6.6 0"/><path d="M4 9a8.7 8.7 0 0 1 12 0"/></svg>',
+  refresh: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 10.5a6 6 0 1 1-1.8-4.3"/><path d="M16 3v4.2h-4.2"/></svg>',
 };
 
 // Static markup can reference an icon declaratively (<span data-icon="user">Label</span>)

@@ -149,7 +149,7 @@
   }
 
   function formatPrice(pair, value) {
-    if (/BTC/i.test(pair)) return Math.round(value).toLocaleString("en-US");
+    if (/BTC/i.test(pair)) return Math.round(value).toLocaleString("fr-FR");
     if (/XAU/i.test(pair)) return Number(value).toFixed(2);
     if (/JPY/i.test(pair)) return Number(value).toFixed(3);
     return Number(value).toFixed(5);

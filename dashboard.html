@@ -17,7 +17,7 @@
       </a>
       <div class="oracle-links">
         <a href="/">Accueil</a>
-        <a href="/tester-gratuitement">Analyse IA</a>
+        <a href="/tester-gratuitement">Tester gratuitement</a>
         <a href="/paiement">S'abonner</a>
         <button class="auth-logout" type="button" data-logout>Déconnexion</button>
       </div>
@@ -35,19 +35,22 @@
       <article class="dashboard-card">
         <span data-icon="user">Plan actuel</span>
         <strong data-user-plan>Free</strong>
-        <p>Les quotas premium seront activés quand le paiement sera connecté.</p>
-        <a class="payment-method-button" href="/paiement">S'abonner maintenant</a>
+        <p data-payment-status hidden>Accès premium actif — aucun quota, aucun paiement à refaire.</p>
+        <div data-payment-form>
+          <p>Les quotas premium seront activés quand le paiement sera connecté.</p>
+          <a class="payment-method-button" href="/paiement">S'abonner maintenant</a>
+        </div>
       </article>
       <article class="dashboard-card">
         <span data-icon="eye">Analyse IA</span>
         <strong>Kronos</strong>
         <p>Lance une analyse profonde avec score danger, quality gate et plan débutant.</p>
-        <a class="payment-method-button" href="/tester-gratuitement">Tester gratuitement</a>
+        <a class="payment-method-button" href="/tester-gratuitement" data-cta-trial>Tester gratuitement</a>
       </article>
       <article class="dashboard-card">
-        <span data-icon="activity">Suivi signaux</span>
-        <strong data-performance-label>En préparation</strong>
-        <p>Le suivi TP1/TP2/SL sera relié aux analyses enregistrées.</p>
+        <span data-icon="activity">Précision Kronos</span>
+        <strong data-performance-label>Calcul en cours...</strong>
+        <p>Winrate global mesuré sur les analyses réellement clôturées (TP/SL), tous comptes confondus. Ton suivi personnel TP1/TP2/SL est juste en dessous, dans "Mes analyses Kronos".</p>
       </article>
     </section>
 
@@ -59,7 +62,7 @@
         </div>
         <span class="oracle-tech" data-dashboard-status>Synchronisation</span>
       </div>
-      <div class="dashboard-metrics" data-dashboard-metrics></div>
+      <div class="dashboard-metrics" data-dashboard-metrics>Chargement...</div>
     </section>
 
     <section class="dashboard-panel">
@@ -70,9 +73,15 @@
         </div>
         <span class="oracle-tech" data-personal-status>Compte connecté</span>
       </div>
-      <div class="dashboard-history" data-dashboard-history></div>
+      <button class="payment-method-button push-toggle" type="button" data-push-toggle hidden>Activer les notifications TP/SL</button>
+      <p class="dashboard-push-status" data-push-status></p>
+      <div class="dashboard-history" data-dashboard-history>Chargement...</div>
     </section>
   </main>
+
+  <footer class="oracle-footer-lite">
+    © 2026 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a> · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
+  </footer>
 
   <script src="/assets/oracle-icons.js" defer></script>
   <script src="/assets/auth.js" defer></script>

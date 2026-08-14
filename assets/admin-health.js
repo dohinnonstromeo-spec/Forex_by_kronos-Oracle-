@@ -32,11 +32,11 @@
       </article>
       <article class="analysis-signal-card">
         <div class="signal-pair">Cache prix</div>
-        ${priceRows.map(([symbol, item]) => `<div class="signal-bottom"><span>${escapeHtml(symbol)}</span><strong>${item.cached ? escapeHtml(item.source || "cache") : "vide"}</strong></div>`).join("")}
+        ${priceRows.length ? priceRows.map(([symbol, item]) => `<div class="signal-bottom"><span>${escapeHtml(symbol)}</span><strong>${item.cached ? escapeHtml(item.source || "cache") : "vide"}</strong></div>`).join("") : `<p class="mt-2 text-sm text-muted-foreground">Aucun prix en cache.</p>`}
       </article>
       <article class="analysis-signal-card">
         <div class="signal-pair">Cache historiques</div>
-        ${historyRows.map(([symbol, item]) => `<div class="signal-bottom"><span>${escapeHtml(symbol)}</span><strong>${item.bars || 0} barres</strong></div>`).join("")}
+        ${historyRows.length ? historyRows.map(([symbol, item]) => `<div class="signal-bottom"><span>${escapeHtml(symbol)}</span><strong>${item.bars || 0} barres</strong></div>`).join("") : `<p class="mt-2 text-sm text-muted-foreground">Aucun historique en cache.</p>`}
       </article>
       <article class="analysis-signal-card">
         <div class="signal-pair">Apprentissage</div>
@@ -45,7 +45,7 @@
       </article>
       <article class="analysis-signal-card">
         <div class="signal-pair">Recommandations</div>
-        ${(health.recommendations || []).map((item) => `<p class="mt-2 text-sm text-muted-foreground">${escapeHtml(item)}</p>`).join("")}
+        ${(health.recommendations || []).length ? health.recommendations.map((item) => `<p class="mt-2 text-sm text-muted-foreground">${escapeHtml(item)}</p>`).join("") : `<p class="mt-2 text-sm text-muted-foreground">Rien à signaler.</p>`}
       </article>
     `;
   }

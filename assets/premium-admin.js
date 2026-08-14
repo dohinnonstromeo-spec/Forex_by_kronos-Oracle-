@@ -42,9 +42,18 @@
     }
     try {
       const response = await fetch(url, options);
-      return response.json();
+      try {
+        return await response.json();
+      } catch {
+        // Reached the server but got a non-JSON body (a crash page, an empty
+        // response...) -- distinct from never reaching it at all, see below.
+        return { ok: false, error: "reponse_serveur_invalide", message: `Réponse inattendue du serveur (code ${response.status}).` };
+      }
     } catch {
-      return null;
+      // fetch() itself only throws for network-level failures (DNS, connection
+      // refused, offline...), never for 4xx/5xx -- those come back as normal JSON
+      // above with the server's real error message (e.g. "Accès admin requis").
+      return { ok: false, error: "reseau_indisponible", message: "Impossible de contacter le serveur (connexion réseau ?)." };
     }
   }
 
@@ -58,15 +67,35 @@
       <article>
         <div>
           <strong>${escapeHtml(user.name || "Compte")} · ${escapeHtml(user.email)}</strong>
-          <span>${escapeHtml(user.role || "user")} · ${escapeHtml(user.plan || "free")}</span>
+          <span>${escapeHtml(user.role || "user")} · ${user.premiumUntil ? `Premium jusqu'au ${formatDate(user.premiumUntil)}` : "Free"} · ${user.manualPremium ? "Manuel" : "Standard"}</span>
         </div>
         <div class="dashboard-history-levels">
-          <button type="button">${user.premiumUntil ? `Premium jusqu'au ${formatDate(user.premiumUntil)}` : "Free"}</button>
-          <button type="button">${user.manualPremium ? "Manuel" : "Standard"}</button>
+          <button type="button" data-revoke-premium="${escapeHtml(user.email)}" ${user.plan === "premium" ? "" : "disabled"}>Révoquer</button>
         </div>
         <span class="${user.plan === "premium" ? "history-open" : "history-blocked"}">${escapeHtml(user.plan || "free")}</span>
       </article>
     `).join("");
+    members.querySelectorAll("[data-revoke-premium]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const email = button.dataset.revokePremium;
+        const token = form?.elements?.token?.value || "";
+        if (!token) {
+          setMessage("Renseigne le token admin avant de révoquer.", true);
+          return;
+        }
+        if (!window.confirm(`Retirer Premium à ${email} ?`)) return;
+        button.disabled = true;
+        setMessage(`Révocation de ${email}...`, false);
+        const data = await adminFetch("/api/admin/revoke-premium", { token, email });
+        if (!data?.ok) {
+          setMessage(data?.message || data?.error || "Révocation impossible (voir détail ci-dessus).", true);
+          button.disabled = false;
+          return;
+        }
+        setMessage(data.message || "Premium retiré.", false);
+        renderMembers(items.map((item) => (item.email === email ? { ...item, ...data.user } : item)));
+      });
+    });
   }
 
   function setMessage(text, error) {

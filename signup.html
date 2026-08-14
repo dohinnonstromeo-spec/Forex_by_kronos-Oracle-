@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inscription · Oracle Forex</title>
-  <meta name="description" content="Creez votre compte Oracle Forex pour utiliser Kronos avec un historique personnel.">
+  <meta name="description" content="Créez votre compte Oracle Forex pour utiliser Kronos avec un historique personnel.">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
 </head>
@@ -31,13 +31,18 @@
       <form class="auth-form" data-auth-form="signup">
         <label>Nom complet<input name="name" type="text" autocomplete="name" required minlength="2"></label>
         <label>Email<input name="email" type="email" autocomplete="email" required></label>
-        <label>Mot de passe<input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
+        <label>Mot de passe<input name="password" type="password" autocomplete="new-password" required minlength="8" aria-describedby="password-hint"></label>
+        <p id="password-hint" class="auth-hint">8 caractères minimum.</p>
         <button class="analysis-submit" type="submit">Créer mon compte</button>
         <p class="auth-message" data-auth-message></p>
       </form>
       <p class="auth-switch">Déjà inscrit ? <a href="/login">Se connecter</a></p>
     </section>
   </main>
+
+  <footer class="oracle-footer-lite">
+    © 2026 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a> · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
+  </footer>
 
   <script src="/assets/auth.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>

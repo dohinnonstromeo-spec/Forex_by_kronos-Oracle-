@@ -54,6 +54,17 @@
     if (!drop || !input || !previews) return;
 
     drop.addEventListener("click", () => input.click());
+    // The drop zone is a <div role="button">, not a real <button>: browsers give
+    // real buttons/links Enter+Space activation for free, but a div needs it wired
+    // by hand or a keyboard-only user (or screen reader) can never reach the file
+    // picker on this page at all -- the whole point of "Analyse IA" is uploading a
+    // chart, so this wasn't a cosmetic gap.
+    drop.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        input.click();
+      }
+    });
     drop.addEventListener("dragover", (event) => {
       event.preventDefault();
       drop.classList.add("dragover");
@@ -427,6 +438,7 @@
         ${renderVisualReading(result)}
         ${renderConfluence(result)}
         ${renderRiskNote(result)}
+        ${renderDeterministicCrossCheck(result)}
         ${renderRiskPanel(result)}
         ${renderTradePlan(result)}
         ${renderBeginnerPlan(result)}
@@ -500,6 +512,7 @@
         ${renderVisualReading(result)}
         ${renderConfluence(result)}
         ${renderRiskNote(result)}
+        ${renderDeterministicCrossCheck(result)}
         ${renderAdvancedDisclosure(result)}
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>
@@ -523,7 +536,7 @@
         <div class="signal-top">
           <div>
             <div class="signal-pair">${escapeHtml(signal.pair)}</div>
-            <div class="signal-dir ${suspended ? "" : buy ? "buy" : "sell"}">${suspended ? suspendLabel : `${buy ? "▲" : "▼"} ${signal.direction}`}</div>
+            <div class="signal-dir ${suspended ? "" : buy ? "buy" : "sell"}">${suspended ? suspendLabel : `${icon(buy ? "arrowUp" : "arrowDown")} ${signal.direction}`}</div>
           </div>
           <span class="oracle-tech">${escapeHtml(suspended ? "ANALYSE SUSPENDUE" : signal.tech)}</span>
         </div>
@@ -585,6 +598,39 @@
       <div class="result-risk-note">
         <span>${icon("alertTriangle")} Risque</span>
         <p>${escapeHtml(text)}</p>
+      </div>
+    `;
+  }
+
+  // Second, independent opinion from the one part of Kronos with a real, backtested
+  // statistical edge (scripts/backtest.mjs) -- shown so the user can manually weigh
+  // it, never used to auto-override the LLM's read (see server.mjs normalizeAnalysis:
+  // deterministicCrossCheck only ever adds an `agreement` field, it doesn't touch score).
+  function renderDeterministicCrossCheck(result) {
+    const check = result.meta?.deterministicCrossCheck;
+    if (!check) return "";
+    const stats = check.stats || {};
+    const statsLine = Number.isFinite(stats.rMoyenTest)
+      ? `R moyen (test hors-échantillon, cette paire) : ${stats.rMoyenTest >= 0 ? "+" : ""}${stats.rMoyenTest.toFixed(3)}${stats.note ? ` — ${stats.note}` : ""}`
+      : "";
+    let cls = "cross-check-neutral";
+    let verdict;
+    if (!check.active) {
+      verdict = `Pas de signal validé actuellement sur cette paire côté moteur backtesté (${escapeHtml(check.reason || "confluence insuffisante")}).`;
+    } else if (check.agreement === "accord") {
+      cls = "cross-check-agree";
+      verdict = `D'accord avec Kronos : ${escapeHtml(check.direction)} (confiance moteur ${check.confidence}%).`;
+    } else if (check.agreement === "desaccord") {
+      cls = "cross-check-disagree";
+      verdict = `En désaccord avec Kronos : le moteur backtesté penche pour ${escapeHtml(check.direction)} (confiance ${check.confidence}%).`;
+    } else {
+      verdict = `Signal actif côté moteur backtesté : ${escapeHtml(check.direction)} (confiance ${check.confidence}%).`;
+    }
+    return `
+      <div class="result-cross-check ${cls}">
+        <span>${icon("activity")} Moteur backtesté (edge prouvé)</span>
+        <p>${verdict}</p>
+        ${statsLine ? `<small>${escapeHtml(statsLine)}</small>` : ""}
       </div>
     `;
   }

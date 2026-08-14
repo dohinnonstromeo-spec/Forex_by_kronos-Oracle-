@@ -13,7 +13,17 @@
       setMetric("pairs", String(data.instrumentsTracked || 6));
       renderPerformance(data);
     } catch {
+      // The static HTML fallback values were a fabricated-looking "500+ comptes
+      // membres" -- fine as a loading placeholder for the ~1s until this resolves,
+      // but if the fetch itself fails (network issue, slow connection, blocked
+      // request) that fake number stayed on screen indefinitely instead of getting
+      // corrected. Now the markup starts at "—" and only this catch path runs on
+      // failure, so a failed fetch shows an honest "unavailable" state instead of a
+      // stale fabricated one.
       setMetric("precision", "À auditer");
+      setMetric("signals", "—");
+      setMetric("members", "—");
+      setMetric("pairs", "—");
     }
   }
 

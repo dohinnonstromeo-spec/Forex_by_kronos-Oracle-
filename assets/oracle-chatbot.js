@@ -55,28 +55,39 @@
       files = await filesToDataUrls([...fileInput.files].slice(0, 2));
       renderPreviews();
     });
+    const sendButton = form.querySelector(".oracle-send-btn");
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const text = input.value.trim();
       if (!text && !files.length) return;
+      // A chat reply can take up to ~30s (see /api/chat's aiBudgetMs). Without
+      // disabling the button, sending a second message before the first resolves
+      // fires both requests concurrently -- unlike every other form on the site
+      // (login/signup, analysis), which already disable their submit button while
+      // pending.
+      sendButton.disabled = true;
       input.value = "";
       addMessage("user", text || "Analyse ces graphiques.");
       const pending = addMessage("assistant", "Analyse en cours...");
-      const response = await postJson("/api/chat", {
-        message: text,
-        images: files,
-        messages: messages.slice(-8),
-      });
-      pending.remove();
-      if (!response?.ok && response?.offline) {
-        setChatOnline(false);
-        addMessage("assistant", response.answer || "ChatBot hors service pour l'instant. Réessaie dans quelques minutes.", { score: 0, technique: "Hors service" });
-      } else if (!response?.answer) {
-        setChatOnline(false);
-        addMessage("assistant", "ChatBot hors service pour l'instant. Le moteur IA n'a pas répondu.", { score: 0, technique: "Hors service" });
-      } else {
-        setChatOnline(true);
-        addMessage("assistant", response.answer, response);
+      try {
+        const response = await postJson("/api/chat", {
+          message: text,
+          images: files,
+          messages: messages.slice(-8),
+        });
+        pending.remove();
+        if (!response?.ok && response?.offline) {
+          setChatOnline(false);
+          addMessage("assistant", response.answer || "ChatBot hors service pour l'instant. Réessaie dans quelques minutes.", { score: 0, technique: "Hors service" });
+        } else if (!response?.answer) {
+          setChatOnline(false);
+          addMessage("assistant", "ChatBot hors service pour l'instant. Le moteur IA n'a pas répondu.", { score: 0, technique: "Hors service" });
+        } else {
+          setChatOnline(true);
+          addMessage("assistant", response.answer, response);
+        }
+      } finally {
+        sendButton.disabled = false;
       }
       files = [];
       fileInput.value = "";

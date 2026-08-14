@@ -325,6 +325,11 @@ body {
   outline: none;
 }
 
+.oracle-chat-input:focus-visible {
+  border-color: var(--amber-neon);
+  box-shadow: 0 0 0 2px oklch(85% .18 210 / .25);
+}
+
 .oracle-page {
   min-height: 100vh;
   color: var(--foreground);
@@ -425,6 +430,25 @@ body {
   line-height: 1.45;
 }
 
+.analysis-warning span svg {
+  width: 17px;
+  height: 17px;
+  color: var(--amber-neon);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+/* Inline icon prefix on a heading/button/label -- em-sized so it scales with
+   whatever text size it sits in (h1 vs a normal button) instead of a fixed px
+   value that would look right in one place and wrong in the other. */
+.icon-prefix svg {
+  width: .78em;
+  height: .78em;
+  vertical-align: -.08em;
+  margin-right: .12em;
+  color: currentColor;
+}
+
 .analysis-stats {
   margin-top: 18px;
   display: grid;
@@ -511,6 +535,11 @@ body {
 .drop-zone.dragover {
   border-color: var(--neon-green);
   box-shadow: 0 0 24px oklch(82% .22 150 / .18);
+}
+
+.drop-zone:focus-visible {
+  outline: 2px solid var(--amber-neon);
+  outline-offset: 2px;
 }
 
 .preview-grid {
@@ -1000,7 +1029,8 @@ body {
 .result-explanation span,
 .result-visual-reading span,
 .result-confluence span,
-.result-risk-note span {
+.result-risk-note span,
+.result-cross-check span {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1014,7 +1044,8 @@ body {
 .result-explanation p,
 .result-visual-reading p,
 .result-confluence p,
-.result-risk-note p {
+.result-risk-note p,
+.result-cross-check p {
   margin-top: 8px;
   color: var(--muted-foreground);
   font-size: 13px;
@@ -1022,9 +1053,19 @@ body {
   white-space: pre-wrap;
 }
 
+.result-cross-check small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  opacity: .75;
+}
+
 .result-visual-reading svg,
 .result-confluence svg,
 .result-risk-note svg,
+.result-cross-check svg,
 .result-advanced summary svg,
 .direction-label svg {
   width: 14px;
@@ -1040,12 +1081,23 @@ body {
 
 .result-confluence span { color: var(--neon-green); }
 .result-risk-note span { color: var(--neon-red); }
+.cross-check-agree span { color: var(--neon-green); }
+.cross-check-disagree span { color: var(--neon-red); }
+.cross-check-neutral span { color: var(--muted-foreground); }
 
 .result-confluence {
   border-color: rgba(0, 255, 136, .18) !important;
 }
 
 .result-risk-note {
+  border-color: rgba(255, 64, 64, .22) !important;
+}
+
+.cross-check-agree {
+  border-color: rgba(0, 255, 136, .18) !important;
+}
+
+.cross-check-disagree {
   border-color: rgba(255, 64, 64, .22) !important;
 }
 
@@ -1154,7 +1206,8 @@ body {
 .beginner-plan,
 .result-visual-reading,
 .result-confluence,
-.result-risk-note {
+.result-risk-note,
+.result-cross-check {
   margin-top: 14px;
   border: 1px solid rgba(255, 255, 255, .12);
   border-radius: 12px;
@@ -1311,6 +1364,12 @@ body {
   font-size: 12px;
 }
 
+.auth-hint {
+  margin: -10px 0 0;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
 .auth-message.error {
   color: var(--neon-red);
 }
@@ -1449,6 +1508,13 @@ body {
   color: var(--foreground);
 }
 
+.dashboard-history-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
 .dashboard-history-levels {
   display: flex;
   flex-wrap: wrap;
@@ -1467,6 +1533,20 @@ body {
 
 .history-open {
   color: var(--neon-green);
+}
+
+.history-win {
+  color: var(--neon-green);
+  font-weight: 600;
+}
+
+.history-loss {
+  color: var(--neon-red);
+  font-weight: 600;
+}
+
+.history-expired {
+  color: var(--muted-foreground);
 }
 
 .history-blocked {
@@ -1571,6 +1651,32 @@ body {
   max-width: 760px;
 }
 
+/* .home-pricing-card normally pairs its info block with a "S'abonner" link --
+   here on the payment page itself that link would just point back at this same
+   page, so it's omitted; center the remaining block instead of the default
+   space-between, which assumed two children. */
+.payment-plan-recap {
+  margin-top: 20px;
+  justify-content: center;
+  text-align: center;
+}
+
+.payment-already-active {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border: 1px solid oklch(85% .2 145 / .3);
+  border-radius: 14px;
+  background: oklch(85% .2 145 / .08);
+  color: var(--neon-green);
+  font-weight: 600;
+  text-align: center;
+}
+
+.dashboard-card [data-payment-status] {
+  color: var(--neon-green);
+  font-weight: 600;
+}
+
 .payment-methods {
   margin-top: 28px;
   display: grid;
@@ -1622,7 +1728,11 @@ body {
   border-radius: var(--radius-md);
   background: var(--oracle-gradient);
   color: var(--primary-foreground);
-  padding: 12px 14px;
+  /* Matches .analysis-submit/.refresh-signals/.new-analysis's padding -- same
+     full-width primary-action-button role, was 12px 14px here for no functional
+     reason. Nav pills (.home-nav-cta) and the hero CTA (.home-button) keep their
+     own padding: different button roles, not a real inconsistency. */
+  padding: 14px 16px;
   font-weight: 900;
 }
 
@@ -1630,6 +1740,23 @@ body {
   opacity: .64;
   pointer-events: none;
   filter: grayscale(.15);
+}
+
+.push-toggle {
+  width: auto;
+  margin-top: 0;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, .18);
+  color: var(--foreground);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 8px 14px;
+}
+
+.dashboard-push-status {
+  margin: 8px 0 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
 }
 
 .payment-note {

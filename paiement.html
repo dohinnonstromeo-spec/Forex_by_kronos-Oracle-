@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paiement · Oracle Forex</title>
   <meta name="description" content="Choisissez le mode de paiement pour activer votre abonnement Oracle Forex.">
+  <meta property="og:title" content="S'abonner · Oracle Forex">
+  <meta property="og:description" content="Signaux Kronos illimités, analyse IA et suivi de performance dès 9,99 €/mois.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
 </head>
@@ -17,7 +21,7 @@
       </a>
       <div class="oracle-links">
         <a href="/">Accueil</a>
-        <a href="/tester-gratuitement">Tester gratuitement</a>
+        <a href="/tester-gratuitement" data-cta-trial>Tester gratuitement</a>
         <a href="/#pricing">Abonnement</a>
         <a href="/dashboard">Dashboard</a>
         <a href="/legal.html#risques">Risques</a>
@@ -30,41 +34,50 @@
       <p class="analysis-kicker">Activation premium</p>
       <h1 class="analysis-title">S'abonner maintenant</h1>
       <p class="analysis-subtitle">Choisissez votre mode de paiement. Les liens sécurisés seront connectés à chaque option quand tu finaliseras la configuration.</p>
+      <div class="home-pricing-card payment-plan-recap">
+        <div>
+          <span class="home-premium-badge">Premium</span>
+          <strong>9,99&nbsp;€ <small>/ mois</small></strong>
+          <p>Signaux, analyse charts IA, chatbot trading, performances et intelligence marché.</p>
+        </div>
+      </div>
+      <p class="payment-already-active" data-payment-status hidden>Ton compte est déjà Premium — accès illimité actif, aucun paiement à refaire.</p>
     </section>
 
-    <section class="payment-methods" aria-label="Modes de paiement">
+    <section class="payment-methods" aria-label="Modes de paiement" data-payment-form>
       <article class="payment-method-card">
         <span class="payment-method-icon" data-icon="smartphone"></span>
         <h2>Mobile Money</h2>
         <p>Orange Money, MTN Mobile Money, Moov, Wave et opérateurs locaux compatibles selon le pays.</p>
-        <a class="payment-method-button is-disabled" href="#" aria-disabled="true">Lien à connecter</a>
+        <button type="button" class="payment-method-button is-disabled" disabled>Lien à connecter</button>
       </article>
 
       <article class="payment-method-card">
         <span class="payment-method-icon" data-icon="creditCard"></span>
         <h2>Carte bancaire</h2>
         <p>Paiement par carte pour les clients qui préfèrent régler directement en ligne.</p>
-        <a class="payment-method-button is-disabled" href="#" aria-disabled="true">Lien à connecter</a>
+        <button type="button" class="payment-method-button is-disabled" disabled>Lien à connecter</button>
       </article>
 
       <article class="payment-method-card">
         <span class="payment-method-icon" data-icon="coin"></span>
         <h2>Crypto</h2>
         <p>Paiement crypto disponible selon la couverture du checkout et le pays du client.</p>
-        <a class="payment-method-button is-disabled" href="#" aria-disabled="true">Lien à connecter</a>
+        <button type="button" class="payment-method-button is-disabled" disabled>Lien à connecter</button>
       </article>
     </section>
 
-    <section class="payment-note">
+    <section class="payment-note" data-payment-form>
       <strong>Important :</strong> l'abonnement reste en préparation tant que les liens de paiement ne sont pas ajoutés. Aucun fournisseur de paiement n'est affiché publiquement dans ce tunnel.
     </section>
   </main>
 
   <footer class="oracle-footer-lite">
-    © 2025 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a>.
+    © 2026 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a> · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
   </footer>
 
   <script src="/assets/oracle-icons.js" defer></script>
+  <script src="/assets/auth.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>
 </body>
 </html>

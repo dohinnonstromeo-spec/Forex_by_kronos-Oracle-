@@ -35,13 +35,38 @@
           <h2 class="font-display text-2xl text-amber-neon">CGU</h2>
           <p class="mt-3 text-sm text-muted-foreground">Oracle Forex fournit des outils éducatifs d'analyse de marché. Les signaux, scores et analyses ne constituent pas un conseil financier personnalisé.</p>
         </article>
-        <article id="confidentialite" class="analysis-card">
-          <h2 class="font-display text-2xl text-amber-neon">Confidentialité</h2>
-          <p class="mt-3 text-sm text-muted-foreground">Les clés API restent côté serveur local via <span class="font-mono">secret.dev</span>. Les screenshots envoyés aux APIs IA doivent éviter toute donnée personnelle ou identifiant de compte.</p>
-        </article>
         <article id="mentions" class="analysis-card">
           <h2 class="font-display text-2xl text-amber-neon">Mentions légales</h2>
-          <p class="mt-3 text-sm text-muted-foreground">Le site est en phase de développement. Les pages paiement, performance et abonnement doivent être finalisées avant une exploitation commerciale.</p>
+          <p class="mt-3 text-sm text-muted-foreground">
+            Éditeur du site : <strong>[À compléter avant exploitation commerciale]</strong><br>
+            Forme juridique : [À compléter]<br>
+            SIRET : [À compléter — attribué par l'INSEE à l'immatriculation de l'entreprise]<br>
+            Siège social : [À compléter]<br>
+            Directeur de la publication : [À compléter]<br>
+            Hébergeur : [À compléter selon l'hébergeur de production retenu]
+          </p>
+          <p class="mt-3 text-sm text-muted-foreground">Le site est en phase de développement. Cette section liste les mentions légales obligatoires (Loi n°2004-575 du 21 juin 2004 pour la confiance dans l'économie numérique) qui doivent être renseignées avec les vraies informations d'immatriculation avant toute exploitation commerciale — elles ne peuvent pas être générées automatiquement.</p>
+        </article>
+        <article id="confidentialite" class="analysis-card">
+          <h2 class="font-display text-2xl text-amber-neon">Confidentialité et RGPD</h2>
+          <p class="mt-3 text-sm text-muted-foreground"><strong>Données collectées :</strong> nom, email et mot de passe (haché, jamais stocké en clair) à l'inscription ; historique des analyses demandées (paire, niveaux, score) ; captures de graphes envoyées pour analyse IA, transmises aux fournisseurs listés ci-dessous puis non conservées par Oracle Forex au-delà du traitement de la requête.</p>
+          <p class="mt-3 text-sm text-muted-foreground"><strong>Finalité et base légale :</strong> exécution du service demandé (compte, analyses, abonnement) et intérêt légitime pour la limitation d'abus (quotas par IP/compte).</p>
+          <p class="mt-3 text-sm text-muted-foreground"><strong>Durée de conservation :</strong> session de connexion valable 14 jours ; compte et historique conservés tant que le compte existe, supprimables sur demande.</p>
+          <p class="mt-3 text-sm text-muted-foreground"><strong>Cookies :</strong> un seul cookie technique de session (nécessaire à la connexion), aucun cookie publicitaire ou de mesure d'audience tierce.</p>
+        </article>
+        <article id="sous-traitants" class="analysis-card">
+          <h2 class="font-display text-2xl text-amber-neon">Sous-traitants et données transmises</h2>
+          <p class="mt-3 text-sm text-muted-foreground">Ces services tiers traitent certaines données pour le compte d'Oracle Forex :</p>
+          <p class="mt-3 text-sm text-muted-foreground">
+            <strong>Groq</strong> — texte des demandes d'analyse et messages du chatbot.<br>
+            <strong>Google Gemini</strong> — captures de graphes envoyées pour l'analyse visuelle.<br>
+            <strong>Twelve Data, Binance, Massive, Marketaux</strong> — aucune donnée personnelle transmise (uniquement des requêtes de prix/actualités de marché, sans identifiant utilisateur).<br>
+            <strong>Hébergeur base de données</strong> (Supabase/Postgres selon l'environnement) — comptes, sessions, historique des analyses.
+          </p>
+        </article>
+        <article id="droits" class="analysis-card">
+          <h2 class="font-display text-2xl text-amber-neon">Vos droits</h2>
+          <p class="mt-3 text-sm text-muted-foreground">Conformément au RGPD, tu peux demander l'accès, la rectification, la suppression ou la portabilité de tes données, ainsi que la clôture de ton compte, en écrivant à <strong>vdohinnon22@gmail.com</strong>. Ces demandes ne sont pas encore automatisées depuis le dashboard.</p>
         </article>
         <article id="risques" class="analysis-card">
           <h2 class="font-display text-2xl text-amber-neon">Risques</h2>
@@ -52,7 +77,7 @@
   </main>
 
   <footer class="oracle-footer-lite">
-    © 2025 Oracle Forex · Outils éducatifs · Aucun conseil financier.
+    © 2026 Oracle Forex · Outils éducatifs · Aucun conseil financier · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
   </footer>
   <script src="/assets/oracle-chatbot.js" defer></script>
 </body>
