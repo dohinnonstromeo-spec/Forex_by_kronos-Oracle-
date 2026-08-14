@@ -21,6 +21,14 @@ const SYMBOLS = [
   { pair: "US500", kind: "yahoo", yahooSymbol: "^GSPC" },
   { pair: "BTC/USD", kind: "binance", binanceSymbol: "BTCUSDT" },
   { pair: "ETH/USD", kind: "binance", binanceSymbol: "ETHUSDT" },
+  // New this round: coverage-expansion research. Same unmodified trend-following
+  // logic (BASELINE_PARAMS), just checking whether the edge already validated on
+  // XAU/USD/US500/BTC/ETH generalizes to other liquid majors not currently in
+  // buildDeterministicSignals()'s symbols list.
+  { pair: "GBP/USD", kind: "yahoo", yahooSymbol: "GBPUSD=X" },
+  { pair: "USD/JPY", kind: "yahoo", yahooSymbol: "USDJPY=X" },
+  { pair: "AUD/USD", kind: "yahoo", yahooSymbol: "AUDUSD=X" },
+  { pair: "USD/CHF", kind: "yahoo", yahooSymbol: "USDCHF=X" },
 ];
 
 const LOOKAHEAD_BARS = 20; // ~1 trading month on daily bars: how long a signal is given to hit TP/SL before being marked "expired"
@@ -436,6 +444,33 @@ async function main() {
     console.log(`  ${"GLOBAL".padEnd(10)} | train: ${fmt(summarize(allTrain))}  ||  test: ${fmt(summarize(allTest))}`);
   }
   console.log("\n  n=3 paires JPY seulement -- indicatif, pas une preuve statistique définitive sur \"les cross JPY\" en général.");
+
+  // EUR/USD was never covered by the mean-reversion research above -- that block only
+  // ever tested JPY crosses. Since EUR/USD (like GBP/JPY) has no positive-expectancy
+  // trend-following variant (see PAIRS_WITHOUT_VALIDATED_EDGE in server.mjs), check
+  // whether a genuinely different strategy family does better there before writing the
+  // pair off entirely. Reuses the EUR/USD and GBP/JPY bars already loaded above --
+  // no extra network calls.
+  console.log("\n\n=== Recherche EUR/USD + GBP/JPY : retour à la moyenne (jamais testé pour EUR/USD) ===");
+  const mrTargets = datasets.filter((d) => d.pair === "EUR/USD" || d.pair === "GBP/JPY");
+  console.log("\n-- Suivi de tendance (rappel, production actuelle) --");
+  for (const { pair, bars } of mrTargets) {
+    const trades = backtestSymbol(pair, bars, BASELINE_PARAMS);
+    const train = trades.filter((t) => t.split === "train");
+    const test = trades.filter((t) => t.split === "test");
+    console.log(`  ${pair.padEnd(10)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
+  }
+  for (const mrVariant of MEAN_REVERSION_VARIANTS) {
+    console.log(`\n-- ${mrVariant.name} --`);
+    for (const { pair, bars } of mrTargets) {
+      const trades = backtestSymbol(pair, bars, mrVariant, evaluateMeanReversionSignalAt);
+      const train = trades.filter((t) => t.split === "train");
+      const test = trades.filter((t) => t.split === "test");
+      console.log(`  ${pair.padEnd(10)} | train: ${fmt(summarize(train))}  ||  test: ${fmt(summarize(test))}`);
+    }
+  }
+  console.log("\n  Lecture: si le nombre de trades test est < 20-30, ne pas faire confiance au R moyen affiché même");
+  console.log("  s'il semble excellent -- un petit échantillon donne des moyennes extrêmes qui ne veulent rien dire.");
 }
 
 main();
