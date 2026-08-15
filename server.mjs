@@ -5072,12 +5072,18 @@ function validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair,
   }
   const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
   const tolerance = levelTolerance(pair, strategy);
+  // Reported live: gold entry ~4200 while live traded at 4300 (2.33% off, inside the
+  // old "soft zone" between tolerance and tolerance*2) still came back valid:true --
+  // score 50 and a warning buried in the reason text, but the trade was returned as
+  // usable. That two-tier design directly contradicted every other check in this
+  // function ("can't verify, don't ship it"): a price outside tolerance is not more
+  // real just because it's less than 2x outside tolerance. Any distance beyond
+  // tolerance now blocks, full stop -- no partial-credit middle ground.
   if (distance > tolerance) {
-    const strict = isScalpingStrategy(strategy) || distance > tolerance * 2;
     return {
-      valid: !strict,
-      score: strict ? 32 : 50,
-      reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%, tolérance ${(tolerance * 100).toFixed(2)}%). ${strict ? "Setup bloqué: attendre un prix plus proche." : "À confirmer avant exécution."}`,
+      valid: false,
+      score: 32,
+      reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%, tolérance ${(tolerance * 100).toFixed(2)}%). Setup bloqué: attendre un prix plus proche.`,
     };
   }
   return { valid: true, score: Math.max(55, Math.min(100, Math.round(55 + rr * 12))), reason: "Niveaux cohérents avec direction, R/R et prix live." };

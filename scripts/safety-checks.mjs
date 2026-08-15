@@ -79,9 +79,12 @@ function validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair,
   }
   const distance = Math.abs(entry - live) / Math.max(Math.abs(live), 1);
   const tolerance = levelTolerance(pair, strategy);
+  // Kept in sync with server.mjs's validateTradeLevels -- the old two-tier
+  // "strict vs soft" split let entries up to 2x tolerance away from live still
+  // validate (reported live: gold entry ~4200 vs live 4300, 2.33% off, still
+  // valid:true). Any distance beyond tolerance blocks now, no soft zone.
   if (distance > tolerance) {
-    const strict = isScalpingStrategy(strategy) || distance > tolerance * 2;
-    return { valid: !strict, score: strict ? 32 : 50, reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%).` };
+    return { valid: false, score: 32, reason: `Entrée trop éloignée du prix live (${(distance * 100).toFixed(2)}%).` };
   }
   return { valid: true, score: Math.max(55, Math.min(100, Math.round(55 + rr * 12))), reason: "Niveaux cohérents avec direction, R/R et prix live." };
 }
@@ -139,6 +142,15 @@ check(
 check(
   "real trustworthy live price, far entry (the original reported bug: 4348 live, 4167 entry): still BLOCKED",
   validateTradeLevels({ direction: "VENTE", entry: 4167, sl: 4180, tp: 4130, ...levelsFor(realLive), pair: "XAU/USD", strategy: "Scalping", risk: "0.5" }).valid === false,
+);
+// Second real bug, reported live 2026-08-15: gold entry ~4200 while live traded at
+// 4300 (2.33% off, non-scalping) still came back valid:true -- inside the old
+// "soft zone" between tolerance (1.8%) and tolerance*2 (3.6%), which returned
+// valid:true with just a lower score instead of blocking. There is no width of
+// "somewhat wrong" that should validate; distance beyond tolerance blocks, period.
+check(
+  "real trustworthy live price, entry inside the old soft zone (1x-2x tolerance): now BLOCKED",
+  validateTradeLevels({ direction: "ACHAT", entry: 4260, sl: 4210, tp: 4420, ...levelsFor(realLive), pair: "XAU/USD", strategy: "Swing Trading", risk: "1" }).valid === false,
 );
 
 console.log("\n=== pricePayload: .trustworthy is computed correctly at the source ===");
