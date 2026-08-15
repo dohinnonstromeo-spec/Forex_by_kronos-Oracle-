@@ -164,6 +164,38 @@ async function ensureRelationalTables() {
       used_at text
     )`,
     `CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_tokens(user_id)`,
+    // Tracks, per pair, the last direction the deterministic engine alerted on for
+    // the "new signal detected" push (see notifyNewSignals) -- without this, every
+    // 60s recompute tick would re-notify subscribers about the exact same still-open
+    // setup instead of only the moment it first appeared or flipped direction.
+    `CREATE TABLE IF NOT EXISTS signal_alert_state (
+      pair text PRIMARY KEY,
+      direction text NOT NULL,
+      alerted_at text NOT NULL
+    )`,
+    // Semi-automatic execution: Kronos prepares an order (PENDING_CONFIRMATION), the
+    // user reviews and sets the size, then explicitly confirms before anything is
+    // sent to the broker -- see sendOrderToBroker. Never transitions to SENT/FILLED
+    // without a user-initiated /api/trade/confirm call.
+    `CREATE TABLE IF NOT EXISTS trade_orders (
+      id text PRIMARY KEY,
+      user_id text NOT NULL,
+      analysis_id text,
+      pair text NOT NULL,
+      direction text NOT NULL,
+      entry real NOT NULL,
+      sl real NOT NULL,
+      tp1 real,
+      tp2 real,
+      volume real,
+      status text NOT NULL DEFAULT 'PENDING_CONFIRMATION',
+      broker_order_id text,
+      error_message text,
+      created_at text NOT NULL,
+      confirmed_at text,
+      sent_at text
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_trade_orders_user ON trade_orders(user_id)`,
   ];
   if (pgPool) {
     for (const statement of statements) await pgPool.query(statement);
@@ -175,6 +207,10 @@ async function ensureRelationalTables() {
   // Swallowing "already exists" makes this safe to call on every startup regardless
   // of whether the column is already there.
   await ensureColumn("analyses", "is_test integer NOT NULL DEFAULT 0");
+  // Comma-separated topic list ("tp_sl", "new_signal") a subscription wants pushes
+  // for -- one browser subscription can carry both, independently toggled (see
+  // dashboard.html's two separate push buttons), so this can't just be a boolean.
+  await ensureColumn("push_subscriptions", "topics text NOT NULL DEFAULT 'tp_sl'");
   relationalTablesReady = true;
   await migrateLegacyJsonIntoRelationalTables();
 }
@@ -676,6 +712,9 @@ async function computeSignalsPayload() {
       const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
       const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
       memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
+      // Fire-and-forget: a slow/failing push send must never delay the signals
+      // response itself, which is on the hot path for every visitor on the site.
+      notifyNewSignals(signals).catch((error) => logOnce("push_new_signal", `alerte nouveau signal échouée (${error.message})`));
       return payload;
     } finally {
       signalsComputeInFlight = null;
@@ -966,8 +1005,112 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // Semi-automatic execution, premium-only: Kronos prepares an order ticket from one
+  // of the user's own OPEN analyses -- nothing is sent to a broker at this point,
+  // only /api/trade/confirm (a separate, explicit, human-initiated call) can do that.
+  if (url.pathname === "/api/trade/prepare") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    if (!hasPremiumAccess(session.user)) return sendJson(res, 403, { ok: false, error: "premium_required" });
+    const body = await readBody(req);
+    const analysisId = String(body?.analysisId || "");
+    if (!analysisId) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    const analysis = rowToAnalysis(await sqlGet(`SELECT * FROM analyses WHERE id = ? AND user_id = ?`, [analysisId, session.user.id]));
+    if (!analysis) return sendJson(res, 404, { ok: false, error: "analysis_not_found" });
+    if (analysis.status !== "OPEN" || !analysis.active) return sendJson(res, 400, { ok: false, error: "analysis_not_open" });
+    const order = {
+      id: `ord_${Date.now()}_${randomBytes(4).toString("hex")}`,
+      pair: analysis.pair,
+      direction: analysis.direction,
+      entry: analysis.entry,
+      sl: analysis.sl,
+      tp1: analysis.tp1,
+      tp2: analysis.tp2,
+      status: "PENDING_CONFIRMATION",
+      createdAt: new Date().toISOString(),
+    };
+    await sqlRun(
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [order.id, session.user.id, analysis.id, order.pair, order.direction, order.entry, order.sl, order.tp1, order.tp2, order.status, order.createdAt],
+    );
+    sendJson(res, 200, { ok: true, order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null }, brokerConfigured: BROKER_CONFIGURED });
+    return;
+  }
+
+  // The one call in this feature that can actually move money -- requires an
+  // explicit, still-pending order the caller owns, and a volume the human chose
+  // (never auto-computed from account balance/risk%, on purpose: one less place a
+  // sizing bug could turn into a real loss).
+  if (url.pathname === "/api/trade/confirm") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const orderId = String(body?.orderId || "");
+    const volume = Number(body?.volume);
+    if (!orderId || !Number.isFinite(volume) || volume <= 0) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    const order = rowToTradeOrder(await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]));
+    if (!order) return sendJson(res, 404, { ok: false, error: "order_not_found" });
+    if (order.status !== "PENDING_CONFIRMATION") return sendJson(res, 400, { ok: false, error: "order_not_pending" });
+    order.volume = volume;
+    order.confirmedAt = new Date().toISOString();
+    const result = await sendOrderToBroker(order);
+    order.status = result.ok ? "SENT" : "FAILED";
+    order.brokerOrderId = result.ok ? result.brokerOrderId : null;
+    order.errorMessage = result.ok ? null : result.error;
+    order.sentAt = result.ok ? new Date().toISOString() : null;
+    await sqlRun(
+      `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ?`,
+      [order.volume, order.status, order.brokerOrderId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
+    );
+    sendJson(res, result.ok ? 200 : 502, { ok: result.ok, order });
+    return;
+  }
+
+  if (url.pathname === "/api/trade/cancel") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const orderId = String(body?.orderId || "");
+    await ensureRelationalTables();
+    const row = await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]);
+    if (!row) return sendJson(res, 404, { ok: false, error: "order_not_found" });
+    if (row.status !== "PENDING_CONFIRMATION") return sendJson(res, 400, { ok: false, error: "order_not_pending" });
+    await sqlRun(`UPDATE trade_orders SET status = 'CANCELLED' WHERE id = ?`, [orderId]);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (url.pathname === "/api/trade/orders") {
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    await ensureRelationalTables();
+    const rows = await sqlAll(`SELECT * FROM trade_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [session.user.id]);
+    sendJson(res, 200, { ok: true, orders: rows.map(rowToTradeOrder), brokerConfigured: BROKER_CONFIGURED });
+    return;
+  }
+
   if (url.pathname === "/api/push/vapid-public-key") {
     sendJson(res, 200, { ok: true, publicKey: pushConfigured ? env.VAPID_PUBLIC_KEY : null, configured: pushConfigured });
+    return;
+  }
+
+  // The browser only ever exposes one PushManager subscription per device, but it
+  // can carry several independently-toggled topics server-side -- the frontend
+  // needs this to know, on page load, which of its own toggle buttons should show
+  // as already active for the subscription it finds via pushManager.getSubscription().
+  if (url.pathname === "/api/push/subscription-topics") {
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const endpoint = url.searchParams.get("endpoint") || "";
+    if (!endpoint) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    const row = await sqlGet(`SELECT topics FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`, [endpoint, session.user.id]);
+    sendJson(res, 200, { ok: true, topics: row?.topics ? row.topics.split(",") : [] });
     return;
   }
 
@@ -980,14 +1123,22 @@ async function handleApi(req, res, url) {
     const endpoint = String(body?.endpoint || "");
     const p256dh = String(body?.keys?.p256dh || "");
     const auth = String(body?.keys?.auth || "");
+    const topic = ["tp_sl", "new_signal"].includes(body?.topic) ? body.topic : "tp_sl";
+    if (topic === "new_signal" && !hasPremiumAccess(session.user)) return sendJson(res, 403, { ok: false, error: "premium_required" });
     if (!endpoint || !p256dh || !auth) return sendJson(res, 400, { ok: false, error: "invalid_subscription" });
     await ensureRelationalTables();
+    // One browser subscription can carry both topics -- a second subscribe call for
+    // the same endpoint (e.g. toggling "new_signal" on after "tp_sl" was already on)
+    // must add to the existing topic list, not replace it, or enabling one silently
+    // disables the other.
+    const existing = await sqlGet(`SELECT topics FROM push_subscriptions WHERE endpoint = ?`, [endpoint]);
+    const topics = Array.from(new Set([...(existing?.topics ? existing.topics.split(",") : []), topic])).join(",");
     await sqlRun(
-      `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT (endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`,
-      [`push_${Date.now()}_${randomBytes(4).toString("hex")}`, session.user.id, endpoint, p256dh, auth, new Date().toISOString()],
+      `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, topics, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth, topics = excluded.topics`,
+      [`push_${Date.now()}_${randomBytes(4).toString("hex")}`, session.user.id, endpoint, p256dh, auth, topics, new Date().toISOString()],
     );
-    sendJson(res, 200, { ok: true });
+    sendJson(res, 200, { ok: true, topics: topics.split(",") });
     return;
   }
 
@@ -1000,6 +1151,31 @@ async function handleApi(req, res, url) {
     if (endpoint) {
       await ensureRelationalTables();
       await sqlRun(`DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`, [endpoint, session.user.id]);
+    }
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // Turns off one topic (e.g. "new_signal") without touching the browser's
+  // PushManager subscription or the other topic still active on it -- unlike
+  // /api/push/unsubscribe above, which tears down the whole subscription.
+  if (url.pathname === "/api/push/unsubscribe-topic") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const endpoint = String(body?.endpoint || "");
+    const topic = String(body?.topic || "");
+    if (!endpoint || !topic) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    const row = await sqlGet(`SELECT topics FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`, [endpoint, session.user.id]);
+    if (row) {
+      const remaining = row.topics.split(",").filter((item) => item && item !== topic);
+      if (remaining.length) {
+        await sqlRun(`UPDATE push_subscriptions SET topics = ? WHERE endpoint = ?`, [remaining.join(","), endpoint]);
+      } else {
+        await sqlRun(`DELETE FROM push_subscriptions WHERE endpoint = ?`, [endpoint]);
+      }
     }
     sendJson(res, 200, { ok: true });
     return;
@@ -6362,6 +6538,64 @@ async function upsertAnalysisRow(analysis) {
   );
 }
 
+function rowToTradeOrder(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    analysisId: row.analysis_id || null,
+    pair: row.pair,
+    direction: row.direction,
+    entry: row.entry,
+    sl: row.sl,
+    tp1: row.tp1 ?? null,
+    tp2: row.tp2 ?? null,
+    volume: row.volume ?? null,
+    status: row.status,
+    brokerOrderId: row.broker_order_id || null,
+    errorMessage: row.error_message || null,
+    createdAt: row.created_at,
+    confirmedAt: row.confirmed_at || null,
+    sentAt: row.sent_at || null,
+  };
+}
+
+// MetaApi's REST trade endpoint (built from documented shape, never exercised
+// against a real account -- there is no way to verify this without one). Expect to
+// need small fixes (exact path/region/field names) the first time this runs against
+// a real MetaApi demo account. Until METAAPI_TOKEN/METAAPI_ACCOUNT_ID are set, every
+// order fails closed with "broker_not_configured" instead of silently pretending to
+// have sent something -- an order can only ever reach the broker after a human
+// explicitly confirms it via /api/trade/confirm (see the semi-automatic design note
+// on the trade_orders table above), so this function is never called on its own.
+const BROKER_CONFIGURED = Boolean(env.METAAPI_TOKEN && env.METAAPI_ACCOUNT_ID);
+
+async function sendOrderToBroker(order) {
+  if (!BROKER_CONFIGURED) return { ok: false, error: "broker_not_configured" };
+  const region = env.METAAPI_REGION || "new-york";
+  const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${env.METAAPI_ACCOUNT_ID}/trade`;
+  const body = {
+    actionType: order.direction === "ACHAT" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+    symbol: String(order.pair).replace("/", ""),
+    volume: order.volume,
+    stopLoss: order.sl,
+    takeProfit: order.tp1 || undefined,
+  };
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "auth-token": env.METAAPI_TOKEN },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
+    return { ok: true, brokerOrderId: String(data?.orderId ?? data?.positionId ?? "") };
+  } catch (error) {
+    return { ok: false, error: `broker_request_failed: ${error.message}` };
+  }
+}
+
 // outcomes was historically a second array, populated only when an analysis closed.
 // It's redundant with analyses itself (every field it carries also lives on the
 // analysis row once outcome is set) -- confirmed no BLOCKED analysis was ever pushed
@@ -6491,7 +6725,7 @@ async function updateLearningOutcomes(prices = null) {
 // expected/normal states, not errors.
 async function notifyAnalysisClosed(analysis) {
   if (!pushConfigured) return;
-  const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ?`, [analysis.userId]);
+  const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ? AND topics LIKE '%tp_sl%'`, [analysis.userId]);
   if (!subs.length) return;
   const outcomeLabel = { TP1_HIT: "TP1 touché", TP2_HIT: "TP2 touché", SL_HIT: "Stop Loss touché", EXPIRED: "Expiré" }[analysis.status] || analysis.status;
   const rText = Number.isFinite(analysis.rMultiple) ? ` (${analysis.rMultiple >= 0 ? "+" : ""}${analysis.rMultiple.toFixed(2)}R)` : "";
@@ -6500,6 +6734,10 @@ async function notifyAnalysisClosed(analysis) {
     body: `${outcomeLabel}${rText} · ${analysis.direction} ${formatLevel(analysis.entry, analysis.pair)}`,
     url: "/dashboard.html",
   });
+  await sendPushToSubscriptions(subs, payload);
+}
+
+async function sendPushToSubscriptions(subs, payload) {
   for (const sub of subs) {
     try {
       await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, payload);
@@ -6512,6 +6750,65 @@ async function notifyAnalysisClosed(analysis) {
         logOnce("push", `envoi push échoué (${error.message})`);
       }
     }
+  }
+}
+
+// Alerts premium users (topic "new_signal") the moment the deterministic engine's
+// signal for a pair transitions into a genuine actionable setup (direct + high
+// confidence), instead of only ever notifying about a user's own already-launched
+// analyses. signal_alert_state dedupes so this fires once per fresh
+// appearance/direction-flip, not on every 60s recompute while the same setup is
+// still open -- called from computeSignalsPayload(), which itself only recomputes
+// on a genuine cache miss, so this never runs more often than the signals cache TTL.
+const NEW_SIGNAL_ALERT_MIN_CONFIDENCE = 70;
+
+async function notifyNewSignals(signals) {
+  if (!pushConfigured) return;
+  await ensureRelationalTables();
+  const alertWorthy = signals.filter((signal) => signal.direct && Number(signal.confiance) >= NEW_SIGNAL_ALERT_MIN_CONFIDENCE);
+  const alertWorthyPairs = new Set(alertWorthy.map((signal) => signal.paire));
+  const priorStates = await sqlAll(`SELECT * FROM signal_alert_state`);
+  // A setup that's no longer alert-worthy (closed/weakened) clears its state, so a
+  // later re-appearance on the same pair is treated as fresh again rather than
+  // permanently suppressed.
+  for (const state of priorStates) {
+    if (!alertWorthyPairs.has(state.pair)) await sqlRun(`DELETE FROM signal_alert_state WHERE pair = ?`, [state.pair]);
+  }
+  const freshSignals = alertWorthy.filter((signal) => {
+    const prior = priorStates.find((state) => state.pair === signal.paire);
+    return !prior || prior.direction !== signal.direction;
+  });
+  if (!freshSignals.length) return;
+
+  const store = await loadAuthStore();
+  const premiumUserIds = new Set(store.users.filter(hasPremiumAccess).map((user) => user.id));
+  if (!premiumUserIds.size) {
+    for (const signal of freshSignals) {
+      await sqlRun(
+        `INSERT INTO signal_alert_state (pair, direction, alerted_at) VALUES (?, ?, ?)
+         ON CONFLICT (pair) DO UPDATE SET direction = excluded.direction, alerted_at = excluded.alerted_at`,
+        [signal.paire, signal.direction, new Date().toISOString()],
+      );
+    }
+    return;
+  }
+  const subs = (await sqlAll(`SELECT * FROM push_subscriptions WHERE topics LIKE '%new_signal%'`))
+    .filter((sub) => premiumUserIds.has(sub.user_id));
+
+  for (const signal of freshSignals) {
+    if (subs.length) {
+      const payload = JSON.stringify({
+        title: `Oracle Forex · Nouveau signal ${signal.paire}`,
+        body: `${signal.direction} ${formatLevel(signal.entree, signal.paire)} · confiance ${signal.confiance}% · ${signal.technique}`,
+        url: "/analyse.html",
+      });
+      await sendPushToSubscriptions(subs, payload);
+    }
+    await sqlRun(
+      `INSERT INTO signal_alert_state (pair, direction, alerted_at) VALUES (?, ?, ?)
+       ON CONFLICT (pair) DO UPDATE SET direction = excluded.direction, alerted_at = excluded.alerted_at`,
+      [signal.paire, signal.direction, new Date().toISOString()],
+    );
   }
 }
 

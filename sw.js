@@ -1,6 +1,7 @@
-// Service worker for browser push notifications (TP/SL trade outcomes). Registered
-// from dashboard.html only -- this is not a full offline/PWA service worker, it only
-// handles the "push" event.
+// Service worker for browser push notifications: personal TP/SL trade outcomes, and
+// (premium only) new high-confidence signal alerts. Registered from dashboard.html
+// only -- this is not a full offline/PWA service worker, it only handles the "push"
+// event.
 self.addEventListener("push", (event) => {
   let data = { title: "Oracle Forex", body: "Une de tes analyses a évolué.", url: "/dashboard.html" };
   try {

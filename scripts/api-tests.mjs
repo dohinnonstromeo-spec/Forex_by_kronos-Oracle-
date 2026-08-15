@@ -73,6 +73,7 @@ after(async () => {
   if (existsSync(dbPath)) {
     const db = new DatabaseSync(dbPath);
     for (const email of createdEmails) {
+      db.prepare("DELETE FROM push_subscriptions WHERE user_id IN (SELECT id FROM users WHERE email = ?)").run(email);
       db.prepare("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = ?)").run(email);
       db.prepare("DELETE FROM analyses WHERE user_id IN (SELECT id FROM users WHERE email = ?)").run(email);
       db.prepare("DELETE FROM users WHERE email = ?").run(email);
@@ -197,6 +198,49 @@ test("admin: grant-premium then revoke-premium work with the real token", { skip
   const revoked = await postJson("/api/admin/revoke-premium", { email }, { "X-Admin-Token": ADMIN_TOKEN });
   assert.equal(revoked.data.ok, true);
   assert.equal(revoked.data.user.plan, "free");
+});
+
+test("push: subscribing to the new_signal topic is blocked for a free account", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+  resetRateLimits();
+  const email = uniqueEmail("apitest_push_free");
+  const signupRes = await fetch(`${BASE}/api/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "ApiTest", email, password: "CorrectPass123!" }),
+  });
+  const cookie = signupRes.headers.get("set-cookie");
+  const { status, data } = await postJson(
+    "/api/push/subscribe",
+    { endpoint: "https://fake.push/apitest-free", keys: { p256dh: "abc", auth: "def" }, topic: "new_signal" },
+    { Cookie: cookie },
+  );
+  assert.equal(status, 403);
+  assert.equal(data.error, "premium_required");
+});
+
+test("push: a premium account can hold both topics on one subscription, and dropping one keeps the other", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+  resetRateLimits();
+  const email = uniqueEmail("apitest_push_premium");
+  const signupRes = await fetch(`${BASE}/api/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "ApiTest", email, password: "CorrectPass123!" }),
+  });
+  const cookie = signupRes.headers.get("set-cookie");
+  await postJson("/api/admin/grant-premium", { email }, { "X-Admin-Token": ADMIN_TOKEN });
+  const endpoint = "https://fake.push/apitest-premium";
+  await postJson("/api/push/subscribe", { endpoint, keys: { p256dh: "abc", auth: "def" }, topic: "tp_sl" }, { Cookie: cookie });
+  const both = await postJson("/api/push/subscribe", { endpoint, keys: { p256dh: "abc", auth: "def" }, topic: "new_signal" }, { Cookie: cookie });
+  assert.deepEqual(both.data.topics.sort(), ["new_signal", "tp_sl"]);
+
+  await fetch(`${BASE}/api/push/unsubscribe-topic`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ endpoint, topic: "new_signal" }),
+  });
+  const remaining = await fetch(`${BASE}/api/push/subscription-topics?endpoint=${encodeURIComponent(endpoint)}`, { headers: { Cookie: cookie } });
+  const remainingData = await remaining.json();
+  assert.deepEqual(remainingData.topics, ["tp_sl"]);
 });
 
 test("password reset: request never reveals whether an email has an account", async () => {

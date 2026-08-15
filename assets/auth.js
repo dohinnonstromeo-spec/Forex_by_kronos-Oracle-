@@ -154,9 +154,11 @@
       ].map(([name, value]) => `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
     }
 
+    const isPremium = String(me.user.plan || "").toLowerCase() === "premium";
     const personal = await fetchJson("/api/my-analyses");
-    renderPersonalHistory(personal);
-    initPush();
+    renderPersonalHistory(personal, isPremium);
+    initPush(isPremium);
+    loadTradeOrders(isPremium);
   }
 
   function urlBase64ToUint8Array(base64) {
@@ -166,66 +168,103 @@
     return Uint8Array.from([...raw].map((char) => char.charCodeAt(0)));
   }
 
-  async function initPush() {
-    const button = document.querySelector("[data-push-toggle]");
-    const status = document.querySelector("[data-push-status]");
-    if (!button) return;
+  const PUSH_TOPIC_LABELS = {
+    tp_sl: { on: "Désactiver les notifications TP/SL", off: "Activer les notifications TP/SL", active: "Notifications TP/SL actives sur cet appareil." },
+    new_signal: { on: "Désactiver les alertes nouveaux signaux", off: "Activer les alertes nouveaux signaux", active: "Alertes nouveaux signaux actives sur cet appareil." },
+  };
+
+  // One browser only ever exposes one PushManager subscription per device, but it
+  // carries several independently-toggled topics server-side (see
+  // /api/push/subscribe's topic param) -- "new_signal" (alerts the moment Kronos
+  // detects a fresh high-confidence setup, not tied to a personal analysis) is
+  // premium-only, "tp_sl" (a saved analysis of yours hit TP/SL) is open to everyone.
+  async function initPush(isPremium) {
+    const buttons = [...document.querySelectorAll("[data-push-toggle]")].filter((button) => {
+      return button.dataset.pushToggle !== "new_signal" || isPremium;
+    });
+    const upsell = document.querySelector("[data-push-upsell]");
+    if (!buttons.length) return;
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
     const vapid = await fetchJson("/api/push/vapid-public-key");
     if (!vapid?.configured) return;
+    if (upsell && !isPremium) upsell.hidden = false;
 
     const registration = await navigator.serviceWorker.register("/sw.js");
     const existing = await registration.pushManager.getSubscription();
-    setPushButtonState(button, status, Boolean(existing));
+    const activeTopics = new Set(
+      existing ? (await fetchJson(`/api/push/subscription-topics?endpoint=${encodeURIComponent(existing.endpoint)}`))?.topics || [] : [],
+    );
 
-    button.addEventListener("click", async () => {
-      button.disabled = true;
-      try {
-        const current = await registration.pushManager.getSubscription();
-        if (current) {
-          await fetch("/api/push/unsubscribe", {
+    buttons.forEach((button) => {
+      const topic = button.dataset.pushToggle;
+      const status = document.querySelector(`[data-push-status="${topic}"]`);
+      setPushButtonState(button, status, topic, activeTopics.has(topic));
+
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const current = await registration.pushManager.getSubscription();
+          if (activeTopics.has(topic)) {
+            if (current) {
+              if (activeTopics.size > 1) {
+                await fetch("/api/push/unsubscribe-topic", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ endpoint: current.endpoint, topic }),
+                });
+              } else {
+                await fetch("/api/push/unsubscribe", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ endpoint: current.endpoint }),
+                });
+                await current.unsubscribe();
+              }
+            }
+            activeTopics.delete(topic);
+            setPushButtonState(button, status, topic, false);
+            return;
+          }
+          let subscription = current;
+          if (!subscription) {
+            const permission = await Notification.requestPermission();
+            if (permission !== "granted") {
+              if (status) status.textContent = "Notifications refusées dans le navigateur.";
+              return;
+            }
+            subscription = await registration.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: urlBase64ToUint8Array(vapid.publicKey),
+            });
+          }
+          await fetch("/api/push/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ endpoint: current.endpoint }),
+            body: JSON.stringify({ ...subscription.toJSON(), topic }),
           });
-          await current.unsubscribe();
-          setPushButtonState(button, status, false);
-          return;
+          activeTopics.add(topic);
+          setPushButtonState(button, status, topic, true);
+        } catch (error) {
+          if (status) status.textContent = "Notifications indisponibles sur cet appareil.";
+        } finally {
+          button.disabled = false;
         }
-        const permission = await Notification.requestPermission();
-        if (permission !== "granted") {
-          status.textContent = "Notifications refusées dans le navigateur.";
-          return;
-        }
-        const subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(vapid.publicKey),
-        });
-        await fetch("/api/push/subscribe", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(subscription.toJSON()),
-        });
-        setPushButtonState(button, status, true);
-      } catch (error) {
-        status.textContent = "Notifications indisponibles sur cet appareil.";
-      } finally {
-        button.disabled = false;
-      }
+      });
+
+      // Only reveal the button once the click handler above is actually wired up --
+      // showing it earlier (right after the VAPID check) meant a fast click during
+      // service-worker registration silently did nothing, no listener attached yet.
+      button.hidden = false;
     });
-
-    // Only reveal the button once the click handler above is actually wired up --
-    // showing it earlier (right after the VAPID check) meant a fast click during
-    // service-worker registration silently did nothing, no listener attached yet.
-    button.hidden = false;
   }
 
-  function setPushButtonState(button, status, active) {
-    button.textContent = active ? "Désactiver les notifications TP/SL" : "Activer les notifications TP/SL";
-    if (status) status.textContent = active ? "Notifications actives sur cet appareil." : "";
+  function setPushButtonState(button, status, topic, active) {
+    const labels = PUSH_TOPIC_LABELS[topic] || PUSH_TOPIC_LABELS.tp_sl;
+    button.textContent = active ? labels.on : labels.off;
+    if (status) status.textContent = active ? labels.active : "";
   }
 
-  function renderPersonalHistory(data) {
+  function renderPersonalHistory(data, isPremium) {
     const host = document.querySelector("[data-dashboard-history]");
     const status = document.querySelector("[data-personal-status]");
     if (!host) return;
@@ -252,6 +291,7 @@
         </div>
         <span class="${historyStatusClass(item.status)}">${escapeHtml(historyStatusLabel(item))}</span>
         ${historyDetailNote(item) ? `<p class="dashboard-history-note">${escapeHtml(historyDetailNote(item))}</p>` : ""}
+        ${item.status === "OPEN" && isPremium ? `<button type="button" class="dashboard-trade-prepare" data-prepare-order="${escapeHtml(item.id)}">Préparer un ordre</button>` : ""}
       </article>
     `).join("");
     host.querySelectorAll("[data-copy-level]").forEach((button) => {
@@ -260,6 +300,122 @@
         const original = button.textContent;
         button.textContent = "Copié";
         setTimeout(() => { button.textContent = original; }, 1400);
+      });
+    });
+    host.querySelectorAll("[data-prepare-order]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const response = await fetch("/api/trade/prepare", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ analysisId: button.dataset.prepareOrder }),
+          });
+          const result = await response.json();
+          if (result.ok) {
+            button.textContent = "Ordre préparé ✓";
+            await loadTradeOrders(true);
+          } else {
+            button.disabled = false;
+          }
+        } catch {
+          button.disabled = false;
+        }
+      });
+    });
+  }
+
+  // Semi-automatic execution: Kronos only ever prepares an order ticket
+  // (PENDING_CONFIRMATION) from an already-open analysis -- nothing reaches the
+  // broker until the user picks a size and clicks "Confirmer et envoyer" below,
+  // a separate explicit call to /api/trade/confirm. Premium-only.
+  const TRADE_ORDER_LABELS = {
+    PENDING_CONFIRMATION: "À valider",
+    SENT: "Envoyé au broker",
+    FAILED: "Échec d'envoi",
+    CANCELLED: "Annulé",
+  };
+
+  async function loadTradeOrders(isPremium) {
+    const panel = document.querySelector("[data-trade-panel]");
+    const upsell = document.querySelector("[data-trade-upsell]");
+    if (!panel) return;
+    if (!isPremium) {
+      if (upsell) upsell.hidden = false;
+      return;
+    }
+    panel.hidden = false;
+    const data = await fetchJson("/api/trade/orders");
+    renderTradeOrders(data?.orders || [], Boolean(data?.brokerConfigured));
+  }
+
+  function renderTradeOrders(orders, brokerConfigured) {
+    const statusEl = document.querySelector("[data-trade-broker-status]");
+    if (statusEl) statusEl.textContent = brokerConfigured ? "Broker connecté" : "Broker non connecté (démo requise)";
+    const host = document.querySelector("[data-trade-orders]");
+    if (!host) return;
+    if (!orders.length) {
+      host.innerHTML = `<div class="dashboard-empty">Aucun ordre préparé. Depuis une analyse ouverte ci-dessus, clique sur "Préparer un ordre".</div>`;
+      return;
+    }
+    host.innerHTML = orders.map((order) => `
+      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}">
+        <div>
+          <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}</strong>
+          <span>${formatDate(order.createdAt)} · ${escapeHtml(TRADE_ORDER_LABELS[order.status] || order.status)}</span>
+        </div>
+        <div class="dashboard-history-levels">
+          <span>Entrée ${escapeHtml(order.entry)}</span>
+          <span>SL ${escapeHtml(order.sl)}</span>
+          <span>TP1 ${escapeHtml(order.tp1 ?? "—")}</span>
+        </div>
+        ${order.status === "PENDING_CONFIRMATION" ? `
+          <div class="dashboard-trade-confirm">
+            <input type="number" step="0.01" min="0.01" placeholder="Taille (lots)" data-order-volume>
+            <button type="button" class="payment-method-button" data-order-confirm>Confirmer et envoyer</button>
+            <button type="button" class="dashboard-trade-cancel" data-order-cancel>Annuler</button>
+          </div>
+        ` : ""}
+        ${order.status === "FAILED" && order.errorMessage ? `<p class="dashboard-history-note">${escapeHtml(order.errorMessage)}</p>` : ""}
+      </article>
+    `).join("");
+
+    host.querySelectorAll("[data-order-confirm]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const article = button.closest("[data-order-id]");
+        const orderId = article.dataset.orderId;
+        const volumeInput = article.querySelector("[data-order-volume]");
+        const volume = Number(volumeInput.value);
+        if (!Number.isFinite(volume) || volume <= 0) {
+          volumeInput.focus();
+          return;
+        }
+        button.disabled = true;
+        try {
+          await fetch("/api/trade/confirm", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ orderId, volume }),
+          });
+        } finally {
+          await loadTradeOrders(true);
+        }
+      });
+    });
+
+    host.querySelectorAll("[data-order-cancel]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const orderId = button.closest("[data-order-id]").dataset.orderId;
+        button.disabled = true;
+        try {
+          await fetch("/api/trade/cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ orderId }),
+          });
+        } finally {
+          await loadTradeOrders(true);
+        }
       });
     });
   }

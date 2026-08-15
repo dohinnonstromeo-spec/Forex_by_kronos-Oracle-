@@ -73,10 +73,32 @@
         </div>
         <span class="oracle-tech" data-personal-status>Compte connecté</span>
       </div>
-      <button class="payment-method-button push-toggle" type="button" data-push-toggle hidden>Activer les notifications TP/SL</button>
-      <p class="dashboard-push-status" data-push-status></p>
+      <div class="dashboard-push-controls">
+        <div>
+          <button class="payment-method-button push-toggle" type="button" data-push-toggle="tp_sl" hidden>Activer les notifications TP/SL</button>
+          <p class="dashboard-push-status" data-push-status="tp_sl"></p>
+        </div>
+        <div>
+          <button class="payment-method-button push-toggle" type="button" data-push-toggle="new_signal" hidden>Activer les alertes nouveaux signaux</button>
+          <p class="dashboard-push-status" data-push-status="new_signal"></p>
+        </div>
+      </div>
+      <p class="dashboard-push-upsell" data-push-upsell hidden>Les alertes de nouveaux signaux (dès qu'un setup fort apparaît, sans lancer d'analyse toi-même) sont réservées aux membres Premium. <a href="/paiement">S'abonner</a></p>
       <div class="dashboard-history" data-dashboard-history>Chargement...</div>
     </section>
+
+    <section class="dashboard-panel" data-trade-panel hidden>
+      <div class="signal-top">
+        <div>
+          <p class="analysis-kicker">Exécution semi-automatique</p>
+          <h2 class="analysis-title">Ordres</h2>
+        </div>
+        <span class="oracle-tech" data-trade-broker-status>Broker non connecté</span>
+      </div>
+      <p class="dashboard-trade-note">Kronos prépare l'ordre à partir d'une analyse ouverte, tu choisis la taille et confirmes — rien n'est envoyé au broker sans ta validation explicite.</p>
+      <div class="dashboard-trade-orders" data-trade-orders>Chargement...</div>
+    </section>
+    <p class="dashboard-push-upsell" data-trade-upsell hidden>L'exécution semi-automatique (Kronos prépare l'ordre, tu valides, il part vers ton broker) est réservée aux membres Premium. <a href="/paiement">S'abonner</a></p>
   </main>
 
   <footer class="oracle-footer-lite">
