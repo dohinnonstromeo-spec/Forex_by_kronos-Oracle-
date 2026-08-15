@@ -1,10 +1,10 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, statSync, readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
-import { createGzip, createBrotliCompress } from "node:zlib";
+import { createGzip, createBrotliCompress, brotliCompressSync, gzipSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import pg from "pg";
 import { imageSize } from "image-size";
@@ -7233,7 +7233,14 @@ async function loadEnv(path) {
 }
 
 const COMPRESSIBLE_EXT = new Set([".html", ".js", ".css", ".json", ".svg"]);
-const HASHED_ASSET_RE = /-[A-Za-z0-9_]{6,}\.(?:js|css)$/;
+// Must actually look like a build hash (mixed case AND a digit), not just any
+// 6+ char word after a hyphen -- the naive version of this matched hand-written,
+// regularly-edited filenames like oracle-extras.css and oracle-chatbot.js ("extras",
+// "chatbot" are both 6+ letters) and gave them a full year of immutable caching they
+// never earned, so real edits to those files were invisible to returning visitors
+// for up to a year without a hard refresh. Confirmed live: only styles-nTlncI0E.css
+// (the one file this project's old build step actually hashed) matches now.
+const HASHED_ASSET_RE = /-(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Z])[A-Za-z0-9_]{6,}\.(?:js|css)$/;
 
 function cacheControlFor(pathname, ext) {
   if (ext === ".html" || pathname === "/") return "no-cache";
@@ -7297,25 +7304,55 @@ async function serveStatic(res, pathname, req = null) {
     return;
   }
   const ext = extname(file);
+  const stat = statSync(file);
+  // Weak ETag from mtime+size: cheap (no file hashing) and correct for this project's
+  // "edit the file directly, no build step" workflow -- any real edit changes mtime.
+  // Without this, a static file with only a 5-minute Cache-Control (everything
+  // that isn't the one genuinely-hashed bundle, see HASHED_ASSET_RE) forced a full
+  // re-download on every single revalidation instead of a cheap 304, for every
+  // visitor, forever.
+  const etag = `W/"${stat.mtimeMs.toString(36)}-${stat.size.toString(36)}"`;
   res.setHeader("Content-Type", mime[ext] || "application/octet-stream");
   res.setHeader("Cache-Control", cacheControlFor(pathname, ext));
+  res.setHeader("ETag", etag);
+  const ifNoneMatch = req?.headers?.["if-none-match"];
+  if (ifNoneMatch && ifNoneMatch === etag) {
+    res.writeHead(304);
+    res.end();
+    return;
+  }
   const compressible = COMPRESSIBLE_EXT.has(ext);
   if (compressible) res.setHeader("Vary", "Accept-Encoding");
   const acceptEncoding = String(req?.headers?.["accept-encoding"] || "");
-  if (compressible && /\bbr\b/.test(acceptEncoding)) {
-    res.setHeader("Content-Encoding", "br");
+  const wantsBr = compressible && /\bbr\b/.test(acceptEncoding);
+  const wantsGzip = compressible && !wantsBr && /\bgzip\b/.test(acceptEncoding);
+  if (wantsBr || wantsGzip) {
+    const encoding = wantsBr ? "br" : "gzip";
+    res.setHeader("Content-Encoding", encoding);
     res.writeHead(200);
-    createReadStream(file).pipe(createBrotliCompress()).pipe(res);
-    return;
-  }
-  if (compressible && /\bgzip\b/.test(acceptEncoding)) {
-    res.setHeader("Content-Encoding", "gzip");
-    res.writeHead(200);
-    createReadStream(file).pipe(createGzip()).pipe(res);
+    res.end(getCompressedAsset(file, stat, encoding));
     return;
   }
   res.writeHead(200);
   createReadStream(file).pipe(res);
+}
+
+// Static assets rarely change (edited by hand, not per-request), so brotli/gzip-
+// compressing the same file from scratch on every single request -- brotli
+// especially is CPU-heavy -- wastes work that only grows with traffic. Cached here
+// keyed by mtime, so an actual edit invalidates it automatically; unbounded growth
+// isn't a concern since the key space is this project's fixed, small set of static
+// files, not anything request- or user-controlled.
+const compressedAssetCache = new Map();
+
+function getCompressedAsset(file, stat, encoding) {
+  const cacheKey = `${file}:${encoding}`;
+  const cached = compressedAssetCache.get(cacheKey);
+  if (cached && cached.mtimeMs === stat.mtimeMs) return cached.buffer;
+  const raw = readFileSync(file);
+  const buffer = encoding === "br" ? brotliCompressSync(raw) : gzipSync(raw);
+  compressedAssetCache.set(cacheKey, { mtimeMs: stat.mtimeMs, buffer });
+  return buffer;
 }
 
 function sendJson(res, status, data) {
