@@ -185,6 +185,33 @@ const reusedFromCache = pricePayload("XAU/USD", genuinelyFresh, "twelve_data", "
 check("cache-reuse preserves the original fetch time instead of resetting it", reusedFromCache.asOf === genuinelyFresh.asOf);
 check("a genuinely fresh fetch still gets its own real timestamp", Boolean(genuinelyFresh.asOf));
 
+console.log("\n=== mergeCachedHistories: same asOf bug, found auditing for it elsewhere, in candle history caching ===");
+
+// Copy of tagHistory() from server.mjs.
+function tagHistory(bars, source, stale, asOf) {
+  Object.defineProperty(bars, "_meta", { value: { source, stale, asOf: asOf || new Date().toISOString() }, enumerable: false });
+  return bars;
+}
+// Copy of mergeCachedHistories() from server.mjs.
+function mergeCachedHistories(existing, histories) {
+  const next = { ...existing };
+  for (const [symbol, bars] of Object.entries(histories)) {
+    if (Array.isArray(bars) && bars.length >= 30 && !bars._meta?.stale) {
+      next[symbol] = { source: bars._meta?.source || "twelve_data", asOf: bars._meta?.asOf || new Date().toISOString(), bars: bars.slice(-80) };
+    }
+  }
+  return next;
+}
+const someBars = Array.from({ length: 30 }, (_, i) => ({ close: 4157 + i, high: 4158 + i, low: 4156 + i, datetime: `2026-08-17T0${i}:00:00Z` }));
+const freshBars = tagHistory([...someBars], "twelve_data:15min", false);
+const freshMerged = mergeCachedHistories({}, { "XAU/USD": freshBars });
+// A cache read re-tags the same underlying bars, carrying the ORIGINAL cache asOf
+// forward (this is what cachedHistory() does, passing cached.asOf as tagHistory's
+// 4th arg) -- merging that back must not stamp a newer timestamp either.
+const reReadFromCache = tagHistory([...someBars], "cache:twelve_data:15min", false, freshMerged["XAU/USD"].asOf);
+const reReadMerged = mergeCachedHistories(freshMerged, { "XAU/USD": reReadFromCache });
+check("re-merging a cache-read history preserves the original fetch time", reReadMerged["XAU/USD"].asOf === freshMerged["XAU/USD"].asOf);
+
 console.log("\n=== assessAnalysisDataReliability: no partial credit for a fake-but-finite price ===");
 
 check("fake/stale price contributes 0 (not partial credit)", liveScoreContribution(staleFallback) === 0);

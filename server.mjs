@@ -2657,13 +2657,18 @@ function cachedHistory(symbol, cache) {
   const bars = cached.bars
     .map((bar) => ({ close: Number(bar.close), high: Number(bar.high), low: Number(bar.low), datetime: bar.datetime }))
     .filter((bar) => Number.isFinite(bar.close));
-  tagHistory(bars, `cache:${cached.source || "history"}`, !isRecentCache(cached, 20 * 60 * 1000));
+  // Same bug class as pricePayload's asOf (see that function's comment): re-tagging a
+  // cache read must preserve when the bars were actually fetched, not stamp "now" --
+  // otherwise mergeCachedHistories below persists that fresh-looking stamp right back
+  // to the cache, and under regular traffic the history (SMA/RSI/support-resistance
+  // all derive from it) could freeze indefinitely without ever being re-fetched.
+  tagHistory(bars, `cache:${cached.source || "history"}`, !isRecentCache(cached, 20 * 60 * 1000), cached.asOf);
   return bars;
 }
 
-function tagHistory(bars, source, stale) {
+function tagHistory(bars, source, stale, asOf) {
   Object.defineProperty(bars, "_meta", {
-    value: { source, stale, asOf: new Date().toISOString() },
+    value: { source, stale, asOf: asOf || new Date().toISOString() },
     enumerable: false,
   });
   return bars;
@@ -5478,7 +5483,14 @@ function mergeCachedHistories(existing, histories) {
     if (Array.isArray(bars) && bars.length >= 30 && !bars._meta?.stale) {
       next[symbol] = {
         source: bars._meta?.source || "twelve_data",
-        asOf: new Date().toISOString(),
+        // Same root cause as pricePayload's asOf bug: this used to always stamp "now",
+        // including when the bars being "merged" back in were just a reused cache
+        // read (see cachedHistory/tagHistory above) rather than a genuine fresh fetch.
+        // That reset the 20-minute freshness clock on every reuse, so a history fetched
+        // once could freeze indefinitely under regular traffic while every technical
+        // indicator derived from it (SMA/RSI/support-resistance) kept reporting as
+        // current. Preserve the bars' own asOf when they carry one.
+        asOf: bars._meta?.asOf || new Date().toISOString(),
         bars: bars.slice(-80),
       };
     }
