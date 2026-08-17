@@ -1515,6 +1515,11 @@ body {
   font-size: 12px;
 }
 
+.dashboard-prepare-error {
+  margin-top: 6px;
+  color: var(--neon-red, #ff5c5c);
+}
+
 .dashboard-trade-prepare {
   grid-column: 1 / -1;
   justify-self: start;

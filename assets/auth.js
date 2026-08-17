@@ -291,7 +291,10 @@
         </div>
         <span class="${historyStatusClass(item.status)}">${escapeHtml(historyStatusLabel(item))}</span>
         ${historyDetailNote(item) ? `<p class="dashboard-history-note">${escapeHtml(historyDetailNote(item))}</p>` : ""}
-        ${item.status === "OPEN" && isPremium ? `<button type="button" class="dashboard-trade-prepare" data-prepare-order="${escapeHtml(item.id)}">Préparer un ordre</button>` : ""}
+        ${item.status === "OPEN" && isPremium ? `
+          <button type="button" class="dashboard-trade-prepare" data-prepare-order="${escapeHtml(item.id)}">Préparer un ordre</button>
+          <p class="dashboard-history-note dashboard-prepare-error" data-prepare-error hidden></p>
+        ` : ""}
       </article>
     `).join("");
     host.querySelectorAll("[data-copy-level]").forEach((button) => {
@@ -302,9 +305,18 @@
         setTimeout(() => { button.textContent = original; }, 1400);
       });
     });
+    const PREPARE_ERROR_LABELS = {
+      premium_required: "Réservé aux comptes Premium.",
+      analysis_not_found: "Analyse introuvable (peut-être déjà supprimée).",
+      analysis_not_open: "Cette analyse n'est plus ouverte (déjà clôturée ou bloquée) -- il faut une analyse encore active.",
+      invalid_request: "Requête invalide.",
+      auth_required: "Session expirée -- reconnecte-toi.",
+    };
     host.querySelectorAll("[data-prepare-order]").forEach((button) => {
+      const errorEl = button.nextElementSibling?.hasAttribute("data-prepare-error") ? button.nextElementSibling : null;
       button.addEventListener("click", async () => {
         button.disabled = true;
+        if (errorEl) errorEl.hidden = true;
         try {
           const response = await fetch("/api/trade/prepare", {
             method: "POST",
@@ -317,9 +329,17 @@
             await loadTradeOrders(true);
           } else {
             button.disabled = false;
+            if (errorEl) {
+              errorEl.textContent = PREPARE_ERROR_LABELS[result.error] || `Échec (${result.error || "erreur inconnue"}).`;
+              errorEl.hidden = false;
+            }
           }
         } catch {
           button.disabled = false;
+          if (errorEl) {
+            errorEl.textContent = "Impossible de contacter le serveur -- vérifie ta connexion.";
+            errorEl.hidden = false;
+          }
         }
       });
     });
