@@ -1070,7 +1070,8 @@ async function handleApi(req, res, url) {
       `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [order.id, session.user.id, analysis.id, order.pair, order.direction, order.entry, order.sl, order.tp1, order.tp2, order.status, order.createdAt],
     );
-    sendJson(res, 200, { ok: true, order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null }, brokerConfigured: BROKER_CONFIGURED });
+    const correlationWarning = await correlationWarnings(session.user.id, order.pair, order.direction);
+    sendJson(res, 200, { ok: true, order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null }, brokerConfigured: BROKER_CONFIGURED, correlationWarning });
     return;
   }
 
@@ -1150,7 +1151,14 @@ async function handleApi(req, res, url) {
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     await ensureRelationalTables();
     const rows = await sqlAll(`SELECT * FROM trade_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [session.user.id]);
-    sendJson(res, 200, { ok: true, orders: rows.map(rowToTradeOrder), brokerConfigured: BROKER_CONFIGURED });
+    const orders = await Promise.all(rows.map(async (row) => {
+      const order = rowToTradeOrder(row);
+      order.correlationWarning = order.status === "PENDING_CONFIRMATION"
+        ? await correlationWarnings(session.user.id, order.pair, order.direction, order.id)
+        : null;
+      return order;
+    }));
+    sendJson(res, 200, { ok: true, orders, brokerConfigured: BROKER_CONFIGURED });
     return;
   }
 
@@ -6674,6 +6682,51 @@ async function upsertAnalysisRow(analysis) {
       analysis.isTest ? 1 : 0,
     ],
   );
+}
+
+// Splits a pair into its two currency legs -- "EUR/USD" -> {base: "EUR", quote:
+// "USD"}. Non-FX symbols (US500, and the crypto/metal pairs already use a "/") don't
+// have a real quote currency, but treating the symbol itself as the base and USD as
+// the quote keeps the same exposure model working without a special case: buying
+// US500 is "long US500 risk", which is exactly the thing correlation checks care
+// about even though it isn't a currency in the traditional sense.
+function currencyLegs(pair = "") {
+  const parts = String(pair).split("/");
+  return parts.length === 2 ? { base: parts[0], quote: parts[1] } : { base: pair, quote: "USD" };
+}
+
+// A buy is long the base currency and short the quote; a sell is the reverse. Two
+// positions share real correlation risk when they're both long (or both short) the
+// same currency through different pairs -- e.g. ACHAT EUR/USD and ACHAT GBP/USD are
+// both short USD; a EUR/USD move and a USD/JPY move aren't independent bets, they're
+// largely the same bet on USD strength/weakness twice.
+function currencyExposure(pair, direction) {
+  const { base, quote } = currencyLegs(pair);
+  const buy = direction === "ACHAT";
+  return { long: buy ? base : quote, short: buy ? quote : base };
+}
+
+// Checks a candidate order against the user's other currently-open (SENT) orders for
+// overlapping currency exposure -- not a hard block (unlike the price-tolerance
+// check), this is a judgment call the trader should see and decide on, not something
+// Kronos can objectively call "wrong". Semi-automatic execution makes it easy to fire
+// off several orders in a row without noticing they're all the same underlying bet.
+async function correlationWarnings(userId, pair, direction, excludeOrderId = null) {
+  const rows = await sqlAll(`SELECT * FROM trade_orders WHERE user_id = ? AND status = 'SENT'`, [userId]);
+  const candidate = currencyExposure(pair, direction);
+  const overlaps = [];
+  for (const row of rows) {
+    if (excludeOrderId && row.id === excludeOrderId) continue;
+    if (row.pair === pair) continue; // same instrument again isn't a correlation finding, it's a duplicate position
+    const existing = currencyExposure(row.pair, row.direction);
+    const sharedCurrency = [candidate.long, candidate.short].find((c) => c === existing.long || c === existing.short);
+    if (!sharedCurrency) continue;
+    const sameSide = (sharedCurrency === candidate.long && sharedCurrency === existing.long) || (sharedCurrency === candidate.short && sharedCurrency === existing.short);
+    if (sameSide) overlaps.push({ pair: row.pair, direction: row.direction, sharedCurrency });
+  }
+  if (!overlaps.length) return null;
+  const list = overlaps.map((o) => `${o.direction} ${o.pair} (${o.sharedCurrency})`).join(", ");
+  return `Exposition corrélée : ${overlaps.length} position(s) déjà ouverte(s) sur le même sens de ${overlaps.map((o) => o.sharedCurrency).join("/")} -- ${list}. Ce n'est pas forcément une erreur, mais l'exposition réelle est plus grande qu'elle n'y paraît si ces paires bougent ensemble.`;
 }
 
 function rowToTradeOrder(row) {

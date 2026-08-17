@@ -369,6 +369,7 @@
           <span>SL ${escapeHtml(order.sl)}</span>
           <span>TP1 ${escapeHtml(order.tp1 ?? "—")}</span>
         </div>
+        ${order.correlationWarning ? `<p class="dashboard-history-note dashboard-correlation-warning">⚠ ${escapeHtml(order.correlationWarning)}</p>` : ""}
         ${order.status === "PENDING_CONFIRMATION" ? `
           <div class="dashboard-trade-confirm">
             <input type="number" step="0.01" min="0.01" placeholder="Taille (lots)" data-order-volume>

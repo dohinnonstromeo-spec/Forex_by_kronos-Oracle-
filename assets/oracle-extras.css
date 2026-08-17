@@ -1554,6 +1554,11 @@ body {
   color: var(--foreground);
 }
 
+.dashboard-correlation-warning {
+  color: var(--amber-neon, #f5a623);
+  font-weight: 500;
+}
+
 .dashboard-trade-confirm {
   display: flex;
   flex-wrap: wrap;
