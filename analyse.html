@@ -121,9 +121,9 @@
             <div class="analysis-field analysis-field-wide">
               <label>Timeframes rapides</label>
               <div class="timeframe-chip-row" data-timeframe-chips>
-                <button type="button" data-timeframe="M5">M5</button>
+                <button type="button" class="active" data-timeframe="M5">M5</button>
                 <button type="button" data-timeframe="M15">M15</button>
-                <button type="button" class="active" data-timeframe="H1">H1</button>
+                <button type="button" data-timeframe="H1">H1</button>
                 <button type="button" data-timeframe="H4">H4</button>
                 <button type="button" data-timeframe="D1">D1</button>
               </div>
@@ -131,8 +131,8 @@
             <div class="analysis-field">
               <label for="timeframe">Timeframe</label>
               <select id="timeframe" name="timeframe">
-                <option>M1</option><option>M5</option><option>M15</option><option>M30</option>
-                <option selected>H1</option><option>H4</option><option>D1</option><option>W1</option>
+                <option>M1</option><option selected>M5</option><option>M15</option><option>M30</option>
+                <option>H1</option><option>H4</option><option>D1</option><option>W1</option>
               </select>
             </div>
             <div class="analysis-field">
@@ -145,8 +145,8 @@
             <div class="analysis-field">
               <label for="strategy">Stratégie</label>
               <select id="strategy" name="strategy">
-                <option>Scalping</option>
-                <option selected>Swing Trading</option>
+                <option selected>Scalping</option>
+                <option>Swing Trading</option>
                 <option>Position Trading</option>
                 <option>Breakout</option>
                 <option>Reversal</option>
@@ -168,8 +168,8 @@
             <div class="analysis-field">
               <label for="analysisDepth">Mode d'analyse</label>
               <select id="analysisDepth" name="analysisDepth">
-                <option>Rapide</option>
-                <option selected>Profonde</option>
+                <option selected>Rapide</option>
+                <option>Profonde</option>
               </select>
             </div>
           </div>
