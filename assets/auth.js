@@ -109,7 +109,8 @@
     const trialLinks = document.querySelectorAll("[data-cta-trial]");
     const paymentStatus = document.querySelectorAll("[data-payment-status]");
     const paymentForms = document.querySelectorAll("[data-payment-form]");
-    if (!loginLinks.length && !dashboardLinks.length && !trialLinks.length && !paymentStatus.length && !paymentForms.length) return;
+    const pricingLinks = document.querySelectorAll("[data-nav-pricing]");
+    if (!loginLinks.length && !dashboardLinks.length && !trialLinks.length && !paymentStatus.length && !paymentForms.length && !pricingLinks.length) return;
 
     const me = await fetchJson("/api/me");
     const loggedIn = Boolean(me?.ok);
@@ -123,6 +124,9 @@
     });
     paymentStatus.forEach((el) => { el.hidden = !premium; });
     paymentForms.forEach((el) => { el.hidden = premium; });
+    // Already premium: seeing "Abonnement"/"S'abonner" in the nav next to your own
+    // account is confusing, not just redundant -- it reads as "you haven't paid yet".
+    pricingLinks.forEach((el) => { el.hidden = premium; });
   }
 
   document.querySelector("[data-logout]")?.addEventListener("click", async () => {
@@ -282,7 +286,7 @@
     // fully-expanded cards made the dashboard extremely long for no reason -- only
     // the pair/direction/status/date need to be visible to scan the list, the
     // levels/reason/duration only matter once you actually want that one trade.
-    host.innerHTML = data.analyses.map((item) => `
+    const cards = data.analyses.map((item) => `
       <details class="dashboard-history-item">
         <summary>
           <span class="dashboard-history-summary-main">
@@ -307,8 +311,38 @@
           ` : ""}
         </div>
       </details>
-    `).join("");
+    `);
+    // Rendering all of it at once (sometimes 20+ cards) made the dashboard scroll
+    // forever for no reason -- only the first page needs to be in the DOM up front,
+    // the rest reveals on demand instead of forcing everyone to scroll past history
+    // they didn't ask to see yet.
+    const PAGE_SIZE = 6;
+    const rest = cards.slice(PAGE_SIZE);
+    host.innerHTML = cards.slice(0, PAGE_SIZE).join("")
+      + (rest.length ? `<button type="button" class="dashboard-history-more" data-history-more>Voir ${rest.length} analyse${rest.length > 1 ? "s" : ""} de plus</button>` : "");
+
+    bindHistoryItemHandlers(host, isPremium);
+    host.querySelector("[data-history-more]")?.addEventListener("click", function () {
+      this.insertAdjacentHTML("beforebegin", rest.join(""));
+      this.remove();
+      bindHistoryItemHandlers(host, isPremium);
+    });
+  }
+
+  const PREPARE_ERROR_LABELS = {
+    premium_required: "Réservé aux comptes Premium.",
+    analysis_not_found: "Analyse introuvable (peut-être déjà supprimée).",
+    analysis_not_open: "Cette analyse n'est plus ouverte (déjà clôturée ou bloquée) -- il faut une analyse encore active.",
+    invalid_request: "Requête invalide.",
+    auth_required: "Session expirée -- reconnecte-toi.",
+  };
+
+  // Re-run after every reveal (initial page + each "Voir plus" click) so newly
+  // inserted cards get working copy/prepare buttons too, not just the first batch.
+  function bindHistoryItemHandlers(host, isPremium) {
     host.querySelectorAll("[data-copy-level]").forEach((button) => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = "1";
       button.addEventListener("click", async () => {
         await navigator.clipboard?.writeText(button.dataset.copyLevel || "");
         const original = button.textContent;
@@ -316,14 +350,9 @@
         setTimeout(() => { button.textContent = original; }, 1400);
       });
     });
-    const PREPARE_ERROR_LABELS = {
-      premium_required: "Réservé aux comptes Premium.",
-      analysis_not_found: "Analyse introuvable (peut-être déjà supprimée).",
-      analysis_not_open: "Cette analyse n'est plus ouverte (déjà clôturée ou bloquée) -- il faut une analyse encore active.",
-      invalid_request: "Requête invalide.",
-      auth_required: "Session expirée -- reconnecte-toi.",
-    };
     host.querySelectorAll("[data-prepare-order]").forEach((button) => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = "1";
       const errorEl = button.nextElementSibling?.hasAttribute("data-prepare-error") ? button.nextElementSibling : null;
       button.addEventListener("click", async () => {
         button.disabled = true;
@@ -407,10 +436,18 @@
             <button type="button" class="payment-method-button" data-order-confirm>Confirmer et envoyer</button>
             <button type="button" class="dashboard-trade-cancel" data-order-cancel>Annuler</button>
           </div>
+          <p class="dashboard-history-note dashboard-prepare-error" data-confirm-error hidden></p>
         ` : ""}
         ${order.status === "FAILED" && order.errorMessage ? `<p class="dashboard-history-note">${escapeHtml(order.errorMessage)}</p>` : ""}
       </article>
     `).join("");
+
+    const CONFIRM_ERROR_LABELS = {
+      price_unavailable: "Prix live indisponible -- impossible de vérifier que le setup tient toujours. Réessaie dans un instant.",
+      order_expired: "Cet ordre a expiré (trop de temps écoulé depuis la préparation) et a été annulé automatiquement -- relance une analyse pour un ordre à jour.",
+      trading_paused: "Trading suspendu temporairement par l'administrateur.",
+      daily_order_cap_reached: "Limite quotidienne d'ordres atteinte.",
+    };
 
     host.querySelectorAll("[data-order-confirm]").forEach((button) => {
       button.addEventListener("click", async () => {
@@ -418,19 +455,48 @@
         const orderId = article.dataset.orderId;
         const volumeInput = article.querySelector("[data-order-volume]");
         const volume = Number(volumeInput.value);
+        const errorEl = article.querySelector("[data-confirm-error]");
         if (!Number.isFinite(volume) || volume <= 0) {
           volumeInput.focus();
           return;
         }
         button.disabled = true;
+        if (errorEl) errorEl.hidden = true;
+        // price_moved/price_unavailable/trading_paused/daily_order_cap_reached all
+        // reject the confirm attempt without touching the order (still
+        // PENDING_CONFIRMATION server-side) -- reloading the list would wipe this
+        // message off the screen the instant it appears, for no reason, since
+        // nothing about the order actually changed. Only reload when the order's
+        // real status did (sent/failed/expired).
+        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "trading_paused", "daily_order_cap_reached"]);
         try {
-          await fetch("/api/trade/confirm", {
+          const response = await fetch("/api/trade/confirm", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ orderId, volume }),
           });
-        } finally {
-          await loadTradeOrders(true);
+          const result = await response.json().catch(() => ({}));
+          if (result.ok) {
+            await loadTradeOrders(true);
+            return;
+          }
+          if (errorEl) {
+            errorEl.textContent = result.error === "price_moved"
+              ? `Le prix a bougé de ${result.distancePercent}% depuis l'analyse (tolérance ${result.tolerancePercent}%) -- confirmation refusée pour ta sécurité. Relance une analyse pour un prix à jour, ou annule cet ordre.`
+              : CONFIRM_ERROR_LABELS[result.error] || `Échec (${result.error || "erreur inconnue"}).`;
+            errorEl.hidden = false;
+          }
+          if (!ORDER_UNCHANGED_ERRORS.has(result.error)) {
+            await loadTradeOrders(true);
+          } else {
+            button.disabled = false;
+          }
+        } catch {
+          if (errorEl) {
+            errorEl.textContent = "Impossible de contacter le serveur -- vérifie ta connexion.";
+            errorEl.hidden = false;
+          }
+          button.disabled = false;
         }
       });
     });

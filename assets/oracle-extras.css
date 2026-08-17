@@ -28,6 +28,10 @@
   --neon-orange: oklch(55% .25 295);
   --neon-green: oklch(82% .22 150);
   --neon-red: oklch(65% .26 18);
+  /* Distinct from --neon-green (used for "still open") so a closed win actually
+     reads differently from a pending signal at a glance -- a yellow-shifted green
+     ("citron"), not the teal-leaning --neon-green. */
+  --lemon-green: oklch(87% .24 118);
   --primary-foreground: oklch(11% .02 265);
   --shadow-card: 0 24px 80px rgba(0, 0, 0, .36);
   --shadow-glow-amber: 0 0 26px oklch(85% .18 210 / .34);
@@ -1648,6 +1652,25 @@ body {
   cursor: pointer;
 }
 
+.dashboard-history-more {
+  display: block;
+  width: 100%;
+  margin-top: var(--space-3, 12px);
+  padding: 11px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--oracle-border);
+  background: transparent;
+  color: var(--amber-neon);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dashboard-history-more:hover {
+  border-style: solid;
+  background: rgba(255, 255, 255, .04);
+}
+
 .dashboard-history-levels {
   display: flex;
   flex-wrap: wrap;
@@ -1669,7 +1692,7 @@ body {
 }
 
 .history-win {
-  color: var(--neon-green);
+  color: var(--lemon-green);
   font-weight: 600;
 }
 
@@ -2072,19 +2095,8 @@ body {
   min-height: 76px;
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: space-between;
   gap: 24px;
-}
-
-/* Sits right next to the brand instead of being pushed to the far right with
-   justify-content: space-between (see .home-links' margin-left: auto below, which
-   now does that job for the rest of the nav). */
-.home-nav-cta-early {
-  margin-left: 4px;
-}
-
-.home-links {
-  margin-left: auto;
 }
 
 .home-brand,

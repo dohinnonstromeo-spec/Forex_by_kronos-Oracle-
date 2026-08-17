@@ -1103,6 +1103,42 @@ async function handleApi(req, res, url) {
       const order = rowToTradeOrder(await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]));
       if (!order) return { status: 404, body: { ok: false, error: "order_not_found" } };
       if (order.status !== "PENDING_CONFIRMATION") return { status: 400, body: { ok: false, error: "order_not_pending" } };
+      // Safety-net expiry: the price-distance check below already catches a setup
+      // that's stale because the market moved, but a quiet pair could still sit
+      // within tolerance 40 minutes later and get confirmed against an analysis
+      // nobody re-read. Auto-cancel instead of trusting "still pending" to mean
+      // "still wanted".
+      const ORDER_EXPIRY_MINUTES = 20;
+      const ageMinutes = (Date.now() - new Date(order.createdAt).getTime()) / 60000;
+      if (ageMinutes > ORDER_EXPIRY_MINUTES) {
+        await sqlRun(`UPDATE trade_orders SET status = 'CANCELLED' WHERE id = ?`, [order.id]);
+        return { status: 409, body: { ok: false, error: "order_expired", expiryMinutes: ORDER_EXPIRY_MINUTES } };
+      }
+      // An order is a market order (executes at whatever the price is right now, not
+      // at the "entry" Kronos computed at /api/trade/prepare time -- see
+      // sendOrderToBroker) but nothing stopped a confirm from firing minutes or hours
+      // later, long after the analyzed setup stopped meaning anything. Same
+      // can't-verify-don't-ship philosophy as validateTradeLevels: reject the confirm
+      // itself (order stays PENDING_CONFIRMATION, doesn't touch the daily cap) rather
+      // than silently sending a stale setup to the broker. Doesn't mutate the order,
+      // so this is safe to fail before the daily-cap count below.
+      const currentPrice = await getAnalysisPrice(order.pair).catch(() => null);
+      if (!currentPrice || !isUsableLivePrice(currentPrice)) {
+        return { status: 409, body: { ok: false, error: "price_unavailable" } };
+      }
+      const priceDistance = Math.abs(order.entry - currentPrice.price) / Math.max(Math.abs(currentPrice.price), 1);
+      const priceTolerance = levelTolerance(order.pair);
+      if (priceDistance > priceTolerance) {
+        return {
+          status: 409,
+          body: {
+            ok: false,
+            error: "price_moved",
+            distancePercent: Math.round(priceDistance * 10000) / 100,
+            tolerancePercent: Math.round(priceTolerance * 10000) / 100,
+          },
+        };
+      }
       // Safety net, not a business limit: caps how many real orders one account can
       // send to a broker in a single day, so a UI bug or a confused user can't fire
       // off far more real trades than anyone intended before anyone notices.
@@ -6798,6 +6834,14 @@ async function sendOrderToBroker(order) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
+    // MetaApi's trade endpoint returns HTTP 200 even when the broker rejects the
+    // trade (e.g. numericCode 10016 TRADE_RETCODE_INVALID_STOPS) -- confirmed live
+    // against the real account: an invalid-stops rejection came back as a 200 with
+    // no orderId/positionId. HTTP success alone is not proof the order was placed;
+    // numericCode 10009 (TRADE_RETCODE_DONE) is MT5's actual "order placed" signal.
+    if (data?.numericCode !== 10009) {
+      return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
+    }
     return { ok: true, brokerOrderId: String(data?.orderId ?? data?.positionId ?? "") };
   } catch (error) {
     return { ok: false, error: `broker_request_failed: ${error.message}` };
