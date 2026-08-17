@@ -3343,9 +3343,12 @@ async function groqVision(prompt, images, maxTokens = 1000) {
           throw new Error(`groq_vision_${response.status}_${model}: ${errText.slice(0, 240)}`);
         }
         const data = await response.json();
-        return data.choices?.[0]?.message?.content?.trim() || "";
+        return {
+          text: data.choices?.[0]?.message?.content?.trim() || "",
+          truncated: data.choices?.[0]?.finish_reason === "length",
+        };
       });
-      if (result) {
+      if (result.text) {
         recordProviderHealth("groq_vision", true);
         return result;
       }
@@ -3354,15 +3357,22 @@ async function groqVision(prompt, images, maxTokens = 1000) {
       logOnce("groq_vision", `${model} indisponible (${error.message})`);
     }
   }
-  return "";
+  return { text: "", truncated: false };
 }
 
 async function analyzeChartImage(prompt, images, maxTokens = 1000) {
   if (!images?.length) return "";
   if (GROQ_KEYS.length && GROQ_VISION_ENABLED) {
     const result = await groqVision(prompt, images, maxTokens);
-    if (result && result.length > 50) return result;
-    logOnce("vision", "Groq Vision insuffisant, bascule Gemini Vision.");
+    // Reported live: a Profonde-mode answer came back long (hundreds of characters --
+    // structure description, echoed technical data) but was cut off mid-sentence
+    // before ever reaching SCORE_CONFIANCE, so the pipeline correctly blocked it
+    // ("format de réponse IA non reconnu") -- but never retried with Gemini's larger
+    // budget, because `result.length > 50` was already satisfied by the truncated
+    // text. Length alone can't tell a genuinely short answer from a long one that got
+    // cut off right before the part that matters; finish_reason can.
+    if (result.text && result.text.length > 50 && !result.truncated) return result.text;
+    logOnce("vision", result.truncated ? "Groq Vision tronqué (MAX_TOKENS), bascule Gemini Vision." : "Groq Vision insuffisant, bascule Gemini Vision.");
   }
   if (GEMINI_KEYS.length) {
     // The *0.7 discount here predates gemini-flash-latest and was sized for the old
@@ -3375,8 +3385,12 @@ async function analyzeChartImage(prompt, images, maxTokens = 1000) {
     // generous cap costs nothing when the model finishes early (finishReason STOP),
     // so there's no real downside to erring high here.
     const result = await geminiVision(prompt, images, maxTokens + 3000);
-    if (result && result.length > 50) return result;
+    if (result.text && result.text.length > 50 && !result.truncated) return result.text;
+    // Both providers truncated or came back empty: a truncated-but-nonempty answer is
+    // still strictly better than nothing for the caller's own length-based fallbacks
+    // downstream, so return whichever text is longest rather than discarding both.
     logOnce("vision", "Gemini Vision insuffisant.");
+    return result.text.length > 50 ? result.text : "";
   }
   return "";
 }
@@ -3400,11 +3414,11 @@ async function visionConsensusCheck(images) {
     // answer, and got cut off mid-JSON (finishReason MAX_TOKENS, unparseable) at both
     // 120 and 200. 300 was the first value that reliably reached finishReason STOP
     // with valid JSON; 400 leaves margin.
-    promiseWithTimeout(groqVision(VISION_CONSENSUS_PROMPT, images, 400), 12000, ""),
-    promiseWithTimeout(geminiVision(VISION_CONSENSUS_PROMPT, images, 400), 12000, ""),
+    promiseWithTimeout(groqVision(VISION_CONSENSUS_PROMPT, images, 400), 12000, { text: "", truncated: false }),
+    promiseWithTimeout(geminiVision(VISION_CONSENSUS_PROMPT, images, 400), 12000, { text: "", truncated: false }),
   ]);
-  const a = parseJson(groqAnswer, null);
-  const b = parseJson(geminiAnswer, null);
+  const a = parseJson(groqAnswer.text, null);
+  const b = parseJson(geminiAnswer.text, null);
   if (!a || !b) return { checked: false };
   const biasA = String(a.bias || "").toLowerCase();
   const biasB = String(b.bias || "").toLowerCase();
@@ -3455,9 +3469,12 @@ async function geminiVision(prompt, images, maxTokens = 700) {
           throw new Error(`gemini_${response.status}_${model}: ${errText.slice(0, 240)}`);
         }
         const data = await response.json();
-        return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "";
+        return {
+          text: data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "",
+          truncated: data.candidates?.[0]?.finishReason === "MAX_TOKENS",
+        };
       });
-      if (result) {
+      if (result.text) {
         recordProviderHealth("gemini_vision", true);
         return result;
       }
@@ -3466,7 +3483,7 @@ async function geminiVision(prompt, images, maxTokens = 700) {
       logOnce("gemini_vision", `${model} indisponible (${error.message})`);
     }
   }
-  return "";
+  return { text: "", truncated: false };
 }
 
 async function fetchJson(url, timeoutMs = 2200) {
