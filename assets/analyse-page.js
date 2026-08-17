@@ -429,6 +429,7 @@
           ${renderCopyValue("R/R ratio", result.rr, "rr")}
           <div class="level-card tech"><span>Technique</span><strong>${escapeHtml(result.technique)}</strong></div>
         </div>
+        ${renderPriceFreshness(result)}
         <div class="score-line">
           <div class="signal-bottom"><span>Score d'efficacité</span><strong>${result.score}%</strong></div>
           <div class="oracle-score"><span class="score-fill ${scoreColor(result.score)}" style="width:${result.score}%"></span></div>
@@ -650,6 +651,19 @@
         ${metaHtml}
       </details>
     `;
+  }
+
+  // Was buried in the collapsed "Détails avancés" section with no age indicator at
+  // all -- a user reading a result after a slow Profonde-mode analysis (60-90+s,
+  // confirmed live) had no way to know the entry was checked against a price from a
+  // minute and a half ago. Shown inline, next to the levels, not hidden.
+  function renderPriceFreshness(result) {
+    const asOf = result.meta?.livePriceAsOf;
+    if (!asOf) return "";
+    const seconds = Math.max(0, Math.round((Date.now() - new Date(asOf).getTime()) / 1000));
+    const label = seconds < 20 ? "à l'instant" : seconds < 60 ? `il y a ${seconds}s` : `il y a ${Math.round(seconds / 60)} min`;
+    const stale = seconds >= 90;
+    return `<p class="result-price-freshness${stale ? " stale" : ""}">Prix vérifié ${label}${stale ? " — vérifie le marché avant d'agir." : "."}</p>`;
   }
 
   function renderAnalysisMeta(result) {

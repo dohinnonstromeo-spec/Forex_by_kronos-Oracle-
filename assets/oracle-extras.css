@@ -1696,6 +1696,17 @@ body {
   gap: 6px;
 }
 
+.result-price-freshness {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.result-price-freshness.stale {
+  color: var(--neon-red, #ff5c5c);
+  font-weight: 600;
+}
+
 .score-fill.green { background: var(--neon-green); }
 .score-fill.orange { background: var(--neon-orange); }
 .score-fill.red { background: var(--neon-red); }

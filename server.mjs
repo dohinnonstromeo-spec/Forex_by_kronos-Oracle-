@@ -1551,7 +1551,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
-    const livePrice = await getAnalysisPrice(selectedPair);
+    let livePrice = await getAnalysisPrice(selectedPair);
     // Fired alongside the main history fetch below (independent data, different
     // granularity -- the deterministic engine wasn't backtested per user-chosen
     // timeframe/strategy), awaited together with `answer` further down so this costs
@@ -1708,6 +1708,18 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     }
     const visionConsensus = await visionConsensusPromise;
     const deterministicCheck = await crossCheckPromise;
+    // Reported live: a real user kept getting entries visibly far from the price they
+    // saw when they finished reading the result. Traced it here -- livePrice above was
+    // captured before the AI call, and Profonde mode can take 60-90+s (confirmed live,
+    // repeatedly, this session). validateTradeLevels was checking the entry against a
+    // price that could be a minute and a half stale by the time anyone read it, with
+    // no indication of that anywhere in the response. Re-fetching right before the
+    // entry is actually validated checks "is this sane right now," which is what
+    // matters -- falls back to the original price if the refetch itself fails, rather
+    // than losing an otherwise-valid analysis to a transient provider hiccup on this
+    // last step.
+    const refreshedPrice = await getAnalysisPrice(selectedPair).catch(() => null);
+    if (refreshedPrice && Number.isFinite(Number(refreshedPrice.price))) livePrice = refreshedPrice;
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup, visionConsensus, deterministicCrossCheck: deterministicCheck });
     if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user, isTest: isTestRequest(req) });
     return result;
@@ -4153,6 +4165,10 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     capital: body.capital || null,
     analysisDepth: body.analysisDepth || "Profonde",
     livePrice: Number.isFinite(live) ? live : null,
+    // Surfaced so the UI can show how old this price actually is instead of
+    // presenting it as instantaneous -- see the refetch-before-validation fix in
+    // runKronosAnalysis for why this matters (Profonde mode can take 60-90+s).
+    livePriceAsOf: livePrice?.asOf || null,
     liveUsable,
     imageQuality,
     calibration,
