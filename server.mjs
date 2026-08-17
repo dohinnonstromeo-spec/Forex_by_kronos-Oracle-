@@ -3372,19 +3372,25 @@ async function groqVision(prompt, images, maxTokens = 1000) {
   return { text: "", truncated: false };
 }
 
+// Reported live twice: a response can come back long (hundreds of characters --
+// structure description, echoed technical data) and still never reach
+// SCORE_CONFIANCE. The first time, finish_reason correctly said "length" and the fix
+// was to check that instead of just text length. The second time, finish_reason said
+// nothing was wrong (the call "completed normally") but the content was cut short
+// anyway -- a model degenerate-stopping mid-answer, not a token-budget ceiling. Length
+// and finish_reason both missed it; the one thing that can't lie is whether the tag
+// the downstream parser actually needs is there. This is the same regex
+// parseConfidenceScore (search "SCORE_CONFIANCE\s*:?\s*(\d{1,3})") uses to read it.
+function hasConfidenceTag(text) {
+  return /SCORE_CONFIANCE\s*:?\s*\d{1,3}/i.test(String(text || ""));
+}
+
 async function analyzeChartImage(prompt, images, maxTokens = 1000) {
   if (!images?.length) return "";
   if (GROQ_KEYS.length && GROQ_VISION_ENABLED) {
     const result = await groqVision(prompt, images, maxTokens);
-    // Reported live: a Profonde-mode answer came back long (hundreds of characters --
-    // structure description, echoed technical data) but was cut off mid-sentence
-    // before ever reaching SCORE_CONFIANCE, so the pipeline correctly blocked it
-    // ("format de réponse IA non reconnu") -- but never retried with Gemini's larger
-    // budget, because `result.length > 50` was already satisfied by the truncated
-    // text. Length alone can't tell a genuinely short answer from a long one that got
-    // cut off right before the part that matters; finish_reason can.
-    if (result.text && result.text.length > 50 && !result.truncated) return result.text;
-    logOnce("vision", result.truncated ? "Groq Vision tronqué (MAX_TOKENS), bascule Gemini Vision." : "Groq Vision insuffisant, bascule Gemini Vision.");
+    if (result.text && result.text.length > 50 && !result.truncated && hasConfidenceTag(result.text)) return result.text;
+    logOnce("vision", result.truncated ? "Groq Vision tronqué (MAX_TOKENS), bascule Gemini Vision." : "Groq Vision incomplet (SCORE_CONFIANCE absent), bascule Gemini Vision.");
   }
   if (GEMINI_KEYS.length) {
     // The *0.7 discount here predates gemini-flash-latest and was sized for the old
@@ -3397,12 +3403,20 @@ async function analyzeChartImage(prompt, images, maxTokens = 1000) {
     // generous cap costs nothing when the model finishes early (finishReason STOP),
     // so there's no real downside to erring high here.
     const result = await geminiVision(prompt, images, maxTokens + 3000);
-    if (result.text && result.text.length > 50 && !result.truncated) return result.text;
-    // Both providers truncated or came back empty: a truncated-but-nonempty answer is
-    // still strictly better than nothing for the caller's own length-based fallbacks
-    // downstream, so return whichever text is longest rather than discarding both.
-    logOnce("vision", "Gemini Vision insuffisant.");
-    return result.text.length > 50 ? result.text : "";
+    if (result.text && result.text.length > 50 && !result.truncated && hasConfidenceTag(result.text)) return result.text;
+    logOnce("vision", "Gemini Vision incomplet aussi (SCORE_CONFIANCE absent).");
+    // Both providers came back incomplete: one more attempt at Groq with a wider
+    // budget before giving up. LLM sampling is stochastic -- the same prompt that
+    // degenerate-stopped once doesn't necessarily fail the same way twice, and this
+    // is strictly better than accepting a truncated answer the pipeline can only
+    // block anyway ("format de réponse IA non reconnu").
+    if (GROQ_KEYS.length && GROQ_VISION_ENABLED) {
+      const retry = await groqVision(prompt, images, maxTokens + 800);
+      if (retry.text && retry.text.length > 50 && !retry.truncated && hasConfidenceTag(retry.text)) return retry.text;
+      logOnce("vision", "Groq Vision (2e tentative) incomplet aussi.");
+      return retry.text.length > result.text.length ? retry.text : result.text;
+    }
+    return result.text || "";
   }
   return "";
 }
