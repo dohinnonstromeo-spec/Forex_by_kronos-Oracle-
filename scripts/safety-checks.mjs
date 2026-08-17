@@ -49,7 +49,11 @@ function pricePayload(symbol, value, source, error, options = {}) {
     stale,
     reliability,
     trustworthy: Boolean(open && !stale && live && reliability >= 70),
-    asOf: new Date().toISOString(),
+    // Preserve the incoming value's own asOf (a reused cached object) instead of
+    // always stamping "now" -- see the matching comment in server.mjs for the bug
+    // this closes (a cached price's freshness clock resetting on every reuse,
+    // letting a fetched-once price freeze indefinitely under real traffic).
+    asOf: value?.asOf || new Date().toISOString(),
   };
 }
 
@@ -166,6 +170,20 @@ check("hardcoded emergency fallback: trustworthy=false", emergencyFallback.trust
 
 const marketClosed = pricePayload("XAU/USD", { price: 4348.61, change: 0 }, "twelve_data", null, { stale: false, reliability: 90, open: false });
 check("real price but market closed: trustworthy=false", marketClosed.trustworthy === false);
+
+// Third real bug, reported live 2026-08-17, the root cause behind repeated "entry way
+// off the real market" reports across the whole session: asOf used to be
+// unconditionally `new Date().toISOString()`, including when re-wrapping an already-
+// cached value (fetchBestPrice's "fresh_cache" branch does exactly this to skip a
+// real provider call). That reset the freshness clock on every reuse, so
+// isRecentCache() never saw the cache age past its TTL under regular traffic -- a
+// price fetched once could freeze indefinitely while every response still claimed
+// stale:false/trustworthy:true, because those flags were computed from the same wrong
+// "now" timestamp, not from how old the underlying value actually was.
+const genuinelyFresh = pricePayload("XAU/USD", { price: 4157.28, change: 1.2 }, "twelve_data", null, { reliability: 95 });
+const reusedFromCache = pricePayload("XAU/USD", genuinelyFresh, "twelve_data", "fresh_cache", { stale: false, reliability: 90 });
+check("cache-reuse preserves the original fetch time instead of resetting it", reusedFromCache.asOf === genuinelyFresh.asOf);
+check("a genuinely fresh fetch still gets its own real timestamp", Boolean(genuinelyFresh.asOf));
 
 console.log("\n=== assessAnalysisDataReliability: no partial credit for a fake-but-finite price ===");
 

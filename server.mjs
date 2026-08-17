@@ -2977,7 +2977,20 @@ function pricePayload(symbol, value, source, error, options = {}) {
     // See scripts/safety-checks.mjs for the regression tests covering this.
     trustworthy: Boolean(open && !stale && live && reliability >= 70),
     assetClass: assetClass(symbol),
-    asOf: new Date().toISOString(),
+    // The actual root cause behind repeated "entry way off the real market" reports:
+    // this used to be unconditionally `new Date().toISOString()`, including in
+    // fetchBestPrice's cache-reuse branch (`pricePayload(symbol, cached, ...)`).
+    // That branch exists specifically to skip a real provider call when the cached
+    // value is still within its TTL -- but stamping a fresh `asOf` on every reuse
+    // resets the freshness clock every time, so isRecentCache() never sees the cache
+    // age past its TTL and a real re-fetch never happens again. A price fetched once
+    // could freeze forever, silently, while every response still claimed
+    // `stale:false, trustworthy:true` because those flags were computed from the same
+    // wrong "now" timestamp. Preserving the incoming value's own `asOf` when it has
+    // one (a reused cached object) and only stamping a new one for genuinely fresh
+    // provider data (which never carries `.asOf` itself, see fetchTwelveDataPrice
+    // etc.) makes the cache actually expire on schedule.
+    asOf: value?.asOf || new Date().toISOString(),
   };
 }
 
