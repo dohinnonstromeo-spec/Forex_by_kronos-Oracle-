@@ -278,24 +278,35 @@
       host.innerHTML = `<div class="dashboard-empty">Aucune analyse personnelle enregistrée pour ce compte. Lance une analyse depuis la page Analyse IA.</div>`;
       return;
     }
+    // <details>/<summary> instead of always-expanded cards: with real history, 20
+    // fully-expanded cards made the dashboard extremely long for no reason -- only
+    // the pair/direction/status/date need to be visible to scan the list, the
+    // levels/reason/duration only matter once you actually want that one trade.
     host.innerHTML = data.analyses.map((item) => `
-      <article>
-        <div>
-          <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
-          <span>${escapeHtml(item.timeframe)} · ${escapeHtml(item.style)} · ${formatDate(item.createdAt)}</span>
+      <details class="dashboard-history-item">
+        <summary>
+          <span class="dashboard-history-summary-main">
+            <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
+            <span class="${historyStatusClass(item.status)}">${historyStatusIcon(item.status)}${escapeHtml(historyStatusLabel(item))}</span>
+          </span>
+          <span class="dashboard-history-summary-date">${formatDate(item.createdAt)}</span>
+        </summary>
+        <div class="dashboard-history-detail">
+          <span class="dashboard-history-meta">${escapeHtml(item.timeframe)} · ${escapeHtml(item.style)}</span>
+          <div class="dashboard-history-levels">
+            <button type="button" data-copy-level="${escapeHtml(item.entry)}">Entrée ${escapeHtml(item.entry)}</button>
+            <button type="button" data-copy-level="${escapeHtml(item.sl)}">SL ${escapeHtml(item.sl)}</button>
+            <button type="button" data-copy-level="${escapeHtml(item.tp1)}">TP1 ${escapeHtml(item.tp1)}</button>
+            <button type="button" data-copy-level="${escapeHtml(item.tp2)}">TP2 ${escapeHtml(item.tp2)}</button>
+          </div>
+          ${historyDuration(item) ? `<p class="dashboard-history-note">Durée jusqu'à clôture : ${historyDuration(item)}</p>` : ""}
+          ${historyDetailNote(item) ? `<p class="dashboard-history-note">${escapeHtml(historyDetailNote(item))}</p>` : ""}
+          ${item.status === "OPEN" && isPremium ? `
+            <button type="button" class="dashboard-trade-prepare" data-prepare-order="${escapeHtml(item.id)}">Préparer un ordre</button>
+            <p class="dashboard-history-note dashboard-prepare-error" data-prepare-error hidden></p>
+          ` : ""}
         </div>
-        <div class="dashboard-history-levels">
-          <button type="button" data-copy-level="${escapeHtml(item.sl)}">SL ${escapeHtml(item.sl)}</button>
-          <button type="button" data-copy-level="${escapeHtml(item.tp1)}">TP1 ${escapeHtml(item.tp1)}</button>
-          <button type="button" data-copy-level="${escapeHtml(item.tp2)}">TP2 ${escapeHtml(item.tp2)}</button>
-        </div>
-        <span class="${historyStatusClass(item.status)}">${escapeHtml(historyStatusLabel(item))}</span>
-        ${historyDetailNote(item) ? `<p class="dashboard-history-note">${escapeHtml(historyDetailNote(item))}</p>` : ""}
-        ${item.status === "OPEN" && isPremium ? `
-          <button type="button" class="dashboard-trade-prepare" data-prepare-order="${escapeHtml(item.id)}">Préparer un ordre</button>
-          <p class="dashboard-history-note dashboard-prepare-error" data-prepare-error hidden></p>
-        ` : ""}
-      </article>
+      </details>
     `).join("");
     host.querySelectorAll("[data-copy-level]").forEach((button) => {
       button.addEventListener("click", async () => {
@@ -447,6 +458,28 @@
     if (status === "SL_HIT") return "history-loss";
     if (status === "EXPIRED") return "history-expired";
     return "history-blocked";
+  }
+
+  // Checkmark for a win, cross for a loss, right before the label -- neither is
+  // shown for OPEN/EXPIRED/BLOCKED, those aren't a win or a loss.
+  function historyStatusIcon(status) {
+    if (status === "TP1_HIT" || status === "TP2_HIT") return "✓ ";
+    if (status === "SL_HIT") return "✕ ";
+    return "";
+  }
+
+  // createdAt -> closedAt wasn't shown anywhere -- how long a setup actually took to
+  // resolve is exactly the kind of thing worth knowing at a glance per trade.
+  function historyDuration(item) {
+    if (!item.closedAt) return "";
+    const ms = new Date(item.closedAt).getTime() - new Date(item.createdAt).getTime();
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    const minutes = Math.round(ms / 60000);
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} h${minutes % 60 ? ` ${minutes % 60} min` : ""}`;
+    const days = Math.floor(hours / 24);
+    return `${days} j${hours % 24 ? ` ${hours % 24} h` : ""}`;
   }
 
   function historyStatusLabel(item) {

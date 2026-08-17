@@ -1486,26 +1486,84 @@ body {
   margin-top: 16px;
 }
 
-.dashboard-history article,
 .dashboard-empty {
-  display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
   border: 1px solid rgba(255, 255, 255, .1);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, .04);
   padding: 14px;
-}
-
-.dashboard-empty {
-  display: block;
   color: var(--muted-foreground);
 }
 
 .dashboard-history strong {
   display: block;
   color: var(--foreground);
+}
+
+/* Collapsed by default (native <details>): only pair/direction/status/date show
+   until you actually open one -- with real trade history a page of always-expanded
+   cards got extremely long for no reason. */
+.dashboard-history-item {
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, .04);
+  overflow: hidden;
+}
+
+.dashboard-history-item summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.dashboard-history-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.dashboard-history-item summary::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  margin-left: 8px;
+  border-right: 2px solid var(--muted-foreground);
+  border-bottom: 2px solid var(--muted-foreground);
+  transform: rotate(45deg);
+  transition: transform .2s ease;
+  flex-shrink: 0;
+}
+
+.dashboard-history-item[open] summary::after {
+  transform: rotate(-135deg);
+}
+
+.dashboard-history-summary-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.dashboard-history-summary-date {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dashboard-history-detail {
+  display: grid;
+  gap: 8px;
+  padding: 0 14px 14px;
+  border-top: 1px solid rgba(255, 255, 255, .08);
+  padding-top: 12px;
+}
+
+.dashboard-history-meta {
+  color: var(--muted-foreground);
+  font-size: 12px;
 }
 
 .dashboard-history-note {
