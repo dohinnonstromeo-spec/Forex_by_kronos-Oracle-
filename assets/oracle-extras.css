@@ -2072,8 +2072,19 @@ body {
   min-height: 76px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 24px;
+}
+
+/* Sits right next to the brand instead of being pushed to the far right with
+   justify-content: space-between (see .home-links' margin-left: auto below, which
+   now does that job for the rest of the nav). */
+.home-nav-cta-early {
+  margin-left: 4px;
+}
+
+.home-links {
+  margin-left: auto;
 }
 
 .home-brand,
