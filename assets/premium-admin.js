@@ -98,6 +98,48 @@
     });
   }
 
+  const tradingStatus = document.querySelector("[data-trading-status]");
+  const tradingRefresh = document.querySelector("[data-trading-refresh]");
+  const tradingPause = document.querySelector("[data-trading-pause]");
+  const tradingResume = document.querySelector("[data-trading-resume]");
+
+  function requireToken() {
+    const token = form?.elements?.token?.value || "";
+    if (!token) setMessage("Renseigne le token admin en haut avant d'utiliser le coupe-circuit.", true);
+    return token;
+  }
+
+  async function refreshTradingStatus() {
+    const token = requireToken();
+    if (!token) return;
+    const data = await adminFetch("/api/admin/trading-status", null, token);
+    if (!data?.ok) {
+      if (tradingStatus) tradingStatus.textContent = data?.message || data?.error || "Statut indisponible.";
+      return;
+    }
+    if (tradingStatus) {
+      tradingStatus.textContent = `${data.paused ? "⏸ EN PAUSE" : "▶ Actif"} · ${data.ordersConfirmedToday} ordre(s) envoyé(s) aujourd'hui (plafond ${data.dailyCapPerUser}/compte/jour) · Broker ${data.brokerConfigured ? "connecté" : "non connecté"}.`;
+    }
+  }
+
+  tradingRefresh?.addEventListener("click", refreshTradingStatus);
+
+  async function setTradingPause(paused) {
+    const token = requireToken();
+    if (!token) return;
+    setMessage(paused ? "Mise en pause..." : "Reprise...", false);
+    const data = await adminFetch("/api/admin/trading-pause", { token, paused });
+    if (!data?.ok) {
+      setMessage(data?.message || data?.error || "Action impossible.", true);
+      return;
+    }
+    setMessage(paused ? "Trading en pause : plus aucun ordre ne partira au broker." : "Trading repris.", false);
+    refreshTradingStatus();
+  }
+
+  tradingPause?.addEventListener("click", () => setTradingPause(true));
+  tradingResume?.addEventListener("click", () => setTradingPause(false));
+
   function setMessage(text, error) {
     if (!message) return;
     message.textContent = text;

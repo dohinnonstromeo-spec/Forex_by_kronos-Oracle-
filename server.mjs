@@ -196,6 +196,15 @@ async function ensureRelationalTables() {
       sent_at text
     )`,
     `CREATE INDEX IF NOT EXISTS idx_trade_orders_user ON trade_orders(user_id)`,
+    // Manual kill switch for semi-automatic execution -- an admin needs to be able to
+    // halt every trade confirmation instantly (a runtime toggle, not a redeploy) if
+    // something looks wrong, without that also depending on the broker or any other
+    // external service being reachable.
+    `CREATE TABLE IF NOT EXISTS app_settings (
+      key text PRIMARY KEY,
+      value text NOT NULL,
+      updated_at text NOT NULL
+    )`,
   ];
   if (pgPool) {
     for (const statement of statements) await pgPool.query(statement);
@@ -847,6 +856,32 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // Manual kill switch for semi-automatic trade execution -- see the pause check
+  // inside /api/trade/confirm. A toggle, not a redeploy, so it takes effect instantly.
+  if (url.pathname === "/api/admin/trading-pause") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    const paused = Boolean(body?.paused);
+    await setAppSetting("trading_paused", paused ? "true" : "false");
+    sendJson(res, 200, { ok: true, paused });
+    return;
+  }
+
+  if (url.pathname === "/api/admin/trading-status") {
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const paused = (await getAppSetting("trading_paused", "false")) === "true";
+    const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+    const sentToday = await sqlGet(
+      `SELECT COUNT(*) as n FROM trade_orders WHERE confirmed_at >= ? AND status IN ('SENT', 'FAILED')`,
+      [todayStart.toISOString()],
+    );
+    sendJson(res, 200, { ok: true, paused, ordersConfirmedToday: Number(sentToday?.n || 0), dailyCapPerUser: TRADE_DAILY_ORDER_CAP, brokerConfigured: BROKER_CONFIGURED });
+    return;
+  }
+
   if (url.pathname === "/api/market-status") {
     sendJson(res, 200, marketStatus());
     return;
@@ -1052,21 +1087,46 @@ async function handleApi(req, res, url) {
     const volume = Number(body?.volume);
     if (!orderId || !Number.isFinite(volume) || volume <= 0) return sendJson(res, 400, { ok: false, error: "invalid_request" });
     await ensureRelationalTables();
-    const order = rowToTradeOrder(await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]));
-    if (!order) return sendJson(res, 404, { ok: false, error: "order_not_found" });
-    if (order.status !== "PENDING_CONFIRMATION") return sendJson(res, 400, { ok: false, error: "order_not_pending" });
-    order.volume = volume;
-    order.confirmedAt = new Date().toISOString();
-    const result = await sendOrderToBroker(order);
-    order.status = result.ok ? "SENT" : "FAILED";
-    order.brokerOrderId = result.ok ? result.brokerOrderId : null;
-    order.errorMessage = result.ok ? null : result.error;
-    order.sentAt = result.ok ? new Date().toISOString() : null;
-    await sqlRun(
-      `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ?`,
-      [order.volume, order.status, order.brokerOrderId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
-    );
-    sendJson(res, result.ok ? 200 : 502, { ok: result.ok, order });
+    // A double-click or a client retry firing two confirms for the same order used to
+    // both read PENDING_CONFIRMATION (the status only flips after sendOrderToBroker
+    // resolves) and both send a real order to the broker. One shared lock instead of a
+    // per-orderId key, same reasoning as anon-quota/rate-limit-attempts elsewhere in
+    // this file: orderId is unbounded over time and fileLocks never sweeps its keys,
+    // so a dynamic key would leak memory. Confirms are rare and human-paced, so
+    // serializing all of them globally costs nothing real.
+    const result = await withFileLock("trade-confirm", async () => {
+      // Manual kill switch: an admin can halt every confirmation instantly (see
+      // /api/admin/trading-pause) without redeploying, if something looks wrong.
+      const paused = (await getAppSetting("trading_paused", "false")) === "true";
+      if (paused) return { status: 423, body: { ok: false, error: "trading_paused" } };
+      const order = rowToTradeOrder(await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]));
+      if (!order) return { status: 404, body: { ok: false, error: "order_not_found" } };
+      if (order.status !== "PENDING_CONFIRMATION") return { status: 400, body: { ok: false, error: "order_not_pending" } };
+      // Safety net, not a business limit: caps how many real orders one account can
+      // send to a broker in a single day, so a UI bug or a confused user can't fire
+      // off far more real trades than anyone intended before anyone notices.
+      const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+      const sentToday = await sqlGet(
+        `SELECT COUNT(*) as n FROM trade_orders WHERE user_id = ? AND confirmed_at >= ? AND status IN ('SENT', 'FAILED')`,
+        [session.user.id, todayStart.toISOString()],
+      );
+      if (Number(sentToday?.n || 0) >= TRADE_DAILY_ORDER_CAP) {
+        return { status: 429, body: { ok: false, error: "daily_order_cap_reached", cap: TRADE_DAILY_ORDER_CAP } };
+      }
+      order.volume = volume;
+      order.confirmedAt = new Date().toISOString();
+      const broker = await sendOrderToBroker(order);
+      order.status = broker.ok ? "SENT" : "FAILED";
+      order.brokerOrderId = broker.ok ? broker.brokerOrderId : null;
+      order.errorMessage = broker.ok ? null : broker.error;
+      order.sentAt = broker.ok ? new Date().toISOString() : null;
+      await sqlRun(
+        `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ?`,
+        [order.volume, order.status, order.brokerOrderId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
+      );
+      return { status: broker.ok ? 200 : 502, body: { ok: broker.ok, order } };
+    });
+    sendJson(res, result.status, result.body);
     return;
   }
 
@@ -6565,6 +6625,23 @@ function rowToTradeOrder(row) {
     sentAt: row.sent_at || null,
   };
 }
+
+async function getAppSetting(key, fallback = null) {
+  await ensureRelationalTables();
+  const row = await sqlGet(`SELECT value FROM app_settings WHERE key = ?`, [key]);
+  return row ? row.value : fallback;
+}
+
+async function setAppSetting(key, value) {
+  await ensureRelationalTables();
+  await sqlRun(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [key, value, new Date().toISOString()],
+  );
+}
+
+const TRADE_DAILY_ORDER_CAP = Number(env.TRADE_DAILY_ORDER_CAP || 10);
 
 // MetaApi's REST trade endpoint (built from documented shape, never exercised
 // against a real account -- there is no way to verify this without one). Expect to
