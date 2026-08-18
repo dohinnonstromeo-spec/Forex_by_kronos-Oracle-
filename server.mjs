@@ -7828,6 +7828,13 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
       `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ?`,
       [order.volume, order.status, order.brokerOrderId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
     );
+    // Fire-and-forget, same reasoning as notifyAnalysisClosed: a push send is a
+    // network call to an external provider, no reason to hold the per-user
+    // trade-confirm lock open for it. Covers both paths that reach this function
+    // (manual confirm and the autonomous bot) -- previously neither one notified
+    // on open, only on close, which meant a bot-opened trade was invisible until
+    // it later resolved.
+    if (broker.ok) notifyOrderOpened(order).catch(() => {});
     return { status: broker.ok ? 200 : 502, body: { ok: broker.ok, order } };
   });
 }
@@ -8184,6 +8191,26 @@ async function notifyAnalysisClosed(analysis) {
   const payload = JSON.stringify({
     title: `Oracle Forex · ${analysis.pair}`,
     body: `${outcomeLabel}${rText} · ${analysis.direction} ${formatLevel(analysis.entry, analysis.pair)}`,
+    url: "/dashboard.html",
+  });
+  await sendPushToSubscriptions(subs, payload);
+}
+
+// The open-side counterpart to notifyAnalysisClosed: before this, a user only
+// ever heard from the site when a trade closed, never when one opened -- for the
+// autonomous bot especially, that meant a position could open and close between
+// two checks of the dashboard with the only notification being the close, well
+// after the fact. Reuses the tp_sl topic (not a new one) so every existing
+// subscriber starts getting this immediately, no re-opt-in required -- it's the
+// same "tell me what happened to my trades" subscription, just covering the
+// other half of a trade's lifecycle.
+async function notifyOrderOpened(order) {
+  if (!pushConfigured || !order.userId) return;
+  const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ? AND topics LIKE '%tp_sl%'`, [order.userId]);
+  if (!subs.length) return;
+  const payload = JSON.stringify({
+    title: `Oracle Forex · ${order.pair}`,
+    body: `Position ouverte · ${order.direction} ${formatLevel(order.entry, order.pair)} · SL ${formatLevel(order.sl, order.pair)}`,
     url: "/dashboard.html",
   });
   await sendPushToSubscriptions(subs, payload);

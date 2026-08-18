@@ -261,7 +261,7 @@
   }
 
   const PUSH_TOPIC_LABELS = {
-    tp_sl: { on: "Désactiver les notifications TP/SL", off: "Activer les notifications TP/SL", active: "Notifications TP/SL actives sur cet appareil." },
+    tp_sl: { on: "Désactiver les notifications de trades", off: "Activer les notifications de trades", active: "Notifications d'ouverture/clôture de trades actives sur cet appareil." },
     new_signal: { on: "Désactiver les alertes nouveaux signaux", off: "Activer les alertes nouveaux signaux", active: "Alertes nouveaux signaux actives sur cet appareil." },
   };
 
@@ -269,7 +269,7 @@
   // carries several independently-toggled topics server-side (see
   // /api/push/subscribe's topic param) -- "new_signal" (alerts the moment Kronos
   // detects a fresh high-confidence setup, not tied to a personal analysis) is
-  // premium-only, "tp_sl" (a saved analysis of yours hit TP/SL) is open to everyone.
+  // premium-only, "tp_sl" (one of your trades opened or closed) is open to everyone.
   async function initPush(isPremium) {
     const buttons = [...document.querySelectorAll("[data-push-toggle]")].filter((button) => {
       return button.dataset.pushToggle !== "new_signal" || isPremium;
