@@ -445,6 +445,8 @@
     const CONFIRM_ERROR_LABELS = {
       price_unavailable: "Prix live indisponible -- impossible de vérifier que le setup tient toujours. Réessaie dans un instant.",
       order_expired: "Cet ordre a expiré (trop de temps écoulé depuis la préparation) et a été annulé automatiquement -- relance une analyse pour un ordre à jour.",
+      levels_crossed_by_price: "Le prix a déjà dépassé le TP ou le SL depuis l'analyse -- ce setup n'a plus de sens au prix actuel. Relance une analyse.",
+      levels_too_close_to_price: "Le SL ou le TP est trop proche du prix actuel pour être accepté par le broker maintenant. Relance une analyse.",
       trading_paused: "Trading suspendu temporairement par l'administrateur.",
       daily_order_cap_reached: "Limite quotidienne d'ordres atteinte.",
     };
@@ -468,7 +470,7 @@
         // message off the screen the instant it appears, for no reason, since
         // nothing about the order actually changed. Only reload when the order's
         // real status did (sent/failed/expired).
-        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "trading_paused", "daily_order_cap_reached"]);
+        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached"]);
         try {
           const response = await fetch("/api/trade/confirm", {
             method: "POST",

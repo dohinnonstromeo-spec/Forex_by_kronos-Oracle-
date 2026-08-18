@@ -1139,6 +1139,24 @@ async function handleApi(req, res, url) {
           },
         };
       }
+      // Confirmed live against a real account: the check above (is the live price
+      // still within the analyzed context) let a real order through that the broker
+      // then rejected with TRADE_RETCODE_INVALID_STOPS -- a tight scalp SL/TP (~$2 on
+      // XAU/USD) sat well inside that percentage tolerance while the market had
+      // already drifted past TP1 itself. A market order executes at the live price,
+      // not "entry", so SL/TP have to be validated against live price directly, not
+      // just checked for being "close enough" to a number that's about to be ignored.
+      const buyOrder = order.direction === "ACHAT";
+      const sideValid = buyOrder
+        ? currentPrice.price < order.tp1 && currentPrice.price > order.sl
+        : currentPrice.price > order.tp1 && currentPrice.price < order.sl;
+      if (!sideValid) {
+        return { status: 409, body: { ok: false, error: "levels_crossed_by_price" } };
+      }
+      const minDistance = executionCostBuffer(order.pair);
+      if (Math.abs(currentPrice.price - order.sl) < minDistance || Math.abs(order.tp1 - currentPrice.price) < minDistance) {
+        return { status: 409, body: { ok: false, error: "levels_too_close_to_price" } };
+      }
       // Safety net, not a business limit: caps how many real orders one account can
       // send to a broker in a single day, so a UI bug or a confused user can't fire
       // off far more real trades than anyone intended before anyone notices.
