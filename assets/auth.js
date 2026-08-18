@@ -342,7 +342,7 @@
         <summary>
           <span class="dashboard-history-summary-main">
             <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
-            <span class="${historyStatusClass(item.status)}">${historyStatusIcon(item.status)}${escapeHtml(historyStatusLabel(item))}</span>
+            <span class="${historyStatusClass(item)}">${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}</span>
           </span>
           <span class="dashboard-history-summary-date">${formatDate(item.createdAt)}</span>
         </summary>
@@ -793,7 +793,7 @@
       <article class="dashboard-trade-order">
         <div>
           <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
-          <span class="${historyStatusClass(item.status)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item.status)}${escapeHtml(historyStatusLabel(item))}</span>
+          <span class="${historyStatusClass(item)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}</span>
         </div>
         <div class="dashboard-history-levels">
           <span>Entrée ${escapeHtml(item.entry)}</span>
@@ -804,19 +804,28 @@
     `).join("");
   }
 
-  function historyStatusClass(status) {
+  // CLOSED_MANUALLY (position closed directly at the broker -- app, dealer, EA --
+  // instead of an automatic SL/TP hit, see getBrokerPositionOutcome server-side)
+  // has no fixed win/loss direction the way TP1_HIT/SL_HIT do: it could be a manual
+  // close in profit or at a loss, so it reads the real rMultiple sign instead of a
+  // hardcoded class.
+  function historyStatusClass(item) {
+    const status = item.status;
     if (status === "OPEN") return "history-open";
     if (status === "TP1_HIT" || status === "TP2_HIT") return "history-win";
     if (status === "SL_HIT") return "history-loss";
+    if (status === "CLOSED_MANUALLY") return Number(item.rMultiple) >= 0 ? "history-win" : "history-loss";
     if (status === "EXPIRED") return "history-expired";
     return "history-blocked";
   }
 
   // Checkmark for a win, cross for a loss, right before the label -- neither is
   // shown for OPEN/EXPIRED/BLOCKED, those aren't a win or a loss.
-  function historyStatusIcon(status) {
+  function historyStatusIcon(item) {
+    const status = item.status;
     if (status === "TP1_HIT" || status === "TP2_HIT") return "✓ ";
     if (status === "SL_HIT") return "✕ ";
+    if (status === "CLOSED_MANUALLY") return Number(item.rMultiple) >= 0 ? "✓ " : "✕ ";
     return "";
   }
 
@@ -839,6 +848,7 @@
     if (item.status === "TP1_HIT") return r ? `TP1 touché · ${r}` : "TP1 touché";
     if (item.status === "TP2_HIT") return r ? `TP2 touché · ${r}` : "TP2 touché";
     if (item.status === "SL_HIT") return r ? `Stop Loss touché · ${r}` : "Stop Loss touché";
+    if (item.status === "CLOSED_MANUALLY") return r ? `Clôturé manuellement · ${r}` : "Clôturé manuellement";
     if (item.status === "EXPIRED") return r ? `Expiré · ${r}` : "Expiré";
     if (item.status === "BLOCKED") return "Bloquée";
     return "En cours";
@@ -850,7 +860,7 @@
   // and never showed the actual exit price for a closed trade.
   function historyDetailNote(item) {
     if (item.status === "BLOCKED" && item.blockReason) return item.blockReason;
-    if (["TP1_HIT", "TP2_HIT", "SL_HIT", "EXPIRED"].includes(item.status)) {
+    if (["TP1_HIT", "TP2_HIT", "SL_HIT", "CLOSED_MANUALLY", "EXPIRED"].includes(item.status)) {
       const price = Number.isFinite(item.closePrice) ? `clôturé à ${item.closePrice}` : "";
       // outcomeReason repeats the status label word-for-word for TP/SL hits ("TP1
       // touché.") -- only worth showing for EXPIRED, where it explains a status the

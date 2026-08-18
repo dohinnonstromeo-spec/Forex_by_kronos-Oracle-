@@ -7842,6 +7842,48 @@ async function getBrokerSymbolSpecification(credentials, pair) {
   };
 }
 
+// Ground truth for a broker-executed position, confirmed live against a real
+// MetaApi demo account. Before this, updateLearningOutcomes only ever simulated
+// an outcome by replaying candle history against the SL/TP levels recorded at
+// order-open time -- it never once asked the broker what actually happened
+// afterward. That meant a position closed manually from the trading app (not
+// through this site at all) stayed "OPEN" in our own records forever, and if the
+// market later happened to cross the ORIGINAL recorded SL, the scheduler would
+// retroactively mark it SL_HIT even though the real position had already been
+// closed by hand, at a real profit, minutes or hours earlier -- confirmed to be
+// exactly this bug from a real user report with real MT5 screenshots.
+// /positions lists only currently-open positions; /history-deals/position/{id}
+// returns the deal(s) for one position once it's closed, including the REAL
+// close price/profit and a `reason` (DEAL_REASON_SL / DEAL_REASON_TP /
+// DEAL_REASON_MOBILE / DEAL_REASON_CLIENT / DEAL_REASON_DEALER) that tells us
+// whether it was an automatic SL/TP hit or a manual close from the app/dealer --
+// both endpoints verified live this session against the real account.
+async function getBrokerPositionOutcome(credentials, positionId) {
+  const region = credentials.region || "new-york";
+  const base = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}`;
+  const headers = { "auth-token": credentials.token };
+  const positionsRes = await fetch(`${base}/positions`, { headers, signal: AbortSignal.timeout(10000) });
+  if (!positionsRes.ok) return null;
+  const positions = await positionsRes.json();
+  if (!Array.isArray(positions)) return null;
+  if (positions.some((p) => String(p.id) === String(positionId))) {
+    return { status: "still_open" };
+  }
+  const dealsRes = await fetch(`${base}/history-deals/position/${positionId}`, { headers, signal: AbortSignal.timeout(10000) });
+  if (!dealsRes.ok) return null;
+  const deals = await dealsRes.json();
+  if (!Array.isArray(deals)) return null;
+  const closingDeal = deals.find((deal) => deal.entryType === "DEAL_ENTRY_OUT");
+  if (!closingDeal) return null; // position not open, but no closing deal found yet -- treat as unresolved, try again next tick
+  return {
+    status: "closed",
+    closePrice: Number(closingDeal.price),
+    profit: Number(closingDeal.profit || 0) + Number(closingDeal.commission || 0) + Number(closingDeal.swap || 0),
+    reason: closingDeal.reason || null,
+    closedAt: closingDeal.time || new Date().toISOString(),
+  };
+}
+
 // Never guessed, never rounded up. valuePerUnit = lossTickValue / tickSize is the
 // account-currency P&L of a 1.0-price-unit move for one lot; riskAmount / (slDistance
 // * valuePerUnit) is the volume that risks exactly riskPercent of balance at the SL.
@@ -7986,8 +8028,57 @@ async function updateLearningOutcomes(prices = null, histories = null) {
     const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ?`, [1]);
     if (openRows.length) {
       const livePrices = prices || await getPrices();
+      // For any OPEN analysis that actually went through a real broker order (semi-
+      // automatic confirm or the autonomous bot -- trade_orders.status = 'SENT' with
+      // a broker_order_id), the broker itself is the ground truth for what happened,
+      // not a simulation. See getBrokerPositionOutcome for why this exists: without
+      // it, a position closed by hand from the trading app (never told to this site
+      // at all) just sat OPEN in our own records until the market later happened to
+      // cross the ORIGINAL recorded SL, at which point this scheduler would
+      // retroactively mark it SL_HIT even though it had already been closed by hand
+      // at a real profit -- a real bug reported with real MT5 screenshots.
+      const brokerOrderRows = await sqlAll(
+        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id
+         FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
+        [],
+      );
+      const brokerOrderByAnalysisId = new Map(brokerOrderRows.map((row) => [row.analysis_id, row]));
+      const credentialsCache = new Map(); // userId -> credentials | null, one lookup per user per tick
       for (const row of openRows) {
         const analysis = rowToAnalysis(row);
+
+        const brokerOrder = brokerOrderByAnalysisId.get(analysis.id);
+        if (brokerOrder) {
+          if (!credentialsCache.has(brokerOrder.user_id)) {
+            credentialsCache.set(brokerOrder.user_id, await getUserBrokerCredentials(brokerOrder.user_id).catch(() => null));
+          }
+          const credentials = credentialsCache.get(brokerOrder.user_id);
+          if (credentials) {
+            const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
+            if (brokerOutcome?.status === "still_open") continue; // confirmed still live at the broker -- no 24h EXPIRED fallback needed, this is authoritative
+            if (brokerOutcome?.status === "closed") {
+              const brokerStatus = brokerOutcome.reason === "DEAL_REASON_SL" ? "SL_HIT"
+                : brokerOutcome.reason === "DEAL_REASON_TP" ? "TP1_HIT" // the broker only ever receives tp1 as a real order-level TP (see sendOrderToBroker) -- tp2 is purely an internal secondary target this site tracks itself, never sent to the broker, so a broker-side TP hit is always tp1
+                : "CLOSED_MANUALLY"; // DEAL_REASON_MOBILE/CLIENT/DEALER -- a human closed it directly at the broker, not an automatic level touch
+              const profit = brokerOutcome.profit;
+              analysis.status = brokerStatus;
+              analysis.closedAt = brokerOutcome.closedAt;
+              analysis.closePrice = brokerOutcome.closePrice;
+              analysis.outcome = profit > 0 ? "win" : profit < 0 ? "loss" : "neutral";
+              analysis.outcomeReason = brokerStatus === "CLOSED_MANUALLY"
+                ? `Clôturé manuellement au broker (${profit >= 0 ? "+" : ""}${profit.toFixed(2)}).`
+                : brokerStatus === "SL_HIT" ? "Stop Loss touché (confirmé par le broker)." : "TP1 touché (confirmé par le broker).";
+              analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
+              await upsertAnalysisRow(analysis);
+              if (analysis.userId && !analysis.isTest) justClosed.push(analysis);
+              continue;
+            }
+            // brokerOutcome null (query failed, e.g. broker temporarily unreachable) --
+            // fall through to the existing candle-history simulation below rather than
+            // leaving the row stuck unevaluated for an entire tick.
+          }
+        }
+
         const price = Number(livePrices[analysis.pair]?.price);
         if (!Number.isFinite(price)) continue;
         // A fast scalp setup (SL/TP a couple dollars from entry) can spike through
@@ -8042,7 +8133,7 @@ async function notifyAnalysisClosed(analysis) {
   if (!pushConfigured) return;
   const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ? AND topics LIKE '%tp_sl%'`, [analysis.userId]);
   if (!subs.length) return;
-  const outcomeLabel = { TP1_HIT: "TP1 touché", TP2_HIT: "TP2 touché", SL_HIT: "Stop Loss touché", EXPIRED: "Expiré" }[analysis.status] || analysis.status;
+  const outcomeLabel = { TP1_HIT: "TP1 touché", TP2_HIT: "TP2 touché", SL_HIT: "Stop Loss touché", CLOSED_MANUALLY: "Clôturé manuellement", EXPIRED: "Expiré" }[analysis.status] || analysis.status;
   const rText = Number.isFinite(analysis.rMultiple) ? ` (${analysis.rMultiple >= 0 ? "+" : ""}${analysis.rMultiple.toFixed(2)}R)` : "";
   const payload = JSON.stringify({
     title: `Oracle Forex · ${analysis.pair}`,
