@@ -240,10 +240,21 @@ async function ensureRelationalTables() {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_auto_trading_status ON auto_trading_accounts(approval_status)`,
   ];
-  if (pgPool) {
-    for (const statement of statements) await pgPool.query(statement);
-  } else {
-    for (const statement of statements) getSqliteDb().exec(statement);
+  // Confirmed live in production: one statement in this list failing for any
+  // reason (a transient pooler/connection hiccup, or a genuine error in a single
+  // new table/index) used to throw out of the whole loop, which meant
+  // relationalTablesReady never got set -- and since EVERY endpoint that touches
+  // the database calls ensureRelationalTables() first, one bad statement here took
+  // down every API route on the site at once, even ones with nothing to do with
+  // the failing table. Each statement now fails on its own (logged, not silent)
+  // instead of cascading into an outage for schema that was already fine.
+  const runStatement = pgPool ? (sql) => pgPool.query(sql) : (sql) => getSqliteDb().exec(sql);
+  for (const statement of statements) {
+    try {
+      await runStatement(statement);
+    } catch (error) {
+      logOnce("schema", `instruction de schéma échouée (${error.message}) -- ${statement.slice(0, 60).replace(/\s+/g, " ")}...`);
+    }
   }
   // Tables created before this column existed need it added on top -- ALTER TABLE
   // ADD COLUMN, not CREATE TABLE IF NOT EXISTS, actually reaches an existing table.
@@ -270,7 +281,17 @@ async function ensureColumn(table, columnDef) {
     if (pgPool) await pgPool.query(alterSql);
     else getSqliteDb().exec(alterSql);
   } catch (error) {
-    if (!/already exists|duplicate column/i.test(error.message)) throw error;
+    if (!/already exists|duplicate column/i.test(error.message)) {
+      // Confirmed live in production: this used to rethrow on any error that
+      // wasn't recognizably "already exists" (e.g. a transient connection/pooler
+      // hiccup), which -- since every ensureColumn call happens before
+      // relationalTablesReady is set -- took down every single API route on the
+      // site at once, none of which had anything to do with this one column.
+      // Logged instead of thrown: a genuinely missing column then surfaces as a
+      // real, specific "column does not exist" error only on the one query that
+      // actually needed it, not as a site-wide outage.
+      logOnce("schema", `ajout de colonne échoué (${table}.${columnDef.split(" ")[0]}: ${error.message})`);
+    }
   }
 }
 
@@ -641,7 +662,18 @@ createServer(async (req, res) => {
     // of reusing it for a next keep-alive request (which would misread those
     // leftover bytes as a new request line).
     if (error.statusCode === 413) res.setHeader("Connection", "close");
-    sendJson(res, error.statusCode || 500, { error: error.statusCode === 413 ? "payload_too_large" : "server_error", message: error.message });
+    // Used to echo the raw error.message straight to the client -- confirmed live
+    // this session: a real Postgres error ("column \"source\" does not exist")
+    // reached visitors verbatim, in English, on a French site, and leaked an
+    // internal schema detail in the process. The real message is still logged
+    // server-side (where it's actually useful, for debugging) via logOnce; what
+    // the client gets is a stable, French, non-technical message instead.
+    logOnce("http-error", `requête non gérée (${error.statusCode || 500}): ${error.message}`);
+    const isPayloadTooLarge = error.statusCode === 413;
+    sendJson(res, error.statusCode || 500, {
+      error: isPayloadTooLarge ? "payload_too_large" : "server_error",
+      message: isPayloadTooLarge ? "Fichier envoyé trop volumineux." : "Une erreur est survenue côté serveur. Réessaie dans un instant.",
+    });
   }
 }).listen(port, () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
