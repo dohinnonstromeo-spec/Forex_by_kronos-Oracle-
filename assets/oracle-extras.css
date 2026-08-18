@@ -2221,14 +2221,8 @@ body {
   max-width: 760px;
 }
 
-/* .home-pricing-card normally pairs its info block with a "S'abonner" link --
-   here on the payment page itself that link would just point back at this same
-   page, so it's omitted; center the remaining block instead of the default
-   space-between, which assumed two children. */
 .payment-plan-recap {
   margin-top: 20px;
-  justify-content: center;
-  text-align: center;
 }
 
 .payment-already-active {
@@ -2576,7 +2570,8 @@ body {
 
 .home-nav-cta,
 .home-button,
-.home-pricing-card a {
+.pricing-card-premium-cta,
+.pricing-card-free-cta {
   border-radius: var(--radius-md);
   font-weight: 800;
   text-align: center;
@@ -2741,7 +2736,7 @@ body {
 }
 
 .home-button.primary,
-.home-pricing-card a {
+.pricing-card-premium-cta {
   background: var(--oracle-gradient);
   color: var(--primary-foreground);
   box-shadow: var(--shadow-glow-amber);
@@ -2754,7 +2749,8 @@ body {
 
 .home-button:hover,
 .home-nav-cta:hover,
-.home-pricing-card a:hover {
+.pricing-card-premium-cta:hover,
+.pricing-card-free-cta:hover {
   transform: translateY(-2px);
 }
 
@@ -2793,7 +2789,7 @@ body {
 
 .home-chart-panel,
 .home-market-card,
-.home-pricing-card,
+.pricing-card-free,
 .home-process div,
 .home-faq-grid details,
 .home-signal-placeholder {
@@ -2805,7 +2801,7 @@ body {
 
 .home-chart-panel,
 .home-market-card,
-.home-pricing-card {
+.pricing-card-free {
   overflow: hidden;
   border-radius: 16px;
 }
@@ -3241,7 +3237,6 @@ body {
 }
 
 .home-process p,
-.home-pricing-card p,
 .home-faq-grid p,
 .home-footer p {
   margin-top: 8px;
@@ -3249,18 +3244,41 @@ body {
   line-height: 1.6;
 }
 
-.home-pricing-card {
-  max-width: 820px;
+/* Pricing: a real Free/Premium comparison (accueil) instead of a single card
+   with nothing to compare it against -- the anchor effect of seeing what's
+   missing from Free is what makes Premium read as worth it, not just the
+   Premium card's own styling. paiement.html reuses only the Premium half
+   (.pricing-card-premium), no Free column needed once someone's already
+   past the comparison decision. */
+.pricing-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.12fr;
+  gap: 20px;
+  max-width: 900px;
   margin: 0 auto;
+  align-items: stretch;
+}
+
+.pricing-card-free,
+.pricing-card-premium-inner {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  padding: 28px;
+  flex-direction: column;
+  height: 100%;
+  padding: 30px 28px;
+  text-align: left;
+}
+
+.pricing-plan-name {
+  color: var(--muted-foreground);
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  font-size: .78rem;
 }
 
 .home-premium-badge {
   display: inline-flex;
+  align-self: flex-start;
   margin-bottom: 14px;
   padding: 5px 10px;
   border-radius: 999px;
@@ -3271,21 +3289,143 @@ body {
   text-transform: uppercase;
 }
 
-.home-pricing-card strong {
+.pricing-plan-price,
+.pricing-card-premium-inner strong {
   display: block;
+  margin-top: 6px;
   font-family: var(--font-display);
-  font-size: 4rem;
+  font-size: 3rem;
   line-height: 1;
 }
 
-.home-pricing-card small {
+.pricing-card-premium-inner strong {
+  font-size: 3.4rem;
+}
+
+.pricing-card-free small,
+.pricing-card-premium-inner small {
   font: 600 1rem var(--font-sans);
   color: var(--muted-foreground);
 }
 
-.home-pricing-card a {
-  min-width: 230px;
-  padding: 15px 20px;
+.pricing-value-framing {
+  margin: 8px 0 0;
+  color: var(--muted-foreground);
+  font-size: .82rem;
+}
+
+.pricing-tagline {
+  margin: 10px 0 0;
+  color: var(--muted-foreground);
+  line-height: 1.6;
+}
+
+.pricing-checklist {
+  display: grid;
+  gap: 11px;
+  margin: 22px 0 26px;
+  padding: 0;
+  list-style: none;
+  flex: 1;
+}
+
+.pricing-checklist li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: .92rem;
+  line-height: 1.4;
+}
+
+.pricing-checklist li span[data-icon] {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  color: var(--neon-green);
+}
+
+.pricing-checklist.is-muted li {
+  color: var(--muted-foreground);
+}
+
+.pricing-checklist.is-muted li span[data-icon] {
+  color: var(--muted-foreground);
+  opacity: .55;
+}
+
+.pricing-card-free-cta {
+  margin-top: auto;
+  padding: 13px 20px;
+  border: 1px solid rgba(255,255,255,.16);
+  color: var(--foreground);
+}
+
+.pricing-card-premium-cta {
+  margin-top: auto;
+  padding: 16px 22px;
+  font-size: 1.02rem;
+}
+
+/* Gradient-border treatment: a 2px padding of the brand gradient behind a
+   near-opaque inner panel, so the border itself is the gradient rather than a
+   flat color -- reads as "this one's different" at a glance next to the plain
+   Free card, echoing the same gold->orange gradient used everywhere else
+   (--oracle-gradient) instead of introducing a new accent for this one spot. */
+.pricing-card-premium {
+  position: relative;
+  border-radius: 20px;
+  padding: 2px;
+  background: linear-gradient(120deg, oklch(81% .16 78), oklch(78% .18 60), oklch(81% .16 78));
+  background-size: 220% 220%;
+  box-shadow: 0 0 44px rgba(217, 172, 89, .22), 0 24px 80px rgba(0,0,0,.32);
+}
+
+.pricing-card-premium-inner {
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(19, 15, 8, .97), rgba(9, 13, 23, .98));
+}
+
+.pricing-ribbon {
+  position: absolute;
+  top: -13px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--oracle-gradient);
+  color: var(--primary-foreground);
+  font-size: .68rem;
+  font-weight: 800;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  padding: 6px 16px;
+  border-radius: 999px;
+  box-shadow: 0 6px 18px rgba(217, 172, 89, .38);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .pricing-card-premium {
+    transition: transform .25s ease, box-shadow .25s ease;
+    animation: pricing-glow-shift 7s ease infinite;
+  }
+  .pricing-card-premium:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 0 64px rgba(217, 172, 89, .32), 0 30px 90px rgba(0,0,0,.4);
+  }
+}
+
+@keyframes pricing-glow-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+@media (max-width: 760px) {
+  .pricing-grid {
+    grid-template-columns: 1fr;
+  }
+  .pricing-ribbon {
+    top: -12px;
+  }
 }
 
 .home-faq-grid {
@@ -3362,7 +3502,6 @@ body {
   .home-chart-body { height: 340px; }
   .home-chart-foot,
   .home-chart-head,
-  .home-pricing-card,
   .home-footer {
     flex-direction: column;
     align-items: flex-start;

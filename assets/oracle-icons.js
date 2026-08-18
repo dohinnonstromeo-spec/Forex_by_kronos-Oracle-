@@ -26,6 +26,7 @@ window.OracleIcons = {
   paperclip: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 6v7.5a4 4 0 0 1-8 0V5.2a2.6 2.6 0 0 1 5.2 0V12a1.2 1.2 0 0 1-2.4 0V6.3"/></svg>',
   radio: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="15.2" r="1.1" fill="currentColor" stroke="none"/><path d="M6.7 12a4.7 4.7 0 0 1 6.6 0"/><path d="M4 9a8.7 8.7 0 0 1 12 0"/></svg>',
   refresh: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 10.5a6 6 0 1 1-1.8-4.3"/><path d="M16 3v4.2h-4.2"/></svg>',
+  close: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5l10 10"/><path d="M15 5 5 15"/></svg>',
 };
 
 // Static markup can reference an icon declaratively (<span data-icon="user">Label</span>)
