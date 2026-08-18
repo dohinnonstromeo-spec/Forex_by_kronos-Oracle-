@@ -927,6 +927,7 @@ createServer(async (req, res) => {
   startLearningOutcomesScheduler();
   startBrokerReconcileScheduler();
   startSignalsBroadcastScheduler();
+  startNewSignalAlertScheduler();
   startAutoTradeScheduler();
   startRateLimitMapSweeper();
 });
@@ -1088,6 +1089,38 @@ function startSignalsBroadcastScheduler() {
     }
   };
   setInterval(tick, SIGNALS_BROADCAST_INTERVAL_MS);
+}
+
+// notifyNewSignals only ever runs as a side effect of computeSignalsPayload()
+// actually recomputing (a genuine cache miss) -- and until now, the only two
+// things that could trigger that recompute were a visitor hitting a
+// signals-consuming endpoint, or startSignalsBroadcastScheduler above (itself
+// gated on someone watching the homepage ticker), or runAutoTradeTick (gated on
+// having an approved autonomous account). A premium user who only wants push
+// alerts, on an otherwise quiet site with no ticker viewers and no bot accounts,
+// could go arbitrarily long between recomputes -- not bounded by
+// signalCacheTtlMs at all, just however long until the next unrelated visitor.
+// Found digging into notification latency ("creuse encore un peu plus"); this is
+// the same kind of "quota-conscious, don't run unless it can actually reach
+// someone" gate the ticker scheduler uses, just checking for an actual new_signal
+// subscriber instead of an SSE connection.
+const NEW_SIGNAL_CHECK_INTERVAL_MS = Number(env.NEW_SIGNAL_CHECK_INTERVAL_SECONDS || 60) * 1000;
+
+function startNewSignalAlertScheduler() {
+  const tick = async () => {
+    try {
+      await ensureRelationalTables();
+      const hasSubscriber = await sqlGet(`SELECT 1 as one FROM push_subscriptions WHERE topics LIKE '%new_signal%' LIMIT 1`);
+      if (!hasSubscriber) return; // no one could receive this alert -- don't burn provider quota computing it
+      const cached = memoryCache.signals.value;
+      const stale = !cached || Date.now() >= memoryCache.signals.expiresAt;
+      if (stale) await computeSignalsPayload(); // recompute fires notifyNewSignals itself as a side effect -- see computeSignalsPayload
+    } catch (error) {
+      logOnce("new-signal-scheduler", `vérification alerte nouveau signal échouée (${error.message})`);
+    }
+  };
+  tick();
+  setInterval(tick, NEW_SIGNAL_CHECK_INTERVAL_MS);
 }
 
 // Fully autonomous per-user execution -- watches the same deterministic signal
