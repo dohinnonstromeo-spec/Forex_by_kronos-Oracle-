@@ -7668,8 +7668,15 @@ async function notifyNewSignals(signals) {
   });
   if (!freshSignals.length) return;
 
-  const store = await loadAuthStore();
-  const premiumUserIds = new Set(store.users.filter(hasPremiumAccess).map((user) => user.id));
+  // Was loadAuthStore() -- every column of every user (password hashes, JSON
+  // preferences/usage blobs included) just to run hasPremiumAccess() over them.
+  // Same filtering logic, only the 5 columns it actually reads.
+  const premiumCandidates = await sqlAll(`SELECT id, role, plan, manual_premium, premium_until FROM users`);
+  const premiumUserIds = new Set(
+    premiumCandidates
+      .filter((row) => hasPremiumAccess({ role: row.role, plan: row.plan, manualPremium: Boolean(Number(row.manual_premium)), premiumUntil: row.premium_until }))
+      .map((row) => row.id),
+  );
   if (!premiumUserIds.size) {
     for (const signal of freshSignals) {
       await sqlRun(
@@ -7900,8 +7907,11 @@ async function performancePayload(log) {
   const closed = log.outcomes.filter((item) => ["win", "loss"].includes(item.result));
   const recent = closed.slice(-12).reverse();
   const totalSignals = log.analyses.filter((item) => item.active).length;
-  const authStore = await loadAuthStore();
-  const memberCount = Array.isArray(authStore.users) ? authStore.users.length : 0;
+  // Was loadAuthStore() -- the entire users table, every column, just to read
+  // .length. A homepage-visible endpoint hit by every visitor has no reason to
+  // pull real user data (password hashes included) into memory for a count.
+  await ensureRelationalTables();
+  const memberCount = Number((await sqlGet(`SELECT COUNT(*) as n FROM users`))?.n || 0);
   const precisionLabel = summary.globalWinRate !== null
     ? `${summary.globalWinRate}% (${summary.globalConfidenceLabel}, n=${summary.closedAnalyses})`
     : "Pas encore de données";
