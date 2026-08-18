@@ -919,6 +919,7 @@ createServer(async (req, res) => {
 }).listen(port, () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
   startLearningOutcomesScheduler();
+  startBrokerReconcileScheduler();
   startSignalsBroadcastScheduler();
   startAutoTradeScheduler();
   startRateLimitMapSweeper();
@@ -8069,6 +8070,100 @@ async function recordLearningAnalysis(result, body, context) {
   return id;
 }
 
+// For any OPEN analysis that actually went through a real broker order (semi-
+// automatic confirm or the autonomous bot -- trade_orders.status = 'SENT' with a
+// broker_order_id), the broker itself is the ground truth for what happened, not
+// a simulation. See getBrokerPositionOutcome for why this exists: without it, a
+// position closed by hand from the trading app (never told to this site at all)
+// just sat OPEN in our own records until the market later happened to cross the
+// ORIGINAL recorded SL, at which point the outcome scheduler would retroactively
+// mark it SL_HIT even though it had already been closed by hand at a real profit
+// -- a real bug reported with real MT5 screenshots. Shared by updateLearningOutcomes
+// (the full 90s tick, candle-simulation fallback included) and
+// reconcileBrokerBackedOutcomes (a much faster, broker-only tick -- see there for
+// why this needed splitting out) so both resolve a broker-backed position exactly
+// the same way. Returns null if the caller should fall through to its own
+// non-broker handling (not broker-backed, no credentials, or the broker query
+// itself failed) -- never null because the position IS still open, that case
+// returns {stillOpen:true} explicitly since "still open" is itself authoritative,
+// not a fallthrough.
+async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, credentialsCache) {
+  const brokerOrder = brokerOrderByAnalysisId.get(analysis.id);
+  if (!brokerOrder) return null;
+  if (!credentialsCache.has(brokerOrder.user_id)) {
+    credentialsCache.set(brokerOrder.user_id, await getUserBrokerCredentials(brokerOrder.user_id).catch(() => null));
+  }
+  const credentials = credentialsCache.get(brokerOrder.user_id);
+  if (!credentials) return null;
+  const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
+  if (brokerOutcome?.status === "still_open") return { stillOpen: true }; // confirmed still live at the broker -- no 24h EXPIRED fallback needed, this is authoritative
+  if (brokerOutcome?.status === "closed") {
+    const brokerStatus = brokerOutcome.reason === "DEAL_REASON_SL" ? "SL_HIT"
+      : brokerOutcome.reason === "DEAL_REASON_TP" ? "TP1_HIT" // the broker only ever receives tp1 as a real order-level TP (see sendOrderToBroker) -- tp2 is purely an internal secondary target this site tracks itself, never sent to the broker, so a broker-side TP hit is always tp1
+      : "CLOSED_MANUALLY"; // DEAL_REASON_MOBILE/CLIENT/DEALER -- a human closed it directly at the broker, not an automatic level touch
+    const profit = brokerOutcome.profit;
+    analysis.status = brokerStatus;
+    analysis.closedAt = brokerOutcome.closedAt;
+    analysis.closePrice = brokerOutcome.closePrice;
+    analysis.outcome = profit > 0 ? "win" : profit < 0 ? "loss" : "neutral";
+    analysis.outcomeReason = brokerStatus === "CLOSED_MANUALLY"
+      ? `Clôturé manuellement au broker (${profit >= 0 ? "+" : ""}${profit.toFixed(2)}).`
+      : brokerStatus === "SL_HIT" ? "Stop Loss touché (confirmé par le broker)." : "TP1 touché (confirmé par le broker).";
+    analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
+    await upsertAnalysisRow(analysis);
+    return { closed: true };
+  }
+  return null; // broker query failed (e.g. temporarily unreachable) -- caller falls through rather than leaving the row stuck unevaluated
+}
+
+// Broker-backed positions used to only ever get reconciled on the same 90s tick as
+// every non-broker analysis's heavier candle-history simulation (see
+// updateLearningOutcomes) -- so even though the broker already knows the instant a
+// position closes, the site could sit on that knowledge for up to 90s before
+// noticing and pushing a notification. Requested explicitly after asking me to dig
+// into notification latency: "creuse encore un peu plus sur les notifications en
+// temps reelle". This is deliberately narrow and cheap (only rows with a real
+// broker_order_id, no candle/history work at all) specifically so it's safe to run
+// far more often without adding real load -- see BROKER_RECONCILE_INTERVAL_MS.
+let brokerReconcileInFlight = false;
+
+async function reconcileBrokerBackedOutcomes() {
+  if (brokerReconcileInFlight) return; // previous run still mid-flight (slow broker response) -- skip this tick rather than pile up overlapping calls to the same positions
+  brokerReconcileInFlight = true;
+  const justClosed = [];
+  try {
+    await withFileLock("learning-log", async () => {
+      await ensureRelationalTables();
+      const brokerOrderRows = await sqlAll(
+        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id
+         FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
+        [],
+      );
+      if (!brokerOrderRows.length) return;
+      const brokerOrderByAnalysisId = new Map(brokerOrderRows.map((row) => [row.analysis_id, row]));
+      const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ?`, [1]);
+      const credentialsCache = new Map();
+      for (const row of openRows) {
+        if (!brokerOrderByAnalysisId.has(row.id)) continue; // not broker-backed -- the slower full tick still owns these
+        const analysis = rowToAnalysis(row);
+        const result = await tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, credentialsCache);
+        if (result?.closed && analysis.userId && !analysis.isTest) justClosed.push(analysis);
+      }
+    });
+  } finally {
+    brokerReconcileInFlight = false;
+  }
+  for (const analysis of justClosed) notifyAnalysisClosed(analysis).catch(() => {});
+}
+
+const BROKER_RECONCILE_INTERVAL_MS = Number(env.BROKER_RECONCILE_INTERVAL_SECONDS || 15) * 1000;
+
+function startBrokerReconcileScheduler() {
+  setInterval(() => {
+    reconcileBrokerBackedOutcomes().catch((error) => logOnce("broker-reconcile", `réconciliation rapide échouée (${error.message})`));
+  }, BROKER_RECONCILE_INTERVAL_MS);
+}
+
 async function updateLearningOutcomes(prices = null, histories = null) {
   // Only OPEN+active rows are pulled here (an indexed WHERE, not a full-table load
   // like the old load-mutate-save-whole-blob version), and only the rows that
@@ -8081,15 +8176,6 @@ async function updateLearningOutcomes(prices = null, histories = null) {
     const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ?`, [1]);
     if (openRows.length) {
       const livePrices = prices || await getPrices();
-      // For any OPEN analysis that actually went through a real broker order (semi-
-      // automatic confirm or the autonomous bot -- trade_orders.status = 'SENT' with
-      // a broker_order_id), the broker itself is the ground truth for what happened,
-      // not a simulation. See getBrokerPositionOutcome for why this exists: without
-      // it, a position closed by hand from the trading app (never told to this site
-      // at all) just sat OPEN in our own records until the market later happened to
-      // cross the ORIGINAL recorded SL, at which point this scheduler would
-      // retroactively mark it SL_HIT even though it had already been closed by hand
-      // at a real profit -- a real bug reported with real MT5 screenshots.
       const brokerOrderRows = await sqlAll(
         `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id
          FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
@@ -8100,36 +8186,11 @@ async function updateLearningOutcomes(prices = null, histories = null) {
       for (const row of openRows) {
         const analysis = rowToAnalysis(row);
 
-        const brokerOrder = brokerOrderByAnalysisId.get(analysis.id);
-        if (brokerOrder) {
-          if (!credentialsCache.has(brokerOrder.user_id)) {
-            credentialsCache.set(brokerOrder.user_id, await getUserBrokerCredentials(brokerOrder.user_id).catch(() => null));
-          }
-          const credentials = credentialsCache.get(brokerOrder.user_id);
-          if (credentials) {
-            const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
-            if (brokerOutcome?.status === "still_open") continue; // confirmed still live at the broker -- no 24h EXPIRED fallback needed, this is authoritative
-            if (brokerOutcome?.status === "closed") {
-              const brokerStatus = brokerOutcome.reason === "DEAL_REASON_SL" ? "SL_HIT"
-                : brokerOutcome.reason === "DEAL_REASON_TP" ? "TP1_HIT" // the broker only ever receives tp1 as a real order-level TP (see sendOrderToBroker) -- tp2 is purely an internal secondary target this site tracks itself, never sent to the broker, so a broker-side TP hit is always tp1
-                : "CLOSED_MANUALLY"; // DEAL_REASON_MOBILE/CLIENT/DEALER -- a human closed it directly at the broker, not an automatic level touch
-              const profit = brokerOutcome.profit;
-              analysis.status = brokerStatus;
-              analysis.closedAt = brokerOutcome.closedAt;
-              analysis.closePrice = brokerOutcome.closePrice;
-              analysis.outcome = profit > 0 ? "win" : profit < 0 ? "loss" : "neutral";
-              analysis.outcomeReason = brokerStatus === "CLOSED_MANUALLY"
-                ? `Clôturé manuellement au broker (${profit >= 0 ? "+" : ""}${profit.toFixed(2)}).`
-                : brokerStatus === "SL_HIT" ? "Stop Loss touché (confirmé par le broker)." : "TP1 touché (confirmé par le broker).";
-              analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
-              await upsertAnalysisRow(analysis);
-              if (analysis.userId && !analysis.isTest) justClosed.push(analysis);
-              continue;
-            }
-            // brokerOutcome null (query failed, e.g. broker temporarily unreachable) --
-            // fall through to the existing candle-history simulation below rather than
-            // leaving the row stuck unevaluated for an entire tick.
-          }
+        const brokerResult = await tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, credentialsCache);
+        if (brokerResult?.stillOpen) continue;
+        if (brokerResult?.closed) {
+          if (analysis.userId && !analysis.isTest) justClosed.push(analysis);
+          continue;
         }
 
         const price = Number(livePrices[analysis.pair]?.price);
