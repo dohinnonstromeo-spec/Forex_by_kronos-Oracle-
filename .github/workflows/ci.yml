@@ -32,27 +32,39 @@ jobs:
       # environment hits, so a crash here means a real crash for users too.
       - name: Boot smoke test (no API keys configured)
         run: |
-          PORT=4174 node server.mjs &
+          PORT=4174 node server.mjs > /tmp/server.log 2>&1 &
           SERVER_PID=$!
-          for i in $(seq 1 20); do
-            if curl -sf http://127.0.0.1:4174/ > /dev/null; then break; fi
+          READY=0
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:4174/ > /dev/null 2>&1; then READY=1; break; fi
             sleep 0.5
           done
+          if [ "$READY" != "1" ]; then
+            echo "::error::Server never became ready within 20s. Last server output: $(tail -c 1200 /tmp/server.log | tr '\n' ' ')"
+            kill "$SERVER_PID" 2>/dev/null
+            exit 1
+          fi
           # -f alone discards the response body and status on failure, which made
           # every past CI failure on this step a dead end (just "did not respond",
-          # no HTTP status, no error body) -- this reports both through a GitHub
-          # Actions error annotation, which is readable from the run summary even
-          # without opening the full raw log.
+          # no HTTP status, no error body). GitHub Actions runs this script with
+          # `bash -eo pipefail` -- a bare `status=$(curl ...)` with no fallback
+          # aborts the whole step the instant curl itself fails (e.g. connection
+          # refused, curl exit 7), bypassing fail() entirely and reporting nothing
+          # but a raw curl exit code -- exactly what happened here twice. The `||
+          # echo "000"` neutralizes that so fail() always actually runs and reports
+          # both the real HTTP status/body and the server's own log tail through a
+          # GitHub Actions error annotation, which is readable from the run/check-run
+          # summary even without opening the full raw log.
           fail() {
-            echo "::error::$1 failed -- HTTP ${2:-none} -- body: $(printf '%s' "$3" | head -c 800)"
+            echo "::error::$1 failed -- HTTP ${2:-none} -- body: $(printf '%s' "$3" | head -c 600) -- server log tail: $(tail -c 600 /tmp/server.log | tr '\n' ' ')"
             kill "$SERVER_PID" 2>/dev/null
             exit 1
           }
           check() {
             local name="$1" url="$2"; shift 2
             local status body
-            status=$(curl -s -o /tmp/smoke_body -w "%{http_code}" "$url" "$@")
-            body=$(cat /tmp/smoke_body)
+            status=$(curl -s -o /tmp/smoke_body -w "%{http_code}" "$url" "$@" || echo "000")
+            body=$(cat /tmp/smoke_body 2>/dev/null || echo "")
             [ "$status" = "200" ] || fail "$name" "$status" "$body"
             echo "$name OK"
           }
