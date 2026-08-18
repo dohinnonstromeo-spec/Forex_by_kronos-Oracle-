@@ -6,3 +6,5 @@ Disallow: /admin
 Disallow: /admin-health
 Disallow: /admin-health.html
 Disallow: /api/
+
+Sitemap: https://forex-by-kronos-oracle.onrender.com/sitemap.xml

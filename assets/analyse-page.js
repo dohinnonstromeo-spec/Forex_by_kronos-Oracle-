@@ -104,7 +104,7 @@
       const progress = startAnalysisProgress(form);
       const body = Object.fromEntries(new FormData(form).entries());
       const deep = body.analysisDepth !== "Rapide";
-      submit.textContent = deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...";
+      setSubmitLabel(submit, deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...");
       body.images = images;
       body.autoDetect = isAutoDetectEnabled();
       body.detectedContext = isAutoDetectEnabled() ? detectedContext : null;
@@ -112,7 +112,7 @@
       finishAnalysisProgress(progress, Boolean(response));
       renderAnalysisResult(result, response);
       submit.disabled = false;
-      submit.textContent = "⚡ Lancer l'analyse Kronos";
+      setSubmitLabel(submit, "Lancer l'analyse Kronos", "zap");
     });
 
     result.addEventListener("click", (event) => {
@@ -121,6 +121,17 @@
       const valueButton = event.target.closest("[data-copy-value]");
       if (valueButton) copySingleValue(valueButton);
     });
+  }
+
+  // .textContent on this button used to permanently destroy its <span data-icon>
+  // child (populated once by oracle-icons.js on page load) -- confirmed live: after
+  // the first analysis, the submit button lost its custom zap SVG for the rest of
+  // the session, replaced by nothing (progress states) or a raw emoji fallback
+  // (idle state). Rebuilds the icon from window.OracleIcons instead of relying on
+  // a DOM node that's already gone.
+  function setSubmitLabel(button, text, iconName = null) {
+    const iconSvg = iconName ? window.OracleIcons?.[iconName] : null;
+    button.innerHTML = iconSvg ? `<span data-icon="${iconName}">${iconSvg}</span>${escapeHtml(text)}` : escapeHtml(text);
   }
 
   function setupTradingView() {
@@ -138,7 +149,11 @@
     if (!select || !chips.length) return;
     const sync = () => {
       const current = select.value.toUpperCase();
-      chips.forEach((chip) => chip.classList.toggle("active", chip.dataset.pair?.toUpperCase() === current));
+      chips.forEach((chip) => {
+        const isActive = chip.dataset.pair?.toUpperCase() === current;
+        chip.classList.toggle("active", isActive);
+        chip.setAttribute("aria-pressed", String(isActive));
+      });
     };
     chips.forEach((chip) => {
       chip.addEventListener("click", () => {
@@ -156,7 +171,11 @@
     if (!select || !chips.length) return;
     const sync = () => {
       const current = select.value.toUpperCase();
-      chips.forEach((chip) => chip.classList.toggle("active", chip.dataset.timeframe?.toUpperCase() === current));
+      chips.forEach((chip) => {
+        const isActive = chip.dataset.timeframe?.toUpperCase() === current;
+        chip.classList.toggle("active", isActive);
+        chip.setAttribute("aria-pressed", String(isActive));
+      });
     };
     chips.forEach((chip) => {
       chip.addEventListener("click", () => {
@@ -311,8 +330,12 @@
   function setupTabs() {
     document.querySelectorAll(".signal-tabs button").forEach((button) => {
       button.addEventListener("click", () => {
-        document.querySelectorAll(".signal-tabs button").forEach((item) => item.classList.remove("active"));
+        document.querySelectorAll(".signal-tabs button").forEach((item) => {
+          item.classList.remove("active");
+          item.setAttribute("aria-pressed", "false");
+        });
         button.classList.add("active");
+        button.setAttribute("aria-pressed", "true");
         activeFilter = button.dataset.filter;
         renderSignals(staticSignals);
       });
@@ -1017,6 +1040,6 @@
   }
 
   function escapeHtml(value) {
-    return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
+    return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char]));
   }
 })();

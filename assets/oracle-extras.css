@@ -24,14 +24,17 @@
   --foreground: oklch(96% .01 240);
   --card: oklch(18% .04 265);
   --muted-foreground: oklch(74% .03 245);
-  /* Was oklch(85% .18 210)/oklch(55% .25 295) -- those hues render as cyan and
-     violet, not amber/orange (confirmed via an audit this session: converted to
-     sRGB they're rgb(0,235,255) and rgb(131,58,240)). The generated Tailwind bundle
-     right next to this file (styles-nTlncI0E.css) already has the correct values;
-     this file loads after it and was silently clobbering both with the wrong hue
-     since the variable was first introduced. Touches every "premium" badge, the
-     logo mark, nav CTAs, and two quantified WCAG AA contrast failures on
-     .quality-checks .bad / .home-news-list b -- all fixed by this one change.
+  /* The hue values below used to be a cyan (85% .18 210) and a violet (55% .25 295)
+     instead of amber/orange (confirmed via an audit this session: converted to
+     sRGB they were rgb(0,235,255) and rgb(131,58,240)). The generated Tailwind
+     bundle right next to this file (styles-nTlncI0E.css) already had the correct
+     values; this file loads after it and was silently clobbering both with the
+     wrong hue since the variable was first introduced -- and the same two wrong
+     literals were also hardcoded directly (not via these variables) in ~20 other
+     places throughout this file, all corrected in the same pass. Touches every
+     "premium" badge, the logo mark, nav CTAs, the chat button glow, focus rings,
+     and two quantified WCAG AA contrast failures on .quality-checks .bad /
+     .home-news-list b -- all fixed by this one change.
      Real amber/orange copied verbatim from the bundle, not re-guessed. */
   --amber-neon: oklch(81% .16 78);
   --neon-orange: oklch(78% .18 60);
@@ -67,13 +70,62 @@
   --radius-pill: 999px;
 }
 
+/* Baseline interactive states -- an audit this session found only 8 :hover and 2
+   :focus-visible rules in this whole file, almost all on the homepage; every card
+   component used on every other page (analysis, dashboard, auth, payment) had
+   none, and no :disabled rule existed anywhere so a disabled button kept its full
+   gradient and pointer cursor. Declared once here, generically, rather than
+   copy-pasted per component. */
+button:disabled,
+input:disabled,
+.payment-method-button:disabled,
+.payment-method-button[disabled] {
+  opacity: .5;
+  cursor: not-allowed;
+  filter: grayscale(.3);
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--amber-neon);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .analysis-card,
+  .auth-card,
+  .dashboard-card,
+  .dashboard-panel,
+  .payment-method-card {
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+
+  .analysis-card:hover,
+  .dashboard-card:hover,
+  .dashboard-panel:hover,
+  .payment-method-card:hover {
+    transform: translateY(-2px);
+    border-color: oklch(81% .16 78 / .35);
+    box-shadow: var(--shadow-card), 0 0 24px oklch(81% .16 78 / .10);
+  }
+
+  .auth-card {
+    animation: oracle-slide-up .28s ease-out;
+  }
+}
+
 body {
   background-color: var(--background);
   background-image:
     linear-gradient(rgba(255,255,255,.026) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255,255,255,.026) 1px, transparent 1px),
-    radial-gradient(circle at 18% 8%, oklch(85% .18 210 / .18), transparent 34rem),
-    radial-gradient(circle at 88% 4%, oklch(55% .25 295 / .15), transparent 34rem);
+    radial-gradient(circle at 18% 8%, oklch(81% .16 78 / .18), transparent 34rem),
+    radial-gradient(circle at 88% 4%, oklch(78% .18 60 / .15), transparent 34rem);
   background-size: 46px 46px, 46px 46px, auto, auto;
 }
 
@@ -92,7 +144,7 @@ body {
   background: var(--oracle-gradient);
   color: var(--primary-foreground);
   font-size: 28px;
-  box-shadow: 0 0 28px oklch(85% .18 210 / .45), inset 0 -6px 14px rgba(0, 0, 0, .18);
+  box-shadow: 0 0 28px oklch(81% .16 78 / .45), inset 0 -6px 14px rgba(0, 0, 0, .18);
 }
 
 .oracle-chat-ai {
@@ -252,8 +304,8 @@ body {
 }
 
 .oracle-msg.user .oracle-bubble {
-  background: oklch(85% .18 210 / .13);
-  border-color: oklch(85% .18 210 / .28);
+  background: oklch(81% .16 78 / .13);
+  border-color: oklch(81% .16 78 / .28);
 }
 
 .oracle-meta {
@@ -264,7 +316,7 @@ body {
 
 .oracle-tech {
   width: fit-content;
-  border: 1px solid oklch(85% .18 210 / .34);
+  border: 1px solid oklch(81% .16 78 / .34);
   border-radius: 999px;
   padding: 3px 8px;
   color: var(--amber-neon);
@@ -340,7 +392,7 @@ body {
 
 .oracle-chat-input:focus-visible {
   border-color: var(--amber-neon);
-  box-shadow: 0 0 0 2px oklch(85% .18 210 / .25);
+  box-shadow: 0 0 0 2px oklch(81% .16 78 / .25);
 }
 
 .oracle-page {
@@ -522,9 +574,14 @@ body {
 .analysis-title {
   margin-top: 8px;
   font-family: var(--font-display);
-  font-size: 44px;
+  /* Was a fixed 44px with a single 36px override below 640px -- no scaling at all
+     between 641-900px, and no further reduction below 640px down to a 375px
+     phone. .home-hero h1 already uses a fluid clamp(); this H1 (used on 10 of 12
+     pages) gets the same treatment instead of two fixed breakpoints. */
+  font-size: clamp(1.9rem, 1.35rem + 2.5vw, 2.75rem);
   line-height: 1;
   letter-spacing: .03em;
+  text-wrap: balance;
 }
 
 .analysis-subtitle {
@@ -535,7 +592,7 @@ body {
 .drop-zone {
   margin-top: 24px;
   min-height: 220px;
-  border: 1px dashed oklch(85% .18 210 / .45);
+  border: 1px dashed oklch(81% .16 78 / .45);
   border-radius: 14px;
   display: grid;
   place-items: center;
@@ -689,10 +746,10 @@ body {
 
 .quick-pair-grid button.active,
 .timeframe-chip-row button.active {
-  border-color: oklch(85% .18 210 / .55);
-  background: oklch(85% .18 210 / .11);
+  border-color: oklch(81% .16 78 / .55);
+  background: oklch(81% .16 78 / .11);
   color: var(--amber-neon);
-  box-shadow: 0 0 18px oklch(85% .18 210 / .12);
+  box-shadow: 0 0 18px oklch(81% .16 78 / .12);
 }
 
 .analysis-submit,
@@ -706,7 +763,7 @@ body {
   color: var(--primary-foreground);
   padding: 14px 16px;
   font-weight: 900;
-  box-shadow: 0 0 22px oklch(85% .18 210 / .22);
+  box-shadow: 0 0 22px oklch(81% .16 78 / .22);
 }
 
 .kronos-engine-badge {
@@ -723,9 +780,9 @@ body {
 
 .market-notice {
   margin-top: 18px;
-  border: 1px solid oklch(85% .18 210 / .25);
+  border: 1px solid oklch(81% .16 78 / .25);
   border-radius: 12px;
-  background: oklch(85% .18 210 / .07);
+  background: oklch(81% .16 78 / .07);
   color: var(--muted-foreground);
   padding: 11px 12px;
   display: flex;
@@ -840,12 +897,12 @@ body {
   display: grid;
   place-items: center;
   align-content: center;
-  border: 1px solid oklch(85% .18 210 / .25);
+  border: 1px solid oklch(81% .16 78 / .25);
   border-radius: 999px;
   background:
     radial-gradient(circle at center, rgba(255,255,255,.07), transparent 58%),
     conic-gradient(from 180deg, var(--neon-green), var(--amber-neon), var(--neon-orange), var(--neon-green));
-  box-shadow: 0 0 28px oklch(85% .18 210 / .16);
+  box-shadow: 0 0 28px oklch(81% .16 78 / .16);
 }
 
 .result-confidence strong,
@@ -1363,6 +1420,12 @@ body {
 }
 
 .auth-form input {
+  /* Without this, a browser's native autofill (address bar suggestion, saved
+     password) renders its own light-mode chrome -- white/yellow background, black
+     text -- against this dark card. Confirmed missing sitewide except on
+     analyse.html's fields; login/signup are exactly the pages autofill triggers on
+     most. */
+  color-scheme: dark;
   width: 100%;
   border: 1px solid rgba(255, 255, 255, .14);
   border-radius: var(--radius-md);
@@ -1836,7 +1899,7 @@ body {
 }
 
 .signal-tabs button.active {
-  border-color: oklch(85% .18 210 / .45);
+  border-color: oklch(81% .16 78 / .45);
   color: var(--amber-neon);
 }
 
@@ -2046,9 +2109,9 @@ body {
 
 .payment-note {
   margin-top: 20px;
-  border: 1px solid oklch(85% .18 210 / .25);
+  border: 1px solid oklch(81% .16 78 / .25);
   border-radius: 14px;
-  background: oklch(85% .18 210 / .07);
+  background: oklch(81% .16 78 / .07);
   color: var(--muted-foreground);
   padding: 14px 16px;
   font-size: 13px;
@@ -2105,6 +2168,13 @@ body {
   }
 
   .copy-level-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Every sibling "small stat tiles" grid on this page already collapses to 1
+     column here (.no-signal-grid, .result-level-grid, .copy-level-grid above) --
+     this one was missed, staying 3 columns of ~90-100px each down to 375px. */
+  .risk-mini-grid {
     grid-template-columns: 1fr;
   }
 
@@ -2168,10 +2238,6 @@ body {
 
   .analysis-card {
     padding: 18px;
-  }
-
-  .analysis-title {
-    font-size: 36px;
   }
 }
 /* Clean static homepage */
@@ -2979,11 +3045,6 @@ body {
   gap: 16px;
   color: var(--muted-foreground);
   font-size: .9rem;
-}
-
-@keyframes home-candle {
-  0%, 100% { transform: scaleY(.9); opacity: .72; }
-  50% { transform: scaleY(1.08); opacity: 1; }
 }
 
 @keyframes home-orbit {
