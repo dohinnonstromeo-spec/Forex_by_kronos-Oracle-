@@ -38,11 +38,30 @@ jobs:
             if curl -sf http://127.0.0.1:4174/ > /dev/null; then break; fi
             sleep 0.5
           done
-          curl -sf http://127.0.0.1:4174/ > /dev/null || (echo "Homepage did not respond" && kill $SERVER_PID && exit 1)
-          curl -sf http://127.0.0.1:4174/api/health > /dev/null || (echo "/api/health did not respond" && kill $SERVER_PID && exit 1)
-          curl -sf http://127.0.0.1:4174/api/signals > /dev/null || (echo "/api/signals did not respond" && kill $SERVER_PID && exit 1)
-          curl -sf -X POST http://127.0.0.1:4174/api/analyze-chart -H "Content-Type: application/json" -d '{"pair":"EUR/USD","timeframe":"H1","style":"Mixte","strategy":"Swing Trading","analysisDepth":"Rapide"}' > /dev/null \
-            || (echo "/api/analyze-chart did not respond" && kill $SERVER_PID && exit 1)
+          # -f alone discards the response body and status on failure, which made
+          # every past CI failure on this step a dead end (just "did not respond",
+          # no HTTP status, no error body) -- this reports both through a GitHub
+          # Actions error annotation, which is readable from the run summary even
+          # without opening the full raw log.
+          fail() {
+            echo "::error::$1 failed -- HTTP ${2:-none} -- body: $(printf '%s' "$3" | head -c 800)"
+            kill "$SERVER_PID" 2>/dev/null
+            exit 1
+          }
+          check() {
+            local name="$1" url="$2"; shift 2
+            local status body
+            status=$(curl -s -o /tmp/smoke_body -w "%{http_code}" "$url" "$@")
+            body=$(cat /tmp/smoke_body)
+            [ "$status" = "200" ] || fail "$name" "$status" "$body"
+            echo "$name OK"
+          }
+          check "Homepage" "http://127.0.0.1:4174/"
+          check "/api/health" "http://127.0.0.1:4174/api/health"
+          check "/api/signals" "http://127.0.0.1:4174/api/signals"
+          check "/api/analyze-chart" "http://127.0.0.1:4174/api/analyze-chart" \
+            -X POST -H "Content-Type: application/json" \
+            -d '{"pair":"EUR/USD","timeframe":"H1","style":"Mixte","strategy":"Swing Trading","analysisDepth":"Rapide"}'
           kill $SERVER_PID
           echo "Smoke test passed."
 
