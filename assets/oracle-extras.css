@@ -1588,6 +1588,42 @@ body {
   color: var(--neon-red);
 }
 
+.premium-admin-cap-field {
+  display: grid;
+  gap: 7px;
+  margin-top: 18px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.premium-admin-cap-row {
+  display: flex;
+  gap: 8px;
+}
+
+.premium-admin-cap-row input {
+  width: 100px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .28);
+  color: var(--foreground);
+  padding: 10px 12px;
+  font-weight: 700;
+}
+
+.premium-admin-cap-row button {
+  border: 1px solid rgba(195, 145, 47, .32);
+  border-radius: 8px;
+  background: rgba(195, 145, 47, .08);
+  color: var(--amber-neon);
+  padding: 10px 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
 .dashboard-hero {
   margin-bottom: 24px;
 }
@@ -2337,6 +2373,7 @@ body {
   }
 
   .oracle-nav-inner {
+    position: relative;
     gap: 10px;
     padding: 14px 16px;
   }
@@ -2353,6 +2390,22 @@ body {
   }
 
   .oracle-links::-webkit-scrollbar { display: none; }
+
+  /* The link list can hold more items than fit on a phone screen (e.g. "Dashboard"
+     on analyse.html's nav) with zero visual hint it scrolls -- confirmed via a real
+     390px-viewport check that Dashboard sat fully off-screen there. This edge fade
+     is the standard "there's more this way" affordance; it's decorative only
+     (pointer-events: none) so it never blocks a tap on the link underneath. */
+  .oracle-nav-inner::after {
+    content: "";
+    position: absolute;
+    top: 1px;
+    bottom: 1px;
+    right: 16px;
+    width: 28px;
+    pointer-events: none;
+    background: linear-gradient(to right, transparent, rgba(6, 9, 18, .92));
+  }
 
   .oracle-links a,
   .oracle-links button {

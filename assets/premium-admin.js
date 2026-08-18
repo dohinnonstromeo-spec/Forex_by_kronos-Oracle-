@@ -102,6 +102,8 @@
   const tradingRefresh = document.querySelector("[data-trading-refresh]");
   const tradingPause = document.querySelector("[data-trading-pause]");
   const tradingResume = document.querySelector("[data-trading-resume]");
+  const tradingCapInput = document.querySelector("[data-trading-cap-input]");
+  const tradingCapSave = document.querySelector("[data-trading-cap-save]");
 
   function requireToken() {
     const token = form?.elements?.token?.value || "";
@@ -120,9 +122,28 @@
     if (tradingStatus) {
       tradingStatus.textContent = `${data.paused ? "⏸ EN PAUSE" : "▶ Actif"} · ${data.ordersConfirmedToday} ordre(s) envoyé(s) aujourd'hui (plafond ${data.dailyCapPerUser}/compte/jour) · Broker ${data.brokerConfigured ? "connecté" : "non connecté"}.`;
     }
+    if (tradingCapInput && document.activeElement !== tradingCapInput) tradingCapInput.value = data.dailyCapPerUser;
   }
 
   tradingRefresh?.addEventListener("click", refreshTradingStatus);
+
+  tradingCapSave?.addEventListener("click", async () => {
+    const token = requireToken();
+    if (!token) return;
+    const cap = Math.round(Number(tradingCapInput?.value));
+    if (!Number.isFinite(cap) || cap < 1 || cap > 200) {
+      setMessage("Plafond invalide (1 à 200).", true);
+      return;
+    }
+    setMessage("Enregistrement du plafond...", false);
+    const data = await adminFetch("/api/admin/trading-pause", { token, dailyOrderCap: cap });
+    if (!data?.ok) {
+      setMessage(data?.message || data?.error || "Action impossible.", true);
+      return;
+    }
+    setMessage(`Plafond mis à jour : ${data.dailyCapPerUser} ordre(s)/compte/jour.`, false);
+    refreshTradingStatus();
+  });
 
   async function setTradingPause(paused) {
     const token = requireToken();

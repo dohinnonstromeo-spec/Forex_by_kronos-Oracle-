@@ -1100,9 +1100,22 @@ async function handleApi(req, res, url) {
     const admin = await requireAdmin(req);
     if (!admin.ok) return sendJson(res, admin.status, admin);
     const body = await readBody(req);
-    const paused = Boolean(body?.paused);
-    await setAppSetting("trading_paused", paused ? "true" : "false");
-    sendJson(res, 200, { ok: true, paused });
+    // `paused` and `dailyOrderCap` are independent settings sent from two different
+    // controls in the admin UI -- only touch whichever one was actually present in
+    // this request, so saving the cap alone can never silently flip pause state.
+    let paused = (await getAppSetting("trading_paused", "false")) === "true";
+    if (body?.paused !== undefined) {
+      paused = Boolean(body.paused);
+      await setAppSetting("trading_paused", paused ? "true" : "false");
+    }
+    if (body?.dailyOrderCap !== undefined) {
+      const cap = Math.round(Number(body.dailyOrderCap));
+      if (!Number.isFinite(cap) || cap < 1 || cap > 200) {
+        return sendJson(res, 400, { ok: false, error: "invalid_cap" });
+      }
+      await setAppSetting("trade_daily_order_cap", String(cap));
+    }
+    sendJson(res, 200, { ok: true, paused, dailyCapPerUser: await getTradeDailyOrderCap() });
     return;
   }
 
@@ -1115,7 +1128,7 @@ async function handleApi(req, res, url) {
       `SELECT COUNT(*) as n FROM trade_orders WHERE confirmed_at >= ? AND status IN ('SENT', 'FAILED')`,
       [todayStart.toISOString()],
     );
-    sendJson(res, 200, { ok: true, paused, ordersConfirmedToday: Number(sentToday?.n || 0), dailyCapPerUser: TRADE_DAILY_ORDER_CAP, brokerConfigured: BROKER_CONFIGURED });
+    sendJson(res, 200, { ok: true, paused, ordersConfirmedToday: Number(sentToday?.n || 0), dailyCapPerUser: await getTradeDailyOrderCap(), brokerConfigured: BROKER_CONFIGURED });
     return;
   }
 
@@ -2262,8 +2275,8 @@ function signalCacheTtlMs(signals = [], newsRisk = null) {
   return hasDirect ? 3 * 60 * 1000 : 90 * 1000;
 }
 
-async function fetchBestPrice(symbol, cached) {
-  if (isRecentCache(cached, cacheTtlMs(symbol))) {
+async function fetchBestPrice(symbol, cached, ttlMs = cacheTtlMs(symbol)) {
+  if (isRecentCache(cached, ttlMs)) {
     return pricePayload(symbol, cached, cached.source || "cache", "fresh_cache", {
       stale: false,
       reliability: Math.min(90, Number(cached.reliability) || 80),
@@ -2288,7 +2301,7 @@ async function fetchBestPrice(symbol, cached) {
       errors.push(error.message);
     }
   }
-  if (isRecentCache(cached, cacheTtlMs(symbol))) {
+  if (isRecentCache(cached, ttlMs)) {
     return pricePayload(symbol, cached, `cache:${cached.source || "last_good"}`, errors.join(" | ") || "using_last_good", {
       stale: true,
       reliability: 55,
@@ -2319,7 +2332,12 @@ async function getExternalPrice(symbol) {
 async function getAnalysisPrice(symbol) {
   if (!symbol) return null;
   const cache = await loadMarketCache();
-  const price = await fetchBestPrice(symbol, cache.prices?.[symbol]);
+  // A user explicitly launching an analysis is a paid, on-demand action -- it must
+  // not silently reuse the same lax cache window the ambient homepage ticker uses
+  // (up to 20min for an open market, see cacheTtlMs) just to save a provider call.
+  // fastPriceCacheTtlMs (3min open / 90s crypto) forces a real re-check far more
+  // often while still protecting provider quota from a burst of back-to-back clicks.
+  const price = await fetchBestPrice(symbol, cache.prices?.[symbol], fastPriceCacheTtlMs(symbol));
   if (price && Number.isFinite(Number(price.price)) && isLivePriceSource(price.source)) {
     await saveMarketCache({
       ...cache,
@@ -7292,6 +7310,14 @@ async function setAppSetting(key, value) {
 
 const TRADE_DAILY_ORDER_CAP = Number(env.TRADE_DAILY_ORDER_CAP || 10);
 
+// Admin-editable from premium-admin.html without a redeploy -- falls back to the
+// env-configured default (or 10) until an admin sets an override.
+async function getTradeDailyOrderCap() {
+  const stored = await getAppSetting("trade_daily_order_cap", null);
+  const cap = Number(stored);
+  return Number.isFinite(cap) && cap >= 1 ? cap : TRADE_DAILY_ORDER_CAP;
+}
+
 // MetaApi's REST trade endpoint -- verified live this session against a real
 // connected MetaApi demo account (region/path/field shape all confirmed correct;
 // numericCode 10009 is the real "order placed" signal, HTTP 200 alone is not, see
@@ -7433,8 +7459,9 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
       `SELECT COUNT(*) as n FROM trade_orders WHERE user_id = ? AND confirmed_at >= ? AND status IN ('SENT', 'FAILED')`,
       [userId, todayStart.toISOString()],
     );
-    if (Number(sentToday?.n || 0) >= TRADE_DAILY_ORDER_CAP) {
-      return { status: 429, body: { ok: false, error: "daily_order_cap_reached", cap: TRADE_DAILY_ORDER_CAP } };
+    const dailyOrderCap = await getTradeDailyOrderCap();
+    if (Number(sentToday?.n || 0) >= dailyOrderCap) {
+      return { status: 429, body: { ok: false, error: "daily_order_cap_reached", cap: dailyOrderCap } };
     }
     order.volume = volume;
     order.confirmedAt = new Date().toISOString();
