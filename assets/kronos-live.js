@@ -4,6 +4,7 @@
     signals: [],
     generatedAt: null,
     nextSignalAt: nextQuarter(),
+    signalsExpanded: false,
   };
 
   const marketSymbols = ["EUR/USD", "XAU/USD", "GBP/JPY", "BTC/USD"];
@@ -139,6 +140,13 @@
     setTimeout(() => comment.remove(), 30000);
   }
 
+  // A long grid of every tracked pair at once (including suspended/non-actionable
+  // ones) is exactly the kind of wall-of-cards the premium redesign elsewhere this
+  // session was meant to get away from. Genuinely fresh signals (direct,
+  // non-suspended -- real setups worth a trader's attention) always show first
+  // and always show in full; everything else collapses behind "Voir plus" instead
+  // of padding the page. Cards stay in the DOM even while collapsed (hidden, not
+  // removed) so updateSignalScores' periodic re-scoring keeps working on them.
   function renderSignals(signals) {
     const section = document.querySelector("#signaux");
     const grid = section?.querySelector(".grid.gap-6.md\\:grid-cols-2, .grid.gap-6");
@@ -151,8 +159,41 @@
       titleRow.appendChild(badge);
     }
 
-    grid.innerHTML = signals.map(signalCard).join("");
+    const fresh = signals.filter((s) => s.direct && !s.suspended);
+    const rest = signals.filter((s) => !(s.direct && !s.suspended));
+    const ordered = [...fresh, ...rest];
+    // At least the fresh ones, at least 2 total so the section never looks nearly
+    // empty -- padded with the next signals in line if fewer than 2 are fresh.
+    const visibleCount = Math.min(ordered.length, Math.max(2, fresh.length));
+
+    grid.innerHTML = ordered.map((signal, index) => signalCard(signal, index >= visibleCount)).join("");
     bindShareButtons(grid);
+
+    let moreButton = section.querySelector("[data-signals-more]");
+    const hiddenCount = ordered.length - visibleCount;
+    if (hiddenCount > 0) {
+      if (!moreButton) {
+        moreButton = document.createElement("button");
+        moreButton.type = "button";
+        moreButton.className = "home-signals-more";
+        moreButton.dataset.signalsMore = "1";
+        grid.insertAdjacentElement("afterend", moreButton);
+        moreButton.addEventListener("click", () => {
+          state.signalsExpanded = !state.signalsExpanded;
+          applySignalsVisibility(grid, moreButton);
+        });
+      }
+      applySignalsVisibility(grid, moreButton, hiddenCount);
+    } else if (moreButton) {
+      moreButton.remove();
+    }
+  }
+
+  function applySignalsVisibility(grid, moreButton, hiddenCountArg) {
+    const extraCards = [...grid.querySelectorAll("[data-signal-extra]")];
+    const hiddenCount = hiddenCountArg ?? extraCards.length;
+    extraCards.forEach((card) => { card.hidden = !state.signalsExpanded; });
+    moreButton.textContent = state.signalsExpanded ? "Voir moins" : `Voir plus (+${hiddenCount})`;
   }
 
   // Delegated so it survives grid.innerHTML being replaced on every refresh --
@@ -186,13 +227,13 @@
     });
   }
 
-  function signalCard(signal) {
+  function signalCard(signal, isExtra) {
     const buy = signal.direction === "ACHAT";
     const score = Number(signal.confiance) || 0;
     const pair = escapeHtml(signal.paire);
     const suspended = signal.suspended || signal.direct === false;
     const suspendLabel = signal.open === false ? "⏸ MARCHÉ FERMÉ" : "⏸ NON VALIDÉ";
-    return `<article data-kronos-pair="${escapeAttr(signal.paire)}" class="glass-card group relative overflow-hidden rounded-xl p-5 transition-all hover:border-amber-neon/40">
+    return `<article data-kronos-pair="${escapeAttr(signal.paire)}" ${isExtra ? "data-signal-extra hidden" : ""} class="glass-card group relative overflow-hidden rounded-xl p-5 transition-all hover:border-amber-neon/40">
       <div class="flex items-start justify-between">
         <div>
           <div class="font-mono text-lg font-bold tracking-wider">${pair}</div>

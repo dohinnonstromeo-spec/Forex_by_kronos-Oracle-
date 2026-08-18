@@ -2876,6 +2876,25 @@ body {
   padding: 14px 22px;
 }
 
+.home-signals-more {
+  display: block;
+  margin: 18px auto 0;
+  padding: 11px 26px;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(195, 145, 47, .32);
+  background: rgba(195, 145, 47, .08);
+  color: var(--amber-neon);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .15s ease, transform .15s ease;
+}
+
+.home-signals-more:hover {
+  background: rgba(195, 145, 47, .16);
+  transform: translateY(-1px);
+}
+
 .home-button.primary,
 .pricing-card-premium-cta {
   background: var(--oracle-gradient);
@@ -3661,5 +3680,85 @@ body {
   .home-news-table-head span:last-child,
   .home-news-list b {
     display: none;
+  }
+}
+
+/* Shared tab component (dashboard.html, admin-contenu.html) -- replaces one long
+   scroll through every section at once with a segmented nav + one panel visible
+   at a time. See assets/oracle-tabs.js: panels stay in the DOM (hidden, not
+   removed), so nothing about a given section's own script needs to know tabs
+   exist. */
+.oracle-tabs-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 24px;
+  padding: 6px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--oracle-border);
+  background: var(--oracle-panel);
+}
+
+.oracle-tabs-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  justify-content: center;
+  padding: 11px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+  white-space: nowrap;
+}
+
+.oracle-tabs-btn:hover {
+  color: var(--foreground);
+}
+
+.oracle-tabs-btn.is-active {
+  background: var(--oracle-gradient);
+  border-color: transparent;
+  color: var(--primary-foreground);
+  box-shadow: var(--shadow-glow-amber);
+}
+
+.oracle-tabs-btn svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+
+.oracle-tabs-panel {
+  animation: oracle-tabs-fade .18s ease;
+}
+
+@keyframes oracle-tabs-fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .oracle-tabs-panel {
+    animation: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .oracle-tabs-nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    justify-content: flex-start;
+  }
+  .oracle-tabs-nav::-webkit-scrollbar { display: none; }
+  .oracle-tabs-btn {
+    flex: 0 0 auto;
   }
 }

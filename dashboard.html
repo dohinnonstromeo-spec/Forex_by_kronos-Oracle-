@@ -46,125 +46,142 @@
       <p class="analysis-subtitle" data-user-greeting>Chargement du profil...</p>
     </section>
 
-    <section class="dashboard-grid">
-      <article class="dashboard-card">
-        <span data-icon="user">Plan actuel</span>
-        <strong data-user-plan>Free</strong>
-        <p data-payment-status hidden data-cms="dashboard.card.premium_active">Accès premium actif — aucun quota, aucun paiement à refaire.</p>
-        <div data-payment-form>
-          <p data-cms="dashboard.card.premium_pending">Les quotas premium seront activés quand le paiement sera connecté.</p>
-          <a class="payment-method-button" href="/paiement" data-cms="pricing.premium.cta">S'abonner maintenant</a>
-        </div>
-      </article>
-      <article class="dashboard-card">
-        <span data-icon="eye">Analyse IA</span>
-        <strong>Kronos</strong>
-        <p data-cms="dashboard.card.analysis_desc">Lance une analyse profonde avec score danger, quality gate et plan débutant.</p>
-        <a class="payment-method-button" href="/tester-gratuitement" data-cta-trial data-cms="global.cta.trial">Tester gratuitement</a>
-      </article>
-      <article class="dashboard-card">
-        <span data-icon="activity">Précision Kronos</span>
-        <strong data-performance-label>Calcul en cours...</strong>
-        <p data-cms="dashboard.card.precision_desc">Winrate global mesuré sur les analyses réellement clôturées (TP/SL), tous comptes confondus. Ton suivi personnel TP1/TP2/SL est juste en dessous, dans "Mes analyses Kronos".</p>
-      </article>
-    </section>
+    <div class="oracle-tabs" data-tabs>
+      <nav class="oracle-tabs-nav" role="tablist">
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="overview" role="tab"><span data-icon="layers"></span>Vue d'ensemble</button>
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="analyses" role="tab"><span data-icon="history"></span>Mes analyses</button>
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="trading" role="tab"><span data-icon="creditCard"></span>Trading</button>
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="robot" role="tab"><span data-icon="zap"></span>Robot Kronos</button>
+      </nav>
 
-    <section class="dashboard-panel">
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker" data-cms="dashboard.performance.kicker">Performance Kronos</p>
-          <h2 class="analysis-title" data-cms="dashboard.performance.title">Résumé actuel</h2>
-        </div>
-        <span class="oracle-tech" data-dashboard-status>Synchronisation</span>
-      </div>
-      <div class="dashboard-metrics" data-dashboard-metrics><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
-    </section>
+      <div class="oracle-tabs-panel" data-tab-panel="overview">
+        <section class="dashboard-grid">
+          <article class="dashboard-card">
+            <span data-icon="user">Plan actuel</span>
+            <strong data-user-plan>Free</strong>
+            <p data-payment-status hidden data-cms="dashboard.card.premium_active">Accès premium actif — aucun quota, aucun paiement à refaire.</p>
+            <div data-payment-form>
+              <p data-cms="dashboard.card.premium_pending">Les quotas premium seront activés quand le paiement sera connecté.</p>
+              <a class="payment-method-button" href="/paiement" data-cms="pricing.premium.cta">S'abonner maintenant</a>
+            </div>
+          </article>
+          <article class="dashboard-card">
+            <span data-icon="eye">Analyse IA</span>
+            <strong>Kronos</strong>
+            <p data-cms="dashboard.card.analysis_desc">Lance une analyse profonde avec score danger, quality gate et plan débutant.</p>
+            <a class="payment-method-button" href="/tester-gratuitement" data-cta-trial data-cms="global.cta.trial">Tester gratuitement</a>
+          </article>
+          <article class="dashboard-card">
+            <span data-icon="activity">Précision Kronos</span>
+            <strong data-performance-label>Calcul en cours...</strong>
+            <p data-cms="dashboard.card.precision_desc">Winrate global mesuré sur les analyses réellement clôturées (TP/SL), tous comptes confondus. Ton suivi personnel TP1/TP2/SL est juste en dessous, dans "Mes analyses Kronos".</p>
+          </article>
+        </section>
 
-    <section class="dashboard-panel">
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker" data-cms="dashboard.history.kicker">Historique personnel</p>
-          <h2 class="analysis-title" data-cms="dashboard.history.title">Mes analyses Kronos</h2>
-        </div>
-        <span class="oracle-tech" data-personal-status>Compte connecté</span>
-      </div>
-      <div class="dashboard-push-controls">
-        <div>
-          <button class="payment-method-button push-toggle" type="button" data-push-toggle="tp_sl" hidden>Activer les notifications TP/SL</button>
-          <p class="dashboard-push-status" data-push-status="tp_sl"></p>
-        </div>
-        <div>
-          <button class="payment-method-button push-toggle" type="button" data-push-toggle="new_signal" hidden>Activer les alertes nouveaux signaux</button>
-          <p class="dashboard-push-status" data-push-status="new_signal"></p>
-        </div>
-      </div>
-      <p class="dashboard-push-upsell" data-push-upsell hidden data-cms="dashboard.push.upsell" data-cms-html>Les alertes de nouveaux signaux (dès qu'un setup fort apparaît, sans lancer d'analyse toi-même) sont réservées aux membres Premium. <a href="/paiement">S'abonner</a></p>
-      <div class="dashboard-history" data-dashboard-history><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
-    </section>
-
-    <section class="dashboard-panel" data-broker-panel hidden>
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker" data-cms="dashboard.broker.kicker">Ton broker</p>
-          <h2 class="analysis-title" data-cms="dashboard.broker.title">Connexion broker</h2>
-        </div>
-      </div>
-      <p class="dashboard-trade-note" data-cms="dashboard.broker.intro">Connecte ton propre compte broker une seule fois ici — il sert aussi bien à l'exécution semi-automatique (ci-dessous) qu'au robot 100% automatique (plus bas). Aucun ordre n'utilise jamais un autre compte que le tien.</p>
-      <div class="dashboard-autotrade-section">
-        <p class="dashboard-history-note" data-cms="dashboard.broker.instructions" data-cms-html>Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
-        <form class="dashboard-autotrade-form" data-autotrade-broker-form>
-          <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
-          <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
-          <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
-          <button type="submit" class="payment-method-button">Connecter mon broker</button>
-        </form>
-        <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message hidden></p>
-        <div class="dashboard-autotrade-connected" data-autotrade-broker-connected hidden>
-          <span>✓ Broker connecté</span>
-          <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect>Déconnecter</button>
-        </div>
-      </div>
-    </section>
-
-    <section class="dashboard-panel" data-trade-panel hidden>
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker" data-cms="dashboard.trade.kicker">Exécution semi-automatique</p>
-          <h2 class="analysis-title" data-cms="dashboard.trade.title">Ordres</h2>
-        </div>
-        <span class="oracle-tech" data-trade-broker-status>Broker non connecté</span>
-      </div>
-      <p class="dashboard-trade-note" data-cms="dashboard.trade.intro">Kronos prépare l'ordre à partir d'une analyse ouverte, tu choisis la taille et confirmes — rien n'est envoyé au broker sans ta validation explicite.</p>
-      <p class="dashboard-history-note dashboard-prepare-error" data-trade-broker-prompt hidden data-cms="dashboard.trade.broker_prompt">Connecte ton broker ci-dessus pour pouvoir envoyer un ordre réel.</p>
-      <div class="dashboard-trade-orders" data-trade-orders><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
-    </section>
-    <p class="dashboard-push-upsell" data-trade-upsell hidden data-cms="dashboard.trade.upsell" data-cms-html>L'exécution semi-automatique (Kronos prépare l'ordre, tu valides, il part vers ton broker) est réservée aux membres Premium. <a href="/paiement">S'abonner</a></p>
-
-    <section class="dashboard-panel" data-autotrade-panel hidden>
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker" data-cms="dashboard.autotrade.kicker">Exécution 100% automatique</p>
-          <h2 class="analysis-title" data-cms="dashboard.autotrade.title">Robot Kronos</h2>
-        </div>
-        <span class="oracle-tech" data-autotrade-status-badge>Statut...</span>
-      </div>
-      <p class="dashboard-trade-note" data-cms="dashboard.autotrade.intro" data-cms-html>Le robot surveille le marché seul et exécute sans confirmation, uniquement sur les paires et le risque approuvés. Nécessite ton propre compte broker connecté (ci-dessus) <strong>et</strong> une approbation manuelle de l'équipe — ce n'est pas activable en un clic.</p>
-
-      <div class="dashboard-autotrade-section" data-autotrade-activation-section hidden>
-        <h3 data-cms="dashboard.autotrade.activation_title">Activation</h3>
-        <p class="dashboard-history-note" data-autotrade-status-text></p>
-        <div class="dashboard-autotrade-metrics" data-autotrade-metrics hidden></div>
-        <button type="button" class="payment-method-button" data-autotrade-request hidden>Demander l'activation</button>
-        <button type="button" class="dashboard-trade-cancel" data-autotrade-pause hidden>Mettre en pause</button>
-        <button type="button" class="payment-method-button" data-autotrade-resume hidden>Reprendre</button>
+        <section class="dashboard-panel">
+          <div class="signal-top">
+            <div>
+              <p class="analysis-kicker" data-cms="dashboard.performance.kicker">Performance Kronos</p>
+              <h2 class="analysis-title" data-cms="dashboard.performance.title">Résumé actuel</h2>
+            </div>
+            <span class="oracle-tech" data-dashboard-status>Synchronisation</span>
+          </div>
+          <div class="dashboard-metrics" data-dashboard-metrics><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
+        </section>
       </div>
 
-      <div class="dashboard-autotrade-section" data-autotrade-history-section hidden>
-        <h3 data-cms="dashboard.autotrade.history_title">Trades du robot</h3>
-        <div class="dashboard-trade-orders" data-autotrade-trades><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
+      <div class="oracle-tabs-panel" data-tab-panel="analyses" hidden>
+        <section class="dashboard-panel">
+          <div class="signal-top">
+            <div>
+              <p class="analysis-kicker" data-cms="dashboard.history.kicker">Historique personnel</p>
+              <h2 class="analysis-title" data-cms="dashboard.history.title">Mes analyses Kronos</h2>
+            </div>
+            <span class="oracle-tech" data-personal-status>Compte connecté</span>
+          </div>
+          <div class="dashboard-push-controls">
+            <div>
+              <button class="payment-method-button push-toggle" type="button" data-push-toggle="tp_sl" hidden>Activer les notifications TP/SL</button>
+              <p class="dashboard-push-status" data-push-status="tp_sl"></p>
+            </div>
+            <div>
+              <button class="payment-method-button push-toggle" type="button" data-push-toggle="new_signal" hidden>Activer les alertes nouveaux signaux</button>
+              <p class="dashboard-push-status" data-push-status="new_signal"></p>
+            </div>
+          </div>
+          <p class="dashboard-push-upsell" data-push-upsell hidden data-cms="dashboard.push.upsell" data-cms-html>Les alertes de nouveaux signaux (dès qu'un setup fort apparaît, sans lancer d'analyse toi-même) sont réservées aux membres Premium. <a href="/paiement">S'abonner</a></p>
+          <div class="dashboard-history" data-dashboard-history><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
+        </section>
       </div>
-    </section>
-    <p class="dashboard-push-upsell" data-autotrade-upsell hidden data-cms="dashboard.autotrade.upsell" data-cms-html>Le trading 100% automatique est réservé aux membres Premium, sous réserve d'approbation admin. <a href="/paiement">S'abonner</a></p>
+
+      <div class="oracle-tabs-panel" data-tab-panel="trading" hidden>
+        <section class="dashboard-panel" data-broker-panel hidden>
+          <div class="signal-top">
+            <div>
+              <p class="analysis-kicker" data-cms="dashboard.broker.kicker">Ton broker</p>
+              <h2 class="analysis-title" data-cms="dashboard.broker.title">Connexion broker</h2>
+            </div>
+          </div>
+          <p class="dashboard-trade-note" data-cms="dashboard.broker.intro">Connecte ton propre compte broker une seule fois ici — il sert aussi bien à l'exécution semi-automatique (ci-dessous) qu'au robot 100% automatique (plus bas). Aucun ordre n'utilise jamais un autre compte que le tien.</p>
+          <div class="dashboard-autotrade-section">
+            <p class="dashboard-history-note" data-cms="dashboard.broker.instructions" data-cms-html>Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
+            <form class="dashboard-autotrade-form" data-autotrade-broker-form>
+              <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
+              <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
+              <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
+              <button type="submit" class="payment-method-button">Connecter mon broker</button>
+            </form>
+            <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message hidden></p>
+            <div class="dashboard-autotrade-connected" data-autotrade-broker-connected hidden>
+              <span>✓ Broker connecté</span>
+              <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect>Déconnecter</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="dashboard-panel" data-trade-panel hidden>
+          <div class="signal-top">
+            <div>
+              <p class="analysis-kicker" data-cms="dashboard.trade.kicker">Exécution semi-automatique</p>
+              <h2 class="analysis-title" data-cms="dashboard.trade.title">Ordres</h2>
+            </div>
+            <span class="oracle-tech" data-trade-broker-status>Broker non connecté</span>
+          </div>
+          <p class="dashboard-trade-note" data-cms="dashboard.trade.intro">Kronos prépare l'ordre à partir d'une analyse ouverte, tu choisis la taille et confirmes — rien n'est envoyé au broker sans ta validation explicite.</p>
+          <p class="dashboard-history-note dashboard-prepare-error" data-trade-broker-prompt hidden data-cms="dashboard.trade.broker_prompt">Connecte ton broker ci-dessus pour pouvoir envoyer un ordre réel.</p>
+          <div class="dashboard-trade-orders" data-trade-orders><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
+        </section>
+        <p class="dashboard-push-upsell" data-trade-upsell hidden data-cms="dashboard.trade.upsell" data-cms-html>L'exécution semi-automatique (Kronos prépare l'ordre, tu valides, il part vers ton broker) est réservée aux membres Premium. <a href="/paiement">S'abonner</a></p>
+      </div>
+
+      <div class="oracle-tabs-panel" data-tab-panel="robot" hidden>
+        <section class="dashboard-panel" data-autotrade-panel hidden>
+          <div class="signal-top">
+            <div>
+              <p class="analysis-kicker" data-cms="dashboard.autotrade.kicker">Exécution 100% automatique</p>
+              <h2 class="analysis-title" data-cms="dashboard.autotrade.title">Robot Kronos</h2>
+            </div>
+            <span class="oracle-tech" data-autotrade-status-badge>Statut...</span>
+          </div>
+          <p class="dashboard-trade-note" data-cms="dashboard.autotrade.intro" data-cms-html>Le robot surveille le marché seul et exécute sans confirmation, uniquement sur les paires et le risque approuvés. Nécessite ton propre compte broker connecté (ci-dessus) <strong>et</strong> une approbation manuelle de l'équipe — ce n'est pas activable en un clic.</p>
+
+          <div class="dashboard-autotrade-section" data-autotrade-activation-section hidden>
+            <h3 data-cms="dashboard.autotrade.activation_title">Activation</h3>
+            <p class="dashboard-history-note" data-autotrade-status-text></p>
+            <div class="dashboard-autotrade-metrics" data-autotrade-metrics hidden></div>
+            <button type="button" class="payment-method-button" data-autotrade-request hidden>Demander l'activation</button>
+            <button type="button" class="dashboard-trade-cancel" data-autotrade-pause hidden>Mettre en pause</button>
+            <button type="button" class="payment-method-button" data-autotrade-resume hidden>Reprendre</button>
+          </div>
+
+          <div class="dashboard-autotrade-section" data-autotrade-history-section hidden>
+            <h3 data-cms="dashboard.autotrade.history_title">Trades du robot</h3>
+            <div class="dashboard-trade-orders" data-autotrade-trades><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
+          </div>
+        </section>
+        <p class="dashboard-push-upsell" data-autotrade-upsell hidden data-cms="dashboard.autotrade.upsell" data-cms-html>Le trading 100% automatique est réservé aux membres Premium, sous réserve d'approbation admin. <a href="/paiement">S'abonner</a></p>
+      </div>
+    </div>
   </main>
 
   <footer class="oracle-footer-lite" data-cms="global.footer.copyright_lite" data-cms-html>
@@ -172,6 +189,7 @@
   </footer>
 
   <script src="/assets/oracle-icons.js" defer></script>
+  <script src="/assets/oracle-tabs.js" defer></script>
   <script src="/assets/auth.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>
   <script src="/assets/site-content.js" defer></script>

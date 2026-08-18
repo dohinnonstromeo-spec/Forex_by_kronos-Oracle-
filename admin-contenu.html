@@ -31,78 +31,97 @@
       <p class="analysis-subtitle">Tout ce qu'il y a sur la page d'administration existante, plus la gestion du contenu de tout le site. Un seul token admin pour tout.</p>
     </section>
 
-    <section class="auth-card premium-admin-card">
-      <p class="analysis-kicker">Administration</p>
-      <h2 class="analysis-title">Accès Premium manuel</h2>
-      <p class="analysis-subtitle">Donne Premium à un testeur sans passer par le paiement. La personne doit d'abord créer un compte.</p>
+    <div class="oracle-tabs" data-tabs>
+      <nav class="oracle-tabs-nav" role="tablist">
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="accounts" role="tab"><span data-icon="user"></span>Comptes &amp; accès</button>
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="circuit" role="tab"><span data-icon="alertTriangle"></span>Coupe-circuit</button>
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="robot" role="tab"><span data-icon="zap"></span>Robot Kronos</button>
+        <button type="button" class="oracle-tabs-btn" data-tab-btn="content" role="tab"><span data-icon="paperclip"></span>Contenu du site</button>
+      </nav>
 
-      <form class="auth-form" data-premium-admin-form>
-        <label>
-          Token admin
-          <input name="token" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" required>
-        </label>
-        <label>
-          Email du compte
-          <input name="email" type="email" placeholder="testeur@email.com" autocomplete="email" required>
-        </label>
-        <label>
-          Durée Premium
-          <input name="days" type="number" min="1" max="730" value="30" required>
-        </label>
-        <button class="analysis-submit" type="submit">Activer Premium</button>
-      </form>
+      <div class="oracle-tabs-panel" data-tab-panel="accounts">
+        <section class="auth-card premium-admin-card">
+          <p class="analysis-kicker">Administration</p>
+          <h2 class="analysis-title">Accès Premium manuel</h2>
+          <p class="analysis-subtitle">Donne Premium à un testeur sans passer par le paiement. La personne doit d'abord créer un compte.</p>
 
-      <div class="auth-message" data-premium-admin-message></div>
-      <div class="premium-admin-actions">
-        <button type="button" data-load-members>Voir les derniers comptes</button>
+          <form class="auth-form" data-premium-admin-form>
+            <label>
+              Token admin
+              <input name="token" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" required>
+            </label>
+            <label>
+              Email du compte
+              <input name="email" type="email" placeholder="testeur@email.com" autocomplete="email" required>
+            </label>
+            <label>
+              Durée Premium
+              <input name="days" type="number" min="1" max="730" value="30" required>
+            </label>
+            <button class="analysis-submit" type="submit">Activer Premium</button>
+          </form>
+
+          <div class="auth-message" data-premium-admin-message></div>
+          <div class="premium-admin-actions">
+            <button type="button" data-load-members>Voir les derniers comptes</button>
+          </div>
+          <div class="dashboard-history" data-premium-members></div>
+        </section>
       </div>
-      <div class="dashboard-history" data-premium-members></div>
-    </section>
 
-    <section class="auth-card premium-admin-card">
-      <p class="analysis-kicker">Exécution semi-automatique</p>
-      <h2 class="analysis-title">Coupe-circuit trading</h2>
-      <p class="analysis-subtitle">Coupe instantanément l'envoi d'ordres au broker pour tous les comptes, sans redéploiement. Utilise le même token admin que ci-dessus.</p>
-      <p data-trading-status>Statut inconnu — clique sur "Actualiser".</p>
-      <div class="premium-admin-actions">
-        <button type="button" data-trading-refresh>Actualiser</button>
-        <button type="button" data-trading-pause>Mettre en pause</button>
-        <button type="button" data-trading-resume>Reprendre</button>
+      <div class="oracle-tabs-panel" data-tab-panel="circuit" hidden>
+        <section class="auth-card premium-admin-card">
+          <p class="analysis-kicker">Exécution semi-automatique</p>
+          <h2 class="analysis-title">Coupe-circuit trading</h2>
+          <p class="analysis-subtitle">Coupe instantanément l'envoi d'ordres au broker pour tous les comptes, sans redéploiement. Utilise le même token admin que ci-dessus.</p>
+          <p data-trading-status>Statut inconnu — clique sur "Actualiser".</p>
+          <div class="premium-admin-actions">
+            <button type="button" data-trading-refresh>Actualiser</button>
+            <button type="button" data-trading-pause>Mettre en pause</button>
+            <button type="button" data-trading-resume>Reprendre</button>
+          </div>
+          <label class="premium-admin-cap-field">Plafond d'ordres réels par compte / jour
+            <div class="premium-admin-cap-row">
+              <input type="number" min="1" max="200" step="1" data-trading-cap-input placeholder="10">
+              <button type="button" data-trading-cap-save>Enregistrer</button>
+            </div>
+          </label>
+        </section>
       </div>
-      <label class="premium-admin-cap-field">Plafond d'ordres réels par compte / jour
-        <div class="premium-admin-cap-row">
-          <input type="number" min="1" max="200" step="1" data-trading-cap-input placeholder="10">
-          <button type="button" data-trading-cap-save>Enregistrer</button>
-        </div>
-      </label>
-    </section>
 
-    <section class="auth-card premium-admin-card">
-      <p class="analysis-kicker">Robot Kronos</p>
-      <h2 class="analysis-title">Demandes de trading automatique</h2>
-      <p class="analysis-subtitle">Approuve individuellement qui a le droit d'utiliser le mode 100% automatique -- chaque approbation fixe une durée, les paires autorisées et les limites de risque. Utilise le même token admin que ci-dessus.</p>
-      <div class="premium-admin-actions">
-        <button type="button" data-autotrade-load>Charger les demandes</button>
+      <div class="oracle-tabs-panel" data-tab-panel="robot" hidden>
+        <section class="auth-card premium-admin-card">
+          <p class="analysis-kicker">Robot Kronos</p>
+          <h2 class="analysis-title">Demandes de trading automatique</h2>
+          <p class="analysis-subtitle">Approuve individuellement qui a le droit d'utiliser le mode 100% automatique -- chaque approbation fixe une durée, les paires autorisées et les limites de risque. Utilise le même token admin que ci-dessus.</p>
+          <div class="premium-admin-actions">
+            <button type="button" data-autotrade-load>Charger les demandes</button>
+          </div>
+          <div class="dashboard-history" data-autotrade-requests></div>
+        </section>
       </div>
-      <div class="dashboard-history" data-autotrade-requests></div>
-    </section>
 
-    <section class="auth-card premium-admin-card">
-      <p class="analysis-kicker">Contenu du site</p>
-      <h2 class="analysis-title">Textes de toutes les pages</h2>
-      <p class="analysis-subtitle">Modifie n'importe quel texte visible du site. Chaque champ s'enregistre automatiquement quand tu cliques ailleurs. "Réinitialiser" revient au texte d'origine du site -- rien n'est jamais perdu définitivement.</p>
-      <div class="premium-admin-actions">
-        <button type="button" data-site-content-load>Charger le contenu du site</button>
+      <div class="oracle-tabs-panel" data-tab-panel="content" hidden>
+        <section class="auth-card premium-admin-card">
+          <p class="analysis-kicker">Contenu du site</p>
+          <h2 class="analysis-title">Textes de toutes les pages</h2>
+          <p class="analysis-subtitle">Modifie n'importe quel texte visible du site. Chaque champ s'enregistre automatiquement quand tu cliques ailleurs. "Réinitialiser" revient au texte d'origine du site -- rien n'est jamais perdu définitivement.</p>
+          <div class="premium-admin-actions">
+            <button type="button" data-site-content-load>Charger le contenu du site</button>
+          </div>
+          <p class="dashboard-history-note" data-site-content-summary></p>
+          <div data-site-content-sections></div>
+        </section>
       </div>
-      <p class="dashboard-history-note" data-site-content-summary></p>
-      <div data-site-content-sections></div>
-    </section>
+    </div>
   </main>
 
   <footer class="oracle-footer-lite">
     © 2026 Oracle Forex · Outil interne · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
   </footer>
 
+  <script src="/assets/oracle-icons.js" defer></script>
+  <script src="/assets/oracle-tabs.js" defer></script>
   <script src="/assets/premium-admin.js" defer></script>
   <script src="/assets/admin-content.js" defer></script>
   <script src="/assets/nav-active.js" defer></script>
