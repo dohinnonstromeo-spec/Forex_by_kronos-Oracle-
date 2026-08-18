@@ -720,6 +720,7 @@
   }
 
   function bindAutoTradeBrokerForm() {
+    bindAutoTradePreferences();
     const form = document.querySelector("[data-autotrade-broker-form]");
     if (!form || form.dataset.bound) return;
     form.dataset.bound = "1";
@@ -864,8 +865,85 @@
         ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
       }
       if (historySection) historySection.hidden = false;
+      renderAutoTradePreferences(status);
       await loadAutoTradeHistory();
     }
+  }
+
+  // Every admin-set bot parameter has a user-side counterpart the account owner
+  // can tighten further (never loosen -- server-side combineTightened() is what
+  // actually enforces that, this is just the UI for it). Hints show the admin's
+  // real current value next to each field so it's never a mystery what "leave
+  // blank" defers to -- the exact kind of invisible-mismatch confusion the
+  // minConfidenceFloor/userMinConfidence pair caused before this UI existed.
+  const AUTOTRADE_PREF_FIELDS = [
+    ["userRiskPercent", "riskPercent", (v) => `${v}%`],
+    ["userMinConfidence", "minConfidenceFloor", (v) => `${v}%`],
+    ["userMinRiskReward", "minRiskReward", (v) => v],
+    ["userMaxConcurrentPositions", "maxConcurrentPositions", (v) => v],
+    ["userMaxTradesPerDay", "maxTradesPerDay", (v) => v],
+    ["userDailyLossLimitPercent", "dailyLossLimitPercent", (v) => `${v}%`],
+    ["userDailyLossLimitAmount", "dailyLossLimitAmount", (v) => v],
+  ];
+
+  function renderAutoTradePreferences(status) {
+    const section = document.querySelector("[data-autotrade-preferences-section]");
+    if (!section) return;
+    section.hidden = false;
+    for (const [prefKey, adminKey, format] of AUTOTRADE_PREF_FIELDS) {
+      const input = section.querySelector(`[data-pref="${prefKey}"]`);
+      if (input && document.activeElement !== input) input.value = status[prefKey] ?? "";
+      const hint = section.querySelector(`[data-pref-hint="${adminKey}"]`);
+      if (hint) hint.textContent = status[adminKey] != null ? `(admin : ${format(status[adminKey])})` : "(admin : aucune limite)";
+    }
+    const hoursStart = section.querySelector('[data-pref="userTradingHoursStart"]');
+    const hoursEnd = section.querySelector('[data-pref="userTradingHoursEnd"]');
+    if (hoursStart && document.activeElement !== hoursStart) hoursStart.value = status.userTradingHoursStart || "";
+    if (hoursEnd && document.activeElement !== hoursEnd) hoursEnd.value = status.userTradingHoursEnd || "";
+    const daysWrap = section.querySelector("[data-pref-trading-days]");
+    if (daysWrap) {
+      daysWrap.querySelectorAll("input").forEach((box) => {
+        box.checked = !status.userTradingDays || status.userTradingDays.includes(Number(box.value));
+      });
+    }
+  }
+
+  function bindAutoTradePreferences() {
+    const button = document.querySelector("[data-autotrade-preferences-save]");
+    if (!button || button.dataset.bound) return;
+    button.dataset.bound = "1";
+    const message = document.querySelector("[data-autotrade-preferences-message]");
+    button.addEventListener("click", async () => {
+      const section = document.querySelector("[data-autotrade-preferences-section]");
+      const field = (name) => section.querySelector(`[data-pref="${name}"]`)?.value || null;
+      const userTradingDays = [...section.querySelectorAll("[data-pref-trading-days] input:checked")].map((input) => Number(input.value));
+      button.disabled = true;
+      if (message) message.hidden = true;
+      try {
+        const response = await fetch("/api/auto-trade/preferences", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            userRiskPercent: field("userRiskPercent"), userMinConfidence: field("userMinConfidence"),
+            userMinRiskReward: field("userMinRiskReward"), userMaxConcurrentPositions: field("userMaxConcurrentPositions"),
+            userMaxTradesPerDay: field("userMaxTradesPerDay"), userDailyLossLimitPercent: field("userDailyLossLimitPercent"),
+            userDailyLossLimitAmount: field("userDailyLossLimitAmount"), userTradingHoursStart: field("userTradingHoursStart"),
+            userTradingHoursEnd: field("userTradingHoursEnd"), userTradingDays,
+          }),
+        });
+        const result = await response.json();
+        if (message) {
+          message.textContent = result.ok ? "✓ Préférences enregistrées." : (result.message || result.error || "Échec de l'enregistrement.");
+          message.classList.toggle("dashboard-prepare-error", !result.ok);
+          message.hidden = false;
+        }
+        if (result.ok) await refreshAutoTradeStatus();
+      } catch {
+        if (message) { message.textContent = "Impossible de contacter le serveur -- vérifie ta connexion."; message.hidden = false; }
+      } finally {
+        button.disabled = false;
+      }
+    });
   }
 
   async function loadAutoTradeHistory() {

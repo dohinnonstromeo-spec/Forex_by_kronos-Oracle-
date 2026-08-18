@@ -314,6 +314,23 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "trading_hours_end text");
   await ensureColumn("auto_trading_accounts", "trading_days text");
   await ensureColumn("auto_trading_accounts", "daily_loss_limit_amount real");
+  // The user-side half of every admin-set bot parameter above (plus the
+  // pre-existing user_min_confidence) -- each one lets the account owner
+  // tighten their own bot's behavior, never loosen it past whatever the admin
+  // approved. Requested directly: basic parameters the user controls
+  // themselves "jusque ca ne depassera jamais la limite que j'aurai a definir
+  // pour chaque compte". NULL means "no personal override, defer entirely to
+  // the admin's value" -- see the tightenAgainst* combining logic in
+  // processAutoTradeForUser.
+  await ensureColumn("auto_trading_accounts", "user_risk_percent real");
+  await ensureColumn("auto_trading_accounts", "user_max_concurrent_positions integer");
+  await ensureColumn("auto_trading_accounts", "user_max_trades_per_day integer");
+  await ensureColumn("auto_trading_accounts", "user_daily_loss_limit_percent real");
+  await ensureColumn("auto_trading_accounts", "user_daily_loss_limit_amount real");
+  await ensureColumn("auto_trading_accounts", "user_min_risk_reward real");
+  await ensureColumn("auto_trading_accounts", "user_trading_hours_start text");
+  await ensureColumn("auto_trading_accounts", "user_trading_hours_end text");
+  await ensureColumn("auto_trading_accounts", "user_trading_days text");
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -1251,49 +1268,70 @@ async function dailyRealizedPnlAmount(userId) {
   return Number(row?.total) || 0;
 }
 
-// trading_hours_start/end are "HH:MM" in UTC; a start > end window is treated as
-// spanning midnight (e.g. 22:00-06:00), not rejected. trading_days is a
-// comma-separated list of JS getUTCDay() values (0=Sunday..6=Saturday). Either
-// left unset (null) means no restriction on that axis -- existing approved
-// accounts are unaffected until an admin explicitly sets one.
-function isWithinTradingWindow(account) {
+// hoursStart/End are "HH:MM" in UTC; a start > end window is treated as
+// spanning midnight (e.g. 22:00-06:00), not rejected. days is a comma-separated
+// list of JS getUTCDay() values (0=Sunday..6=Saturday). Either left unset (null)
+// means no restriction on that axis. Shared by the admin's window and the
+// user's own (narrower-only) window -- see processAutoTradeForUser, which
+// requires BOTH to independently allow the current moment, so a user's window
+// can only ever restrict further than the admin's, never widen it.
+function isWithinWindow(hoursStart, hoursEnd, days) {
   const now = new Date();
-  if (account.trading_days) {
-    const allowedDays = new Set(String(account.trading_days).split(",").filter(Boolean).map(Number));
+  if (days) {
+    const allowedDays = new Set(String(days).split(",").filter(Boolean).map(Number));
     if (allowedDays.size && !allowedDays.has(now.getUTCDay())) return false;
   }
-  if (account.trading_hours_start && account.trading_hours_end) {
+  if (hoursStart && hoursEnd) {
     const current = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
-    const start = account.trading_hours_start, end = account.trading_hours_end;
-    const withinWindow = start <= end ? (current >= start && current <= end) : (current >= start || current <= end);
+    const withinWindow = hoursStart <= hoursEnd ? (current >= hoursStart && current <= hoursEnd) : (current >= hoursStart || current <= hoursEnd);
     if (!withinWindow) return false;
   }
   return true;
 }
 
+// Every admin-set limit has a user-side counterpart the account owner can set
+// themselves (see /api/auto-trade/preferences) -- but only ever to tighten it
+// further, never loosen it, so an approved account can never end up trading
+// more aggressively than what was actually approved. `tighter` says which
+// direction "tighter" means for a given parameter: "lower" (risk%, position/
+// trade caps, loss limits -- smaller is safer) or "higher" (confidence floor,
+// min R:R -- pickier is safer). A null/0 admin value (no limit set) still lets
+// a user impose one on themselves.
+function combineTightened(adminValue, userValue, tighter) {
+  const admin = Number(adminValue) || 0;
+  const user = Number(userValue) || 0;
+  if (!admin && !user) return 0;
+  if (!admin) return user;
+  if (!user) return admin;
+  return tighter === "lower" ? Math.min(admin, user) : Math.max(admin, user);
+}
+
 async function processAutoTradeForUser(account, signals) {
   const userId = account.user_id;
-  if (!isWithinTradingWindow(account)) return;
+  if (!isWithinWindow(account.trading_hours_start, account.trading_hours_end, account.trading_days)) return;
+  if (!isWithinWindow(account.user_trading_hours_start, account.user_trading_hours_end, account.user_trading_days)) return;
   const approvedPairs = new Set(String(account.approved_pairs || "").split(",").filter(Boolean));
   if (!approvedPairs.size) return;
-  const minConfidence = Math.max(Number(account.min_confidence_floor) || 70, Number(account.user_min_confidence) || 0);
-  const minRiskReward = Number(account.min_risk_reward) || 0;
+  const minConfidence = combineTightened(account.min_confidence_floor || 70, account.user_min_confidence, "higher");
+  const minRiskReward = combineTightened(account.min_risk_reward, account.user_min_risk_reward, "higher");
   const candidates = signals.filter((s) =>
     approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || Number(s.rr) >= minRiskReward),
   );
   if (!candidates.length) return;
 
-  const dailyLossLimitPercent = Math.abs(Number(account.daily_loss_limit_percent) || 3);
+  const dailyLossLimitPercent = combineTightened(account.daily_loss_limit_percent || 3, account.user_daily_loss_limit_percent, "lower");
   if ((await dailyRealizedPnlPercent(userId)) <= -dailyLossLimitPercent) return;
-  const dailyLossLimitAmount = Number(account.daily_loss_limit_amount) || 0;
+  const dailyLossLimitAmount = combineTightened(account.daily_loss_limit_amount, account.user_daily_loss_limit_amount, "lower");
   if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId)) <= -dailyLossLimitAmount) return;
 
-  const maxConcurrent = Number(account.max_concurrent_positions) || 2;
+  const maxConcurrent = combineTightened(account.max_concurrent_positions || 2, account.user_max_concurrent_positions, "lower");
   let openCount = await countOpenAutoPositions(userId);
   if (openCount >= maxConcurrent) return;
-  const maxTradesPerDay = Number(account.max_trades_per_day) || 0;
+  const maxTradesPerDay = combineTightened(account.max_trades_per_day, account.user_max_trades_per_day, "lower");
   let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId) : 0;
   if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) return;
+
+  const effectiveRiskPercent = combineTightened(account.risk_percent, account.user_risk_percent, "lower");
 
   const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
   const accountInfo = await getBrokerAccountInformation(credentials).catch(() => null);
@@ -1317,7 +1355,7 @@ async function processAutoTradeForUser(account, signals) {
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) continue;
-    const volume = computeAutoTradeVolume({ balance: accountInfo.balance, riskPercent: account.risk_percent, entry: signal.entree, sl: signal.sl, specification });
+    const volume = computeAutoTradeVolume({ balance: accountInfo.balance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification });
     if (!volume) continue;
 
     const analysisId = `auto_${Date.now()}_${randomBytes(4).toString("hex")}`;
@@ -1329,7 +1367,7 @@ async function processAutoTradeForUser(account, signals) {
       timeframe: "Auto",
       style: "Signal automatique (bot)",
       strategy: "Swing Trading",
-      risk: `${account.risk_percent}%`,
+      risk: `${effectiveRiskPercent}%`,
       direction: signal.direction,
       entry: signal.entree,
       sl: signal.sl,
@@ -1346,7 +1384,7 @@ async function processAutoTradeForUser(account, signals) {
     await sqlRun(
       `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, risk_percent_at_trade)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?)`,
-      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, signal.tp1, signal.tp2, new Date().toISOString(), account.risk_percent],
+      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, signal.tp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
@@ -2058,19 +2096,49 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // A user may only ever tighten one of these past whatever the admin approved,
+  // never loosen it -- processAutoTradeForUser's combineTightened() takes the
+  // stricter of the two at read time regardless of what's stored here, so this
+  // endpoint only needs to clamp each field to a sane absolute range (not
+  // compare against the admin's current value) to keep the UI from sending
+  // garbage. Any field omitted from the body is left untouched; any field sent
+  // as 0/null clears that personal override, deferring back to the admin's
+  // value entirely.
   if (url.pathname === "/api/auto-trade/preferences") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     const body = await readBody(req);
-    // A user may only tighten the admin's confidence floor, never loosen it --
-    // runAutoTradeTick already takes the max() of both, this just clamps what's
-    // stored to a sane range so the UI can't send garbage.
-    const userMinConfidence = Number.isFinite(Number(body?.userMinConfidence)) ? Math.max(60, Math.min(99, Number(body.userMinConfidence))) : null;
+    const clamp = (value, min, max) => {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? Math.max(min, Math.min(max, n)) : null;
+    };
+    const clampInt = (value, min, max) => { const c = clamp(value, min, max); return c ? Math.round(c) : null; };
+    const userMinConfidence = clamp(body?.userMinConfidence, 60, 99);
+    const userRiskPercent = clamp(body?.userRiskPercent, 0.1, 3);
+    const userMaxConcurrentPositions = clampInt(body?.userMaxConcurrentPositions, 1, 5);
+    const userMaxTradesPerDay = clampInt(body?.userMaxTradesPerDay, 1, 100);
+    const userDailyLossLimitPercent = clamp(body?.userDailyLossLimitPercent, 1, 10);
+    const userDailyLossLimitAmount = Number.isFinite(Number(body?.userDailyLossLimitAmount)) && Number(body.userDailyLossLimitAmount) > 0 ? Number(body.userDailyLossLimitAmount) : null;
+    const userMinRiskReward = clamp(body?.userMinRiskReward, 0.1, 10);
+    const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const userTradingHoursStart = timePattern.test(body?.userTradingHoursStart) && timePattern.test(body?.userTradingHoursEnd) ? body.userTradingHoursStart : null;
+    const userTradingHoursEnd = userTradingHoursStart ? body.userTradingHoursEnd : null;
+    const userTradingDaysInput = Array.isArray(body?.userTradingDays) ? [...new Set(body.userTradingDays.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))] : [];
+    const userTradingDays = userTradingDaysInput.length && userTradingDaysInput.length < 7 ? userTradingDaysInput.join(",") : null;
     await ensureRelationalTables();
     await sqlRun(
-      `UPDATE auto_trading_accounts SET user_min_confidence = ?, updated_at = ? WHERE user_id = ?`,
-      [userMinConfidence, new Date().toISOString(), session.user.id],
+      `UPDATE auto_trading_accounts SET
+         user_min_confidence = ?, user_risk_percent = ?, user_max_concurrent_positions = ?, user_max_trades_per_day = ?,
+         user_daily_loss_limit_percent = ?, user_daily_loss_limit_amount = ?, user_min_risk_reward = ?,
+         user_trading_hours_start = ?, user_trading_hours_end = ?, user_trading_days = ?, updated_at = ?
+       WHERE user_id = ?`,
+      [
+        userMinConfidence, userRiskPercent, userMaxConcurrentPositions, userMaxTradesPerDay,
+        userDailyLossLimitPercent, userDailyLossLimitAmount, userMinRiskReward,
+        userTradingHoursStart, userTradingHoursEnd, userTradingDays, new Date().toISOString(),
+        session.user.id,
+      ],
     );
     sendJson(res, 200, { ok: true });
     return;
@@ -2104,7 +2172,24 @@ async function handleApi(req, res, url) {
       dailyLossLimitPercent: row?.daily_loss_limit_percent ?? null,
       maxConcurrentPositions: row?.max_concurrent_positions ?? null,
       minConfidenceFloor: row?.min_confidence_floor ?? null,
+      maxTradesPerDay: row?.max_trades_per_day ?? null,
+      minRiskReward: row?.min_risk_reward ?? null,
+      tradingHoursStart: row?.trading_hours_start || null,
+      tradingHoursEnd: row?.trading_hours_end || null,
+      tradingDays: row?.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
+      dailyLossLimitAmount: row?.daily_loss_limit_amount ?? null,
+      // The user's own preferences (see /api/auto-trade/preferences) -- each one
+      // only ever tightens the admin value above, never loosens it.
       userMinConfidence: row?.user_min_confidence ?? null,
+      userRiskPercent: row?.user_risk_percent ?? null,
+      userMaxConcurrentPositions: row?.user_max_concurrent_positions ?? null,
+      userMaxTradesPerDay: row?.user_max_trades_per_day ?? null,
+      userDailyLossLimitPercent: row?.user_daily_loss_limit_percent ?? null,
+      userDailyLossLimitAmount: row?.user_daily_loss_limit_amount ?? null,
+      userMinRiskReward: row?.user_min_risk_reward ?? null,
+      userTradingHoursStart: row?.user_trading_hours_start || null,
+      userTradingHoursEnd: row?.user_trading_hours_end || null,
+      userTradingDays: row?.user_trading_days ? row.user_trading_days.split(",").filter(Boolean).map(Number) : null,
       userPaused: Boolean(Number(row?.user_paused)),
       brokerConnected,
       brokerLastCheckStatus: row?.broker_last_check_status || null,
