@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
-import { createReadStream, existsSync, statSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, statSync, readFileSync, mkdirSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
@@ -47,6 +47,12 @@ let pgTableReady = false;
 let sqliteDb = null;
 function getSqliteDb() {
   if (!pgPool && !sqliteDb) {
+    // data/ is gitignored and never committed -- a genuinely fresh clone (or a
+    // fresh CI checkout, which caught this) has no data/ directory at all yet.
+    // sqlite's DatabaseSync will happily create the .db FILE on open, but never
+    // the parent directory, so opening it here first threw "unable to open
+    // database file" before anything else in the app got a chance to run.
+    mkdirSync(dataDir, { recursive: true });
     sqliteDb = new DatabaseSync(sqliteDbPath);
   }
   return sqliteDb;
@@ -125,7 +131,6 @@ async function ensureRelationalTables() {
     `CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status)`,
     `CREATE INDEX IF NOT EXISTS idx_analyses_user ON analyses(user_id)`,
     `CREATE INDEX IF NOT EXISTS idx_analyses_outcome ON analyses(outcome)`,
-    `CREATE INDEX IF NOT EXISTS idx_analyses_user_source_status ON analyses(user_id, source, status)`,
     `CREATE TABLE IF NOT EXISTS push_subscriptions (
       id text PRIMARY KEY,
       user_id text NOT NULL,
@@ -271,6 +276,18 @@ async function ensureRelationalTables() {
   // personal "Mes analyses" feed can filter by origin -- see auto_trading_accounts.
   await ensureColumn("analyses", "source text NOT NULL DEFAULT 'manual'");
   await ensureColumn("trade_orders", "risk_percent_at_trade real");
+  // Must run after the ensureColumn above, not in the main statements list --
+  // on a genuinely fresh database (no prior "source" column) this index used to
+  // run before "source" existed and silently failed every time (caught live
+  // against a truly empty database, not just a reused dev one where the column
+  // was already there from an earlier run). try/catch, not .catch() -- the sqlite
+  // branch of runStatement is synchronous (DatabaseSync.exec returns undefined,
+  // not a promise), same reasoning as the main statements loop above.
+  try {
+    await runStatement(`CREATE INDEX IF NOT EXISTS idx_analyses_user_source_status ON analyses(user_id, source, status)`);
+  } catch (error) {
+    logOnce("schema", `index idx_analyses_user_source_status échoué (${error.message})`);
+  }
   relationalTablesReady = true;
   await migrateLegacyJsonIntoRelationalTables();
 }
