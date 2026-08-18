@@ -418,7 +418,10 @@
       host.innerHTML = `<div class="dashboard-empty">Aucun ordre préparé. Depuis une analyse ouverte ci-dessus, clique sur "Préparer un ordre".</div>`;
       return;
     }
-    host.innerHTML = orders.map((order) => `
+    const clearableCount = orders.filter((order) => order.status === "CANCELLED" || order.status === "FAILED").length;
+    host.innerHTML = (clearableCount ? `
+      <button type="button" class="dashboard-history-more" data-orders-clear-all>Vider les ${clearableCount} ordre${clearableCount > 1 ? "s" : ""} annulé${clearableCount > 1 ? "s" : ""}/échoué${clearableCount > 1 ? "s" : ""}</button>
+    ` : "") + orders.map((order) => `
       <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}">
         <div>
           <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}</strong>
@@ -439,8 +442,35 @@
           <p class="dashboard-history-note dashboard-prepare-error" data-confirm-error hidden></p>
         ` : ""}
         ${order.status === "FAILED" && order.errorMessage ? `<p class="dashboard-history-note">${escapeHtml(order.errorMessage)}</p>` : ""}
+        ${order.status === "CANCELLED" || order.status === "FAILED" ? `
+          <button type="button" class="dashboard-trade-cancel" data-order-clear>Retirer de la liste</button>
+        ` : ""}
       </article>
     `).join("");
+
+    host.querySelector("[data-orders-clear-all]")?.addEventListener("click", async function () {
+      this.disabled = true;
+      try {
+        await fetch("/api/trade/clear-all", { method: "POST" });
+      } finally {
+        await loadTradeOrders(true);
+      }
+    });
+    host.querySelectorAll("[data-order-clear]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const orderId = button.closest("[data-order-id]").dataset.orderId;
+        button.disabled = true;
+        try {
+          await fetch("/api/trade/clear", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ orderId }),
+          });
+        } finally {
+          await loadTradeOrders(true);
+        }
+      });
+    });
 
     const CONFIRM_ERROR_LABELS = {
       price_unavailable: "Prix live indisponible -- impossible de vérifier que le setup tient toujours. Réessaie dans un instant.",

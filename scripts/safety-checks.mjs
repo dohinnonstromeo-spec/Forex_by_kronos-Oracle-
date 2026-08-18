@@ -228,5 +228,74 @@ const gateWithRealLive = qualityGateLivePriceChecks({ meta: { liveUsable: true, 
 check("real price in quick mode: 'Prix live' check passes", gateWithRealLive.prixLive === true);
 check("real price in quick mode: 'Historique' correctly relaxed (by design, quick mode)", gateWithRealLive.historique === true);
 
+console.log("\n=== evaluateOutcomeFromHistory: point-sampling misses a touch-and-revert, candle history doesn't ===");
+
+// Copy of evaluateOutcomeFromHistory() from server.mjs.
+function evaluateOutcomeFromHistory(analysis, bars) {
+  if (!Array.isArray(bars) || !bars.length) return null;
+  if (![analysis.entry, analysis.sl, analysis.tp1].every(Number.isFinite)) return null;
+  const buy = analysis.direction === "ACHAT";
+  const risk = Math.abs(analysis.entry - analysis.sl);
+  const rMultipleAt = (level) => (risk > 0 ? Math.round((Math.abs(level - analysis.entry) / risk) * 1000) / 1000 : null);
+  const createdAtMs = new Date(analysis.createdAt).getTime();
+  if (!Number.isFinite(createdAtMs)) return null;
+  const relevant = bars
+    .filter((bar) => Number.isFinite(bar.high) && Number.isFinite(bar.low) && Number.isFinite(new Date(bar.datetime).getTime()) && new Date(bar.datetime).getTime() >= createdAtMs)
+    .sort((a, b) => new Date(a.datetime).getTime() - new Date(b.datetime).getTime());
+  for (const bar of relevant) {
+    const hitSl = buy ? bar.low <= analysis.sl : bar.high >= analysis.sl;
+    const hitTp2 = Number.isFinite(analysis.tp2) && (buy ? bar.high >= analysis.tp2 : bar.low <= analysis.tp2);
+    const hitTp1 = buy ? bar.high >= analysis.tp1 : bar.low <= analysis.tp1;
+    if (hitSl) return { status: "SL_HIT", result: "loss", price: analysis.sl, rMultiple: -1, reason: "Stop Loss touché (détecté sur l'historique des bougies)." };
+    if (hitTp2) return { status: "TP2_HIT", result: "win", price: analysis.tp2, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché (détecté sur l'historique des bougies)." };
+    if (hitTp1) return { status: "TP1_HIT", result: "win", price: analysis.tp1, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché (détecté sur l'historique des bougies)." };
+  }
+  return null;
+}
+
+// Real production report, 2026-08-18: a scalp analysis's TP/SL sat only ~$2 from
+// entry on XAU/USD -- easily crossed and reverted within one candle, invisible to a
+// checker that only ever looks at "price right now" every 90s.
+const scalpAnalysis = { direction: "ACHAT", entry: 4420.79, sl: 4418.80, tp1: 4422.48, tp2: 4423.48, createdAt: "2026-08-17T23:55:00.000Z" };
+
+const tp1SpikeAndRevert = [
+  { datetime: "2026-08-17T23:56:00.000Z", high: 4421.0, low: 4420.5 },
+  { datetime: "2026-08-17T23:57:00.000Z", high: 4423.0, low: 4421.8 }, // wicks through TP1 (4422.48)
+  { datetime: "2026-08-17T23:58:00.000Z", high: 4421.2, low: 4420.9 }, // back below TP1 by the next bar
+];
+check(
+  "TP1 spiked through and reverted -- current-price-only would show 'not hit', history correctly shows TP1_HIT",
+  evaluateOutcomeFromHistory(scalpAnalysis, tp1SpikeAndRevert)?.status === "TP1_HIT",
+);
+
+const slSpikeAndRevert = [
+  { datetime: "2026-08-17T23:56:00.000Z", high: 4420.9, low: 4420.3 },
+  { datetime: "2026-08-17T23:57:00.000Z", high: 4420.5, low: 4418.5 }, // wicks through SL (4418.80)
+  { datetime: "2026-08-17T23:58:00.000Z", high: 4421.0, low: 4420.6 }, // recovered above SL by the next bar
+];
+check(
+  "SL spiked through and reverted -- history correctly shows SL_HIT",
+  evaluateOutcomeFromHistory(scalpAnalysis, slSpikeAndRevert)?.status === "SL_HIT",
+);
+
+const bothInSameBar = [
+  { datetime: "2026-08-17T23:56:00.000Z", high: 4423.0, low: 4418.5 }, // one wide bar spans both SL and TP1
+];
+check(
+  "SL and TP1 both inside the same bar's range -- SL wins (conservative ordering, matches scripts/backtest.mjs)",
+  evaluateOutcomeFromHistory(scalpAnalysis, bothInSameBar)?.status === "SL_HIT",
+);
+
+const noTouch = [
+  { datetime: "2026-08-17T23:56:00.000Z", high: 4421.0, low: 4420.5 },
+  { datetime: "2026-08-17T23:57:00.000Z", high: 4421.3, low: 4420.7 },
+];
+check("neither level touched -- returns null so the point-price/24h-expiry fallback still applies", evaluateOutcomeFromHistory(scalpAnalysis, noTouch) === null);
+
+const barsBeforeCreation = [
+  { datetime: "2026-08-17T20:00:00.000Z", high: 4423.0, low: 4418.5 }, // would hit both, but it's before createdAt
+];
+check("bars from before the analysis existed are ignored, not treated as a touch", evaluateOutcomeFromHistory(scalpAnalysis, barsBeforeCreation) === null);
+
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

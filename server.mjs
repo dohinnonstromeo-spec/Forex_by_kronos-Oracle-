@@ -693,7 +693,8 @@ function startLearningOutcomesScheduler() {
   const tick = async () => {
     try {
       const prices = await getPrices();
-      await updateLearningOutcomes(prices);
+      const histories = await getHistories(prices);
+      await updateLearningOutcomes(prices, histories);
     } catch (error) {
       logOnce("scheduler", `sync outcomes échoué (${error.message})`);
     }
@@ -716,7 +717,7 @@ async function computeSignalsPayload() {
       const prices = await getPrices();
       const market = marketStatus();
       const histories = await getHistories(prices);
-      await updateLearningOutcomes(prices);
+      await updateLearningOutcomes(prices, histories);
       const newsRisk = await economicRiskWindow();
       const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
       const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
@@ -1010,7 +1011,8 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/learning") {
     const prices = await getPrices();
-    const learning = await updateLearningOutcomes(prices);
+    const histories = await getHistories(prices);
+    const learning = await updateLearningOutcomes(prices, histories);
     sendJson(res, 200, learningSummary(learning));
     return;
   }
@@ -1021,7 +1023,8 @@ async function handleApi(req, res, url) {
       return;
     }
     const prices = await getPrices();
-    const learning = await updateLearningOutcomes(prices);
+    const histories = await getHistories(prices);
+    const learning = await updateLearningOutcomes(prices, histories);
     const payload = await performancePayload(learning);
     memoryCache.performance = { value: payload, expiresAt: Date.now() + 5 * 60 * 1000 };
     sendJson(res, 200, payload);
@@ -1035,7 +1038,8 @@ async function handleApi(req, res, url) {
       return;
     }
     const prices = await getPrices();
-    const learning = await updateLearningOutcomes(prices);
+    const histories = await getHistories(prices);
+    const learning = await updateLearningOutcomes(prices, histories);
     sendJson(res, 200, personalAnalysesPayload(learning, session.user.id));
     return;
   }
@@ -1196,6 +1200,36 @@ async function handleApi(req, res, url) {
     if (!row) return sendJson(res, 404, { ok: false, error: "order_not_found" });
     if (row.status !== "PENDING_CONFIRMATION") return sendJson(res, 400, { ok: false, error: "order_not_pending" });
     await sqlRun(`UPDATE trade_orders SET status = 'CANCELLED' WHERE id = ?`, [orderId]);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // Purely a declutter action -- CANCELLED/FAILED orders are dead ends (nothing
+  // reached the broker, or the attempt is already recorded as a loss/no-op
+  // elsewhere), never SENT ones, so deleting them here can't erase real trade
+  // history. Explicit status check (not "not PENDING_CONFIRMATION") so this can
+  // never accidentally delete a SENT order regardless of future status values.
+  if (url.pathname === "/api/trade/clear") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const orderId = String(body?.orderId || "");
+    await ensureRelationalTables();
+    const row = await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]);
+    if (!row) return sendJson(res, 404, { ok: false, error: "order_not_found" });
+    if (!["CANCELLED", "FAILED"].includes(row.status)) return sendJson(res, 400, { ok: false, error: "order_not_clearable" });
+    await sqlRun(`DELETE FROM trade_orders WHERE id = ?`, [orderId]);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (url.pathname === "/api/trade/clear-all") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    await ensureRelationalTables();
+    await sqlRun(`DELETE FROM trade_orders WHERE user_id = ? AND status IN ('CANCELLED', 'FAILED')`, [session.user.id]);
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -6944,7 +6978,7 @@ async function recordLearningAnalysis(result, body, context) {
   return id;
 }
 
-async function updateLearningOutcomes(prices = null) {
+async function updateLearningOutcomes(prices = null, histories = null) {
   // Only OPEN+active rows are pulled here (an indexed WHERE, not a full-table load
   // like the old load-mutate-save-whole-blob version), and only the rows that
   // actually resolve this tick get written. Still wrapped in the lock: two overlapping
@@ -6960,7 +6994,18 @@ async function updateLearningOutcomes(prices = null) {
         const analysis = rowToAnalysis(row);
         const price = Number(livePrices[analysis.pair]?.price);
         if (!Number.isFinite(price)) continue;
-        const outcome = evaluateOutcome(analysis, price);
+        // A fast scalp setup (SL/TP a couple dollars from entry) can spike through
+        // TP or SL and revert entirely between two checks of this scheduler (every
+        // 90s, see LEARNING_OUTCOMES_INTERVAL_MS) -- point-sampling "price" only ever
+        // sees where the market is RIGHT NOW, so that touch is invisible and the
+        // analysis sits OPEN, excluded from win/loss stats, until the 24h EXPIRED
+        // fallback marks it "neutral" using whatever price happens to be current at
+        // that moment -- silently turning a real win or loss into a stat that isn't
+        // either. Checking candle high/low since createdAt first (same SL-first,
+        // then TP2, then TP1 ordering scripts/backtest.mjs uses) catches the actual
+        // touch; the point check remains as a fallback only for pairs/moments where
+        // no history is available.
+        const outcome = evaluateOutcomeFromHistory(analysis, histories?.[analysis.pair]) || evaluateOutcome(analysis, price);
         const ageHours = (Date.now() - new Date(analysis.createdAt).getTime()) / 3600000;
         if (!outcome && ageHours < 24) continue;
         const finalOutcome = outcome || {
@@ -6972,7 +7017,11 @@ async function updateLearningOutcomes(prices = null) {
         };
         analysis.status = finalOutcome.status;
         analysis.closedAt = new Date().toISOString();
-        analysis.closePrice = price;
+        // finalOutcome.price, not the current point `price`: for a history-detected
+        // touch the two can differ a lot (price may have moved well past the level
+        // and back by the time this tick runs) -- the level that was actually
+        // crossed is the real close price, not wherever the market happens to be now.
+        analysis.closePrice = finalOutcome.price;
         analysis.outcome = finalOutcome.result;
         analysis.outcomeReason = finalOutcome.reason;
         analysis.rMultiple = Number.isFinite(finalOutcome.rMultiple) ? finalOutcome.rMultiple : null;
@@ -7080,6 +7129,34 @@ async function notifyNewSignals(signals) {
       [signal.paire, signal.direction, new Date().toISOString()],
     );
   }
+}
+
+// Same intent as evaluateOutcome() below but checks the actual candle path since the
+// analysis was created instead of a single point-in-time price -- see the long
+// comment in updateLearningOutcomes() for why point-sampling misses real touches on
+// fast setups. Ordering (SL, then TP2, then TP1) matches
+// scripts/backtest.mjs's simulateForward() so live results and backtested results
+// stay comparable instead of using two different definitions of "hit".
+function evaluateOutcomeFromHistory(analysis, bars) {
+  if (!Array.isArray(bars) || !bars.length) return null;
+  if (![analysis.entry, analysis.sl, analysis.tp1].every(Number.isFinite)) return null;
+  const buy = analysis.direction === "ACHAT";
+  const risk = Math.abs(analysis.entry - analysis.sl);
+  const rMultipleAt = (level) => (risk > 0 ? Math.round((Math.abs(level - analysis.entry) / risk) * 1000) / 1000 : null);
+  const createdAtMs = new Date(analysis.createdAt).getTime();
+  if (!Number.isFinite(createdAtMs)) return null;
+  const relevant = bars
+    .filter((bar) => Number.isFinite(bar.high) && Number.isFinite(bar.low) && Number.isFinite(new Date(bar.datetime).getTime()) && new Date(bar.datetime).getTime() >= createdAtMs)
+    .sort((a, b) => new Date(a.datetime).getTime() - new Date(b.datetime).getTime());
+  for (const bar of relevant) {
+    const hitSl = buy ? bar.low <= analysis.sl : bar.high >= analysis.sl;
+    const hitTp2 = Number.isFinite(analysis.tp2) && (buy ? bar.high >= analysis.tp2 : bar.low <= analysis.tp2);
+    const hitTp1 = buy ? bar.high >= analysis.tp1 : bar.low <= analysis.tp1;
+    if (hitSl) return { status: "SL_HIT", result: "loss", price: analysis.sl, rMultiple: -1, reason: "Stop Loss touché (détecté sur l'historique des bougies)." };
+    if (hitTp2) return { status: "TP2_HIT", result: "win", price: analysis.tp2, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché (détecté sur l'historique des bougies)." };
+    if (hitTp1) return { status: "TP1_HIT", result: "win", price: analysis.tp1, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché (détecté sur l'historique des bougies)." };
+  }
+  return null;
 }
 
 function evaluateOutcome(analysis, price) {
