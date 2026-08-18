@@ -26,7 +26,11 @@
       // corrected. Now the markup starts at "—" and only this catch path runs on
       // failure, so a failed fetch shows an honest "unavailable" state instead of a
       // stale fabricated one.
-      setMetric("precision", "À auditer");
+      // Same label as the "not yet publishable" success path above -- two different
+      // phrasings for what reads to a visitor as the same "why is this blank"
+      // question looked like a leaked internal dev note, confirmed by this
+      // session's design audit.
+      setMetric("precision", "En audit");
       setMetric("signals", "—");
       setMetric("members", "—");
       setMetric("pairs", "—");

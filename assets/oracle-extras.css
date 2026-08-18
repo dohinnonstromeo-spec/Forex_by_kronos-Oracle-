@@ -96,6 +96,37 @@ textarea:focus-visible,
   border-radius: 4px;
 }
 
+/* Shared skeleton/shimmer -- no skeleton pattern existed anywhere in this file
+   before; every loading moment (dashboard metrics/history/orders, homepage
+   market/signals/news) just showed the literal word "Chargement..." as static
+   text. One reusable component instead of a bespoke loading state per panel. */
+.oracle-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.oracle-skeleton-line {
+  height: 14px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, rgba(255,255,255,.04) 25%, rgba(255,255,255,.09) 37%, rgba(255,255,255,.04) 63%);
+  background-size: 400% 100%;
+}
+
+.oracle-skeleton-line:nth-child(2) { width: 82%; }
+.oracle-skeleton-line:nth-child(3) { width: 60%; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .oracle-skeleton-line {
+    animation: oracle-shimmer 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes oracle-shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .analysis-card,
   .auth-card,
