@@ -203,6 +203,43 @@
     loadBrokerPanel(isPremium);
     loadTradeOrders(isPremium);
     loadAutoTrade(isPremium);
+    startLivePositionsPolling();
+  }
+
+  // Real floating P&L for whichever open positions are currently rendered on the
+  // page, refreshed every 10s -- not a websocket/true push, but close enough that
+  // the dashboard stops looking frozen between the 90s server-side outcome-
+  // scheduler ticks. Purely additive: matches cards by data-broker-order-id (set
+  // by renderTradeOrders/loadAutoTradeHistory) and only touches the ones it finds
+  // a live position for -- a card with no match (position already closed, or the
+  // user has no broker connected at all) is left exactly as the order-list
+  // rendering already drew it.
+  let livePositionsPollStarted = false;
+  function startLivePositionsPolling() {
+    if (livePositionsPollStarted) return;
+    if (!document.querySelector("[data-trade-panel], [data-autotrade-panel]")) return;
+    livePositionsPollStarted = true;
+    refreshLivePositions();
+    setInterval(refreshLivePositions, 10000);
+  }
+
+  async function refreshLivePositions() {
+    const slots = document.querySelectorAll("[data-broker-order-id]:not([data-broker-order-id=''])");
+    if (!slots.length) return;
+    const data = await fetchJson("/api/trade/live-positions");
+    const positions = new Map((data?.positions || []).map((p) => [p.id, p]));
+    slots.forEach((card) => {
+      const pnlEl = card.querySelector("[data-live-pnl]");
+      if (!pnlEl) return;
+      const position = positions.get(card.dataset.brokerOrderId);
+      if (!position) {
+        pnlEl.hidden = true; // no longer an open position at the broker -- next full refresh will show its real outcome
+        return;
+      }
+      pnlEl.hidden = false;
+      pnlEl.textContent = `${position.profit >= 0 ? "+" : ""}${position.profit.toFixed(2)}`;
+      pnlEl.classList.toggle("is-negative", position.profit < 0);
+    });
   }
 
   // Shared by both the semi-automatic flow and the autonomous bot -- a user
@@ -476,10 +513,10 @@
     host.innerHTML = (clearableCount ? `
       <button type="button" class="dashboard-history-more" data-orders-clear-all>Vider les ${clearableCount} ordre${clearableCount > 1 ? "s" : ""} annulé${clearableCount > 1 ? "s" : ""}/échoué${clearableCount > 1 ? "s" : ""}</button>
     ` : "") + orders.map((order) => `
-      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}">
+      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}">
         <div>
           <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}</strong>
-          <span>${formatDate(order.createdAt)} · ${escapeHtml(TRADE_ORDER_LABELS[order.status] || order.status)}</span>
+          <span>${formatDate(order.createdAt)} · ${escapeHtml(TRADE_ORDER_LABELS[order.status] || order.status)}${order.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
         </div>
         <div class="dashboard-history-levels">
           <span>Entrée ${escapeHtml(order.entry)}</span>
@@ -790,10 +827,10 @@
       return;
     }
     host.innerHTML = trades.slice(0, 20).map((item) => `
-      <article class="dashboard-trade-order">
+      <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}">
         <div>
           <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
-          <span class="${historyStatusClass(item)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}</span>
+          <span class="${historyStatusClass(item)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}${item.status === "OPEN" && item.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
         </div>
         <div class="dashboard-history-levels">
           <span>Entrée ${escapeHtml(item.entry)}</span>

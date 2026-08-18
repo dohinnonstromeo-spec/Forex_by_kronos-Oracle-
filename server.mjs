@@ -1957,11 +1957,46 @@ async function handleApi(req, res, url) {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     await ensureRelationalTables();
+    // Joins in trade_orders.broker_order_id -- the dashboard's live-P&L polling
+    // (see /api/trade/live-positions) matches a real broker position back to the
+    // card it belongs to by this id, so it has to be present here, not just on the
+    // semi-automatic order list.
     const rows = await sqlAll(
-      `SELECT * FROM analyses WHERE user_id = ? AND source = 'auto_signal' ORDER BY created_at DESC LIMIT 50`,
+      `SELECT a.*, o.broker_order_id as broker_order_id FROM analyses a
+       LEFT JOIN trade_orders o ON o.analysis_id = a.id
+       WHERE a.user_id = ? AND a.source = 'auto_signal' ORDER BY a.created_at DESC LIMIT 50`,
       [session.user.id],
     );
-    sendJson(res, 200, { ok: true, trades: rows.map(rowToAnalysis) });
+    sendJson(res, 200, { ok: true, trades: rows.map((row) => ({ ...rowToAnalysis(row), brokerOrderId: row.broker_order_id || null })) });
+    return;
+  }
+
+  // Real floating P&L for the user's own currently-open broker positions, direct
+  // from MetaApi (unrealizedProfit/currentPrice, not simulated) -- the dashboard
+  // polls this every 10s to show something closer to live without needing a
+  // websocket. Matched back to a specific order/trade card client-side by
+  // brokerOrderId (see /api/trade/orders and /api/auto-trade/history). Silently
+  // empty (never an error) for a user with no connected broker or none open --
+  // this endpoint is purely additive, the existing order lists already work
+  // without it.
+  if (url.pathname === "/api/trade/live-positions") {
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const credentials = await getUserBrokerCredentials(session.user.id);
+    if (!credentials) return sendJson(res, 200, { ok: true, positions: [] });
+    const positions = await getBrokerOpenPositions(credentials).catch(() => null);
+    if (!positions) return sendJson(res, 200, { ok: true, positions: [], stale: true });
+    sendJson(res, 200, {
+      ok: true,
+      positions: positions.map((p) => ({
+        id: String(p.id),
+        symbol: p.symbol,
+        currentPrice: Number(p.currentPrice),
+        profit: Number(p.profit),
+        stopLoss: Number.isFinite(Number(p.stopLoss)) ? Number(p.stopLoss) : null,
+        takeProfit: Number.isFinite(Number(p.takeProfit)) ? Number(p.takeProfit) : null,
+      })),
+    });
     return;
   }
 
@@ -7858,18 +7893,29 @@ async function getBrokerSymbolSpecification(credentials, pair) {
 // DEAL_REASON_MOBILE / DEAL_REASON_CLIENT / DEAL_REASON_DEALER) that tells us
 // whether it was an automatic SL/TP hit or a manual close from the app/dealer --
 // both endpoints verified live this session against the real account.
-async function getBrokerPositionOutcome(credentials, positionId) {
+function brokerApiBase(credentials) {
   const region = credentials.region || "new-york";
-  const base = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}`;
-  const headers = { "auth-token": credentials.token };
-  const positionsRes = await fetch(`${base}/positions`, { headers, signal: AbortSignal.timeout(10000) });
-  if (!positionsRes.ok) return null;
-  const positions = await positionsRes.json();
-  if (!Array.isArray(positions)) return null;
+  return `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}`;
+}
+
+// The same /positions list backs both getBrokerPositionOutcome (is this specific
+// position still open?) and the dashboard's live-P&L polling (every open
+// position's real unrealizedProfit/currentPrice, straight from the broker, no
+// guessing) -- one fetch, two call sites, instead of duplicating the request.
+async function getBrokerOpenPositions(credentials) {
+  const res = await fetch(`${brokerApiBase(credentials)}/positions`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(10000) });
+  if (!res.ok) return null;
+  const positions = await res.json();
+  return Array.isArray(positions) ? positions : null;
+}
+
+async function getBrokerPositionOutcome(credentials, positionId) {
+  const positions = await getBrokerOpenPositions(credentials);
+  if (!positions) return null;
   if (positions.some((p) => String(p.id) === String(positionId))) {
     return { status: "still_open" };
   }
-  const dealsRes = await fetch(`${base}/history-deals/position/${positionId}`, { headers, signal: AbortSignal.timeout(10000) });
+  const dealsRes = await fetch(`${brokerApiBase(credentials)}/history-deals/position/${positionId}`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(10000) });
   if (!dealsRes.ok) return null;
   const deals = await dealsRes.json();
   if (!Array.isArray(deals)) return null;
