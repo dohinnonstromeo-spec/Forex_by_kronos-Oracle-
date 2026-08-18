@@ -6671,14 +6671,19 @@ async function resetPassword(body = {}) {
   });
 }
 
+// Runs on nearly every authenticated request (dashboard, trade endpoints,
+// my-analyses, auto-trade, ...) -- was loadAuthStore(), the entire users AND
+// sessions tables, on every single call. token_hash is UNIQUE-indexed and id is
+// the primary key, so both lookups below are real indexed single-row reads
+// instead of a full scan + JS .find() over every account on the site.
 async function currentSession(req) {
   const token = cookieValue(req, "oracle_session");
   if (!token) return null;
   const tokenHash = sessionHash(token);
-  const store = await loadAuthStore();
-  const session = store.sessions.find((item) => item.tokenHash === tokenHash && new Date(item.expiresAt).getTime() > Date.now());
-  if (!session) return null;
-  const user = store.users.find((item) => item.id === session.userId);
+  await ensureRelationalTables();
+  const session = rowToSession(await sqlGet(`SELECT * FROM sessions WHERE token_hash = ?`, [tokenHash]));
+  if (!session || new Date(session.expiresAt).getTime() <= Date.now()) return null;
+  const user = rowToUser(await sqlGet(`SELECT * FROM users WHERE id = ?`, [session.userId]));
   if (!user) return null;
   return { session, user };
 }
@@ -6721,9 +6726,16 @@ function publicUser(user) {
 
 async function consumeQuota(user, feature, req = null) {
   if (!user) return consumeAnonymousQuota(req, feature);
-  return withFileLock("auth-store", async () => {
-    const store = await loadAuthStore();
-    const stored = store.users.find((item) => item.id === user.id) || user;
+  // Was loadAuthStore() + saveAuthStore() -- the entire users table read AND
+  // re-written (every row upserted, not just this one) on every single
+  // analysis/chat/detection call from every logged-in user, all serialized behind
+  // one global "auth-store" lock shared with signup/login/premium-grant. A single
+  // indexed row read/write, locked per-user (correctness only requires
+  // serializing the same user's own concurrent requests against each other, not
+  // against every other user's), fixes both.
+  return withFileLock(`quota:${user.id}`, async () => {
+    await ensureRelationalTables();
+    const stored = rowToUser(await sqlGet(`SELECT * FROM users WHERE id = ?`, [user.id])) || user;
     if (hasPremiumAccess(stored)) {
       return { ok: true, unlimited: true, feature };
     }
@@ -6750,7 +6762,7 @@ async function consumeQuota(user, feature, req = null) {
     }
     stored.usage[feature] = used + 1;
     stored.updatedAt = new Date().toISOString();
-    await saveAuthStore(store);
+    await upsertUserRow(stored);
     return { ok: true, feature, plan: effectivePlan(stored), limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
   });
 }
