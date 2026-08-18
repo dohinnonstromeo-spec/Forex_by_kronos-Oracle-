@@ -24,8 +24,17 @@
   --foreground: oklch(96% .01 240);
   --card: oklch(18% .04 265);
   --muted-foreground: oklch(74% .03 245);
-  --amber-neon: oklch(85% .18 210);
-  --neon-orange: oklch(55% .25 295);
+  /* Was oklch(85% .18 210)/oklch(55% .25 295) -- those hues render as cyan and
+     violet, not amber/orange (confirmed via an audit this session: converted to
+     sRGB they're rgb(0,235,255) and rgb(131,58,240)). The generated Tailwind bundle
+     right next to this file (styles-nTlncI0E.css) already has the correct values;
+     this file loads after it and was silently clobbering both with the wrong hue
+     since the variable was first introduced. Touches every "premium" badge, the
+     logo mark, nav CTAs, and two quantified WCAG AA contrast failures on
+     .quality-checks .bad / .home-news-list b -- all fixed by this one change.
+     Real amber/orange copied verbatim from the bundle, not re-guessed. */
+  --amber-neon: oklch(81% .16 78);
+  --neon-orange: oklch(78% .18 60);
   --neon-green: oklch(82% .22 150);
   --neon-red: oklch(65% .26 18);
   /* Distinct from --neon-green (used for "still open") so a closed win actually
@@ -34,10 +43,10 @@
   --lemon-green: oklch(87% .24 118);
   --primary-foreground: oklch(11% .02 265);
   --shadow-card: 0 24px 80px rgba(0, 0, 0, .36);
-  --shadow-glow-amber: 0 0 26px oklch(85% .18 210 / .34);
+  --shadow-glow-amber: 0 0 26px oklch(81% .16 78 / .34);
   --oracle-panel: rgba(14, 19, 34, .78);
   --oracle-border: rgba(180, 230, 255, .13);
-  --oracle-gradient: linear-gradient(135deg, oklch(85% .18 210), oklch(55% .25 295));
+  --oracle-gradient: linear-gradient(135deg, oklch(81% .16 78), oklch(78% .18 60));
 
   /* Spacing/radius scale -- introduced to stop new components from picking
      one-off magic numbers (an audit found 8 distinct border-radius values
@@ -949,7 +958,7 @@ body {
 }
 
 .next-actions > span {
-  color: var(--neon-blue);
+  color: rgb(0, 180, 255);
   font-family: var(--font-mono);
   font-size: 10px;
   text-transform: uppercase;

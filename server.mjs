@@ -720,6 +720,15 @@ function startRateLimitMapSweeper() {
       await sqlRun(`DELETE FROM rate_limit_attempts WHERE kind = 'signup' AND first_attempt_at < ?`, [signupCutoff]);
       const today = new Date().toISOString().slice(0, 10);
       await sqlRun(`DELETE FROM anonymous_usage WHERE date <> ?`, [today]);
+      // recentLogs (logOnce's throttle map) grows slowly but permanently otherwise --
+      // same unbounded-Map class already fixed for fileLocks/rate-limit keys, just
+      // missed here. A stale entry costs nothing to drop: the next matching log call
+      // just fires immediately instead of staying throttled, which is correct once
+      // it's been this long anyway.
+      const logCutoff = Date.now() - 2 * 60 * 60 * 1000;
+      for (const [key, lastSeen] of recentLogs) {
+        if (lastSeen < logCutoff) recentLogs.delete(key);
+      }
     } catch (error) {
       logOnce("rate-limit-sweep", `nettoyage échoué (${error.message})`);
     }
