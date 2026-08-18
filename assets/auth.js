@@ -1,4 +1,42 @@
 (() => {
+  document.querySelectorAll("[data-password-strength]").forEach((meter) => {
+    const input = meter.closest("form")?.querySelector('input[type="password"][autocomplete="new-password"]');
+    const fill = meter.querySelector("[data-password-strength-fill]");
+    const label = meter.querySelector("[data-password-strength-label]");
+    if (!input || !fill || !label) return;
+
+    const LEVELS = [
+      { min: 0, key: "weak", text: "Faible" },
+      { min: 2, key: "fair", text: "Moyen" },
+      { min: 3, key: "good", text: "Bon" },
+      { min: 4, key: "strong", text: "Excellent" },
+    ];
+
+    function scorePassword(value) {
+      let score = 0;
+      if (value.length >= 8) score += 1;
+      if (value.length >= 12) score += 1;
+      if (/[a-z]/.test(value) && /[A-Z]/.test(value)) score += 1;
+      if (/[0-9]/.test(value)) score += 1;
+      if (/[^a-zA-Z0-9]/.test(value)) score += 1;
+      return score;
+    }
+
+    input.addEventListener("input", () => {
+      const value = input.value;
+      if (!value) {
+        meter.hidden = true;
+        return;
+      }
+      meter.hidden = false;
+      const score = scorePassword(value);
+      const level = [...LEVELS].reverse().find((l) => score >= l.min) || LEVELS[0];
+      fill.style.width = `${Math.min(100, (score / 5) * 100)}%`;
+      fill.dataset.level = level.key;
+      label.textContent = `Force du mot de passe : ${level.text}`;
+    });
+  });
+
   const form = document.querySelector("[data-auth-form]");
   const message = document.querySelector("[data-auth-message]");
 

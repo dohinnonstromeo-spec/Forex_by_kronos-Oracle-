@@ -431,7 +431,8 @@ body {
   color: var(--foreground);
 }
 
-.oracle-nav {
+.oracle-nav,
+.home-header {
   position: fixed;
   inset: 0 0 auto;
   z-index: 50;
@@ -481,6 +482,24 @@ body {
 
 .oracle-links a:hover {
   color: var(--amber-neon);
+}
+
+.oracle-links a[aria-current="page"],
+.home-links a[aria-current="page"] {
+  color: var(--amber-neon);
+  position: relative;
+}
+
+.oracle-links a[aria-current="page"]::after,
+.home-links a[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -6px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--amber-neon);
 }
 
 .oracle-main {
@@ -1491,6 +1510,39 @@ body {
   color: var(--neon-red);
 }
 
+.password-strength {
+  margin: -8px 0 0;
+  display: grid;
+  gap: 5px;
+}
+
+.password-strength-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, .1);
+  overflow: hidden;
+}
+
+.password-strength-bar span {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--neon-red);
+  transition: width .2s ease, background-color .2s ease;
+}
+
+.password-strength-bar span[data-level="weak"] { background: var(--neon-red); }
+.password-strength-bar span[data-level="fair"] { background: var(--neon-orange); }
+.password-strength-bar span[data-level="good"] { background: var(--amber-neon); }
+.password-strength-bar span[data-level="strong"] { background: var(--neon-green); }
+
+.password-strength-label {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
 .auth-switch {
   margin-top: 16px;
   color: var(--muted-foreground);
@@ -2318,15 +2370,6 @@ body {
   background: var(--background);
   color: var(--foreground);
   overflow-x: hidden;
-}
-
-.home-header {
-  position: fixed;
-  inset: 0 0 auto;
-  z-index: 50;
-  border-bottom: 1px solid rgba(255,255,255,.07);
-  background: rgba(6, 10, 20, .74);
-  backdrop-filter: blur(18px);
 }
 
 .home-nav {
