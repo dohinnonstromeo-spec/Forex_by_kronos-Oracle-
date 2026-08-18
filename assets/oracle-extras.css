@@ -732,7 +732,8 @@ body {
 }
 
 .quick-pair-grid button,
-.timeframe-chip-row button {
+.timeframe-chip-row button,
+.quick-pair-grid a {
   border: 1px solid rgba(255,255,255,.1);
   border-radius: 999px;
   background: rgba(255,255,255,.05);
@@ -741,7 +742,16 @@ body {
   padding: 8px 11px;
   font-family: var(--font-mono);
   font-size: 11px;
+  text-decoration: none;
   transition: border-color .18s ease, color .18s ease, background .18s ease;
+}
+
+/* .quick-pair-grid doubles as legal.html's table-of-contents nav (real <a> links,
+   not the pair-selection buttons this class was built for) -- same pill look,
+   plain anchors instead of toggled "active" state. */
+.quick-pair-grid a:hover {
+  border-color: oklch(81% .16 78 / .4);
+  color: var(--amber-neon);
 }
 
 .quick-pair-grid button.active,
@@ -1485,6 +1495,16 @@ body {
   cursor: pointer;
 }
 
+/* Pausing live trading or revoking a bot's access is not the same weight of action
+   as "Actualiser" -- previously identical styling made a halt-everything button
+   look exactly as low-stakes as a refresh click. */
+.premium-admin-actions button[data-trading-pause],
+.premium-admin-actions button[data-autotrade-revoke] {
+  border-color: rgba(239, 91, 86, .4);
+  background: rgba(239, 91, 86, .08);
+  color: var(--neon-red);
+}
+
 .dashboard-hero {
   margin-bottom: 24px;
 }
@@ -2033,6 +2053,18 @@ body {
   color: var(--neon-green);
 }
 
+/* All three payment methods used the exact same green icon regardless of type --
+   otherwise pixel-identical cards told apart only by the glyph itself. */
+.payment-method-icon[data-icon="creditCard"] {
+  background: oklch(81% .16 78 / .12);
+  color: var(--amber-neon);
+}
+
+.payment-method-icon[data-icon="coin"] {
+  background: rgba(0, 180, 255, .12);
+  color: rgb(0, 180, 255);
+}
+
 .payment-method-icon svg {
   width: 22px;
   height: 22px;
@@ -2066,6 +2098,15 @@ body {
      own padding: different button roles, not a real inconsistency. */
   padding: 14px 16px;
   font-weight: 900;
+}
+
+/* The 404 page's two recovery buttons were the one place this component got
+   reused for plain navigation (not a payment action) and needed to sit side by
+   side instead of full-width -- previously a one-off inline style, the only
+   inline style anywhere in this codebase. */
+.payment-method-button.is-inline {
+  width: auto;
+  margin-top: 0;
 }
 
 .payment-method-button.is-disabled {

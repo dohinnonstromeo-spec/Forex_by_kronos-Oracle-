@@ -35,6 +35,15 @@
       <h1 class="analysis-title">Mentions légales et risques</h1>
       <p class="analysis-subtitle">Cette page clarifie les limites du service, la confidentialité et le risque trading.</p>
 
+      <nav class="quick-pair-grid mt-4" aria-label="Sommaire">
+        <a href="#cgu">CGU</a>
+        <a href="#mentions">Mentions légales</a>
+        <a href="#confidentialite">Confidentialité et RGPD</a>
+        <a href="#sous-traitants">Sous-traitants</a>
+        <a href="#droits">Vos droits</a>
+        <a href="#risques">Risques</a>
+      </nav>
+
       <div class="analysis-form-grid mt-6">
         <article id="cgu" class="analysis-card">
           <h2 class="font-display text-2xl text-amber-neon">CGU</h2>
@@ -42,14 +51,18 @@
         </article>
         <article id="mentions" class="analysis-card">
           <h2 class="font-display text-2xl text-amber-neon">Mentions légales</h2>
-          <p class="mt-3 text-sm text-muted-foreground">
-            Éditeur du site : <strong>[À compléter avant exploitation commerciale]</strong><br>
-            Forme juridique : [À compléter]<br>
-            SIRET : [À compléter — attribué par l'INSEE à l'immatriculation de l'entreprise]<br>
-            Siège social : [À compléter]<br>
-            Directeur de la publication : [À compléter]<br>
-            Hébergeur : [À compléter selon l'hébergeur de production retenu]
-          </p>
+          <div class="analysis-warning">
+            <span data-icon="alertTriangle"></span>
+            <p>
+              <strong>Section en attente d'immatriculation — pas encore les informations définitives.</strong><br>
+              Éditeur du site : [À compléter avant exploitation commerciale]<br>
+              Forme juridique : [À compléter]<br>
+              SIRET : [À compléter — attribué par l'INSEE à l'immatriculation de l'entreprise]<br>
+              Siège social : [À compléter]<br>
+              Directeur de la publication : [À compléter]<br>
+              Hébergeur : [À compléter selon l'hébergeur de production retenu]
+            </p>
+          </div>
           <p class="mt-3 text-sm text-muted-foreground">Le site est en phase de développement. Cette section liste les mentions légales obligatoires (Loi n°2004-575 du 21 juin 2004 pour la confiance dans l'économie numérique) qui doivent être renseignées avec les vraies informations d'immatriculation avant toute exploitation commerciale — elles ne peuvent pas être générées automatiquement.</p>
         </article>
         <article id="confidentialite" class="analysis-card">
@@ -84,6 +97,7 @@
   <footer class="oracle-footer-lite">
     © 2026 Oracle Forex · Outils éducatifs · Aucun conseil financier · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
   </footer>
+  <script src="/assets/oracle-icons.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>
 </body>
 </html>
