@@ -2061,8 +2061,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
       })
       : [];
     const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
-    const learning = await loadLearningLog();
-    const calibration = calibrationFor(learning, body);
+    const calibration = calibrationFor({ outcomes: await loadCalibrationOutcomes() }, body);
     const quickApiSetup = !deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice);
     const deepAssistedSetup = deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice) && !newsContext?.activeRisk && technicalSnapshot?.valid;
     const apiOnlySetup = deepAssistedSetup || (!images.length && includeNewsContext && shouldUseApiOnlySetup({
@@ -7518,6 +7517,42 @@ async function loadLearningLog() {
       closedAt: item.closedAt,
     }));
   return { version: 1, analyses, outcomes, updatedAt: null };
+}
+
+// calibrationFor() only ever reads .outcomes (never .analyses) -- confirmed by
+// reading its body, not assumed. runKronosAnalysis calls loadLearningLog() purely
+// to feed calibrationFor() on every single /api/analyze-chart request, which means
+// the most-used endpoint on the site was loading every OPEN and BLOCKED analysis
+// too (every column, including the heavy technical_snapshot/multi_timeframe JSON
+// blobs) just to immediately discard all of it in the outcomes .filter() below.
+// Same query, same field mapping, same resulting shape as loadLearningLog()'s own
+// outcomes array (outcome IS NOT NULL is the exact SQL equivalent of the
+// `item.outcome` truthy check there) -- just fetched directly instead of filtered
+// in JS after loading rows that were never going to match. Deliberately NOT
+// touching calibrationFor() itself, or any other loadLearningLog() call site
+// (personal history, admin, public performance) -- those genuinely need the full
+// analyses list for other reasons, and this endpoint is the one place where the
+// full load was pure waste on every call.
+async function loadCalibrationOutcomes() {
+  await ensureRelationalTables();
+  const rows = await sqlAll(
+    `SELECT id, user_id, pair, timeframe, style, strategy, analysis_depth, score, outcome, status, r_multiple, closed_at
+     FROM analyses WHERE is_test = 0 AND outcome IS NOT NULL ORDER BY created_at ASC`,
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    userId: row.user_id || null,
+    pair: row.pair,
+    timeframe: row.timeframe,
+    style: row.style,
+    strategy: row.strategy || "Swing Trading",
+    analysisDepth: row.analysis_depth || "Profonde",
+    score: row.score,
+    result: row.outcome,
+    status: row.status,
+    rMultiple: row.r_multiple,
+    closedAt: row.closed_at,
+  }));
 }
 
 async function recordLearningAnalysis(result, body, context) {
