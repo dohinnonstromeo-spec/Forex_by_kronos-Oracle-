@@ -2103,6 +2103,13 @@ body {
   letter-spacing: normal;
 }
 
+.dashboard-autotrade-hint {
+  text-transform: none;
+  font-weight: 500;
+  letter-spacing: normal;
+  opacity: .75;
+}
+
 .dashboard-autotrade-warning {
   margin: 4px 0 14px;
   padding: 9px 12px;

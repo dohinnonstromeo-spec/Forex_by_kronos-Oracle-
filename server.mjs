@@ -293,6 +293,27 @@ async function ensureRelationalTables() {
   // at which point the endpoint falls back to created_at so pre-existing history
   // never shows up as unread on first use.
   await ensureColumn("users", "notifications_seen_at text");
+  // Real broker-confirmed profit in the account's own currency (whatever the
+  // broker uses -- USD, EUR, ...), set only for broker-backed closes (see
+  // tryResolveBrokerBackedOutcome). Needed so a monetary daily-loss cap can sum
+  // real closed P&L instead of the existing rMultiple*riskPercent approximation.
+  await ensureColumn("analyses", "broker_profit_amount real");
+  // Four admin-configurable auto-trade parameters requested directly: a cap on
+  // total trades opened per day (distinct from max_concurrent_positions, which
+  // only limits how many can be OPEN at once -- nothing stopped the bot from
+  // opening and closing many trades in the same day before this), a minimum R:R
+  // filter, a trading-hours/days window (UTC), and a monetary (not just percent)
+  // daily-loss cap since "tout depend du broker de chacun" -- the percent-based
+  // one alone doesn't map cleanly to how someone actually thinks about their risk
+  // in their own account's currency. NULL/0 = no restriction for every one of
+  // these, so existing approved accounts are completely unaffected until an admin
+  // explicitly sets a value.
+  await ensureColumn("auto_trading_accounts", "max_trades_per_day integer");
+  await ensureColumn("auto_trading_accounts", "min_risk_reward real");
+  await ensureColumn("auto_trading_accounts", "trading_hours_start text");
+  await ensureColumn("auto_trading_accounts", "trading_hours_end text");
+  await ensureColumn("auto_trading_accounts", "trading_days text");
+  await ensureColumn("auto_trading_accounts", "daily_loss_limit_amount real");
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -1198,20 +1219,81 @@ async function countOpenAutoPositions(userId) {
   return Number(row?.n || 0);
 }
 
+// Distinct from countOpenAutoPositions: that one counts positions currently open
+// (capped by max_concurrent_positions), this counts every trade opened today
+// regardless of whether it's since closed -- nothing stopped the bot from opening
+// and closing many trades in the same day before max_trades_per_day existed.
+async function countAutoTradesOpenedToday(userId) {
+  const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+  // Excludes BLOCKED: a rejected order attempt (price moved, broker error, ...)
+  // never became a real trade, so it shouldn't eat into a "trades per day" budget
+  // meant to cap real market exposure.
+  const row = await sqlGet(
+    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source = 'auto_signal' AND created_at >= ? AND status != 'BLOCKED'`,
+    [userId, todayStart.toISOString()],
+  );
+  return Number(row?.n || 0);
+}
+
+// Real broker-reported P&L for the day, in the account's own currency -- the
+// monetary counterpart to dailyRealizedPnlPercent's %-of-balance approximation,
+// since "tout depend du broker de chacun" (each account's own currency, USD/EUR/
+// whatever) doesn't map cleanly onto a single shared percentage. Only sums
+// broker_profit_amount, which is only ever set for real broker-backed closes (see
+// tryResolveBrokerBackedOutcome) -- exactly the trades this cap is meant to guard.
+async function dailyRealizedPnlAmount(userId) {
+  const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+  const row = await sqlGet(
+    `SELECT SUM(a.broker_profit_amount) as total FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
+    [userId, todayStart.toISOString()],
+  );
+  return Number(row?.total) || 0;
+}
+
+// trading_hours_start/end are "HH:MM" in UTC; a start > end window is treated as
+// spanning midnight (e.g. 22:00-06:00), not rejected. trading_days is a
+// comma-separated list of JS getUTCDay() values (0=Sunday..6=Saturday). Either
+// left unset (null) means no restriction on that axis -- existing approved
+// accounts are unaffected until an admin explicitly sets one.
+function isWithinTradingWindow(account) {
+  const now = new Date();
+  if (account.trading_days) {
+    const allowedDays = new Set(String(account.trading_days).split(",").filter(Boolean).map(Number));
+    if (allowedDays.size && !allowedDays.has(now.getUTCDay())) return false;
+  }
+  if (account.trading_hours_start && account.trading_hours_end) {
+    const current = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
+    const start = account.trading_hours_start, end = account.trading_hours_end;
+    const withinWindow = start <= end ? (current >= start && current <= end) : (current >= start || current <= end);
+    if (!withinWindow) return false;
+  }
+  return true;
+}
+
 async function processAutoTradeForUser(account, signals) {
   const userId = account.user_id;
+  if (!isWithinTradingWindow(account)) return;
   const approvedPairs = new Set(String(account.approved_pairs || "").split(",").filter(Boolean));
   if (!approvedPairs.size) return;
   const minConfidence = Math.max(Number(account.min_confidence_floor) || 70, Number(account.user_min_confidence) || 0);
-  const candidates = signals.filter((s) => approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence);
+  const minRiskReward = Number(account.min_risk_reward) || 0;
+  const candidates = signals.filter((s) =>
+    approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || Number(s.rr) >= minRiskReward),
+  );
   if (!candidates.length) return;
 
-  const dailyLossLimit = Math.abs(Number(account.daily_loss_limit_percent) || 3);
-  if ((await dailyRealizedPnlPercent(userId)) <= -dailyLossLimit) return;
+  const dailyLossLimitPercent = Math.abs(Number(account.daily_loss_limit_percent) || 3);
+  if ((await dailyRealizedPnlPercent(userId)) <= -dailyLossLimitPercent) return;
+  const dailyLossLimitAmount = Number(account.daily_loss_limit_amount) || 0;
+  if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId)) <= -dailyLossLimitAmount) return;
 
   const maxConcurrent = Number(account.max_concurrent_positions) || 2;
   let openCount = await countOpenAutoPositions(userId);
   if (openCount >= maxConcurrent) return;
+  const maxTradesPerDay = Number(account.max_trades_per_day) || 0;
+  let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId) : 0;
+  if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) return;
 
   const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
   const accountInfo = await getBrokerAccountInformation(credentials).catch(() => null);
@@ -1219,6 +1301,7 @@ async function processAutoTradeForUser(account, signals) {
 
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
+    if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
     // Dedup: reuses `analyses` directly instead of a separate tracking table -- an
     // OPEN auto_signal position already exists for this pair means this signal (or
     // one like it) has already been acted on; don't fire again every tick while it's
@@ -1269,6 +1352,7 @@ async function processAutoTradeForUser(account, signals) {
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
     if (result.status === 200) {
       openCount += 1;
+      tradesOpenedToday += 1;
     } else {
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
@@ -1495,6 +1579,12 @@ async function handleApi(req, res, url) {
       // nothing change if the user's own preference is already sitting higher.
       // Surfaced in the admin panel so that isn't invisible.
       userMinConfidence: row.user_min_confidence ?? null,
+      maxTradesPerDay: row.max_trades_per_day ?? null,
+      minRiskReward: row.min_risk_reward ?? null,
+      tradingHoursStart: row.trading_hours_start || null,
+      tradingHoursEnd: row.trading_hours_end || null,
+      tradingDays: row.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
+      dailyLossLimitAmount: row.daily_loss_limit_amount ?? null,
       userPaused: Boolean(Number(row.user_paused)),
       brokerConnected: Boolean(row.broker_token && row.broker_account_id && row.broker_connected_at),
       brokerLastCheckStatus: row.broker_last_check_status,
@@ -1522,18 +1612,44 @@ async function handleApi(req, res, url) {
     const dailyLossLimitPercent = Math.max(1, Math.min(10, Number(body?.dailyLossLimitPercent) || 3));
     const maxConcurrentPositions = Math.max(1, Math.min(5, Math.round(Number(body?.maxConcurrentPositions) || 2)));
     const minConfidenceFloor = Math.max(60, Math.min(95, Number(body?.minConfidenceFloor) || NEW_SIGNAL_ALERT_MIN_CONFIDENCE));
+    // All four below are optional -- 0/absent means "no restriction on this axis",
+    // same as before this feature existed, so approving an account without
+    // touching these fields behaves exactly as it always has.
+    const maxTradesPerDayRaw = Number(body?.maxTradesPerDay) || 0;
+    const maxTradesPerDay = maxTradesPerDayRaw > 0 ? Math.max(1, Math.min(100, Math.round(maxTradesPerDayRaw))) : null;
+    const minRiskRewardRaw = Number(body?.minRiskReward) || 0;
+    const minRiskReward = minRiskRewardRaw > 0 ? Math.max(0.1, Math.min(10, minRiskRewardRaw)) : null;
+    const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const tradingHoursStart = timePattern.test(body?.tradingHoursStart) && timePattern.test(body?.tradingHoursEnd) ? body.tradingHoursStart : null;
+    const tradingHoursEnd = tradingHoursStart ? body.tradingHoursEnd : null;
+    const tradingDaysInput = Array.isArray(body?.tradingDays) ? body.tradingDays.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : [];
+    // 7 (or 0, meaning the field wasn't sent) distinct days selected is
+    // functionally "every day" -- stored as null rather than "0,1,2,3,4,5,6" so it
+    // reads the same as "never configured" going forward.
+    const uniqueTradingDays = [...new Set(tradingDaysInput)];
+    if (Array.isArray(body?.tradingDays) && !uniqueTradingDays.length) return sendJson(res, 400, { ok: false, error: "no_trading_days" });
+    const tradingDays = uniqueTradingDays.length && uniqueTradingDays.length < 7 ? uniqueTradingDays.join(",") : null;
+    const dailyLossLimitAmountRaw = Number(body?.dailyLossLimitAmount) || 0;
+    const dailyLossLimitAmount = dailyLossLimitAmountRaw > 0 ? dailyLossLimitAmountRaw : null;
     const approvedUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
     await sqlRun(
-      `INSERT INTO auto_trading_accounts (user_id, approval_status, requested_at, decided_at, decided_by, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, user_paused, created_at, updated_at)
-       VALUES (?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `INSERT INTO auto_trading_accounts (user_id, approval_status, requested_at, decided_at, decided_by, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, max_trades_per_day, min_risk_reward, trading_hours_start, trading_hours_end, trading_days, daily_loss_limit_amount, user_paused, created_at, updated_at)
+       VALUES (?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          approval_status = 'approved', decided_at = excluded.decided_at, decided_by = excluded.decided_by,
          reject_reason = NULL, approved_until = excluded.approved_until, approved_pairs = excluded.approved_pairs,
          risk_percent = excluded.risk_percent, daily_loss_limit_percent = excluded.daily_loss_limit_percent,
          max_concurrent_positions = excluded.max_concurrent_positions, min_confidence_floor = excluded.min_confidence_floor,
+         max_trades_per_day = excluded.max_trades_per_day, min_risk_reward = excluded.min_risk_reward,
+         trading_hours_start = excluded.trading_hours_start, trading_hours_end = excluded.trading_hours_end,
+         trading_days = excluded.trading_days, daily_loss_limit_amount = excluded.daily_loss_limit_amount,
          user_paused = 0, updated_at = excluded.updated_at`,
-      [userId, now, now, admin.user?.email || "token", approvedUntil, pairs.join(","), riskPercent, dailyLossLimitPercent, maxConcurrentPositions, minConfidenceFloor, now, now],
+      [
+        userId, now, now, admin.user?.email || "token", approvedUntil, pairs.join(","), riskPercent, dailyLossLimitPercent,
+        maxConcurrentPositions, minConfidenceFloor, maxTradesPerDay, minRiskReward, tradingHoursStart, tradingHoursEnd,
+        tradingDays, dailyLossLimitAmount, now, now,
+      ],
     );
     sendJson(res, 200, { ok: true, approvedUntil });
     return;
@@ -7597,6 +7713,7 @@ function rowToAnalysis(row) {
     outcome: row.outcome || null,
     outcomeReason: row.outcome_reason || null,
     rMultiple: row.r_multiple ?? null,
+    brokerProfitAmount: row.broker_profit_amount ?? null,
     isTest: Boolean(Number(row.is_test)),
     source: row.source || "manual",
   };
@@ -7607,12 +7724,13 @@ async function upsertAnalysisRow(analysis) {
     `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth,
        direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal,
        image_quality, calibration, validation, technical_snapshot, multi_timeframe,
-       closed_at, close_price, outcome, outcome_reason, r_multiple, is_test, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount, is_test, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        user_id = excluded.user_id, status = excluded.status, block_reason = excluded.block_reason,
        closed_at = excluded.closed_at, close_price = excluded.close_price,
-       outcome = excluded.outcome, outcome_reason = excluded.outcome_reason, r_multiple = excluded.r_multiple`,
+       outcome = excluded.outcome, outcome_reason = excluded.outcome_reason, r_multiple = excluded.r_multiple,
+       broker_profit_amount = excluded.broker_profit_amount`,
     [
       analysis.id,
       analysis.userId || null,
@@ -7645,6 +7763,7 @@ async function upsertAnalysisRow(analysis) {
       analysis.outcome || null,
       analysis.outcomeReason || null,
       Number.isFinite(analysis.rMultiple) ? analysis.rMultiple : null,
+      Number.isFinite(analysis.brokerProfitAmount) ? analysis.brokerProfitAmount : null,
       analysis.isTest ? 1 : 0,
       analysis.source || "manual",
     ],
@@ -8200,6 +8319,7 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
       ? `Clôturé manuellement au broker (${profit >= 0 ? "+" : ""}${profit.toFixed(2)}).`
       : brokerStatus === "SL_HIT" ? "Stop Loss touché (confirmé par le broker)." : "TP1 touché (confirmé par le broker).";
     analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
+    analysis.brokerProfitAmount = profit;
     await upsertAnalysisRow(analysis);
     return { closed: true };
   }

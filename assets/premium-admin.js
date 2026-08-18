@@ -194,6 +194,13 @@
   // `symbols` const) -- offering any other pair here would let an admin "approve"
   // something the bot can never act on.
   const AUTOTRADE_PAIRS = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD", "USD/JPY", "USD/CHF"];
+  // JS Date#getUTCDay() values (0=dimanche..6=samedi), listed Monday-first for a
+  // more natural reading order in French -- server.mjs's isWithinTradingWindow
+  // reads the same values back regardless of display order.
+  const AUTOTRADE_DAYS = [
+    { value: 1, label: "Lun" }, { value: 2, label: "Mar" }, { value: 3, label: "Mer" }, { value: 4, label: "Jeu" },
+    { value: 5, label: "Ven" }, { value: 6, label: "Sam" }, { value: 0, label: "Dim" },
+  ];
   const AUTOTRADE_STATUS_LABELS = {
     none: "Aucune demande",
     requested: "En attente",
@@ -233,7 +240,7 @@
             · broker ${request.brokerConnected ? "connecté" : "non connecté"}
           </span>
         </div>
-        <div class="dashboard-autotrade-pairs">
+        <div class="dashboard-autotrade-pairs" data-trading-pairs>
           ${AUTOTRADE_PAIRS.map((pair) => `
             <label>
               <input type="checkbox" value="${escapeHtml(pair)}" ${request.approvedPairs.includes(pair) ? "checked" : ""}>
@@ -258,6 +265,31 @@
             <input type="number" min="60" max="95" step="1" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">
           </label>
         </div>
+        <div class="dashboard-autotrade-form">
+          <label class="dashboard-autotrade-field">Trades max / jour <span class="dashboard-autotrade-hint">(0 = illimité)</span>
+            <input type="number" min="0" max="100" step="1" value="${request.maxTradesPerDay ?? 0}" data-field="maxTradesPerDay">
+          </label>
+          <label class="dashboard-autotrade-field">R:R minimum <span class="dashboard-autotrade-hint">(0 = pas de filtre)</span>
+            <input type="number" min="0" max="10" step="0.1" value="${request.minRiskReward ?? 0}" data-field="minRiskReward">
+          </label>
+          <label class="dashboard-autotrade-field">Perte max / jour (montant) <span class="dashboard-autotrade-hint">(0 = pas de plafond, devise du broker)</span>
+            <input type="number" min="0" step="1" value="${request.dailyLossLimitAmount ?? 0}" data-field="dailyLossLimitAmount">
+          </label>
+          <label class="dashboard-autotrade-field">Heure de début <span class="dashboard-autotrade-hint">(UTC)</span>
+            <input type="time" value="${escapeHtml(request.tradingHoursStart || "")}" data-field="tradingHoursStart">
+          </label>
+          <label class="dashboard-autotrade-field">Heure de fin <span class="dashboard-autotrade-hint">(UTC)</span>
+            <input type="time" value="${escapeHtml(request.tradingHoursEnd || "")}" data-field="tradingHoursEnd">
+          </label>
+        </div>
+        <div class="dashboard-autotrade-pairs" data-trading-days>
+          ${AUTOTRADE_DAYS.map(({ value, label }) => `
+            <label>
+              <input type="checkbox" value="${value}" ${!request.tradingDays || request.tradingDays.includes(value) ? "checked" : ""}>
+              ${escapeHtml(label)}
+            </label>
+          `).join("")}
+        </div>
         ${request.userMinConfidence != null && request.userMinConfidence > (request.minConfidenceFloor ?? 70) ? `
           <p class="dashboard-autotrade-warning">⚠ Ce compte a lui-même réglé sa confiance minimale à ${escapeHtml(request.userMinConfidence)}%, plus haut que le plancher admin ci-dessus (${escapeHtml(request.minConfidenceFloor ?? 70)}%) -- c'est la valeur la plus haute des deux qui s'applique réellement, donc c'est celle du compte, pas celle-ci, qui filtre les trades tant qu'elle reste au-dessus.</p>
         ` : ""}
@@ -275,15 +307,20 @@
         const token = form?.elements?.token?.value || "";
         if (!token) { setMessage("Renseigne le token admin avant d'approuver.", true); return; }
         const card = button.closest("[data-autotrade-request-card]");
-        const pairs = [...card.querySelectorAll('.dashboard-autotrade-pairs input:checked')].map((input) => input.value);
+        const pairs = [...card.querySelectorAll('[data-trading-pairs] input:checked')].map((input) => input.value);
         if (!pairs.length) { setMessage("Coche au moins une paire avant d'approuver.", true); return; }
+        const tradingDays = [...card.querySelectorAll('[data-trading-days] input:checked')].map((input) => Number(input.value));
+        if (!tradingDays.length) { setMessage("Coche au moins un jour de trading avant d'approuver.", true); return; }
         const field = (name) => Number(card.querySelector(`[data-field="${name}"]`).value);
+        const timeField = (name) => card.querySelector(`[data-field="${name}"]`).value || null;
         button.disabled = true;
         setMessage("Approbation en cours...", false);
         const data = await adminFetch("/api/admin/auto-trade/approve", {
-          token, userId, pairs,
+          token, userId, pairs, tradingDays,
           days: field("days"), riskPercent: field("riskPercent"), dailyLossLimitPercent: field("dailyLossLimitPercent"),
           maxConcurrentPositions: field("maxConcurrentPositions"), minConfidenceFloor: field("minConfidenceFloor"),
+          maxTradesPerDay: field("maxTradesPerDay"), minRiskReward: field("minRiskReward"), dailyLossLimitAmount: field("dailyLossLimitAmount"),
+          tradingHoursStart: timeField("tradingHoursStart"), tradingHoursEnd: timeField("tradingHoursEnd"),
         });
         button.disabled = false;
         if (!data?.ok) { setMessage(data?.message || data?.error || "Approbation impossible.", true); return; }
