@@ -287,6 +287,12 @@ async function ensureRelationalTables() {
   // personal "Mes analyses" feed can filter by origin -- see auto_trading_accounts.
   await ensureColumn("analyses", "source text NOT NULL DEFAULT 'manual'");
   await ensureColumn("trade_orders", "risk_percent_at_trade real");
+  // Marks how far a user has read into their own trade-open/close feed (see
+  // /api/notifications/summary) -- the in-app fallback for anyone without an
+  // active push subscription. NULL until they ever open the notifications panel,
+  // at which point the endpoint falls back to created_at so pre-existing history
+  // never shows up as unread on first use.
+  await ensureColumn("users", "notifications_seen_at text");
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -2084,6 +2090,51 @@ async function handleApi(req, res, url) {
         await sqlRun(`DELETE FROM push_subscriptions WHERE endpoint = ?`, [endpoint]);
       }
     }
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // Fallback for a user who never granted push permission (dismissed the prompt,
+  // a mobile browser quirk, etc.) -- without this, that user gets literally zero
+  // real-time signal that a trade opened or closed, silently, forever. Reuses the
+  // exact same event set the push notifications cover (trade_orders opens,
+  // analyses closes) rather than a separate log, so this can never drift out of
+  // sync with what a push-subscribed user would have been told. "Unread" is
+  // relative to notifications_seen_at, defaulting to the account's created_at so a
+  // brand-new user never sees years of pre-existing history flagged as unread.
+  if (url.pathname === "/api/notifications/summary") {
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    await ensureRelationalTables();
+    const userRow = await sqlGet(`SELECT notifications_seen_at, created_at FROM users WHERE id = ?`, [session.user.id]);
+    const seenAt = userRow?.notifications_seen_at || userRow?.created_at || "1970-01-01T00:00:00.000Z";
+    const opens = await sqlAll(
+      `SELECT id, pair, direction, entry, sl, sent_at as at FROM trade_orders
+       WHERE user_id = ? AND status = 'SENT' AND broker_order_id IS NOT NULL AND sent_at IS NOT NULL
+       ORDER BY sent_at DESC LIMIT 20`,
+      [session.user.id],
+    );
+    const closes = await sqlAll(
+      `SELECT id, pair, direction, outcome, r_multiple, status, closed_at as at FROM analyses
+       WHERE user_id = ? AND status != 'OPEN' AND closed_at IS NOT NULL AND is_test = ?
+       ORDER BY closed_at DESC LIMIT 20`,
+      [session.user.id, 0],
+    );
+    const items = [
+      ...opens.map((row) => ({ type: "opened", pair: row.pair, direction: row.direction, entry: row.entry, sl: row.sl, at: row.at })),
+      ...closes.map((row) => ({ type: "closed", pair: row.pair, direction: row.direction, status: row.status, outcome: row.outcome, rMultiple: row.r_multiple, at: row.at })),
+    ].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 20);
+    const count = items.filter((item) => new Date(item.at) > new Date(seenAt)).length;
+    sendJson(res, 200, { ok: true, count, items });
+    return;
+  }
+
+  if (url.pathname === "/api/notifications/mark-seen") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    await ensureRelationalTables();
+    await sqlRun(`UPDATE users SET notifications_seen_at = ? WHERE id = ?`, [new Date().toISOString(), session.user.id]);
     sendJson(res, 200, { ok: true });
     return;
   }

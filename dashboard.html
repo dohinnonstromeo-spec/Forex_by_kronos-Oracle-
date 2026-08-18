@@ -24,6 +24,16 @@
         <a href="/">Accueil</a>
         <a href="/tester-gratuitement" data-cta-trial data-cms="global.cta.trial">Tester gratuitement</a>
         <a href="/paiement" data-payment-form>S'abonner</a>
+        <div class="auth-notif" data-notif-wrap hidden>
+          <button class="auth-notif-bell" type="button" data-notif-bell aria-label="Notifications">
+            🔔<span class="auth-notif-badge" data-notif-badge hidden>0</span>
+          </button>
+          <div class="auth-notif-panel" data-notif-panel hidden>
+            <p class="auth-notif-title">Activité récente</p>
+            <p class="auth-notif-empty" data-notif-empty hidden>Aucun événement pour l'instant.</p>
+            <div data-notif-list></div>
+          </div>
+        </div>
         <button class="auth-logout" type="button" data-logout>Déconnexion</button>
       </div>
     </div>

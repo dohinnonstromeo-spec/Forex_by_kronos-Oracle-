@@ -204,6 +204,7 @@
     loadTradeOrders(isPremium);
     loadAutoTrade(isPremium);
     startLivePositionsPolling();
+    startNotificationsFallback();
   }
 
   // Real floating P&L for whichever open positions are currently rendered on the
@@ -240,6 +241,56 @@
       pnlEl.textContent = `${position.profit >= 0 ? "+" : ""}${position.profit.toFixed(2)}`;
       pnlEl.classList.toggle("is-negative", position.profit < 0);
     });
+  }
+
+  // Fallback for a user who never granted push permission (dismissed the prompt,
+  // a mobile browser quirk, whatever the reason) -- without this they get zero
+  // real-time signal a trade opened or closed, silently, forever. Polls the same
+  // event set the push notifications cover (see /api/notifications/summary), so
+  // it can never show something push wouldn't have also said.
+  let notificationsFallbackStarted = false;
+  function startNotificationsFallback() {
+    if (notificationsFallbackStarted) return;
+    const wrap = document.querySelector("[data-notif-wrap]");
+    if (!wrap) return;
+    notificationsFallbackStarted = true;
+    wrap.hidden = false;
+    const bell = wrap.querySelector("[data-notif-bell]");
+    const panel = wrap.querySelector("[data-notif-panel]");
+    bell.addEventListener("click", () => {
+      const opening = panel.hidden;
+      panel.hidden = !panel.hidden;
+      if (opening) markNotificationsSeen();
+    });
+    document.addEventListener("click", (event) => {
+      if (!panel.hidden && !wrap.contains(event.target)) panel.hidden = true;
+    });
+    refreshNotifications();
+    setInterval(refreshNotifications, 20000);
+  }
+
+  async function refreshNotifications() {
+    const wrap = document.querySelector("[data-notif-wrap]");
+    if (!wrap) return;
+    const data = await fetchJson("/api/notifications/summary");
+    if (!data?.ok) return;
+    const badge = wrap.querySelector("[data-notif-badge]");
+    badge.hidden = !data.count;
+    badge.textContent = data.count > 9 ? "9+" : String(data.count);
+    const list = wrap.querySelector("[data-notif-list]");
+    const empty = wrap.querySelector("[data-notif-empty]");
+    const items = data.items || [];
+    empty.hidden = items.length > 0;
+    list.innerHTML = items.map((item) => {
+      const label = item.type === "opened" ? "Position ouverte" : `${historyStatusIcon(item)}${historyStatusLabel(item)}`;
+      return `<div class="auth-notif-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong><small>${formatDate(item.at)}</small></div>`;
+    }).join("");
+  }
+
+  async function markNotificationsSeen() {
+    await fetch("/api/notifications/mark-seen", { method: "POST" }).catch(() => {});
+    const badge = document.querySelector("[data-notif-badge]");
+    if (badge) badge.hidden = true;
   }
 
   // Shared by both the semi-automatic flow and the autonomous bot -- a user

@@ -1560,6 +1560,94 @@ body {
   font-weight: 700;
 }
 
+.auth-notif {
+  position: relative;
+}
+
+.auth-notif-bell {
+  position: relative;
+  background: none;
+  border: none;
+  color: var(--foreground);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.auth-notif-badge {
+  position: absolute;
+  top: -4px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--neon-red);
+  color: var(--foreground);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.auth-notif-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(320px, 84vw);
+  max-height: 360px;
+  overflow-y: auto;
+  background: var(--card);
+  border: 1px solid var(--oracle-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 14px;
+  z-index: 40;
+}
+
+.auth-notif-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted-foreground);
+  margin: 0 0 10px;
+}
+
+.auth-notif-empty {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  margin: 0;
+}
+
+.auth-notif-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 0;
+  border-top: 1px solid var(--oracle-border);
+  font-size: 12px;
+}
+
+.auth-notif-item:first-child {
+  border-top: none;
+}
+
+.auth-notif-item span {
+  color: var(--amber-neon);
+  font-weight: 600;
+}
+
+.auth-notif-item strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.auth-notif-item small {
+  color: var(--muted-foreground);
+}
+
 .premium-admin-card {
   width: min(760px, 100%);
 }
