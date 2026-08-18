@@ -92,31 +92,15 @@
       <div class="dashboard-history" data-dashboard-history><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
     </section>
 
-    <section class="dashboard-panel" data-trade-panel hidden>
+    <section class="dashboard-panel" data-broker-panel hidden>
       <div class="signal-top">
         <div>
-          <p class="analysis-kicker">Exécution semi-automatique</p>
-          <h2 class="analysis-title">Ordres</h2>
+          <p class="analysis-kicker">Ton broker</p>
+          <h2 class="analysis-title">Connexion broker</h2>
         </div>
-        <span class="oracle-tech" data-trade-broker-status>Broker non connecté</span>
       </div>
-      <p class="dashboard-trade-note">Kronos prépare l'ordre à partir d'une analyse ouverte, tu choisis la taille et confirmes — rien n'est envoyé au broker sans ta validation explicite.</p>
-      <div class="dashboard-trade-orders" data-trade-orders><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
-    </section>
-    <p class="dashboard-push-upsell" data-trade-upsell hidden>L'exécution semi-automatique (Kronos prépare l'ordre, tu valides, il part vers ton broker) est réservée aux membres Premium. <a href="/paiement">S'abonner</a></p>
-
-    <section class="dashboard-panel" data-autotrade-panel hidden>
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker">Exécution 100% automatique</p>
-          <h2 class="analysis-title">Robot Kronos</h2>
-        </div>
-        <span class="oracle-tech" data-autotrade-status-badge>Statut...</span>
-      </div>
-      <p class="dashboard-trade-note">Le robot surveille le marché seul et exécute sans confirmation, uniquement sur les paires et le risque approuvés. Nécessite ton propre compte broker connecté <strong>et</strong> une approbation manuelle de l'équipe — ce n'est pas activable en un clic.</p>
-
+      <p class="dashboard-trade-note">Connecte ton propre compte broker une seule fois ici — il sert aussi bien à l'exécution semi-automatique (ci-dessous) qu'au robot 100% automatique (plus bas). Aucun ordre n'utilise jamais un autre compte que le tien.</p>
       <div class="dashboard-autotrade-section">
-        <h3>1. Connecter ton broker</h3>
         <p class="dashboard-history-note">Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
         <form class="dashboard-autotrade-form" data-autotrade-broker-form>
           <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
@@ -130,9 +114,34 @@
           <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect>Déconnecter</button>
         </div>
       </div>
+    </section>
+
+    <section class="dashboard-panel" data-trade-panel hidden>
+      <div class="signal-top">
+        <div>
+          <p class="analysis-kicker">Exécution semi-automatique</p>
+          <h2 class="analysis-title">Ordres</h2>
+        </div>
+        <span class="oracle-tech" data-trade-broker-status>Broker non connecté</span>
+      </div>
+      <p class="dashboard-trade-note">Kronos prépare l'ordre à partir d'une analyse ouverte, tu choisis la taille et confirmes — rien n'est envoyé au broker sans ta validation explicite.</p>
+      <p class="dashboard-history-note dashboard-prepare-error" data-trade-broker-prompt hidden>Connecte ton broker ci-dessus pour pouvoir envoyer un ordre réel.</p>
+      <div class="dashboard-trade-orders" data-trade-orders><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
+    </section>
+    <p class="dashboard-push-upsell" data-trade-upsell hidden>L'exécution semi-automatique (Kronos prépare l'ordre, tu valides, il part vers ton broker) est réservée aux membres Premium. <a href="/paiement">S'abonner</a></p>
+
+    <section class="dashboard-panel" data-autotrade-panel hidden>
+      <div class="signal-top">
+        <div>
+          <p class="analysis-kicker">Exécution 100% automatique</p>
+          <h2 class="analysis-title">Robot Kronos</h2>
+        </div>
+        <span class="oracle-tech" data-autotrade-status-badge>Statut...</span>
+      </div>
+      <p class="dashboard-trade-note">Le robot surveille le marché seul et exécute sans confirmation, uniquement sur les paires et le risque approuvés. Nécessite ton propre compte broker connecté (ci-dessus) <strong>et</strong> une approbation manuelle de l'équipe — ce n'est pas activable en un clic.</p>
 
       <div class="dashboard-autotrade-section" data-autotrade-activation-section hidden>
-        <h3>2. Activation</h3>
+        <h3>Activation</h3>
         <p class="dashboard-history-note" data-autotrade-status-text></p>
         <div class="dashboard-autotrade-metrics" data-autotrade-metrics hidden></div>
         <button type="button" class="payment-method-button" data-autotrade-request hidden>Demander l'activation</button>

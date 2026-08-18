@@ -1431,7 +1431,7 @@ async function handleApi(req, res, url) {
       [order.id, session.user.id, analysis.id, order.pair, order.direction, order.entry, order.sl, order.tp1, order.tp2, order.status, order.createdAt],
     );
     const correlationWarning = await correlationWarnings(session.user.id, order.pair, order.direction);
-    sendJson(res, 200, { ok: true, order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null }, brokerConfigured: BROKER_CONFIGURED, correlationWarning });
+    sendJson(res, 200, { ok: true, order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null }, brokerConfigured: Boolean(await getUserBrokerCredentials(session.user.id)), correlationWarning });
     return;
   }
 
@@ -1447,7 +1447,13 @@ async function handleApi(req, res, url) {
     const orderId = String(body?.orderId || "");
     const volume = Number(body?.volume);
     if (!orderId || !Number.isFinite(volume) || volume <= 0) return sendJson(res, 400, { ok: false, error: "invalid_request" });
-    const result = await confirmAndSendOrder({ orderId, userId: session.user.id, volume });
+    // Every user's own connected broker, never the shared house account -- a
+    // logged-in user with no broker connected is blocked here, before the order or
+    // the per-user lock is ever touched, rather than silently executing against
+    // someone else's account. See getUserBrokerCredentials.
+    const credentials = await getUserBrokerCredentials(session.user.id);
+    if (!credentials) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
+    const result = await confirmAndSendOrder({ orderId, userId: session.user.id, volume, credentials });
     sendJson(res, result.status, result.body);
     return;
   }
@@ -1509,7 +1515,7 @@ async function handleApi(req, res, url) {
         : null;
       return order;
     }));
-    sendJson(res, 200, { ok: true, orders, brokerConfigured: BROKER_CONFIGURED });
+    sendJson(res, 200, { ok: true, orders, brokerConfigured: Boolean(await getUserBrokerCredentials(session.user.id)) });
     return;
   }
 
@@ -7321,20 +7327,40 @@ async function getTradeDailyOrderCap() {
 // MetaApi's REST trade endpoint -- verified live this session against a real
 // connected MetaApi demo account (region/path/field shape all confirmed correct;
 // numericCode 10009 is the real "order placed" signal, HTTP 200 alone is not, see
-// the check below). BROKER_CONFIGURED reflects only the shared house account used
-// by the semi-automatic flow; the autonomous bot never depends on it, each
-// approved user's own credentials are checked independently (see
-// auto_trading_accounts / runAutoTradeTick).
+// the check below). BROKER_CONFIGURED reflects only the shared house account,
+// which the real trade-execution path no longer depends on (both the
+// semi-automatic flow and the autonomous bot always use each user's own connected
+// credentials, see getUserBrokerCredentials / auto_trading_accounts) -- it's kept
+// only for the admin panel's own env-config visibility.
 const BROKER_CONFIGURED = Boolean(env.METAAPI_TOKEN && env.METAAPI_ACCOUNT_ID);
 
-// The shared house demo account (env vars) backs the semi-automatic flow; the
-// autonomous per-user bot always passes its own connected credentials explicitly
-// (see auto_trading_accounts) -- resolving to the env fallback only when nothing
-// explicit is given keeps every existing manual-confirm call site working
-// unchanged.
+// Both the semi-automatic flow and the autonomous bot now always pass their own
+// connected user's credentials explicitly (see getUserBrokerCredentials /
+// auto_trading_accounts) -- the env-var house account below is kept only as a
+// generic fallback for the rare caller that has no per-user credentials to give
+// (there are none left on the real trade-execution path as of this migration; a
+// confirm request with no connected broker is rejected before ever reaching here,
+// see /api/trade/confirm), not something any real user's order can fall through to.
 function resolveBrokerCredentials(explicit) {
   if (explicit) return explicit;
   return BROKER_CONFIGURED ? { token: env.METAAPI_TOKEN, accountId: env.METAAPI_ACCOUNT_ID, region: env.METAAPI_REGION || "new-york" } : null;
+}
+
+// Looks up a user's own verified broker connection from auto_trading_accounts, the
+// same table/columns the autonomous bot's runAutoTradeTick reads (broker_connected_at
+// IS NOT NULL, not just token/account presence -- a failed verification still saves
+// the row so the user can retry without retyping, but must never be trusted for real
+// execution). Shared by /api/trade/confirm (semi-automatic) and the bot scheduler's
+// account list, so both flows read the exact same connection.
+async function getUserBrokerCredentials(userId) {
+  await ensureRelationalTables();
+  const row = await sqlGet(
+    `SELECT broker_token, broker_account_id, broker_region FROM auto_trading_accounts
+     WHERE user_id = ? AND broker_token IS NOT NULL AND broker_account_id IS NOT NULL AND broker_connected_at IS NOT NULL`,
+    [userId],
+  );
+  if (!row) return null;
+  return { token: row.broker_token, accountId: row.broker_account_id, region: row.broker_region || "new-york" };
 }
 
 async function sendOrderToBroker(order, credentials = null) {

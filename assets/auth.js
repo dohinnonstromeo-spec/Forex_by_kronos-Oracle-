@@ -200,8 +200,20 @@
     const personal = await fetchJson("/api/my-analyses");
     renderPersonalHistory(personal, isPremium);
     initPush(isPremium);
+    loadBrokerPanel(isPremium);
     loadTradeOrders(isPremium);
     loadAutoTrade(isPremium);
+  }
+
+  // Shared by both the semi-automatic flow and the autonomous bot -- a user
+  // connects their broker exactly once here, instead of the connect form being
+  // buried inside the bot panel like it used to be (which made it look like
+  // semi-automatic trades needed a second, separate connection).
+  function loadBrokerPanel(isPremium) {
+    const panel = document.querySelector("[data-broker-panel]");
+    if (!panel) return;
+    panel.hidden = !isPremium;
+    if (isPremium) bindAutoTradeBrokerForm();
   }
 
   function urlBase64ToUint8Array(base64) {
@@ -450,7 +462,10 @@
 
   function renderTradeOrders(orders, brokerConfigured) {
     const statusEl = document.querySelector("[data-trade-broker-status]");
-    if (statusEl) statusEl.textContent = brokerConfigured ? "Broker connecté" : "Broker non connecté (démo requise)";
+    if (statusEl) statusEl.textContent = brokerConfigured ? "Broker connecté" : "Broker non connecté";
+    const prompt = document.querySelector("[data-trade-broker-prompt]");
+    if (prompt) prompt.hidden = brokerConfigured;
+    renderBrokerConnectStatus(brokerConfigured);
     const host = document.querySelector("[data-trade-orders]");
     if (!host) return;
     if (!orders.length) {
@@ -518,6 +533,7 @@
       levels_too_close_to_price: "Le SL ou le TP est trop proche du prix actuel pour être accepté par le broker maintenant. Relance une analyse.",
       trading_paused: "Trading suspendu temporairement par l'administrateur.",
       daily_order_cap_reached: "Limite quotidienne d'ordres atteinte.",
+      broker_not_connected: "Tu dois d'abord connecter ton broker (section \"Connexion broker\" ci-dessus) avant d'envoyer un ordre réel.",
     };
 
     host.querySelectorAll("[data-order-confirm]").forEach((button) => {
@@ -539,7 +555,7 @@
         // message off the screen the instant it appears, for no reason, since
         // nothing about the order actually changed. Only reload when the order's
         // real status did (sent/failed/expired).
-        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached"]);
+        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached", "broker_not_connected"]);
         try {
           const response = await fetch("/api/trade/confirm", {
             method: "POST",
@@ -647,7 +663,9 @@
         if (message) { message.textContent = "Impossible de contacter le serveur -- vérifie ta connexion."; message.hidden = false; }
       } finally {
         submitButton.disabled = false;
-        await refreshAutoTradeStatus();
+        // The broker connection is shared by both flows -- reflect it in both
+        // panels immediately, not just the one the form happens to live in.
+        await Promise.all([refreshAutoTradeStatus(), loadTradeOrders(true)]);
       }
     });
 
@@ -657,7 +675,7 @@
       try {
         await fetch("/api/auto-trade/broker/disconnect", { method: "POST" });
       } finally {
-        await refreshAutoTradeStatus();
+        await Promise.all([refreshAutoTradeStatus(), loadTradeOrders(true)]);
       }
     });
 
@@ -692,6 +710,17 @@
     });
   }
 
+  // The single broker connection (auto_trading_accounts) backs both the
+  // semi-automatic panel and the bot panel -- one function toggles the shared
+  // connect-form/"connected" display so both panels always agree, instead of each
+  // keeping its own copy of the same toggle logic.
+  function renderBrokerConnectStatus(connected) {
+    const brokerConnected = document.querySelector("[data-autotrade-broker-connected]");
+    const brokerForm = document.querySelector("[data-autotrade-broker-form]");
+    if (brokerConnected) brokerConnected.hidden = !connected;
+    if (brokerForm) brokerForm.hidden = connected;
+  }
+
   async function refreshAutoTradeStatus() {
     const status = await fetchJson("/api/auto-trade/status");
     if (!status?.ok) return;
@@ -699,10 +728,7 @@
     const badge = document.querySelector("[data-autotrade-status-badge]");
     if (badge) badge.textContent = AUTOTRADE_STATUS_LABELS[status.approvalStatus] || status.approvalStatus;
 
-    const brokerConnected = document.querySelector("[data-autotrade-broker-connected]");
-    const brokerForm = document.querySelector("[data-autotrade-broker-form]");
-    if (brokerConnected) brokerConnected.hidden = !status.brokerConnected;
-    if (brokerForm) brokerForm.hidden = status.brokerConnected;
+    renderBrokerConnectStatus(status.brokerConnected);
 
     const activationSection = document.querySelector("[data-autotrade-activation-section]");
     if (activationSection) activationSection.hidden = !status.brokerConnected;
