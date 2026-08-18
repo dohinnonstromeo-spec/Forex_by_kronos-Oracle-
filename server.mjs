@@ -1489,6 +1489,12 @@ async function handleApi(req, res, url) {
       dailyLossLimitPercent: row.daily_loss_limit_percent,
       maxConcurrentPositions: row.max_concurrent_positions,
       minConfidenceFloor: row.min_confidence_floor,
+      // The account owner can raise their own floor above the admin's (see
+      // processAutoTradeForUser: Math.max(minConfidenceFloor, userMinConfidence)) --
+      // an admin lowering minConfidenceFloor expecting more trades to fire sees
+      // nothing change if the user's own preference is already sitting higher.
+      // Surfaced in the admin panel so that isn't invisible.
+      userMinConfidence: row.user_min_confidence ?? null,
       userPaused: Boolean(Number(row.user_paused)),
       brokerConnected: Boolean(row.broker_token && row.broker_account_id && row.broker_connected_at),
       brokerLastCheckStatus: row.broker_last_check_status,

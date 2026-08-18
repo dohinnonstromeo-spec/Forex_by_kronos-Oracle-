@@ -242,12 +242,25 @@
           `).join("")}
         </div>
         <div class="dashboard-autotrade-form">
-          <input type="number" min="1" max="90" step="1" placeholder="Jours" value="7" data-field="days">
-          <input type="number" min="0.1" max="3" step="0.1" placeholder="Risque % / trade" value="${request.riskPercent ?? 0.5}" data-field="riskPercent">
-          <input type="number" min="1" max="10" step="0.5" placeholder="Perte max / jour %" value="${request.dailyLossLimitPercent ?? 3}" data-field="dailyLossLimitPercent">
-          <input type="number" min="1" max="5" step="1" placeholder="Positions max" value="${request.maxConcurrentPositions ?? 2}" data-field="maxConcurrentPositions">
-          <input type="number" min="60" max="95" step="1" placeholder="Confiance min %" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">
+          <label class="dashboard-autotrade-field">Durée (jours)
+            <input type="number" min="1" max="90" step="1" value="7" data-field="days">
+          </label>
+          <label class="dashboard-autotrade-field">Risque % / trade
+            <input type="number" min="0.1" max="3" step="0.1" value="${request.riskPercent ?? 0.5}" data-field="riskPercent">
+          </label>
+          <label class="dashboard-autotrade-field">Perte max / jour (%)
+            <input type="number" min="1" max="10" step="0.5" value="${request.dailyLossLimitPercent ?? 3}" data-field="dailyLossLimitPercent">
+          </label>
+          <label class="dashboard-autotrade-field">Positions ouvertes max
+            <input type="number" min="1" max="5" step="1" value="${request.maxConcurrentPositions ?? 2}" data-field="maxConcurrentPositions">
+          </label>
+          <label class="dashboard-autotrade-field">Confiance min (%)
+            <input type="number" min="60" max="95" step="1" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">
+          </label>
         </div>
+        ${request.userMinConfidence != null && request.userMinConfidence > (request.minConfidenceFloor ?? 70) ? `
+          <p class="dashboard-autotrade-warning">⚠ Ce compte a lui-même réglé sa confiance minimale à ${escapeHtml(request.userMinConfidence)}%, plus haut que le plancher admin ci-dessus (${escapeHtml(request.minConfidenceFloor ?? 70)}%) -- c'est la valeur la plus haute des deux qui s'applique réellement, donc c'est celle du compte, pas celle-ci, qui filtre les trades tant qu'elle reste au-dessus.</p>
+        ` : ""}
         <div class="premium-admin-actions">
           <button type="button" data-autotrade-approve="${escapeHtml(request.userId)}">Approuver</button>
           <button type="button" data-autotrade-reject="${escapeHtml(request.userId)}">Refuser</button>
