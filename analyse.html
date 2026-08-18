@@ -8,19 +8,19 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Oracle Forex">
-  <title>Analyse IA · Oracle Forex</title>
-  <meta name="description" content="Console Kronos pour analyser jusqu'à 2 screenshots de charts Forex avec Groq Vision, Gemini en secours et les données marché.">
+  <title data-cms="analyse.seo.title">Analyse IA · Oracle Forex</title>
+  <meta name="description" content="Console Kronos pour analyser jusqu'à 2 screenshots de charts Forex avec Groq Vision, Gemini en secours et les données marché." data-cms="analyse.seo.description">
   <link rel="canonical" href="https://forex-by-kronos-oracle.onrender.com/analyse.html">
-  <meta property="og:title" content="Analyse IA · Oracle Forex">
-  <meta property="og:description" content="Analysez vos graphes Forex avec Kronos : score de confiance, plan de risque et niveaux d'entrée/sortie.">
+  <meta property="og:title" content="Analyse IA · Oracle Forex" data-cms="analyse.seo.og_title">
+  <meta property="og:description" content="Analysez vos graphes Forex avec Kronos : score de confiance, plan de risque et niveaux d'entrée/sortie." data-cms="analyse.seo.description">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://forex-by-kronos-oracle.onrender.com/analyse.html">
   <meta property="og:image" content="https://forex-by-kronos-oracle.onrender.com/assets/og-image.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Analyse IA · Oracle Forex">
-  <meta name="twitter:description" content="Analysez vos graphes Forex avec Kronos : score de confiance, plan de risque et niveaux d'entrée/sortie.">
+  <meta name="twitter:title" content="Analyse IA · Oracle Forex" data-cms="analyse.seo.og_title">
+  <meta name="twitter:description" content="Analysez vos graphes Forex avec Kronos : score de confiance, plan de risque et niveaux d'entrée/sortie." data-cms="analyse.seo.description">
   <meta name="twitter:image" content="https://forex-by-kronos-oracle.onrender.com/assets/og-image.png">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
@@ -37,7 +37,7 @@
         <a href="/#signaux">Signaux</a>
         <a href="/#intelligence">Intelligence</a>
         <a href="/#pricing">Abonnement</a>
-        <a href="/dashboard">Dashboard</a>
+        <a href="/dashboard" data-cms="global.nav.dashboard">Dashboard</a>
         <a href="/legal.html#risques">Risques</a>
       </div>
     </div>
@@ -45,12 +45,12 @@
 
   <main class="oracle-main">
     <section class="analysis-hero">
-      <p class="analysis-kicker">Terminal Kronos</p>
-      <h1 class="analysis-title">Analyse Forex Intelligente</h1>
-      <p class="analysis-subtitle">Vision chart · prix live · styles techniques · stratégies de trading · apprentissage contrôlé</p>
+      <p class="analysis-kicker" data-cms="analyse.hero.kicker">Terminal Kronos</p>
+      <h1 class="analysis-title" data-cms="analyse.hero.title">Analyse Forex Intelligente</h1>
+      <p class="analysis-subtitle" data-cms="analyse.hero.subtitle">Vision chart · prix live · styles techniques · stratégies de trading · apprentissage contrôlé</p>
       <div class="analysis-warning">
         <span data-icon="alertTriangle"></span>
-        <p>Les résultats restent éducatifs. Kronos donne un plan lisible, mais l'utilisateur doit confirmer le contexte de marché avant toute décision réelle.</p>
+        <p data-cms="analyse.hero.warning">Les résultats restent éducatifs. Kronos donne un plan lisible, mais l'utilisateur doit confirmer le contexte de marché avant toute décision réelle.</p>
       </div>
       <div class="analysis-stats" aria-label="Forces du moteur Kronos">
         <div><strong>2</strong><span>graphes max</span></div>
@@ -62,16 +62,16 @@
 
     <div class="analysis-layout">
       <section class="analysis-card">
-        <p class="analysis-kicker">Console d'analyse Kronos</p>
-        <h2 class="analysis-title icon-prefix"><span data-icon="zap"></span>Analyse de Chart IA</h2>
-        <p class="analysis-subtitle">Déposez votre screenshot · Analyse généralement en quelques secondes</p>
+        <p class="analysis-kicker" data-cms="analyse.console.kicker">Console d'analyse Kronos</p>
+        <h2 class="analysis-title icon-prefix"><span data-icon="zap"></span><span data-cms="analyse.console.title">Analyse de Chart IA</span></h2>
+        <p class="analysis-subtitle" data-cms="analyse.console.subtitle">Déposez votre screenshot · Analyse généralement en quelques secondes</p>
 
         <form id="analysisForm">
           <input id="chartUpload" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
           <div class="drop-zone" role="button" tabindex="0" aria-label="Ajouter des captures de graphe">
             <div>
-              <div class="font-display text-3xl text-amber-neon icon-prefix"><span data-icon="paperclip"></span>Glissez vos graphiques</div>
-              <p class="mt-2 text-sm text-muted-foreground">PNG/JPG/WEBP · 2 images max · MT4 / MT5 / TradingView / cTrader</p>
+              <div class="font-display text-3xl text-amber-neon icon-prefix"><span data-icon="paperclip"></span><span data-cms="analyse.dropzone.title">Glissez vos graphiques</span></div>
+              <p class="mt-2 text-sm text-muted-foreground" data-cms="analyse.dropzone.helper">PNG/JPG/WEBP · 2 images max · MT4 / MT5 / TradingView / cTrader</p>
             </div>
           </div>
           <div class="preview-grid"></div>
@@ -79,8 +79,8 @@
           <section class="tv-chart-card" aria-label="Graphique TradingView">
             <div class="signal-top">
               <div>
-                <p class="analysis-kicker">Chart interface</p>
-                <h2 class="tv-chart-title">TradingView</h2>
+                <p class="analysis-kicker" data-cms="analyse.tvchart.kicker">Chart interface</p>
+                <h2 class="tv-chart-title" data-cms="analyse.tvchart.title">TradingView</h2>
               </div>
               <span class="oracle-tech">Affichage seulement</span>
             </div>
@@ -90,7 +90,7 @@
               loading="lazy"
               src="https://s.tradingview.com/widgetembed/?symbol=FX%3AEURUSD&interval=60&theme=dark&style=1&timezone=Africa%2FPorto-Novo&withdateranges=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&studies=%5B%5D"
             ></iframe>
-            <p class="tv-chart-note">TradingView sert à visualiser le chart. Les signaux restent basés sur les APIs de données et l'analyse IA.</p>
+            <p class="tv-chart-note" data-cms="analyse.tvchart.note">TradingView sert à visualiser le chart. Les signaux restent basés sur les APIs de données et l'analyse IA.</p>
           </section>
 
           <div class="analysis-form-grid">
@@ -189,16 +189,16 @@
 
           <label class="kronos-engine-badge mt-4 badge-start-clickable">
             <input id="autoDetectChart" name="autoDetect" type="checkbox" class="accent-neon-green">
-            Détection automatique paire/timeframes sur les graphes
+            <span data-cms="analyse.checkbox.autodetect">Détection automatique paire/timeframes sur les graphes</span>
           </label>
           <label class="kronos-engine-badge mt-3 analysis-live-toggle">
             <input id="includeNewsContext" name="includeNewsContext" type="checkbox" checked>
-            Croiser l'analyse avec prix live, calendrier économique et news API
+            <span data-cms="analyse.checkbox.news">Croiser l'analyse avec prix live, calendrier économique et news API</span>
           </label>
           <div id="chartDetectionPanel" class="market-notice"></div>
 
-          <button class="analysis-submit mt-6 icon-prefix" type="submit"><span data-icon="zap"></span>Lancer l'analyse Kronos</button>
-          <div class="kronos-engine-badge"><span class="oracle-chat-dot"></span>Moteur Kronos · En ligne</div>
+          <button class="analysis-submit mt-6 icon-prefix" type="submit"><span data-icon="zap"></span><span data-cms="analyse.submit_button">Lancer l'analyse Kronos</span></button>
+          <div class="kronos-engine-badge"><span class="oracle-chat-dot"></span><span data-cms="analyse.engine_badge">Moteur Kronos · En ligne</span></div>
         </form>
 
         <div id="analysisResult" class="analysis-result"></div>
@@ -207,8 +207,8 @@
       <aside class="analysis-card">
         <div class="signal-top">
           <div>
-            <p class="analysis-kicker">Signaux automatiques</p>
-            <h2 class="analysis-title icon-prefix"><span data-icon="radio"></span>Signaux Live Kronos</h2>
+            <p class="analysis-kicker" data-cms="analyse.signals.kicker">Signaux automatiques</p>
+            <h2 class="analysis-title icon-prefix"><span data-icon="radio"></span><span data-cms="analyse.signals.title">Signaux Live Kronos</span></h2>
           </div>
           <span class="oracle-tech signals-age">Statut marché en vérification</span>
         </div>
@@ -222,18 +222,19 @@
         </div>
 
         <div class="analysis-signals"></div>
-        <button class="refresh-signals mt-6 icon-prefix" type="button"><span data-icon="refresh"></span>Actualiser les signaux</button>
+        <button class="refresh-signals mt-6 icon-prefix" type="button"><span data-icon="refresh"></span><span data-cms="analyse.refresh_button">Actualiser les signaux</span></button>
       </aside>
     </div>
   </main>
 
-  <footer class="oracle-footer-lite">
+  <footer class="oracle-footer-lite" data-cms="global.footer.copyright_lite" data-cms-html>
     © 2026 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a> · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
   </footer>
 
   <script src="/assets/oracle-icons.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>
   <script src="/assets/analyse-page.js" defer></script>
+  <script src="/assets/site-content.js" defer></script>
   <script src="/assets/nav-active.js" defer></script>
 </body>
 </html>

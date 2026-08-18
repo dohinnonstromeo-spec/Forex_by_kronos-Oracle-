@@ -211,6 +211,17 @@ async function ensureRelationalTables() {
       value text NOT NULL,
       updated_at text NOT NULL
     )`,
+    // Admin-editable site copy -- absence of a row means "use the default text
+    // already written in the HTML", so this table starts empty and the site is
+    // byte-for-byte unchanged until an admin actually overrides something. See
+    // SITE_CONTENT_REGISTRY for the closed set of valid keys and assets/site-content.js
+    // for how overrides get applied client-side (the HTML is never rewritten on disk).
+    `CREATE TABLE IF NOT EXISTS site_content (
+      key text PRIMARY KEY,
+      value text NOT NULL,
+      updated_at text NOT NULL,
+      updated_by text
+    )`,
     // Fully autonomous per-user execution: a user connects their own broker (never
     // the shared METAAPI_TOKEN env vars sendOrderToBroker falls back to), an admin
     // must separately approve them (approval_status), and the approval itself
@@ -310,6 +321,219 @@ async function ensureColumn(table, columnDef) {
       logOnce("schema", `ajout de colonne échoué (${table}.${columnDef.split(" ")[0]}: ${error.message})`);
     }
   }
+}
+
+// The closed set of admin-editable text blocks on the site. Hand-written in step
+// with the matching data-cms="key" attributes added to the HTML (no runtime HTML
+// scanning -- this project deliberately carries no HTML-parsing dependency), so
+// this list IS the source of truth for both validating writes (see
+// /api/admin/site-content/set) and rendering the admin editor's fields/labels.
+// `page` is informational (groups fields in the admin UI); a key used by more
+// than one page (shared footer/CTA/pricing text) lists every page it appears on
+// so one edit updates all of them via the same data-cms attribute value.
+// `richText: true` means the value may contain a small allowed set of HTML tags
+// (see sanitizeRichContent) and is applied via innerHTML client-side instead of
+// textContent.
+const SITE_CONTENT_REGISTRY = [
+  // --- Shared across multiple pages ---
+  { key: "global.cta.trial", page: "toutes les pages", label: "Bouton \"Tester gratuitement\" (partout)", richText: false },
+  { key: "global.nav.login", page: "toutes les pages", label: "Lien \"Connexion\" (partout)", richText: false },
+  { key: "global.nav.dashboard", page: "toutes les pages", label: "Lien \"Dashboard\" (partout)", richText: false },
+  { key: "global.footer.disclaimer", page: "toutes les pages", label: "Avertissement pied de page (partout)", richText: false },
+  { key: "global.footer.copyright_lite", page: "paiement / connexion / inscription / dashboard / analyse / mot de passe", label: "Ligne de copyright \"Analyses IA éducatives\"", richText: true },
+  { key: "legal.footer.copyright", page: "legal.html / 404.html", label: "Ligne de copyright \"Outils éducatifs\"", richText: true },
+  { key: "pricing.premium.badge", page: "index.html / paiement.html", label: "Badge \"Premium\" (offre)", richText: false },
+  { key: "pricing.premium.price", page: "index.html / paiement.html", label: "Prix Premium affiché", richText: true },
+  { key: "pricing.premium.features", page: "index.html / paiement.html", label: "Description de l'offre Premium", richText: false },
+  { key: "pricing.premium.cta", page: "index.html", label: "Bouton \"S'abonner maintenant\"", richText: false },
+
+  // --- index.html ---
+  { key: "home.seo.title", page: "index.html", label: "Titre de l'onglet / SEO (accueil)", richText: false },
+  { key: "home.seo.description", page: "index.html", label: "Description SEO (accueil)", richText: false },
+  { key: "home.hero.pill", page: "index.html", label: "Bandeau \"KRONOS LIVE...\"", richText: false },
+  { key: "home.hero.title", page: "index.html", label: "Titre principal de l'accueil", richText: true },
+  { key: "home.hero.subtitle", page: "index.html", label: "Sous-titre de l'accueil", richText: false },
+  { key: "home.hero.cta_discover", page: "index.html", label: "Bouton \"DÉCOUVRIR\"", richText: false },
+  { key: "home.hero.metric_precision_label", page: "index.html", label: "Légende métrique \"Précision Kronos\"", richText: false },
+  { key: "home.hero.metric_signals_label", page: "index.html", label: "Légende métrique \"Signaux suivis\"", richText: false },
+  { key: "home.hero.metric_members_label", page: "index.html", label: "Légende métrique \"Comptes membres\"", richText: false },
+  { key: "home.hero.metric_pairs_label", page: "index.html", label: "Légende métrique \"Instruments surveillés\"", richText: false },
+  { key: "home.market.kicker", page: "index.html", label: "Sur-titre section \"Marchés en direct\"", richText: false },
+  { key: "home.market.title", page: "index.html", label: "Titre section \"Prix surveillés par Kronos\"", richText: false },
+  { key: "home.pulse.kicker", page: "index.html", label: "Sur-titre section \"Pulse marché\"", richText: false },
+  { key: "home.pulse.title", page: "index.html", label: "Titre section \"Mini graphes suivis\"", richText: false },
+  { key: "home.news.kicker", page: "index.html", label: "Sur-titre section actualités", richText: false },
+  { key: "home.news.title", page: "index.html", label: "Titre section actualités", richText: false },
+  { key: "home.signaux.kicker", page: "index.html", label: "Sur-titre section signaux", richText: false },
+  { key: "home.signaux.title", page: "index.html", label: "Titre section signaux", richText: false },
+  { key: "home.signaux.skeleton_note", page: "index.html", label: "Texte pendant le chargement des signaux", richText: false },
+  { key: "home.signaux.performance_title", page: "index.html", label: "Titre \"Performances · résultats réels\"", richText: false },
+  { key: "home.intelligence.kicker", page: "index.html", label: "Sur-titre section intelligence", richText: false },
+  { key: "home.intelligence.title", page: "index.html", label: "Titre section intelligence", richText: false },
+  { key: "home.intelligence.copy", page: "index.html", label: "Paragraphe explicatif intelligence", richText: false },
+  { key: "home.intelligence.step1_title", page: "index.html", label: "Étape 1 - titre (Lecture du graphe)", richText: false },
+  { key: "home.intelligence.step1_desc", page: "index.html", label: "Étape 1 - description", richText: false },
+  { key: "home.intelligence.step2_title", page: "index.html", label: "Étape 2 - titre (Données marché)", richText: false },
+  { key: "home.intelligence.step2_desc", page: "index.html", label: "Étape 2 - description", richText: false },
+  { key: "home.intelligence.step3_title", page: "index.html", label: "Étape 3 - titre (Validation Kronos)", richText: false },
+  { key: "home.intelligence.step3_desc", page: "index.html", label: "Étape 3 - description", richText: false },
+  { key: "home.pricing.kicker", page: "index.html", label: "Sur-titre section abonnement", richText: false },
+  { key: "home.pricing.title", page: "index.html", label: "Titre section abonnement", richText: false },
+  { key: "home.faq.kicker", page: "index.html", label: "Sur-titre section FAQ", richText: false },
+  { key: "home.faq.title", page: "index.html", label: "Titre section FAQ", richText: false },
+  { key: "home.faq.q1", page: "index.html", label: "FAQ 1 - question", richText: false },
+  { key: "home.faq.a1", page: "index.html", label: "FAQ 1 - réponse", richText: false },
+  { key: "home.faq.q2", page: "index.html", label: "FAQ 2 - question", richText: false },
+  { key: "home.faq.a2", page: "index.html", label: "FAQ 2 - réponse", richText: false },
+  { key: "home.faq.q3", page: "index.html", label: "FAQ 3 - question", richText: false },
+  { key: "home.faq.a3", page: "index.html", label: "FAQ 3 - réponse", richText: false },
+
+  // --- paiement.html ---
+  { key: "payment.seo.title", page: "paiement.html", label: "Titre de l'onglet / SEO (paiement)", richText: false },
+  { key: "payment.seo.og_title", page: "paiement.html", label: "Titre partagé réseaux sociaux (paiement)", richText: false },
+  { key: "payment.seo.description", page: "paiement.html", label: "Description SEO (paiement)", richText: false },
+  { key: "payment.hero.kicker", page: "paiement.html", label: "Sur-titre \"Activation premium\"", richText: false },
+  { key: "payment.hero.title", page: "paiement.html", label: "Titre \"S'abonner maintenant\"", richText: false },
+  { key: "payment.hero.subtitle", page: "paiement.html", label: "Sous-titre de la page paiement", richText: false },
+  { key: "payment.already_active", page: "paiement.html", label: "Message \"déjà Premium\"", richText: false },
+  { key: "payment.method.mobile.title", page: "paiement.html", label: "Carte \"Mobile Money\" - titre", richText: false },
+  { key: "payment.method.mobile.desc", page: "paiement.html", label: "Carte \"Mobile Money\" - description", richText: false },
+  { key: "payment.method.card.title", page: "paiement.html", label: "Carte \"Carte bancaire\" - titre", richText: false },
+  { key: "payment.method.card.desc", page: "paiement.html", label: "Carte \"Carte bancaire\" - description", richText: false },
+  { key: "payment.method.crypto.title", page: "paiement.html", label: "Carte \"Crypto\" - titre", richText: false },
+  { key: "payment.method.crypto.desc", page: "paiement.html", label: "Carte \"Crypto\" - description", richText: false },
+  { key: "payment.method.cta_soon", page: "paiement.html", label: "Bouton \"Bientôt disponible\" (les 3 cartes)", richText: false },
+  { key: "payment.note", page: "paiement.html", label: "Note de bas de page \"Lancement imminent\"", richText: true },
+
+  // --- legal.html ---
+  { key: "legal.seo.title", page: "legal.html", label: "Titre de l'onglet / SEO (mentions légales)", richText: false },
+  { key: "legal.seo.description", page: "legal.html", label: "Description SEO (mentions légales)", richText: false },
+  { key: "legal.hero.kicker", page: "legal.html", label: "Sur-titre \"Transparence Oracle Forex\"", richText: false },
+  { key: "legal.hero.title", page: "legal.html", label: "Titre \"Mentions légales et risques\"", richText: false },
+  { key: "legal.hero.subtitle", page: "legal.html", label: "Sous-titre de la page mentions légales", richText: false },
+  { key: "legal.cgu.body", page: "legal.html", label: "Section CGU", richText: false },
+  { key: "legal.mentions.placeholder", page: "legal.html", label: "Bloc placeholder immatriculation (à compléter)", richText: true },
+  { key: "legal.mentions.note", page: "legal.html", label: "Note explicative sous le placeholder", richText: false },
+  { key: "legal.confidentialite.donnees", page: "legal.html", label: "Confidentialité — Données collectées", richText: true },
+  { key: "legal.confidentialite.finalite", page: "legal.html", label: "Confidentialité — Finalité et base légale", richText: true },
+  { key: "legal.confidentialite.duree", page: "legal.html", label: "Confidentialité — Durée de conservation", richText: true },
+  { key: "legal.confidentialite.cookies", page: "legal.html", label: "Confidentialité — Cookies", richText: true },
+  { key: "legal.soustraitants.intro", page: "legal.html", label: "Sous-traitants — Introduction", richText: false },
+  { key: "legal.soustraitants.liste", page: "legal.html", label: "Sous-traitants — Liste (Groq, Gemini, etc.)", richText: true },
+  { key: "legal.droits.body", page: "legal.html", label: "Section \"Vos droits\" (RGPD)", richText: true },
+  { key: "legal.risques.body", page: "legal.html", label: "Section \"Risques\"", richText: false },
+
+  // --- dashboard.html ---
+  { key: "dashboard.seo.title", page: "dashboard.html", label: "Titre de l'onglet / SEO (dashboard)", richText: false },
+  { key: "dashboard.seo.description", page: "dashboard.html", label: "Description SEO (dashboard)", richText: false },
+  { key: "dashboard.hero.kicker", page: "dashboard.html", label: "Sur-titre \"Espace membre\"", richText: false },
+  { key: "dashboard.hero.title", page: "dashboard.html", label: "Titre \"Dashboard Kronos\"", richText: false },
+  { key: "dashboard.card.premium_active", page: "dashboard.html", label: "Carte plan — message \"Premium actif\"", richText: false },
+  { key: "dashboard.card.premium_pending", page: "dashboard.html", label: "Carte plan — message \"quotas en attente\"", richText: false },
+  { key: "dashboard.card.analysis_desc", page: "dashboard.html", label: "Carte \"Analyse IA\" — description", richText: false },
+  { key: "dashboard.card.precision_desc", page: "dashboard.html", label: "Carte \"Précision Kronos\" — description", richText: false },
+  { key: "dashboard.performance.kicker", page: "dashboard.html", label: "Sur-titre \"Performance Kronos\"", richText: false },
+  { key: "dashboard.performance.title", page: "dashboard.html", label: "Titre \"Résumé actuel\"", richText: false },
+  { key: "dashboard.history.kicker", page: "dashboard.html", label: "Sur-titre \"Historique personnel\"", richText: false },
+  { key: "dashboard.history.title", page: "dashboard.html", label: "Titre \"Mes analyses Kronos\"", richText: false },
+  { key: "dashboard.push.upsell", page: "dashboard.html", label: "Upsell alertes nouveaux signaux", richText: true },
+  { key: "dashboard.broker.kicker", page: "dashboard.html", label: "Sur-titre \"Ton broker\"", richText: false },
+  { key: "dashboard.broker.title", page: "dashboard.html", label: "Titre \"Connexion broker\"", richText: false },
+  { key: "dashboard.broker.intro", page: "dashboard.html", label: "Broker — paragraphe d'intro", richText: false },
+  { key: "dashboard.broker.instructions", page: "dashboard.html", label: "Broker — instructions de connexion", richText: true },
+  { key: "dashboard.trade.kicker", page: "dashboard.html", label: "Sur-titre \"Exécution semi-automatique\"", richText: false },
+  { key: "dashboard.trade.title", page: "dashboard.html", label: "Titre \"Ordres\"", richText: false },
+  { key: "dashboard.trade.intro", page: "dashboard.html", label: "Ordres — paragraphe d'intro", richText: false },
+  { key: "dashboard.trade.broker_prompt", page: "dashboard.html", label: "Ordres — message \"connecte ton broker\"", richText: false },
+  { key: "dashboard.trade.upsell", page: "dashboard.html", label: "Upsell exécution semi-automatique", richText: true },
+  { key: "dashboard.autotrade.kicker", page: "dashboard.html", label: "Sur-titre \"Exécution 100% automatique\"", richText: false },
+  { key: "dashboard.autotrade.title", page: "dashboard.html", label: "Titre \"Robot Kronos\"", richText: false },
+  { key: "dashboard.autotrade.intro", page: "dashboard.html", label: "Robot — paragraphe d'intro", richText: true },
+  { key: "dashboard.autotrade.activation_title", page: "dashboard.html", label: "Robot — titre \"Activation\"", richText: false },
+  { key: "dashboard.autotrade.history_title", page: "dashboard.html", label: "Robot — titre \"Trades du robot\"", richText: false },
+  { key: "dashboard.autotrade.upsell", page: "dashboard.html", label: "Upsell trading 100% automatique", richText: true },
+
+  // --- analyse.html ---
+  { key: "analyse.seo.title", page: "analyse.html", label: "Titre de l'onglet / SEO (analyse)", richText: false },
+  { key: "analyse.seo.og_title", page: "analyse.html", label: "Titre partagé réseaux sociaux (analyse)", richText: false },
+  { key: "analyse.seo.description", page: "analyse.html", label: "Description SEO (analyse)", richText: false },
+  { key: "analyse.hero.kicker", page: "analyse.html", label: "Sur-titre \"Terminal Kronos\"", richText: false },
+  { key: "analyse.hero.title", page: "analyse.html", label: "Titre \"Analyse Forex Intelligente\"", richText: false },
+  { key: "analyse.hero.subtitle", page: "analyse.html", label: "Sous-titre de la page analyse", richText: false },
+  { key: "analyse.hero.warning", page: "analyse.html", label: "Avertissement \"résultats éducatifs\"", richText: false },
+  { key: "analyse.console.kicker", page: "analyse.html", label: "Sur-titre \"Console d'analyse Kronos\"", richText: false },
+  { key: "analyse.console.title", page: "analyse.html", label: "Titre \"Analyse de Chart IA\"", richText: false },
+  { key: "analyse.console.subtitle", page: "analyse.html", label: "Sous-titre de la console d'analyse", richText: false },
+  { key: "analyse.dropzone.title", page: "analyse.html", label: "Zone de dépôt — titre \"Glissez vos graphiques\"", richText: false },
+  { key: "analyse.dropzone.helper", page: "analyse.html", label: "Zone de dépôt — aide (formats acceptés)", richText: false },
+  { key: "analyse.tvchart.kicker", page: "analyse.html", label: "Sur-titre \"Chart interface\"", richText: false },
+  { key: "analyse.tvchart.title", page: "analyse.html", label: "Titre \"TradingView\"", richText: false },
+  { key: "analyse.tvchart.note", page: "analyse.html", label: "Note sous le graphique TradingView", richText: false },
+  { key: "analyse.checkbox.autodetect", page: "analyse.html", label: "Case à cocher — détection automatique", richText: false },
+  { key: "analyse.checkbox.news", page: "analyse.html", label: "Case à cocher — croiser avec news/API", richText: false },
+  { key: "analyse.submit_button", page: "analyse.html", label: "Bouton \"Lancer l'analyse Kronos\"", richText: false },
+  { key: "analyse.engine_badge", page: "analyse.html", label: "Badge \"Moteur Kronos · En ligne\"", richText: false },
+  { key: "analyse.signals.kicker", page: "analyse.html", label: "Sur-titre \"Signaux automatiques\"", richText: false },
+  { key: "analyse.signals.title", page: "analyse.html", label: "Titre \"Signaux Live Kronos\"", richText: false },
+  { key: "analyse.refresh_button", page: "analyse.html", label: "Bouton \"Actualiser les signaux\"", richText: false },
+
+  // --- login.html ---
+  { key: "login.seo.title", page: "login.html", label: "Titre de l'onglet / SEO (connexion)", richText: false },
+  { key: "login.seo.description", page: "login.html", label: "Description SEO (connexion)", richText: false },
+  { key: "login.hero.kicker", page: "login.html", label: "Sur-titre \"Espace membre\"", richText: false },
+  { key: "login.hero.title", page: "login.html", label: "Titre \"Connexion\"", richText: false },
+  { key: "login.hero.subtitle", page: "login.html", label: "Sous-titre de la page connexion", richText: false },
+  { key: "login.submit_button", page: "login.html", label: "Bouton \"Se connecter\"", richText: false },
+
+  // --- signup.html ---
+  { key: "signup.seo.title", page: "signup.html", label: "Titre de l'onglet / SEO (inscription)", richText: false },
+  { key: "signup.seo.description", page: "signup.html", label: "Description SEO (inscription)", richText: false },
+  { key: "signup.hero.kicker", page: "signup.html", label: "Sur-titre \"Nouveau compte\"", richText: false },
+  { key: "signup.hero.title", page: "signup.html", label: "Titre \"Inscription\"", richText: false },
+  { key: "signup.hero.subtitle", page: "signup.html", label: "Sous-titre de la page inscription", richText: false },
+  { key: "signup.password_hint", page: "signup.html", label: "Indice \"8 caractères minimum\"", richText: false },
+  { key: "signup.submit_button", page: "signup.html", label: "Bouton \"Créer mon compte\"", richText: false },
+];
+
+const SITE_CONTENT_KEYS = new Set(SITE_CONTENT_REGISTRY.map((entry) => entry.key));
+
+// Small allowlist sanitizer for richText site-content values -- these get injected
+// via innerHTML into every visitor's page, so even though only an authenticated
+// admin can write them, this is cheap defense in depth (matches the sanitization
+// discipline already used for user-submitted text elsewhere in this file). Strips
+// everything except a few safe inline tags/attributes; no scripts, no event
+// handlers, no javascript: URLs.
+function sanitizeRichContent(html) {
+  const ALLOWED_TAGS = new Set(["br", "strong", "b", "em", "i", "a", "span", "small"]);
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<\/?([a-z0-9]+)([^>]*)>/gi, (match, tag, attrs) => {
+      const lowerTag = tag.toLowerCase();
+      if (!ALLOWED_TAGS.has(lowerTag)) return "";
+      const closing = match.startsWith("</");
+      if (closing) return `</${lowerTag}>`;
+      let safeAttrs = "";
+      if (lowerTag === "a") {
+        const href = attrs.match(/href\s*=\s*"([^"]*)"/i)?.[1] || attrs.match(/href\s*=\s*'([^']*)'/i)?.[1];
+        if (href && /^(https?:|mailto:|\/)/i.test(href.trim())) safeAttrs += ` href="${href.replace(/"/g, "&quot;")}"`;
+        if (/target\s*=\s*["']_blank["']/i.test(attrs)) safeAttrs += ` target="_blank" rel="noopener"`;
+      }
+      if (lowerTag === "span") {
+        const cls = attrs.match(/class\s*=\s*"([^"]*)"/i)?.[1];
+        if (cls) safeAttrs += ` class="${cls.replace(/"/g, "&quot;")}"`;
+      }
+      return `<${lowerTag}${safeAttrs}>`;
+    });
+}
+
+let siteContentCache = { value: null, expiresAt: 0 };
+async function getSiteContentOverrides() {
+  if (siteContentCache.value && Date.now() < siteContentCache.expiresAt) return siteContentCache.value;
+  await ensureRelationalTables();
+  const rows = await sqlAll(`SELECT key, value FROM site_content`, []);
+  const overrides = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+  siteContentCache = { value: overrides, expiresAt: Date.now() + 60 * 1000 };
+  return overrides;
 }
 
 async function ensureStateTable() {
@@ -1073,6 +1297,58 @@ async function handleApi(req, res, url) {
     const token = cookieValue(req, "oracle_session");
     if (token) await destroySession(token);
     clearSessionCookie(res);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // Public: every visitor's browser needs this to render any admin-edited text
+  // (see assets/site-content.js) -- returns only genuinely overridden keys, cached
+  // in memory ~60s so the hottest possible route (every page load, site-wide)
+  // never hits the DB directly. Empty object on a site with no overrides yet.
+  if (url.pathname === "/api/site-content") {
+    sendJson(res, 200, { ok: true, overrides: await getSiteContentOverrides() });
+    return;
+  }
+
+  if (url.pathname === "/api/admin/site-content/registry") {
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    sendJson(res, 200, { ok: true, registry: SITE_CONTENT_REGISTRY });
+    return;
+  }
+
+  if (url.pathname === "/api/admin/site-content/set") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    const key = String(body?.key || "");
+    const entry = SITE_CONTENT_REGISTRY.find((item) => item.key === key);
+    if (!entry) return sendJson(res, 400, { ok: false, error: "unknown_key" });
+    let value = String(body?.value ?? "").slice(0, 5000);
+    if (entry.richText) value = sanitizeRichContent(value);
+    await ensureRelationalTables();
+    const now = new Date().toISOString();
+    await sqlRun(
+      `INSERT INTO site_content (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+      [key, value, now, admin.user?.email || "token"],
+    );
+    siteContentCache = { value: null, expiresAt: 0 };
+    sendJson(res, 200, { ok: true, value });
+    return;
+  }
+
+  if (url.pathname === "/api/admin/site-content/reset") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    const key = String(body?.key || "");
+    if (!SITE_CONTENT_KEYS.has(key)) return sendJson(res, 400, { ok: false, error: "unknown_key" });
+    await ensureRelationalTables();
+    await sqlRun(`DELETE FROM site_content WHERE key = ?`, [key]);
+    siteContentCache = { value: null, expiresAt: 0 };
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -8353,6 +8629,7 @@ async function serveStatic(res, pathname, req = null) {
     "/admin-premium": "/premium-admin.html",
     "/admin-health": "/admin-health.html",
     "/admin": "/premium-admin.html",
+    "/admin-contenu": "/admin-contenu.html",
     "/legal": "/legal.html",
     "/cgu": "/legal.html",
     "/confidentialite": "/legal.html",

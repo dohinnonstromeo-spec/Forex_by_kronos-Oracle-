@@ -1624,6 +1624,105 @@ body {
   cursor: pointer;
 }
 
+.site-content-page-group {
+  margin-top: 14px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: var(--radius-md);
+  background: rgba(0, 0, 0, .18);
+  overflow: hidden;
+}
+
+.site-content-page-group summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 14px 16px;
+  font-weight: 800;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  list-style: none;
+}
+
+.site-content-page-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.site-content-count {
+  color: var(--muted-foreground);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: none;
+}
+
+.site-content-fields {
+  display: grid;
+  gap: 14px;
+  padding: 4px 16px 16px;
+}
+
+.site-content-field {
+  display: grid;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, .06);
+}
+
+.site-content-field label {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.site-content-rich-badge {
+  color: var(--amber-neon);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+
+.site-content-field textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .28);
+  color: var(--foreground);
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.site-content-field-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.site-content-field-status {
+  color: var(--neon-green);
+  font-size: 11px;
+  min-height: 14px;
+}
+
+.site-content-field-actions button {
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground);
+  padding: 5px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.site-content-field-actions button:disabled {
+  opacity: .4;
+  cursor: default;
+}
+
 .dashboard-hero {
   margin-bottom: 24px;
 }

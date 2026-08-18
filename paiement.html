@@ -8,19 +8,19 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Oracle Forex">
-  <title>Paiement · Oracle Forex</title>
-  <meta name="description" content="Choisissez le mode de paiement pour activer votre abonnement Oracle Forex.">
+  <title data-cms="payment.seo.title">Paiement · Oracle Forex</title>
+  <meta name="description" content="Choisissez le mode de paiement pour activer votre abonnement Oracle Forex." data-cms="payment.seo.description">
   <link rel="canonical" href="https://forex-by-kronos-oracle.onrender.com/paiement">
-  <meta property="og:title" content="S'abonner · Oracle Forex">
-  <meta property="og:description" content="Signaux Kronos illimités, analyse IA et suivi de performance dès 9,99 €/mois.">
+  <meta property="og:title" content="S'abonner · Oracle Forex" data-cms="payment.seo.og_title">
+  <meta property="og:description" content="Signaux Kronos illimités, analyse IA et suivi de performance dès 9,99 €/mois." data-cms="payment.seo.description">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://forex-by-kronos-oracle.onrender.com/paiement">
   <meta property="og:image" content="https://forex-by-kronos-oracle.onrender.com/assets/og-image.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="S'abonner · Oracle Forex">
-  <meta name="twitter:description" content="Signaux Kronos illimités, analyse IA et suivi de performance dès 9,99 €/mois.">
+  <meta name="twitter:title" content="S'abonner · Oracle Forex" data-cms="payment.seo.og_title">
+  <meta name="twitter:description" content="Signaux Kronos illimités, analyse IA et suivi de performance dès 9,99 €/mois." data-cms="payment.seo.description">
   <meta name="twitter:image" content="https://forex-by-kronos-oracle.onrender.com/assets/og-image.png">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
@@ -34,9 +34,9 @@
       </a>
       <div class="oracle-links">
         <a href="/">Accueil</a>
-        <a href="/tester-gratuitement" data-cta-trial>Tester gratuitement</a>
+        <a href="/tester-gratuitement" data-cta-trial data-cms="global.cta.trial">Tester gratuitement</a>
         <a href="/#pricing" data-nav-pricing>Abonnement</a>
-        <a href="/dashboard">Dashboard</a>
+        <a href="/dashboard" data-cms="global.nav.dashboard">Dashboard</a>
         <a href="/legal.html#risques">Risques</a>
       </div>
     </div>
@@ -44,54 +44,55 @@
 
   <main class="oracle-main payment-main">
     <section class="payment-hero">
-      <p class="analysis-kicker">Activation premium</p>
-      <h1 class="analysis-title">S'abonner maintenant</h1>
-      <p class="analysis-subtitle">Choisissez votre mode de paiement. Les liens sécurisés seront connectés à chaque option quand tu finaliseras la configuration.</p>
+      <p class="analysis-kicker" data-cms="payment.hero.kicker">Activation premium</p>
+      <h1 class="analysis-title" data-cms="payment.hero.title">S'abonner maintenant</h1>
+      <p class="analysis-subtitle" data-cms="payment.hero.subtitle">Choisissez votre mode de paiement. Les liens sécurisés seront connectés à chaque option quand tu finaliseras la configuration.</p>
       <div class="home-pricing-card payment-plan-recap">
         <div>
-          <span class="home-premium-badge">Premium</span>
-          <strong>9,99&nbsp;€ <small>/ mois</small></strong>
-          <p>Signaux, analyse charts IA, chatbot trading, performances et intelligence marché.</p>
+          <span class="home-premium-badge" data-cms="pricing.premium.badge">Premium</span>
+          <strong data-cms="pricing.premium.price" data-cms-html>9,99&nbsp;€ <small>/ mois</small></strong>
+          <p data-cms="pricing.premium.features">Signaux, analyse charts IA, chatbot trading, performances et intelligence marché.</p>
         </div>
       </div>
-      <p class="payment-already-active" data-payment-status hidden>Ton compte est déjà Premium — accès illimité actif, aucun paiement à refaire.</p>
+      <p class="payment-already-active" data-payment-status hidden data-cms="payment.already_active">Ton compte est déjà Premium — accès illimité actif, aucun paiement à refaire.</p>
     </section>
 
     <section class="payment-methods" aria-label="Modes de paiement" data-payment-form>
       <article class="payment-method-card">
         <span class="payment-method-icon" data-icon="smartphone"></span>
-        <h2>Mobile Money</h2>
-        <p>Orange Money, MTN Mobile Money, Moov, Wave et opérateurs locaux compatibles selon le pays.</p>
-        <button type="button" class="payment-method-button is-disabled" disabled>Bientôt disponible</button>
+        <h2 data-cms="payment.method.mobile.title">Mobile Money</h2>
+        <p data-cms="payment.method.mobile.desc">Orange Money, MTN Mobile Money, Moov, Wave et opérateurs locaux compatibles selon le pays.</p>
+        <button type="button" class="payment-method-button is-disabled" disabled data-cms="payment.method.cta_soon">Bientôt disponible</button>
       </article>
 
       <article class="payment-method-card">
         <span class="payment-method-icon" data-icon="creditCard"></span>
-        <h2>Carte bancaire</h2>
-        <p>Paiement par carte pour les clients qui préfèrent régler directement en ligne.</p>
-        <button type="button" class="payment-method-button is-disabled" disabled>Bientôt disponible</button>
+        <h2 data-cms="payment.method.card.title">Carte bancaire</h2>
+        <p data-cms="payment.method.card.desc">Paiement par carte pour les clients qui préfèrent régler directement en ligne.</p>
+        <button type="button" class="payment-method-button is-disabled" disabled data-cms="payment.method.cta_soon">Bientôt disponible</button>
       </article>
 
       <article class="payment-method-card">
         <span class="payment-method-icon" data-icon="coin"></span>
-        <h2>Crypto</h2>
-        <p>Paiement crypto disponible selon la couverture du checkout et le pays du client.</p>
-        <button type="button" class="payment-method-button is-disabled" disabled>Bientôt disponible</button>
+        <h2 data-cms="payment.method.crypto.title">Crypto</h2>
+        <p data-cms="payment.method.crypto.desc">Paiement crypto disponible selon la couverture du checkout et le pays du client.</p>
+        <button type="button" class="payment-method-button is-disabled" disabled data-cms="payment.method.cta_soon">Bientôt disponible</button>
       </article>
     </section>
 
     <section class="payment-note" data-payment-form>
-      <strong>Lancement imminent :</strong> les moyens de paiement ouvrent très bientôt. Pour être prévenu(e) dès l'activation ou pour rejoindre l'accès anticipé, écris-nous à <a href="mailto:vdohinnon22@gmail.com">vdohinnon22@gmail.com</a>.
+      <span data-cms="payment.note" data-cms-html><strong>Lancement imminent :</strong> les moyens de paiement ouvrent très bientôt. Pour être prévenu(e) dès l'activation ou pour rejoindre l'accès anticipé, écris-nous à <a href="mailto:vdohinnon22@gmail.com">vdohinnon22@gmail.com</a>.</span>
     </section>
   </main>
 
-  <footer class="oracle-footer-lite">
+  <footer class="oracle-footer-lite" data-cms="global.footer.copyright_lite" data-cms-html>
     © 2026 Oracle Forex · Analyses IA éducatives · <a href="/legal.html#risques">Risque de perte en capital</a> · <a href="mailto:vdohinnon22@gmail.com">Contact</a>.
   </footer>
 
   <script src="/assets/oracle-icons.js" defer></script>
   <script src="/assets/auth.js" defer></script>
   <script src="/assets/oracle-chatbot.js" defer></script>
+  <script src="/assets/site-content.js" defer></script>
   <script src="/assets/nav-active.js" defer></script>
 </body>
 </html>

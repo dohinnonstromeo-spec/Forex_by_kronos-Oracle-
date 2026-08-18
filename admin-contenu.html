@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Accès Premium manuel · Oracle Forex</title>
-  <meta name="description" content="Outil interne Oracle Forex pour activer ou révoquer l'accès Premium manuel d'un compte.">
+  <title>Administration complète · Oracle Forex</title>
+  <meta name="description" content="Espace admin complet Oracle Forex : comptes premium, coupe-circuit trading, robot Kronos et contenu du site.">
   <meta name="robots" content="noindex, nofollow">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
@@ -17,6 +17,7 @@
         <span>ORACLE <span class="text-amber-neon">FOREX</span></span>
       </a>
       <div class="oracle-links">
+        <a href="/premium-admin">Admin (résumé)</a>
         <a href="/dashboard">Dashboard</a>
         <a href="/admin-health">Santé API</a>
       </div>
@@ -26,8 +27,13 @@
   <main class="oracle-main auth-main">
     <section class="auth-card premium-admin-card">
       <p class="analysis-kicker">Administration</p>
-      <h1 class="analysis-title">Accès Premium manuel</h1>
-      <p class="analysis-subtitle"><a href="/admin-contenu" class="payment-method-button is-inline">→ Gestion complète du site (comptes, trading et contenu)</a></p>
+      <h1 class="analysis-title">Espace admin complet</h1>
+      <p class="analysis-subtitle">Tout ce qu'il y a sur la page d'administration existante, plus la gestion du contenu de tout le site. Un seul token admin pour tout.</p>
+    </section>
+
+    <section class="auth-card premium-admin-card">
+      <p class="analysis-kicker">Administration</p>
+      <h2 class="analysis-title">Accès Premium manuel</h2>
       <p class="analysis-subtitle">Donne Premium à un testeur sans passer par le paiement. La personne doit d'abord créer un compte.</p>
 
       <form class="auth-form" data-premium-admin-form>
@@ -80,6 +86,17 @@
       </div>
       <div class="dashboard-history" data-autotrade-requests></div>
     </section>
+
+    <section class="auth-card premium-admin-card">
+      <p class="analysis-kicker">Contenu du site</p>
+      <h2 class="analysis-title">Textes de toutes les pages</h2>
+      <p class="analysis-subtitle">Modifie n'importe quel texte visible du site. Chaque champ s'enregistre automatiquement quand tu cliques ailleurs. "Réinitialiser" revient au texte d'origine du site -- rien n'est jamais perdu définitivement.</p>
+      <div class="premium-admin-actions">
+        <button type="button" data-site-content-load>Charger le contenu du site</button>
+      </div>
+      <p class="dashboard-history-note" data-site-content-summary></p>
+      <div data-site-content-sections></div>
+    </section>
   </main>
 
   <footer class="oracle-footer-lite">
@@ -87,6 +104,7 @@
   </footer>
 
   <script src="/assets/premium-admin.js" defer></script>
+  <script src="/assets/admin-content.js" defer></script>
   <script src="/assets/nav-active.js" defer></script>
 </body>
 </html>

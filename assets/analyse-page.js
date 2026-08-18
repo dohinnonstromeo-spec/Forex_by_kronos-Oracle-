@@ -100,6 +100,15 @@
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const submit = form.querySelector(".analysis-submit");
+      // Captured here, not hardcoded below -- this button's idle label can be
+      // overridden by the site-content admin CMS (data-cms="analyse.submit_button"),
+      // applied asynchronously by site-content.js shortly after page load. Reading
+      // the button's *current* text right before we overwrite it (rather than a
+      // literal string) means the reset after the analysis finishes restores
+      // whatever was actually showing -- default or admin-overridden -- instead of
+      // silently reverting a CMS edit back to the hardcoded original the first time
+      // anyone submits the form.
+      const idleLabel = submit.textContent.trim() || "Lancer l'analyse Kronos";
       submit.disabled = true;
       const progress = startAnalysisProgress(form);
       const body = Object.fromEntries(new FormData(form).entries());
@@ -112,7 +121,7 @@
       finishAnalysisProgress(progress, Boolean(response));
       renderAnalysisResult(result, response);
       submit.disabled = false;
-      setSubmitLabel(submit, "Lancer l'analyse Kronos", "zap");
+      setSubmitLabel(submit, idleLabel, "zap");
     });
 
     result.addEventListener("click", (event) => {

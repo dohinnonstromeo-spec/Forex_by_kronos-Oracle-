@@ -4,6 +4,21 @@
   const members = document.querySelector("[data-premium-members]");
   const loadButton = document.querySelector("[data-load-members]");
 
+  // The token used to have to be retyped on every page load/navigation -- painful
+  // now that the admin token is shared across two pages (this one and
+  // admin-contenu.html). sessionStorage: survives navigating within the tab,
+  // cleared when the tab closes, never sent anywhere itself (only ever read back
+  // into this same form field, which adminFetch already turns into a header).
+  const tokenInput = form?.elements?.token;
+  if (tokenInput) {
+    const saved = sessionStorage.getItem("oracle_admin_token");
+    if (saved) tokenInput.value = saved;
+    tokenInput.addEventListener("input", () => {
+      if (tokenInput.value) sessionStorage.setItem("oracle_admin_token", tokenInput.value);
+      else sessionStorage.removeItem("oracle_admin_token");
+    });
+  }
+
   form?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const body = Object.fromEntries(new FormData(form).entries());
