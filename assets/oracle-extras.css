@@ -3688,6 +3688,21 @@ body {
    at a time. See assets/oracle-tabs.js: panels stay in the DOM (hidden, not
    removed), so nothing about a given section's own script needs to know tabs
    exist. */
+.oracle-tabs {
+  /* Both host pages' <main> is `display:grid; place-items:center`, which sizes
+     an item with no explicit width to its own intrinsic (max-)content size
+     instead of stretching it to the track -- confirmed live: with no width set
+     here, the tab nav's 4 unwrapped buttons gave this element a ~670px
+     min-content width, and the grid track grew to match, overflowing the whole
+     page on a narrow viewport. .auth-card/.premium-admin-card avoid the same
+     trap by giving themselves an explicit width (min(…, 100%)); this needed
+     the same treatment. min-width:0 on top so a wide descendant can never
+     re-introduce the same problem through the "grid item's automatic minimum
+     size is content-based" path either. */
+  width: 100%;
+  min-width: 0;
+}
+
 .oracle-tabs-nav {
   display: flex;
   flex-wrap: wrap;
@@ -3750,15 +3765,18 @@ body {
 }
 
 @media (max-width: 760px) {
+  /* A horizontally-scrolling bar (the .oracle-links pattern elsewhere) would
+     silently hide 2 of these 4 tabs off-screen with zero visual hint to swipe --
+     confirmed live, genuinely easy to miss. A 2x2 grid instead keeps every tab
+     visible and tappable at once, no discovery problem, no scrolling. */
   .oracle-tabs-nav {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-    justify-content: flex-start;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+    min-width: 0;
   }
-  .oracle-tabs-nav::-webkit-scrollbar { display: none; }
   .oracle-tabs-btn {
-    flex: 0 0 auto;
+    padding: 12px 10px;
+    font-size: 12.5px;
   }
 }
