@@ -154,6 +154,126 @@
     }
   }
 
+  // Same pair list the deterministic signal engine actually trades (server.mjs's
+  // `symbols` const) -- offering any other pair here would let an admin "approve"
+  // something the bot can never act on.
+  const AUTOTRADE_PAIRS = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD", "USD/JPY", "USD/CHF"];
+  const AUTOTRADE_STATUS_LABELS = {
+    none: "Aucune demande",
+    requested: "En attente",
+    approved: "Approuvé",
+    rejected: "Refusé",
+    revoked: "Révoqué",
+  };
+
+  const autotradeLoad = document.querySelector("[data-autotrade-load]");
+  const autotradeRequests = document.querySelector("[data-autotrade-requests]");
+
+  autotradeLoad?.addEventListener("click", async () => {
+    const token = form?.elements?.token?.value || "";
+    setMessage("Chargement des demandes...", false);
+    const data = await adminFetch("/api/admin/auto-trade/requests", null, token);
+    if (!data?.ok) {
+      setMessage(data?.message || data?.error || "Chargement impossible.", true);
+      return;
+    }
+    setMessage(`${data.requests.length} demande(s) chargée(s).`, false);
+    renderAutoTradeRequests(data.requests);
+  });
+
+  function renderAutoTradeRequests(requests = []) {
+    if (!autotradeRequests) return;
+    if (!requests.length) {
+      autotradeRequests.innerHTML = `<div class="dashboard-empty">Aucune demande pour l'instant.</div>`;
+      return;
+    }
+    autotradeRequests.innerHTML = requests.map((request) => `
+      <article data-autotrade-request-card="${escapeHtml(request.userId)}">
+        <div>
+          <strong>${escapeHtml(request.userName || "Compte")} · ${escapeHtml(request.userEmail)}</strong>
+          <span class="${request.approvalStatus === "approved" ? "history-open" : request.approvalStatus === "requested" ? "" : "history-blocked"}">
+            ${escapeHtml(AUTOTRADE_STATUS_LABELS[request.approvalStatus] || request.approvalStatus)}
+            ${request.approvalStatus === "approved" ? `· jusqu'au ${formatDate(request.approvedUntil)}` : ""}
+            · broker ${request.brokerConnected ? "connecté" : "non connecté"}
+          </span>
+        </div>
+        <div class="dashboard-autotrade-pairs">
+          ${AUTOTRADE_PAIRS.map((pair) => `
+            <label>
+              <input type="checkbox" value="${escapeHtml(pair)}" ${request.approvedPairs.includes(pair) ? "checked" : ""}>
+              ${escapeHtml(pair)}
+            </label>
+          `).join("")}
+        </div>
+        <div class="dashboard-autotrade-form">
+          <input type="number" min="1" max="90" step="1" placeholder="Jours" value="7" data-field="days">
+          <input type="number" min="0.1" max="3" step="0.1" placeholder="Risque % / trade" value="${request.riskPercent ?? 0.5}" data-field="riskPercent">
+          <input type="number" min="1" max="10" step="0.5" placeholder="Perte max / jour %" value="${request.dailyLossLimitPercent ?? 3}" data-field="dailyLossLimitPercent">
+          <input type="number" min="1" max="5" step="1" placeholder="Positions max" value="${request.maxConcurrentPositions ?? 2}" data-field="maxConcurrentPositions">
+          <input type="number" min="60" max="95" step="1" placeholder="Confiance min %" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">
+        </div>
+        <div class="premium-admin-actions">
+          <button type="button" data-autotrade-approve="${escapeHtml(request.userId)}">Approuver</button>
+          <button type="button" data-autotrade-reject="${escapeHtml(request.userId)}">Refuser</button>
+          <button type="button" data-autotrade-revoke="${escapeHtml(request.userId)}" ${request.approvalStatus === "approved" ? "" : "disabled"}>Révoquer</button>
+        </div>
+      </article>
+    `).join("");
+
+    autotradeRequests.querySelectorAll("[data-autotrade-approve]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const userId = button.dataset.autotradeApprove;
+        const token = form?.elements?.token?.value || "";
+        if (!token) { setMessage("Renseigne le token admin avant d'approuver.", true); return; }
+        const card = button.closest("[data-autotrade-request-card]");
+        const pairs = [...card.querySelectorAll('.dashboard-autotrade-pairs input:checked')].map((input) => input.value);
+        if (!pairs.length) { setMessage("Coche au moins une paire avant d'approuver.", true); return; }
+        const field = (name) => Number(card.querySelector(`[data-field="${name}"]`).value);
+        button.disabled = true;
+        setMessage("Approbation en cours...", false);
+        const data = await adminFetch("/api/admin/auto-trade/approve", {
+          token, userId, pairs,
+          days: field("days"), riskPercent: field("riskPercent"), dailyLossLimitPercent: field("dailyLossLimitPercent"),
+          maxConcurrentPositions: field("maxConcurrentPositions"), minConfidenceFloor: field("minConfidenceFloor"),
+        });
+        button.disabled = false;
+        if (!data?.ok) { setMessage(data?.message || data?.error || "Approbation impossible.", true); return; }
+        setMessage(`Approuvé jusqu'au ${formatDate(data.approvedUntil)}.`, false);
+        autotradeLoad?.click();
+      });
+    });
+
+    autotradeRequests.querySelectorAll("[data-autotrade-reject]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const userId = button.dataset.autotradeReject;
+        const token = form?.elements?.token?.value || "";
+        if (!token) { setMessage("Renseigne le token admin avant de refuser.", true); return; }
+        const reason = window.prompt("Raison du refus (optionnel) :") || "";
+        button.disabled = true;
+        const data = await adminFetch("/api/admin/auto-trade/reject", { token, userId, reason });
+        button.disabled = false;
+        if (!data?.ok) { setMessage(data?.message || data?.error || "Action impossible.", true); return; }
+        setMessage("Demande refusée.", false);
+        autotradeLoad?.click();
+      });
+    });
+
+    autotradeRequests.querySelectorAll("[data-autotrade-revoke]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const userId = button.dataset.autotradeRevoke;
+        const token = form?.elements?.token?.value || "";
+        if (!token) { setMessage("Renseigne le token admin avant de révoquer.", true); return; }
+        if (!window.confirm("Révoquer l'accès au trading automatique pour ce compte ?")) return;
+        button.disabled = true;
+        const data = await adminFetch("/api/admin/auto-trade/revoke", { token, userId });
+        button.disabled = false;
+        if (!data?.ok) { setMessage(data?.message || data?.error || "Action impossible.", true); return; }
+        setMessage("Accès révoqué.", false);
+        autotradeLoad?.click();
+      });
+    });
+  }
+
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (char) => ({
       "&": "&amp;",

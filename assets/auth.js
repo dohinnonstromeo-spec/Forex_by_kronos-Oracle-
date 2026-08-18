@@ -163,6 +163,7 @@
     renderPersonalHistory(personal, isPremium);
     initPush(isPremium);
     loadTradeOrders(isPremium);
+    loadAutoTrade(isPremium);
   }
 
   function urlBase64ToUint8Array(base64) {
@@ -548,6 +549,195 @@
         }
       });
     });
+  }
+
+  // Fully autonomous execution: separate from the semi-automatic panel above.
+  // Requires premium AND a connected broker AND a separate admin approval -- this
+  // function only ever reads/reflects state, the approval decision itself happens
+  // in the admin panel (assets/premium-admin.js).
+  const AUTOTRADE_STATUS_LABELS = {
+    none: "Pas encore demandée",
+    requested: "Demande envoyée -- en attente d'approbation",
+    approved: "Actif",
+    rejected: "Demande refusée",
+    revoked: "Accès révoqué",
+    expired: "Approbation expirée -- redemande l'activation",
+  };
+
+  async function loadAutoTrade(isPremium) {
+    const panel = document.querySelector("[data-autotrade-panel]");
+    const upsell = document.querySelector("[data-autotrade-upsell]");
+    if (!panel) return;
+    if (!isPremium) {
+      if (upsell) upsell.hidden = false;
+      return;
+    }
+    panel.hidden = false;
+    bindAutoTradeBrokerForm();
+    await refreshAutoTradeStatus();
+  }
+
+  function bindAutoTradeBrokerForm() {
+    const form = document.querySelector("[data-autotrade-broker-form]");
+    if (!form || form.dataset.bound) return;
+    form.dataset.bound = "1";
+    const message = document.querySelector("[data-autotrade-broker-message]");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const token = form.querySelector("[data-autotrade-token]").value.trim();
+      const accountId = form.querySelector("[data-autotrade-account-id]").value.trim();
+      const region = form.querySelector("[data-autotrade-region]").value.trim() || "london";
+      if (!token || !accountId) return;
+      const submitButton = form.querySelector('button[type="submit"]');
+      submitButton.disabled = true;
+      if (message) message.hidden = true;
+      try {
+        const response = await fetch("/api/auto-trade/broker/connect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, accountId, region }),
+        });
+        const result = await response.json();
+        if (result.ok) {
+          form.reset();
+          form.querySelector("[data-autotrade-region]").value = "london";
+        } else if (message) {
+          message.textContent = result.message ? `Connexion refusée : ${result.message}` : `Échec (${result.error || "erreur inconnue"}).`;
+          message.hidden = false;
+        }
+      } catch {
+        if (message) { message.textContent = "Impossible de contacter le serveur -- vérifie ta connexion."; message.hidden = false; }
+      } finally {
+        submitButton.disabled = false;
+        await refreshAutoTradeStatus();
+      }
+    });
+
+    document.querySelector("[data-autotrade-broker-disconnect]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await fetch("/api/auto-trade/broker/disconnect", { method: "POST" });
+      } finally {
+        await refreshAutoTradeStatus();
+      }
+    });
+
+    document.querySelector("[data-autotrade-request]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await fetch("/api/auto-trade/request", { method: "POST" });
+      } finally {
+        await refreshAutoTradeStatus();
+      }
+    });
+
+    document.querySelector("[data-autotrade-pause]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await fetch("/api/auto-trade/pause", { method: "POST" });
+      } finally {
+        await refreshAutoTradeStatus();
+      }
+    });
+
+    document.querySelector("[data-autotrade-resume]")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await fetch("/api/auto-trade/resume", { method: "POST" });
+      } finally {
+        await refreshAutoTradeStatus();
+      }
+    });
+  }
+
+  async function refreshAutoTradeStatus() {
+    const status = await fetchJson("/api/auto-trade/status");
+    if (!status?.ok) return;
+
+    const badge = document.querySelector("[data-autotrade-status-badge]");
+    if (badge) badge.textContent = AUTOTRADE_STATUS_LABELS[status.approvalStatus] || status.approvalStatus;
+
+    const brokerConnected = document.querySelector("[data-autotrade-broker-connected]");
+    const brokerForm = document.querySelector("[data-autotrade-broker-form]");
+    if (brokerConnected) brokerConnected.hidden = !status.brokerConnected;
+    if (brokerForm) brokerForm.hidden = status.brokerConnected;
+
+    const activationSection = document.querySelector("[data-autotrade-activation-section]");
+    if (activationSection) activationSection.hidden = !status.brokerConnected;
+
+    const statusText = document.querySelector("[data-autotrade-status-text]");
+    const requestButton = document.querySelector("[data-autotrade-request]");
+    const pauseButton = document.querySelector("[data-autotrade-pause]");
+    const resumeButton = document.querySelector("[data-autotrade-resume]");
+    const metrics = document.querySelector("[data-autotrade-metrics]");
+    const historySection = document.querySelector("[data-autotrade-history-section]");
+
+    if (requestButton) requestButton.hidden = true;
+    if (pauseButton) pauseButton.hidden = true;
+    if (resumeButton) resumeButton.hidden = true;
+    if (metrics) metrics.hidden = true;
+    if (historySection) historySection.hidden = true;
+
+    if (status.approvalStatus === "none" || status.approvalStatus === "rejected" || status.approvalStatus === "expired") {
+      if (statusText) {
+        statusText.textContent = status.approvalStatus === "rejected" && status.rejectReason
+          ? `Demande refusée : ${status.rejectReason}`
+          : "Connecte ton broker ci-dessus, puis demande l'activation. Un administrateur doit approuver le compte avant que le robot ne trade réellement.";
+      }
+      if (requestButton) requestButton.hidden = false;
+    } else if (status.approvalStatus === "requested") {
+      if (statusText) statusText.textContent = "Demande envoyée -- en attente d'approbation par un administrateur.";
+    } else if (status.approvalStatus === "revoked") {
+      if (statusText) statusText.textContent = "L'accès au trading automatique a été révoqué.";
+    } else if (status.approvalStatus === "approved") {
+      const until = status.approvedUntil ? formatDate(status.approvedUntil) : "";
+      if (statusText) {
+        statusText.textContent = status.userPaused
+          ? `En pause (approuvé jusqu'au ${until}).`
+          : `Actif jusqu'au ${until} · paires : ${status.approvedPairs.join(", ") || "aucune"} · risque ${status.riskPercent}% par trade.`;
+      }
+      if (pauseButton) pauseButton.hidden = status.userPaused;
+      if (resumeButton) resumeButton.hidden = !status.userPaused;
+      if (metrics) {
+        metrics.hidden = false;
+        metrics.innerHTML = [
+          ["Positions ouvertes", `${status.openPositions} / ${status.maxConcurrentPositions ?? "—"}`],
+          ["P&L du jour", `${status.dailyPnlPercent >= 0 ? "+" : ""}${status.dailyPnlPercent}%`],
+          ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
+          ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
+        ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+      }
+      if (historySection) historySection.hidden = false;
+      await loadAutoTradeHistory();
+    }
+  }
+
+  async function loadAutoTradeHistory() {
+    const host = document.querySelector("[data-autotrade-trades]");
+    if (!host) return;
+    const data = await fetchJson("/api/auto-trade/history");
+    const trades = data?.trades || [];
+    if (!trades.length) {
+      host.innerHTML = `<div class="dashboard-empty">Le robot n'a encore ouvert aucune position.</div>`;
+      return;
+    }
+    host.innerHTML = trades.slice(0, 20).map((item) => `
+      <article class="dashboard-trade-order">
+        <div>
+          <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
+          <span class="${historyStatusClass(item.status)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item.status)}${escapeHtml(historyStatusLabel(item))}</span>
+        </div>
+        <div class="dashboard-history-levels">
+          <span>Entrée ${escapeHtml(item.entry)}</span>
+          <span>SL ${escapeHtml(item.sl)}</span>
+          <span>TP1 ${escapeHtml(item.tp1 ?? "—")}</span>
+        </div>
+      </article>
+    `).join("");
   }
 
   function historyStatusClass(status) {

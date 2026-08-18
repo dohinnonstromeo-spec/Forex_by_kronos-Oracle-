@@ -54,7 +54,7 @@
 
     <section class="auth-card premium-admin-card">
       <p class="analysis-kicker">Exécution semi-automatique</p>
-      <h1 class="analysis-title">Coupe-circuit trading</h1>
+      <h2 class="analysis-title">Coupe-circuit trading</h2>
       <p class="analysis-subtitle">Coupe instantanément l'envoi d'ordres au broker pour tous les comptes, sans redéploiement. Utilise le même token admin que ci-dessus.</p>
       <p data-trading-status>Statut inconnu — clique sur "Actualiser".</p>
       <div class="premium-admin-actions">
@@ -62,6 +62,16 @@
         <button type="button" data-trading-pause>Mettre en pause</button>
         <button type="button" data-trading-resume>Reprendre</button>
       </div>
+    </section>
+
+    <section class="auth-card premium-admin-card">
+      <p class="analysis-kicker">Robot Kronos</p>
+      <h2 class="analysis-title">Demandes de trading automatique</h2>
+      <p class="analysis-subtitle">Approuve individuellement qui a le droit d'utiliser le mode 100% automatique -- chaque approbation fixe une durée, les paires autorisées et les limites de risque. Utilise le même token admin que ci-dessus.</p>
+      <div class="premium-admin-actions">
+        <button type="button" data-autotrade-load>Charger les demandes</button>
+      </div>
+      <div class="dashboard-history" data-autotrade-requests></div>
     </section>
   </main>
 

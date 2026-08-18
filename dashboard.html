@@ -104,6 +104,48 @@
       <div class="dashboard-trade-orders" data-trade-orders>Chargement...</div>
     </section>
     <p class="dashboard-push-upsell" data-trade-upsell hidden>L'exécution semi-automatique (Kronos prépare l'ordre, tu valides, il part vers ton broker) est réservée aux membres Premium. <a href="/paiement">S'abonner</a></p>
+
+    <section class="dashboard-panel" data-autotrade-panel hidden>
+      <div class="signal-top">
+        <div>
+          <p class="analysis-kicker">Exécution 100% automatique</p>
+          <h2 class="analysis-title">Robot Kronos</h2>
+        </div>
+        <span class="oracle-tech" data-autotrade-status-badge>Statut...</span>
+      </div>
+      <p class="dashboard-trade-note">Le robot surveille le marché seul et exécute sans confirmation, uniquement sur les paires et le risque approuvés. Nécessite ton propre compte broker connecté <strong>et</strong> une approbation manuelle de l'équipe — ce n'est pas activable en un clic.</p>
+
+      <div class="dashboard-autotrade-section">
+        <h3>1. Connecter ton broker</h3>
+        <p class="dashboard-history-note">Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
+        <form class="dashboard-autotrade-form" data-autotrade-broker-form>
+          <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
+          <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
+          <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
+          <button type="submit" class="payment-method-button">Connecter mon broker</button>
+        </form>
+        <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message hidden></p>
+        <div class="dashboard-autotrade-connected" data-autotrade-broker-connected hidden>
+          <span>✓ Broker connecté</span>
+          <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect>Déconnecter</button>
+        </div>
+      </div>
+
+      <div class="dashboard-autotrade-section" data-autotrade-activation-section hidden>
+        <h3>2. Activation</h3>
+        <p class="dashboard-history-note" data-autotrade-status-text></p>
+        <div class="dashboard-autotrade-metrics" data-autotrade-metrics hidden></div>
+        <button type="button" class="payment-method-button" data-autotrade-request hidden>Demander l'activation</button>
+        <button type="button" class="dashboard-trade-cancel" data-autotrade-pause hidden>Mettre en pause</button>
+        <button type="button" class="payment-method-button" data-autotrade-resume hidden>Reprendre</button>
+      </div>
+
+      <div class="dashboard-autotrade-section" data-autotrade-history-section hidden>
+        <h3>Trades du robot</h3>
+        <div class="dashboard-trade-orders" data-autotrade-trades>Chargement...</div>
+      </div>
+    </section>
+    <p class="dashboard-push-upsell" data-autotrade-upsell hidden>Le trading 100% automatique est réservé aux membres Premium, sous réserve d'approbation admin. <a href="/paiement">S'abonner</a></p>
   </main>
 
   <footer class="oracle-footer-lite">

@@ -297,5 +297,51 @@ const barsBeforeCreation = [
 ];
 check("bars from before the analysis existed are ignored, not treated as a touch", evaluateOutcomeFromHistory(scalpAnalysis, barsBeforeCreation) === null);
 
+console.log("\n=== computeAutoTradeVolume: autonomous bot position sizing never risks more than approved ===");
+
+// Copy of computeAutoTradeVolume() from server.mjs.
+function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification }) {
+  const slDistance = Math.abs(Number(entry) - Number(sl));
+  if (!(slDistance > 0) || !(balance > 0) || !(Number(riskPercent) > 0)) return null;
+  const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
+  if (!(valuePerUnitPerLot > 0)) return null;
+  const riskAmount = balance * (Number(riskPercent) / 100);
+  const rawVolume = riskAmount / (slDistance * valuePerUnitPerLot);
+  const steppedVolume = Math.floor(rawVolume / specification.volumeStep) * specification.volumeStep;
+  const volume = Math.min(steppedVolume, specification.maxVolume);
+  return volume >= specification.minVolume ? Math.round(volume * 100) / 100 : null;
+}
+
+// Real numbers confirmed live this session against the connected MetaApi demo
+// account: XAU/USD tickSize 0.01, lossTickValue ~1 (USD account), balance
+// $43,230.85, 0.1% risk, $15 SL distance -> volume 0.02 lots, confirmed against a
+// real order actually sent and filled.
+const xauSpec = { tickSize: 0.01, lossTickValue: 1, minVolume: 0.01, maxVolume: 10, volumeStep: 0.01 };
+check(
+  "real XAU/USD numbers from this session reproduce the exact volume a real order used (0.02 lots)",
+  computeAutoTradeVolume({ balance: 43230.85, riskPercent: 0.1, entry: 4400.13601, sl: 4385.13601, specification: xauSpec }) === 0.02,
+);
+
+// Confirmed live: GBP/JPY's lossTickValue (~0.627 for a USD account) differs
+// meaningfully from a same-magnitude EUR/USD tick value (1.0) -- proving the
+// formula must use the pair-specific, already-FX-converted lossTickValue and never
+// a shared/guessed constant across pairs.
+const gbpjpySpec = { tickSize: 0.001, lossTickValue: 0.627, minVolume: 0.01, maxVolume: 20, volumeStep: 0.01 };
+const gbpjpyVolume = computeAutoTradeVolume({ balance: 43230.85, riskPercent: 0.1, entry: 216.051, sl: 215.051, specification: gbpjpySpec });
+check("a different pair's distinct tick value produces a materially different volume, not a copy-pasted constant", gbpjpyVolume !== 0.02 && gbpjpyVolume > 0);
+
+check(
+  "never rounds UP to the broker's minimum volume -- a setup too small to size safely is skipped, not risked anyway",
+  computeAutoTradeVolume({ balance: 100, riskPercent: 0.1, entry: 4400, sl: 3000, specification: xauSpec }) === null,
+);
+
+check(
+  "volume is capped at the broker's maxVolume, never sized past it",
+  computeAutoTradeVolume({ balance: 50_000_000, riskPercent: 3, entry: 4400, sl: 4399, specification: xauSpec }) === xauSpec.maxVolume,
+);
+
+check("no balance -- fails closed instead of guessing a size", computeAutoTradeVolume({ balance: 0, riskPercent: 0.5, entry: 4400, sl: 4385, specification: xauSpec }) === null);
+check("zero SL distance (entry === sl, malformed signal) -- fails closed, would otherwise divide by zero", computeAutoTradeVolume({ balance: 43230, riskPercent: 0.5, entry: 4400, sl: 4400, specification: xauSpec }) === null);
+
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);
