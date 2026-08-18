@@ -172,11 +172,49 @@
 
   async function filesToDataUrls(items) {
     const valid = items.filter((file) => /image\/(png|jpe?g|webp)/i.test(file.type)).slice(0, 2);
-    return Promise.all(valid.map((file) => new Promise((resolve) => {
+    return Promise.all(valid.map(imageFileToOptimizedDataUrl));
+  }
+
+  // Same optimization as assets/analyse-page.js's imageFileToOptimizedDataUrl --
+  // duplicated rather than shared (no bundler on this site) since chat images were
+  // going out at full phone-camera resolution (8-15MB base64) while the analysis
+  // page already solved this exact problem two files over.
+  async function imageFileToOptimizedDataUrl(file) {
+    const original = await readFileAsDataUrl(file);
+    try {
+      const image = await loadImage(original);
+      const maxSide = 1800;
+      const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+      const width = Math.max(1, Math.round(image.width * scale));
+      const height = Math.max(1, Math.round(image.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(image, 0, 0, width, height);
+      return canvas.toDataURL("image/jpeg", 0.88);
+    } catch {
+      return original;
+    }
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
       reader.readAsDataURL(file);
-    })));
+    });
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = reject;
+      image.src = src;
+    });
   }
 
   async function postJson(url, body) {

@@ -1979,6 +1979,26 @@ Réponds en JSON strict:
 // would have caught and blocked outright. Same underlying AI call, same hallucination
 // risk, but only one of the two paths was actually checking for it.
 async function runKronosAnalysis({ body, images, req, user }) {
+    // /api/comment, /api/news-summary, and /api/briefing all route their free-text
+    // fields through sanitizeUserText before they reach a prompt -- this endpoint,
+    // the most-used and most-expensive of the bunch, never got the same treatment.
+    // body.pair/style/strategy/risk/capital go straight into the AI prompt (below)
+    // and into the analyses row with no length cap and no injection-phrase
+    // filtering. Normalized once here, in place, so every existing read of
+    // body.xxx throughout this function (and the ~20 call sites downstream) gets
+    // the sanitized value automatically instead of touching each one individually.
+    if (body.pair) {
+      const sanitizedPair = sanitizePairLabel(body.pair);
+      body.pair = sanitizedPair === "N/A" ? "" : sanitizedPair;
+    }
+    if (body.timeframe) body.timeframe = normalizeTimeframe(body.timeframe) || "";
+    if (body.style) body.style = sanitizeUserText(body.style, 40);
+    if (body.strategy) body.strategy = sanitizeUserText(body.strategy, 40);
+    if (body.risk) body.risk = sanitizeUserText(body.risk, 40);
+    if (body.capital) {
+      const capital = Number(body.capital);
+      body.capital = Number.isFinite(capital) && capital > 0 ? Math.min(capital, 100_000_000) : null;
+    }
     const imageQuality = assessImageQuality(images);
     if (images.length && imageQuality.score < 20) {
       return {

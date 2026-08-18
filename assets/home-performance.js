@@ -1,10 +1,16 @@
 (() => {
   document.addEventListener("DOMContentLoaded", refreshHomeMetrics);
+  // Sole owner of /api/performance rendering on the home page -- kronos-live.js
+  // used to also fetch and render this same panel (via fragile h3-text matching)
+  // every 5 minutes, racing this file to overwrite the same DOM node with a
+  // different, less complete template. Removed there; the periodic refresh moved
+  // here instead so the panel still stays fresh on a long-open tab.
+  setInterval(refreshHomeMetrics, 5 * 60 * 1000);
 
   async function refreshHomeMetrics() {
     try {
       const response = await fetch("/api/performance", { signal: AbortSignal.timeout(3500) });
-      if (!response.ok) return;
+      if (!response.ok) throw new Error(`http_${response.status}`);
       const data = await response.json();
       const publishablePrecision = data.precisionAudited && Number(data.precision) >= 55;
       setMetric("precision", publishablePrecision ? data.precisionLabel : "En audit");
@@ -24,7 +30,22 @@
       setMetric("signals", "—");
       setMetric("members", "—");
       setMetric("pairs", "—");
+      // The small metrics above were the only thing this catch ever touched -- the
+      // full stats/chart/recent panel (renderPerformance) was left showing its
+      // static "Chargement..." placeholder forever on a failed fetch, with no
+      // retry and no visible failure state, confirmed live this session's audit.
+      showPanelError();
     }
+  }
+
+  function showPanelError() {
+    const panel = document.querySelector(".home-performance-panel");
+    if (!panel) return;
+    const message = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Performance indisponible pour l'instant -- nouvelle tentative dans quelques minutes.</div>`;
+    const stats = panel.querySelector(".home-performance-stats");
+    const chart = panel.querySelector(".home-performance-chart");
+    if (stats && !stats.children.length) stats.innerHTML = message;
+    if (chart && !chart.children.length) chart.innerHTML = message;
   }
 
   function setMetric(name, value) {

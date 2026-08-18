@@ -12,15 +12,16 @@
 
   async function boot() {
     injectStyles();
-    await updatePrices();
-    await updateSignals();
-    await updatePerformancePanel();
-    wireNewsSummaries();
+    // Independent of each other (different endpoints, different DOM regions) --
+    // used to await one after another, which delayed first paint by the sum of all
+    // three round trips instead of the slowest one. Home page performance rendering
+    // itself lives in home-performance.js (a fuller, more correct implementation --
+    // see the removed updatePerformancePanel below), not here.
+    await Promise.all([updatePrices(), updateSignals(), wireNewsSummaries()]);
     setInterval(updateCountdowns, 1000);
     setInterval(updatePrices, 60000);
     setInterval(updateSignals, 15 * 60 * 1000);
     setInterval(updateSignalScores, 5 * 60 * 1000);
-    setInterval(updatePerformancePanel, 5 * 60 * 1000);
   }
 
   async function updatePrices() {
@@ -62,9 +63,12 @@
   }
 
   async function updateSignalScores() {
-    for (const signal of state.signals) {
+    // Concurrent, not one-at-a-time -- a sequential loop meant later cards visibly
+    // updated their score noticeably after earlier ones on every refresh, an
+    // avoidable staggered pop-in with no ordering requirement between signals.
+    await Promise.all(state.signals.map(async (signal) => {
       const price = state.prices[signal.paire]?.price;
-      if (!price) continue;
+      if (!price) return;
       const changePercent = (((price - Number(signal.entree)) / Number(signal.entree)) * 100).toFixed(2);
       const score = await postJson("/api/confidence", {
         pair: signal.paire,
@@ -74,7 +78,7 @@
         changePercent,
       });
       const card = document.querySelector(`[data-kronos-pair="${cssEscape(signal.paire)}"]`);
-      if (!card || !score) continue;
+      if (!card || !score) return;
       const scoreEl = card.querySelector("[data-kronos-score]");
       const barEl = card.querySelector("[data-kronos-bar]");
       const badgeEl = card.querySelector("[data-kronos-status]");
@@ -84,7 +88,7 @@
         badgeEl.textContent = Number(score.score) < 20 ? "SIGNAL ANNULÉ" : Number(score.score) < 40 ? "SIGNAL FAIBLIT" : score.statut || "FORT";
         badgeEl.className = `kronos-status ${Number(score.score) < 40 ? "danger" : ""}`;
       }
-    }
+    }));
   }
 
   // Anchored on data-market-row/-price/-change instead of the row's visual Tailwind
@@ -288,36 +292,16 @@
 
   async function wireNewsSummaries() {
     const rows = [...document.querySelectorAll("#news li")].slice(0, 6);
-    for (const row of rows) {
+    // Concurrent, not one-at-a-time -- each row's summary is independent, a
+    // sequential loop just staggered how long the later rows sat unsummarized.
+    await Promise.all(rows.map(async (row) => {
       const title = row.textContent.replace(/\s+/g, " ").trim();
       const firstCell = row.children[1];
-      if (!firstCell || firstCell.dataset.kronosSummarized) continue;
+      if (!firstCell || firstCell.dataset.kronosSummarized) return;
       firstCell.dataset.kronosSummarized = "true";
       const data = await postJson("/api/news-summary", { title });
       if (data?.summary) firstCell.innerHTML = `<span class="inline-flex text-xs md:text-sm">${flap(data.summary.slice(0, 38))}</span>`;
-    }
-  }
-
-  async function updatePerformancePanel() {
-    const data = await getJson("/api/performance");
-    if (!data) return;
-    [...document.querySelectorAll("h3")].forEach((title) => {
-      if (!/Performances/i.test(title.textContent || "")) return;
-      const panel = title.closest(".glass-card");
-      const grid = panel?.querySelector(".grid");
-      if (!grid) return;
-      title.textContent = "Performances · résultats réels";
-      if (!Array.isArray(data.recent) || !data.recent.length) {
-        grid.innerHTML = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Pas encore assez de signaux clôturés pour publier une performance réelle.</div>`;
-        return;
-      }
-      grid.innerHTML = data.recent.map((item) => `
-        <div class="flex items-center justify-between rounded border border-border bg-background/40 px-3 py-2">
-          <span class="text-muted-foreground">${escapeHtml(item.pair)} · ${escapeHtml(item.style || "Style")}</span>
-          <span class="${item.result === "win" ? "text-neon-green" : "text-neon-red"}">${item.result === "win" ? "TP1" : "SL"} · ${Number(item.score || 0)}%</span>
-        </div>
-      `).join("");
-    });
+    }));
   }
 
   function flap(value) {
@@ -327,11 +311,17 @@
   }
 
   function typewrite(node, text) {
+    // renderLiveComment can call this again for the same node before the prior
+    // call's interval finished (price jitters across the 0.1% threshold twice in
+    // quick succession) -- without cancelling the old timer first, two intervals
+    // race to append characters into the same textContent, producing garbled,
+    // interleaved text, plus a leaked interval once the node is later removed.
+    if (node._typewriteTimer) clearInterval(node._typewriteTimer);
     node.textContent = "";
     let i = 0;
-    const timer = setInterval(() => {
+    node._typewriteTimer = setInterval(() => {
       node.textContent += text[i++] || "";
-      if (i > text.length) clearInterval(timer);
+      if (i > text.length) { clearInterval(node._typewriteTimer); node._typewriteTimer = null; }
     }, 18);
   }
 
