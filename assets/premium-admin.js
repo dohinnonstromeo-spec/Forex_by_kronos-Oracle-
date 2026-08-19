@@ -298,6 +298,30 @@
           <button type="button" data-autotrade-reject="${escapeHtml(request.userId)}">Refuser</button>
           <button type="button" data-autotrade-revoke="${escapeHtml(request.userId)}" ${request.approvalStatus === "approved" ? "" : "disabled"}>Révoquer</button>
         </div>
+
+        <div class="dashboard-autotrade-section" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--oracle-border)">
+          <h3>Mode scalping (bêta -- infrastructure prête, pas encore branché à l'exécution autonome)</h3>
+          <label class="dashboard-autotrade-field" style="flex:0 0 auto">
+            <span style="display:flex;align-items:center;gap:6px;text-transform:none;font-size:13px;color:var(--foreground)">
+              <input type="checkbox" ${request.scalpEnabled ? "checked" : ""} data-scalp-field="scalpEnabled" style="width:auto">
+              Activer le mode scalping pour ce compte
+            </span>
+          </label>
+          <div class="dashboard-autotrade-form">
+            <label class="dashboard-autotrade-field">Objectif de profit (montant) <span class="dashboard-autotrade-hint">(min 0.3)</span>
+              <input type="number" min="0.3" max="100" step="0.1" value="${request.scalpProfitTargetAmount ?? 1}" data-scalp-field="scalpProfitTargetAmount">
+            </label>
+            <label class="dashboard-autotrade-field">Perte max par trade (montant)
+              <input type="number" min="0.3" max="200" step="0.1" value="${request.scalpLossLimitAmount ?? 2}" data-scalp-field="scalpLossLimitAmount">
+            </label>
+            <label class="dashboard-autotrade-field">Durée max de détention (secondes)
+              <input type="number" min="5" max="3600" step="5" value="${request.scalpMaxHoldSeconds ?? 120}" data-scalp-field="scalpMaxHoldSeconds">
+            </label>
+          </div>
+          <div class="premium-admin-actions">
+            <button type="button" data-autotrade-scalp-save="${escapeHtml(request.userId)}">Enregistrer le mode scalping</button>
+          </div>
+        </div>
       </article>
     `).join("");
 
@@ -355,6 +379,29 @@
         button.disabled = false;
         if (!data?.ok) { setMessage(data?.message || data?.error || "Action impossible.", true); return; }
         setMessage("Accès révoqué.", false);
+        autotradeLoad?.click();
+      });
+    });
+
+    autotradeRequests.querySelectorAll("[data-autotrade-scalp-save]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const userId = button.dataset.autotradeScalpSave;
+        const token = form?.elements?.token?.value || "";
+        if (!token) { setMessage("Renseigne le token admin avant d'enregistrer.", true); return; }
+        const card = button.closest("[data-autotrade-request-card]");
+        const scalpField = (name) => card.querySelector(`[data-scalp-field="${name}"]`);
+        button.disabled = true;
+        setMessage("Enregistrement du mode scalping...", false);
+        const data = await adminFetch("/api/admin/auto-trade/scalp-settings", {
+          token, userId,
+          scalpEnabled: scalpField("scalpEnabled").checked,
+          scalpProfitTargetAmount: Number(scalpField("scalpProfitTargetAmount").value),
+          scalpLossLimitAmount: Number(scalpField("scalpLossLimitAmount").value),
+          scalpMaxHoldSeconds: Number(scalpField("scalpMaxHoldSeconds").value),
+        });
+        button.disabled = false;
+        if (!data?.ok) { setMessage(data?.message || data?.error || "Enregistrement impossible.", true); return; }
+        setMessage("Mode scalping enregistré.", false);
         autotradeLoad?.click();
       });
     });

@@ -287,6 +287,11 @@ async function ensureRelationalTables() {
   // personal "Mes analyses" feed can filter by origin -- see auto_trading_accounts.
   await ensureColumn("analyses", "source text NOT NULL DEFAULT 'manual'");
   await ensureColumn("trade_orders", "risk_percent_at_trade real");
+  // Snapshotted at order-creation time, same reasoning as risk_percent_at_trade
+  // above -- an account's scalp settings can change after a position is already
+  // open, and an in-flight trade must keep the timeout it was actually opened
+  // under, not retroactively inherit a later edit. See startScalpTimeoutScheduler.
+  await ensureColumn("trade_orders", "scalp_max_hold_seconds integer");
   // Marks how far a user has read into their own trade-open/close feed (see
   // /api/notifications/summary) -- the in-app fallback for anyone without an
   // active push subscription. NULL until they ever open the notifications panel,
@@ -331,6 +336,19 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "user_trading_hours_start text");
   await ensureColumn("auto_trading_accounts", "user_trading_hours_end text");
   await ensureColumn("auto_trading_accounts", "user_trading_days text");
+  // Scalp mode is a deliberately separate approval from the main swing bot above
+  // (scalp_enabled, not approval_status) -- a materially different risk profile
+  // (tiny targets, transaction cost is proportionally huge, needs its own
+  // max-hold force-close) that an admin must opt an account into explicitly, not
+  // inherit automatically from an existing swing approval. Requested directly;
+  // see closeBrokerPosition / startScalpTimeoutScheduler for the execution side.
+  // Deliberately NOT wired to autonomous opening yet -- no backtested short-term
+  // edge exists to open real positions against, only the closing/safety
+  // infrastructure is being built ahead of that.
+  await ensureColumn("auto_trading_accounts", "scalp_enabled integer NOT NULL DEFAULT 0");
+  await ensureColumn("auto_trading_accounts", "scalp_profit_target_amount real");
+  await ensureColumn("auto_trading_accounts", "scalp_loss_limit_amount real");
+  await ensureColumn("auto_trading_accounts", "scalp_max_hold_seconds integer");
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -964,6 +982,7 @@ createServer(async (req, res) => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
   startLearningOutcomesScheduler();
   startBrokerReconcileScheduler();
+  startScalpTimeoutScheduler();
   startSignalsBroadcastScheduler();
   startNewSignalAlertScheduler();
   startAutoTradeScheduler();
@@ -1623,6 +1642,10 @@ async function handleApi(req, res, url) {
       tradingHoursEnd: row.trading_hours_end || null,
       tradingDays: row.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
       dailyLossLimitAmount: row.daily_loss_limit_amount ?? null,
+      scalpEnabled: Boolean(Number(row.scalp_enabled)),
+      scalpProfitTargetAmount: row.scalp_profit_target_amount ?? null,
+      scalpLossLimitAmount: row.scalp_loss_limit_amount ?? null,
+      scalpMaxHoldSeconds: row.scalp_max_hold_seconds ?? null,
       userPaused: Boolean(Number(row.user_paused)),
       brokerConnected: Boolean(row.broker_token && row.broker_account_id && row.broker_connected_at),
       brokerLastCheckStatus: row.broker_last_check_status,
@@ -1727,6 +1750,38 @@ async function handleApi(req, res, url) {
     await sqlRun(
       `UPDATE auto_trading_accounts SET approval_status = 'revoked', approved_until = ?, decided_at = ?, decided_by = ?, updated_at = ? WHERE user_id = ?`,
       [now, now, admin.user?.email || "token", now, userId],
+    );
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // Deliberately separate from /api/admin/auto-trade/approve -- scalp is a
+  // materially different risk profile (tiny targets, transaction cost is
+  // proportionally huge) that an admin opts an account into explicitly, never
+  // inherited from an existing swing approval. Not yet reachable from
+  // autonomous execution (no validated short-term signal exists to open
+  // against -- see the scalp backtest research) -- this endpoint exists so the
+  // settings/UI round-trip is already proven before that's wired in.
+  if (url.pathname === "/api/admin/auto-trade/scalp-settings") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    const userId = String(body?.userId || "");
+    if (!userId) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    const user = await sqlGet(`SELECT id FROM users WHERE id = ?`, [userId]);
+    if (!user) return sendJson(res, 404, { ok: false, error: "user_not_found" });
+    const scalpEnabled = Boolean(body?.scalpEnabled);
+    // 0.30 floor matches the smallest target actually requested ("meme 0.3$
+    // minimum") -- below that the cost-viability guard (isScalpTargetCostViable,
+    // 3x round-trip cost) would reject nearly every real-world spread anyway.
+    const scalpProfitTargetAmount = Math.max(0.3, Math.min(100, Number(body?.scalpProfitTargetAmount) || 1));
+    const scalpLossLimitAmount = Math.max(0.3, Math.min(200, Number(body?.scalpLossLimitAmount) || 2));
+    const scalpMaxHoldSeconds = Math.max(5, Math.min(3600, Math.round(Number(body?.scalpMaxHoldSeconds) || 120)));
+    await sqlRun(
+      `UPDATE auto_trading_accounts SET scalp_enabled = ?, scalp_profit_target_amount = ?, scalp_loss_limit_amount = ?, scalp_max_hold_seconds = ?, updated_at = ? WHERE user_id = ?`,
+      [scalpEnabled ? 1 : 0, scalpProfitTargetAmount, scalpLossLimitAmount, scalpMaxHoldSeconds, new Date().toISOString(), userId],
     );
     sendJson(res, 200, { ok: true });
     return;
@@ -2190,6 +2245,10 @@ async function handleApi(req, res, url) {
       userTradingHoursStart: row?.user_trading_hours_start || null,
       userTradingHoursEnd: row?.user_trading_hours_end || null,
       userTradingDays: row?.user_trading_days ? row.user_trading_days.split(",").filter(Boolean).map(Number) : null,
+      scalpEnabled: Boolean(Number(row?.scalp_enabled)),
+      scalpProfitTargetAmount: row?.scalp_profit_target_amount ?? null,
+      scalpLossLimitAmount: row?.scalp_loss_limit_amount ?? null,
+      scalpMaxHoldSeconds: row?.scalp_max_hold_seconds ?? null,
       userPaused: Boolean(Number(row?.user_paused)),
       brokerConnected,
       brokerLastCheckStatus: row?.broker_last_check_status || null,
@@ -8021,6 +8080,32 @@ async function sendOrderToBroker(order, credentials = null) {
   }
 }
 
+// The bot has never actively closed a position before -- every existing close
+// (TP/SL hit, manual close from the app) happens AT the broker, this site only
+// ever finds out about it afterward (see tryResolveBrokerBackedOutcome). Scalp
+// mode's max-hold-time force-close is the first time this site itself needs to
+// tell the broker to close something right now, not just watch for it -- see
+// startScalpTimeoutScheduler. Verified live this session (used throughout, by
+// hand, to close every real test position opened for other verifications).
+async function closeBrokerPosition(credentials, positionId) {
+  const region = credentials.region || "new-york";
+  const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/trade`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "auth-token": credentials.token },
+      body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId: String(positionId) }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
+    if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: `broker_request_failed: ${error.message}` };
+  }
+}
+
 // The one function in this feature that can actually move money -- shared by
 // /api/trade/confirm (human clicks "Confirmer", credentials = null -> falls back to
 // the shared house account) and the autonomous scheduler (runAutoTradeTick,
@@ -8176,7 +8261,34 @@ async function getBrokerSymbolSpecification(credentials, pair) {
     minVolume: Number(spec?.minVolume) || 0.01,
     maxVolume: Number(spec?.maxVolume) || 100,
     volumeStep: Number(spec?.volumeStep) || 0.01,
+    bid: Number(price?.bid) || null,
+    ask: Number(price?.ask) || null,
   };
+}
+
+// Approximate round-trip transaction cost (spread only -- commission isn't
+// consistently exposed by this API, same "not a precise cost model" honesty
+// scripts/backtest.mjs already applies to its own cost haircut) for one scalp
+// trade at a given volume: buying at ask and immediately selling at bid (or the
+// reverse) loses exactly the spread, which is the dominant cost at the tiny
+// profit targets scalp mode is built around -- a fixed cost that eats a much
+// bigger share of a $0.30-3 target than it would of a normal swing trade's
+// target, which is exactly why "sans risque" isn't real for this style and this
+// guard exists at all.
+function estimateScalpRoundTripCost(specification, volume) {
+  const { bid, ask, tickSize, lossTickValue } = specification;
+  if (!(bid > 0) || !(ask > 0) || !(tickSize > 0) || !(lossTickValue > 0) || !(volume > 0)) return null;
+  const spread = ask - bid;
+  return (spread / tickSize) * lossTickValue * volume;
+}
+
+// A scalp trade only makes sense if its profit target meaningfully exceeds what
+// it costs just to get in and out -- minRatio defaults to 3x so a target isn't
+// approved right at the break-even edge, where normal price noise around the
+// spread could make a "winning" trade a net loss once cost is counted.
+function isScalpTargetCostViable(targetAmount, roundTripCost, minRatio = 3) {
+  if (!(targetAmount > 0) || !(roundTripCost > 0)) return false;
+  return targetAmount >= roundTripCost * minRatio;
 }
 
 // Ground truth for a broker-executed position, confirmed live against a real
@@ -8457,6 +8569,58 @@ function startBrokerReconcileScheduler() {
   setInterval(() => {
     reconcileBrokerBackedOutcomes().catch((error) => logOnce("broker-reconcile", `réconciliation rapide échouée (${error.message})`));
   }, BROKER_RECONCILE_INTERVAL_MS);
+}
+
+// Scalp mode's one genuinely new closing behavior: a profit target or a stop-loss
+// is just a normal broker-side TP/SL order (sendOrderToBroker already handles
+// that, and the existing fast reconcile scheduler above already notices the
+// close quickly) -- but "give up and get out after N seconds regardless of P&L"
+// has no broker-side order type. This is the only thing that has to actively
+// reach out and tell the broker to close something, rather than just watching
+// for a close that already happened. Narrow and cheap on purpose (only
+// source='auto_scalp' rows, one broker call per timed-out position) so it's
+// safe to run often.
+const SCALP_TIMEOUT_INTERVAL_MS = Number(env.SCALP_TIMEOUT_INTERVAL_SECONDS || 10) * 1000;
+let scalpTimeoutInFlight = false;
+
+async function checkScalpTimeouts() {
+  if (scalpTimeoutInFlight) return;
+  scalpTimeoutInFlight = true;
+  try {
+    await ensureRelationalTables();
+    const rows = await sqlAll(
+      `SELECT a.id as analysis_id, a.user_id as user_id, o.broker_order_id as broker_order_id, o.sent_at as sent_at, o.scalp_max_hold_seconds as scalp_max_hold_seconds
+       FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+       WHERE a.status = 'OPEN' AND a.source = 'auto_scalp' AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL AND o.sent_at IS NOT NULL`,
+      [],
+    );
+    if (!rows.length) return;
+    const credentialsCache = new Map();
+    for (const row of rows) {
+      const heldSeconds = (Date.now() - new Date(row.sent_at).getTime()) / 1000;
+      const maxHold = Number(row.scalp_max_hold_seconds) || 0;
+      if (!maxHold || heldSeconds < maxHold) continue;
+      if (!credentialsCache.has(row.user_id)) {
+        credentialsCache.set(row.user_id, await getUserBrokerCredentials(row.user_id).catch(() => null));
+      }
+      const credentials = credentialsCache.get(row.user_id);
+      if (!credentials) continue;
+      // Not resolved here -- just asks the broker to close it; the existing fast
+      // reconcile scheduler picks up the resulting close (real price, real
+      // profit) on its own very next tick, same as any other close.
+      await closeBrokerPosition(credentials, row.broker_order_id).catch((error) => {
+        logOnce(`scalp-timeout-${row.analysis_id}`, `fermeture scalp échouée (${error.message})`);
+      });
+    }
+  } finally {
+    scalpTimeoutInFlight = false;
+  }
+}
+
+function startScalpTimeoutScheduler() {
+  setInterval(() => {
+    checkScalpTimeouts().catch((error) => logOnce("scalp-timeout-scheduler", `vérification timeout scalp échouée (${error.message})`));
+  }, SCALP_TIMEOUT_INTERVAL_MS);
 }
 
 async function updateLearningOutcomes(prices = null, histories = null) {
