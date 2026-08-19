@@ -349,6 +349,28 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "scalp_profit_target_amount real");
   await ensureColumn("auto_trading_accounts", "scalp_loss_limit_amount real");
   await ensureColumn("auto_trading_accounts", "scalp_max_hold_seconds integer");
+  // scalp_pairs: restricted server-side to SCALP_VALIDATED_PAIRS only (GBP/USD,
+  // XAU/USD) -- unlike the swing bot's approved_pairs, which covers everything
+  // in `symbols`, scalp mode only ever trades pairs with an actual backtested
+  // edge (see scripts/backtest-scalp-fx-meanrev.mjs), never "whatever's
+  // approved". scalp_lot_mode: 'auto' (same balance x risk% sizing as swing,
+  // computeAutoTradeVolume) or 'fixed' (always the same lot, scalp_fixed_lot --
+  // requested directly: "priorite tout petit lot pour ne pas cramer le compte
+  // d'un coup", an explicit small fixed lot the admin can impose regardless of
+  // balance/stop distance).
+  await ensureColumn("auto_trading_accounts", "scalp_pairs text");
+  await ensureColumn("auto_trading_accounts", "scalp_lot_mode text NOT NULL DEFAULT 'auto'");
+  await ensureColumn("auto_trading_accounts", "scalp_fixed_lot real");
+  // Progressive risk by capital tier, requested directly: as the real account
+  // balance crosses thresholds the admin defines, risk% per trade steps up
+  // automatically -- e.g. 0.3% under $100, 1% past $1000. Stored as a JSON array
+  // of {minBalance, riskPercent}, resolved against the REAL live balance at
+  // trade time (see resolveAdminRiskPercent), not the balance at approval time.
+  // Only takes effect when risk_tiers_enabled is set -- disabled accounts keep
+  // using the existing flat risk_percent exactly as before, zero behavior
+  // change for anyone who hasn't opted in.
+  await ensureColumn("auto_trading_accounts", "risk_tiers_enabled integer NOT NULL DEFAULT 0");
+  await ensureColumn("auto_trading_accounts", "risk_tiers text");
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -986,6 +1008,7 @@ createServer(async (req, res) => {
   startSignalsBroadcastScheduler();
   startNewSignalAlertScheduler();
   startAutoTradeScheduler();
+  startScalpTradingScheduler();
   startRateLimitMapSweeper();
 });
 
@@ -1228,6 +1251,49 @@ async function runAutoTradeTick() {
   }
 }
 
+// Fully separate scheduler from the swing bot above -- its own approval flag
+// (scalp_enabled, not approval_status), its own accounts query, its own tick
+// function. Requested directly: a new, additive way to activate this, not a
+// change bolted onto the existing one. Uses the same global kill switch
+// (trading_paused) and broker-connection requirement as swing, since both
+// still mean "stop everything" / "no real credentials, no real trade".
+const SCALP_TRADING_INTERVAL_MS = Number(env.SCALP_TRADING_INTERVAL_SECONDS || 60) * 1000;
+
+function startScalpTradingScheduler() {
+  const tick = async () => {
+    try {
+      await runScalpTradingTick();
+    } catch (error) {
+      logOnce("scalp-trading-scheduler", `cycle scalp échoué (${error.message})`);
+    }
+  };
+  tick();
+  setInterval(tick, SCALP_TRADING_INTERVAL_MS);
+}
+
+async function runScalpTradingTick() {
+  if ((await getAppSetting("trading_paused", "false")) === "true") return;
+  await ensureRelationalTables();
+  // Deliberately independent of approval_status/approved_until (the swing
+  // bot's own approval workflow) -- scalp_enabled is its own gate, set via
+  // /api/admin/auto-trade/scalp-settings, so an admin can turn scalp on for an
+  // account without that account needing separate swing approval too. Still
+  // requires real, verified broker credentials and the user not being paused,
+  // same non-negotiable safety floor as every other execution path.
+  const accounts = await sqlAll(
+    `SELECT * FROM auto_trading_accounts WHERE scalp_enabled = 1
+     AND user_paused = 0 AND broker_token IS NOT NULL AND broker_account_id IS NOT NULL AND broker_connected_at IS NOT NULL`,
+    [],
+  );
+  if (!accounts.length) return;
+  for (const account of accounts) {
+    const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
+    await processScalpForUser(account, credentials).catch((error) => {
+      logOnce(`scalp-user-${account.user_id}`, `scalp échoué pour un utilisateur (${error.message})`);
+    });
+  }
+}
+
 // Realized P&L for the day, in %-of-balance terms, approximated from
 // rMultiple × the risk% actually used for each trade (frozen at confirm time in
 // trade_orders.risk_percent_at_trade) -- an honest approximation, not an exact
@@ -1325,6 +1391,24 @@ function combineTightened(adminValue, userValue, tighter) {
   return tighter === "lower" ? Math.min(admin, user) : Math.max(admin, user);
 }
 
+// Resolves the admin's risk% ceiling for THIS tick's real live balance -- when
+// risk_tiers_enabled, picks the highest tier whose minBalance the current
+// balance has actually reached (a small account never accidentally gets a big
+// account's risk%), falling through to the flat risk_percent when tiers are off
+// or malformed. Combined with the user's own tightening preference afterward,
+// same as every other parameter (see combineTightened) -- tiers change what the
+// admin ceiling IS, they don't change how it interacts with the user's side.
+function resolveAdminRiskPercent(account, balance) {
+  if (!account.risk_tiers_enabled || !account.risk_tiers) return account.risk_percent;
+  let tiers;
+  try { tiers = JSON.parse(account.risk_tiers); } catch { return account.risk_percent; }
+  if (!Array.isArray(tiers) || !tiers.length) return account.risk_percent;
+  const eligible = tiers
+    .filter((t) => Number.isFinite(Number(t?.minBalance)) && Number.isFinite(Number(t?.riskPercent)) && Number(balance) >= Number(t.minBalance))
+    .sort((a, b) => Number(b.minBalance) - Number(a.minBalance));
+  return eligible.length ? Number(eligible[0].riskPercent) : account.risk_percent;
+}
+
 async function processAutoTradeForUser(account, signals) {
   const userId = account.user_id;
   if (!isWithinWindow(account.trading_hours_start, account.trading_hours_end, account.trading_days)) return;
@@ -1350,11 +1434,14 @@ async function processAutoTradeForUser(account, signals) {
   let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId) : 0;
   if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) return;
 
-  const effectiveRiskPercent = combineTightened(account.risk_percent, account.user_risk_percent, "lower");
-
   const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
   const accountInfo = await getBrokerAccountInformation(credentials).catch(() => null);
   if (!accountInfo || !(accountInfo.balance > 0)) return; // fail closed: no confirmed real balance, no trade
+
+  // Tiers need the REAL balance just fetched above, not a cached/approval-time
+  // figure -- resolved fresh every tick so a balance that just crossed a tier
+  // threshold takes effect on the very next trade, not after some delay.
+  const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, accountInfo.balance), account.user_risk_percent, "lower");
 
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
@@ -1413,6 +1500,121 @@ async function processAutoTradeForUser(account, signals) {
     } else {
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
+  }
+}
+
+// clampVolumeToSpec both callers below need: round down to the broker's
+// volumeStep, never exceed maxVolume, and fail (null) rather than silently
+// round UP to minVolume if the requested size doesn't even reach it -- same
+// fail-closed philosophy as computeAutoTradeVolume.
+function clampVolumeToSpec(rawVolume, specification) {
+  if (!(rawVolume > 0)) return null;
+  const stepped = Math.floor(rawVolume / specification.volumeStep) * specification.volumeStep;
+  const volume = Math.min(stepped, specification.maxVolume);
+  return volume >= specification.minVolume ? Math.round(volume * 100) / 100 : null;
+}
+
+// Scalp mode's opening logic -- deliberately its own function, never merged
+// into processAutoTradeForUser above. Requested directly: "sans detruire en
+// priorite les anciens edge" -- the swing engine's tested code path is not
+// touched by any of this. Only ever trades SCALP_PARAMS_BY_PAIR's two
+// validated pairs, one position at a time per account (deliberately
+// conservative), sized either automatically (risk exactly
+// scalp_loss_limit_amount if the stop is hit) or to a fixed lot the admin
+// imposes -- "priorite tout petit lot pour ne pas cramer le compte d'un coup".
+async function processScalpForUser(account, credentials) {
+  if (!Number(account.scalp_enabled)) return;
+  const scalpPairs = String(account.scalp_pairs || "").split(",").filter((p) => SCALP_PARAMS_BY_PAIR[p]);
+  if (!scalpPairs.length) return;
+  const userId = account.user_id;
+
+  // One open scalp position at a time -- keeps worst-case exposure bounded to
+  // a single scalp_loss_limit_amount (or fixed-lot equivalent) regardless of
+  // how many validated pairs are enabled.
+  const alreadyOpen = await sqlGet(
+    `SELECT 1 FROM analyses WHERE user_id = ? AND source = 'auto_scalp' AND status = 'OPEN' AND active = 1 LIMIT 1`,
+    [userId],
+  );
+  if (alreadyOpen) return;
+
+  for (const pair of scalpPairs) {
+    const price = await getAnalysisPrice(pair).catch(() => null);
+    if (!price || !isUsableLivePrice(price)) continue;
+    const history = await getHistoryForSymbol(pair, price, { timeframe: "M1", historyBudgetMs: 4000 }).catch(() => []);
+    const signal = computeScalpMeanReversionSignal(pair, price, history);
+    if (!signal) continue;
+
+    const specification = await getBrokerSymbolSpecification(credentials, pair).catch(() => null);
+    if (!specification) continue;
+
+    let volume;
+    if (account.scalp_lot_mode === "fixed" && Number(account.scalp_fixed_lot) > 0) {
+      volume = clampVolumeToSpec(Number(account.scalp_fixed_lot), specification);
+    } else {
+      const lossLimitAmount = Number(account.scalp_loss_limit_amount) || 2;
+      const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
+      volume = valuePerUnitPerLot > 0 ? clampVolumeToSpec(lossLimitAmount / (signal.risk * valuePerUnitPerLot), specification) : null;
+    }
+    if (!volume) continue;
+
+    // Cost-viability guard (see estimateScalpRoundTripCost/isScalpTargetCostViable):
+    // reject if the real spread would eat too much of this specific trade's
+    // actual dollar target at this volume -- the exact mechanism the backtest
+    // showed matters most for tiny targets.
+    const targetAmount = Math.abs(signal.tp - signal.entry) / specification.tickSize * specification.lossTickValue * volume;
+    const roundTripCost = estimateScalpRoundTripCost(specification, volume);
+    if (!isScalpTargetCostViable(targetAmount, roundTripCost)) continue;
+
+    const dailyLossLimitAmount = Number(account.scalp_loss_limit_amount) || 0;
+    if (dailyLossLimitAmount > 0) {
+      const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
+      const todayLoss = await sqlGet(
+        `SELECT SUM(a.broker_profit_amount) as total FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+         WHERE o.user_id = ? AND a.source = 'auto_scalp' AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
+        [userId, todayStart.toISOString()],
+      );
+      if (Number(todayLoss?.total) <= -dailyLossLimitAmount * 3) continue; // circuit breaker: 3 real scalp losses worth in one day, stop for today
+    }
+
+    const analysisId = `scalp_${Date.now()}_${randomBytes(4).toString("hex")}`;
+    await upsertAnalysisRow({
+      id: analysisId,
+      createdAt: new Date().toISOString(),
+      userId,
+      pair,
+      timeframe: "M1",
+      style: "Mean-reversion (bot scalp)",
+      strategy: "Scalp",
+      risk: account.scalp_lot_mode === "fixed" ? `lot fixe ${volume}` : `${account.scalp_loss_limit_amount || 2}$`,
+      direction: signal.direction,
+      entry: signal.entry,
+      sl: signal.sl,
+      tp1: signal.tp,
+      tp2: signal.tp,
+      rr: Math.round((Math.abs(signal.tp - signal.entry) / Math.abs(signal.entry - signal.sl)) * 100) / 100,
+      score: 0,
+      active: true,
+      status: "OPEN",
+      source: "auto_scalp",
+    });
+    // The admin's scalp_max_hold_seconds may only shorten the validated
+    // signal's own hold time (30min for both pairs), never extend it past what
+    // was actually backtested -- same "tighten only" rule as every other
+    // admin/user parameter pair this session.
+    const validatedHoldSeconds = signal.maxHoldBars * 60;
+    const holdSeconds = account.scalp_max_hold_seconds > 0 ? Math.min(validatedHoldSeconds, account.scalp_max_hold_seconds) : validatedHoldSeconds;
+    const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
+    await sqlRun(
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?)`,
+      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, signal.tp, signal.tp, new Date().toISOString(), holdSeconds],
+    );
+
+    const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
+    if (result.status !== 200) {
+      await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "scalp_trade_rejected", analysisId]);
+    }
+    return; // one attempt per tick, even across multiple enabled pairs -- deliberately unhurried
   }
 }
 
@@ -1646,6 +1848,9 @@ async function handleApi(req, res, url) {
       scalpProfitTargetAmount: row.scalp_profit_target_amount ?? null,
       scalpLossLimitAmount: row.scalp_loss_limit_amount ?? null,
       scalpMaxHoldSeconds: row.scalp_max_hold_seconds ?? null,
+      scalpPairs: row.scalp_pairs ? row.scalp_pairs.split(",").filter(Boolean) : [],
+      scalpLotMode: row.scalp_lot_mode || "auto",
+      scalpFixedLot: row.scalp_fixed_lot ?? null,
       userPaused: Boolean(Number(row.user_paused)),
       brokerConnected: Boolean(row.broker_token && row.broker_account_id && row.broker_connected_at),
       brokerLastCheckStatus: row.broker_last_check_status,
@@ -1692,11 +1897,23 @@ async function handleApi(req, res, url) {
     const tradingDays = uniqueTradingDays.length && uniqueTradingDays.length < 7 ? uniqueTradingDays.join(",") : null;
     const dailyLossLimitAmountRaw = Number(body?.dailyLossLimitAmount) || 0;
     const dailyLossLimitAmount = dailyLossLimitAmountRaw > 0 ? dailyLossLimitAmountRaw : null;
+    // Progressive risk tiers: each {minBalance, riskPercent} clamped the same way
+    // the flat riskPercent above is, so a tier can never grant more risk than a
+    // single flat approval could -- just lets it start lower and step up with
+    // real balance instead of being fixed for the whole approval.
+    const riskTiersEnabled = Boolean(body?.riskTiersEnabled);
+    const riskTiersInput = Array.isArray(body?.riskTiers) ? body.riskTiers : [];
+    const riskTiers = riskTiersInput
+      .map((t) => ({ minBalance: Number(t?.minBalance), riskPercent: Number(t?.riskPercent) }))
+      .filter((t) => Number.isFinite(t.minBalance) && t.minBalance >= 0 && Number.isFinite(t.riskPercent) && t.riskPercent > 0)
+      .map((t) => ({ minBalance: t.minBalance, riskPercent: Math.max(0.1, Math.min(3, t.riskPercent)) }));
+    if (riskTiersEnabled && !riskTiers.length) return sendJson(res, 400, { ok: false, error: "no_valid_risk_tiers" });
+    const riskTiersJson = riskTiers.length ? JSON.stringify(riskTiers) : null;
     const approvedUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
     await sqlRun(
-      `INSERT INTO auto_trading_accounts (user_id, approval_status, requested_at, decided_at, decided_by, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, max_trades_per_day, min_risk_reward, trading_hours_start, trading_hours_end, trading_days, daily_loss_limit_amount, user_paused, created_at, updated_at)
-       VALUES (?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `INSERT INTO auto_trading_accounts (user_id, approval_status, requested_at, decided_at, decided_by, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, max_trades_per_day, min_risk_reward, trading_hours_start, trading_hours_end, trading_days, daily_loss_limit_amount, risk_tiers_enabled, risk_tiers, user_paused, created_at, updated_at)
+       VALUES (?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          approval_status = 'approved', decided_at = excluded.decided_at, decided_by = excluded.decided_by,
          reject_reason = NULL, approved_until = excluded.approved_until, approved_pairs = excluded.approved_pairs,
@@ -1705,11 +1922,12 @@ async function handleApi(req, res, url) {
          max_trades_per_day = excluded.max_trades_per_day, min_risk_reward = excluded.min_risk_reward,
          trading_hours_start = excluded.trading_hours_start, trading_hours_end = excluded.trading_hours_end,
          trading_days = excluded.trading_days, daily_loss_limit_amount = excluded.daily_loss_limit_amount,
+         risk_tiers_enabled = excluded.risk_tiers_enabled, risk_tiers = excluded.risk_tiers,
          user_paused = 0, updated_at = excluded.updated_at`,
       [
         userId, now, now, admin.user?.email || "token", approvedUntil, pairs.join(","), riskPercent, dailyLossLimitPercent,
         maxConcurrentPositions, minConfidenceFloor, maxTradesPerDay, minRiskReward, tradingHoursStart, tradingHoursEnd,
-        tradingDays, dailyLossLimitAmount, now, now,
+        tradingDays, dailyLossLimitAmount, riskTiersEnabled ? 1 : 0, riskTiersJson, now, now,
       ],
     );
     sendJson(res, 200, { ok: true, approvedUntil });
@@ -1758,10 +1976,9 @@ async function handleApi(req, res, url) {
   // Deliberately separate from /api/admin/auto-trade/approve -- scalp is a
   // materially different risk profile (tiny targets, transaction cost is
   // proportionally huge) that an admin opts an account into explicitly, never
-  // inherited from an existing swing approval. Not yet reachable from
-  // autonomous execution (no validated short-term signal exists to open
-  // against -- see the scalp backtest research) -- this endpoint exists so the
-  // settings/UI round-trip is already proven before that's wired in.
+  // inherited from an existing swing approval. Executes autonomously via
+  // runScalpTradingTick/processScalpForUser against the validated
+  // mean-reversion edge (scripts/backtest-scalp-fx-meanrev.mjs).
   if (url.pathname === "/api/admin/auto-trade/scalp-settings") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const admin = await requireAdmin(req);
@@ -1779,9 +1996,31 @@ async function handleApi(req, res, url) {
     const scalpProfitTargetAmount = Math.max(0.3, Math.min(100, Number(body?.scalpProfitTargetAmount) || 1));
     const scalpLossLimitAmount = Math.max(0.3, Math.min(200, Number(body?.scalpLossLimitAmount) || 2));
     const scalpMaxHoldSeconds = Math.max(5, Math.min(3600, Math.round(Number(body?.scalpMaxHoldSeconds) || 120)));
+    // Restricted to SCALP_PARAMS_BY_PAIR's validated set only -- an admin
+    // cannot enable scalp on a pair with no demonstrated edge, unlike the
+    // swing bot's approved_pairs which accepts anything in `symbols`.
+    const scalpPairsInput = Array.isArray(body?.scalpPairs) ? body.scalpPairs.filter((p) => SCALP_PARAMS_BY_PAIR[p]) : [];
+    const scalpPairs = scalpPairsInput.length ? scalpPairsInput.join(",") : null;
+    const scalpLotMode = body?.scalpLotMode === "fixed" ? "fixed" : "auto";
+    const scalpFixedLotRaw = Number(body?.scalpFixedLot) || 0;
+    const scalpFixedLot = scalpFixedLotRaw > 0 ? Math.max(0.01, Math.min(1, scalpFixedLotRaw)) : null;
+    if (scalpEnabled && !scalpPairs) return sendJson(res, 400, { ok: false, error: "no_valid_scalp_pairs" });
+    if (scalpEnabled && scalpLotMode === "fixed" && !scalpFixedLot) return sendJson(res, 400, { ok: false, error: "invalid_fixed_lot" });
+    const now = new Date().toISOString();
+    // UPSERT, not a bare UPDATE -- confirmed live this session: a user who
+    // never connected a broker or requested swing trading has no
+    // auto_trading_accounts row at all yet, and scalp is deliberately
+    // independent of that flow (see the comment above), so a plain UPDATE
+    // silently affected zero rows and the setting never actually took effect.
     await sqlRun(
-      `UPDATE auto_trading_accounts SET scalp_enabled = ?, scalp_profit_target_amount = ?, scalp_loss_limit_amount = ?, scalp_max_hold_seconds = ?, updated_at = ? WHERE user_id = ?`,
-      [scalpEnabled ? 1 : 0, scalpProfitTargetAmount, scalpLossLimitAmount, scalpMaxHoldSeconds, new Date().toISOString(), userId],
+      `INSERT INTO auto_trading_accounts (user_id, scalp_enabled, scalp_profit_target_amount, scalp_loss_limit_amount, scalp_max_hold_seconds, scalp_pairs, scalp_lot_mode, scalp_fixed_lot, approval_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'none', ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         scalp_enabled = excluded.scalp_enabled, scalp_profit_target_amount = excluded.scalp_profit_target_amount,
+         scalp_loss_limit_amount = excluded.scalp_loss_limit_amount, scalp_max_hold_seconds = excluded.scalp_max_hold_seconds,
+         scalp_pairs = excluded.scalp_pairs, scalp_lot_mode = excluded.scalp_lot_mode, scalp_fixed_lot = excluded.scalp_fixed_lot,
+         updated_at = excluded.updated_at`,
+      [userId, scalpEnabled ? 1 : 0, scalpProfitTargetAmount, scalpLossLimitAmount, scalpMaxHoldSeconds, scalpPairs, scalpLotMode, scalpFixedLot, now, now],
     );
     sendJson(res, 200, { ok: true });
     return;
@@ -4031,6 +4270,52 @@ async function deterministicCrossCheck(pair, livePrice) {
     technique: signal.direct ? signal.technique : null,
     stats: DETERMINISTIC_ENGINE_STATS_BY_PAIR[pair] || null,
   };
+}
+
+// Real, walk-forward-validated mean-reversion edge (scripts/backtest-scalp-fx-
+// meanrev.mjs, real Dukascopy M1 bars, real observed broker spread as cost,
+// 365 days, train AND test both positive across dozens of neighboring parameter
+// combinations, not an isolated lucky pick) -- fade an RSI extreme stretched
+// away from its own moving average, targeting a return toward the mean rather
+// than continuation. Deliberately the OPPOSITE hypothesis from
+// computeDeterministicSignal's momentum/trend-following logic above, and
+// deliberately separate from it end to end (own function, own params, own
+// scheduler below) -- this must never alter what the swing engine does.
+// Only GBP/USD and XAU/USD: the only two pairs with a demonstrated edge.
+// EUR/USD and USD/JPY were tested on the same 365 days and never cleared
+// train-and-test-both-positive on more than one isolated combination each --
+// indistinguishable from chance, so they're excluded here on purpose, not an
+// oversight.
+const SCALP_PARAMS_BY_PAIR = {
+  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 30 },
+  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 30 },
+};
+
+function computeScalpMeanReversionSignal(pair, price, history) {
+  const params = SCALP_PARAMS_BY_PAIR[pair];
+  if (!params) return null; // not a validated scalp pair -- never trade it, regardless of what an account is configured with
+  if (!price?.open || !isUsableLivePrice(price)) return null;
+  if (!Array.isArray(history) || history.length < params.maPeriod + 20) return null;
+  const closes = history.map((bar) => bar.close);
+  const last = Number(price.price);
+  const ma = average(closes.slice(-params.maPeriod));
+  const atr = average(history.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.0004;
+  const rsi = calculateRsi(closes.slice(-100));
+  if (!Number.isFinite(last) || !Number.isFinite(ma) || !Number.isFinite(rsi) || !ma) return null;
+  const stretchPct = Math.abs(((last - ma) / ma) * 100);
+  const volatilityPct = (atr / last) * 100;
+  if (volatilityPct < params.volatilityMinPct || volatilityPct > params.volatilityMaxPct) return null;
+  let direction = null;
+  if (rsi <= params.oversold && stretchPct >= params.minStretchPct) direction = "ACHAT";
+  if (rsi >= params.overbought && stretchPct >= params.minStretchPct) direction = "VENTE";
+  if (!direction) return null;
+  const risk = atr * params.riskAtrMultiplier;
+  const entry = last;
+  const sl = direction === "ACHAT" ? entry - risk : entry + risk;
+  // Target is the mean itself (capped by tpR) -- the actual bet is "price
+  // returns toward ma", same reasoning as the backtest this is copied from.
+  const tp = direction === "ACHAT" ? Math.min(entry + risk * params.tpR, ma) : Math.max(entry - risk * params.tpR, ma);
+  return { direction, entry, sl, tp, risk, maxHoldBars: params.maxHoldBars };
 }
 
 function cautiousSignal(symbol, price, base, reason, history = []) {

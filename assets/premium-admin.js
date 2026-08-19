@@ -194,6 +194,10 @@
   // `symbols` const) -- offering any other pair here would let an admin "approve"
   // something the bot can never act on.
   const AUTOTRADE_PAIRS = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD", "USD/JPY", "USD/CHF"];
+  // Only pairs with a real, backtested mean-reversion edge (see
+  // scripts/backtest-scalp-fx-meanrev.mjs) -- deliberately a much shorter list
+  // than AUTOTRADE_PAIRS above, and the server rejects anything else anyway.
+  const SCALP_VALIDATED_PAIRS = ["GBP/USD", "XAU/USD"];
   // JS Date#getUTCDay() values (0=dimanche..6=samedi), listed Monday-first for a
   // more natural reading order in French -- server.mjs's isWithinTradingWindow
   // reads the same values back regardless of display order.
@@ -300,21 +304,38 @@
         </div>
 
         <div class="dashboard-autotrade-section" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--oracle-border)">
-          <h3>Mode scalping (bêta -- infrastructure prête, pas encore branché à l'exécution autonome)</h3>
+          <h3>Mode scalping -- mean-reversion, edge validé par backtest (GBP/USD, XAU/USD)</h3>
           <label class="dashboard-autotrade-field" style="flex:0 0 auto">
             <span style="display:flex;align-items:center;gap:6px;text-transform:none;font-size:13px;color:var(--foreground)">
               <input type="checkbox" ${request.scalpEnabled ? "checked" : ""} data-scalp-field="scalpEnabled" style="width:auto">
               Activer le mode scalping pour ce compte
             </span>
           </label>
+          <div class="dashboard-autotrade-pairs" data-scalp-pairs>
+            ${SCALP_VALIDATED_PAIRS.map((pair) => `
+              <label>
+                <input type="checkbox" value="${pair}" ${(request.scalpPairs || []).includes(pair) ? "checked" : ""}>
+                ${escapeHtml(pair)}
+              </label>
+            `).join("")}
+          </div>
           <div class="dashboard-autotrade-form">
-            <label class="dashboard-autotrade-field">Objectif de profit (montant) <span class="dashboard-autotrade-hint">(min 0.3)</span>
-              <input type="number" min="0.3" max="100" step="0.1" value="${request.scalpProfitTargetAmount ?? 1}" data-scalp-field="scalpProfitTargetAmount">
+            <label class="dashboard-autotrade-field">Mode de lot
+              <select data-scalp-field="scalpLotMode">
+                <option value="auto" ${request.scalpLotMode !== "fixed" ? "selected" : ""}>Automatique (calculé depuis la perte max)</option>
+                <option value="fixed" ${request.scalpLotMode === "fixed" ? "selected" : ""}>Lot fixe imposé</option>
+              </select>
             </label>
-            <label class="dashboard-autotrade-field">Perte max par trade (montant)
+            <label class="dashboard-autotrade-field">Lot fixe <span class="dashboard-autotrade-hint">(si mode "fixe", ex: 0.01)</span>
+              <input type="number" min="0.01" max="1" step="0.01" value="${request.scalpFixedLot ?? 0.01}" data-scalp-field="scalpFixedLot">
+            </label>
+            <label class="dashboard-autotrade-field">Perte max par trade (montant) <span class="dashboard-autotrade-hint">(sert au calcul du lot en mode auto)</span>
               <input type="number" min="0.3" max="200" step="0.1" value="${request.scalpLossLimitAmount ?? 2}" data-scalp-field="scalpLossLimitAmount">
             </label>
-            <label class="dashboard-autotrade-field">Durée max de détention (secondes)
+            <label class="dashboard-autotrade-field">Objectif de profit (montant) <span class="dashboard-autotrade-hint">(indicatif -- la vraie cible vient du signal)</span>
+              <input type="number" min="0.3" max="100" step="0.1" value="${request.scalpProfitTargetAmount ?? 1}" data-scalp-field="scalpProfitTargetAmount">
+            </label>
+            <label class="dashboard-autotrade-field">Durée max de détention (secondes) <span class="dashboard-autotrade-hint">(plafond -- le signal vise 30min)</span>
               <input type="number" min="5" max="3600" step="5" value="${request.scalpMaxHoldSeconds ?? 120}" data-scalp-field="scalpMaxHoldSeconds">
             </label>
           </div>
@@ -390,11 +411,15 @@
         if (!token) { setMessage("Renseigne le token admin avant d'enregistrer.", true); return; }
         const card = button.closest("[data-autotrade-request-card]");
         const scalpField = (name) => card.querySelector(`[data-scalp-field="${name}"]`);
+        const scalpEnabled = scalpField("scalpEnabled").checked;
+        const scalpPairs = [...card.querySelectorAll("[data-scalp-pairs] input:checked")].map((input) => input.value);
+        if (scalpEnabled && !scalpPairs.length) { setMessage("Coche au moins une paire scalping avant d'activer.", true); return; }
         button.disabled = true;
         setMessage("Enregistrement du mode scalping...", false);
         const data = await adminFetch("/api/admin/auto-trade/scalp-settings", {
-          token, userId,
-          scalpEnabled: scalpField("scalpEnabled").checked,
+          token, userId, scalpEnabled, scalpPairs,
+          scalpLotMode: scalpField("scalpLotMode").value,
+          scalpFixedLot: Number(scalpField("scalpFixedLot").value),
           scalpProfitTargetAmount: Number(scalpField("scalpProfitTargetAmount").value),
           scalpLossLimitAmount: Number(scalpField("scalpLossLimitAmount").value),
           scalpMaxHoldSeconds: Number(scalpField("scalpMaxHoldSeconds").value),
