@@ -2819,7 +2819,14 @@ async function handleApi(req, res, url) {
         brokerConnected: demoConnected,
         brokerLastCheckStatus: row?.broker_demo_last_check_status || null,
         enabled: Boolean(Number(row?.demo_trading_enabled ?? 1)),
+        // dailyPnlAmount: the REAL cumulative $ from actual broker-confirmed
+        // closes today (see dailyRealizedPnlAmount / broker_profit_amount) --
+        // requested directly, "le cumul vrai vrai des pertes et des profits",
+        // not the R×risk% approximation dailyPnlPercent has always been. Both
+        // kept: percent still matters for the daily-loss-limit-% gate's own
+        // math, but the dashboard leads with the real amount now.
         dailyPnlPercent: demoConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id, "demo")) * 100) / 100 : 0,
+        dailyPnlAmount: demoConnected ? Math.round((await dailyRealizedPnlAmount(session.user.id, "demo")) * 100) / 100 : 0,
         openPositions: demoConnected ? await countOpenAutoPositions(session.user.id, "demo") : 0,
         lastTick: autoTradeTickStatus.get(`${session.user.id}:demo`) || null,
       },
@@ -2829,6 +2836,7 @@ async function handleApi(req, res, url) {
         authorized: Boolean(Number(row?.live_trading_authorized)),
         enabled: Boolean(Number(row?.live_trading_enabled)),
         dailyPnlPercent: liveConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id, "live")) * 100) / 100 : 0,
+        dailyPnlAmount: liveConnected ? Math.round((await dailyRealizedPnlAmount(session.user.id, "live")) * 100) / 100 : 0,
         openPositions: liveConnected ? await countOpenAutoPositions(session.user.id, "live") : 0,
         lastTick: autoTradeTickStatus.get(`${session.user.id}:live`) || null,
       },
@@ -2990,9 +2998,17 @@ async function handleApi(req, res, url) {
     await ensureRelationalTables();
     const userRow = await sqlGet(`SELECT notifications_seen_at, created_at FROM users WHERE id = ?`, [session.user.id]);
     const seenAt = userRow?.notifications_seen_at || userRow?.created_at || "1970-01-01T00:00:00.000Z";
+    // This is a "this happened" event log, not a "is it still open" indicator --
+    // status is deliberately NOT filtered to 'SENT' here. Now that
+    // tryResolveBrokerBackedOutcome correctly flips status to 'CLOSED' on close
+    // (see that fix), filtering on 'SENT' would make a "position opened"
+    // notification vanish the moment the position resolves, sometimes before the
+    // user ever saw it (a fast scalp close especially). broker_order_id/sent_at
+    // being set already means "genuinely sent successfully", independent of
+    // whatever the position has done since.
     const opens = await sqlAll(
       `SELECT id, pair, direction, entry, sl, sent_at as at, broker_slot FROM trade_orders
-       WHERE user_id = ? AND status = 'SENT' AND broker_order_id IS NOT NULL AND sent_at IS NOT NULL
+       WHERE user_id = ? AND broker_order_id IS NOT NULL AND sent_at IS NOT NULL
        ORDER BY sent_at DESC LIMIT 20`,
       [session.user.id],
     );
@@ -9389,15 +9405,28 @@ async function updateLearningOutcomes(prices = null, histories = null) {
 // top of the file for why this is push and not email. Silently no-ops if push isn't
 // configured (VAPID keys missing) or the user has no active subscription, both
 // expected/normal states, not errors.
+// originLabel/slotLabel: requested directly -- a notification for a bot-opened
+// or bot-closed trade looked identical to a manual one, so there was no way to
+// tell which without opening the dashboard, and no way to tell demo from real
+// money either. analysis.source and analysis.brokerSlot are already on the row
+// (see rowToAnalysis), no extra query needed here.
+function originLabel(source) {
+  return source === "auto_signal" ? "🤖 Robot Kronos · " : source === "auto_scalp" ? "🤖 Robot Kronos (scalp) · " : "";
+}
+function slotLabel(brokerSlot) {
+  return brokerSlot === "live" ? "RÉEL · " : brokerSlot === "demo" ? "Démo · " : "";
+}
+
 async function notifyAnalysisClosed(analysis) {
   if (!pushConfigured) return;
   const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ? AND topics LIKE '%tp_sl%'`, [analysis.userId]);
   if (!subs.length) return;
   const outcomeLabel = { TP1_HIT: "TP1 touché", TP2_HIT: "TP2 touché", SL_HIT: "Stop Loss touché", CLOSED_MANUALLY: "Clôturé manuellement", EXPIRED: "Expiré" }[analysis.status] || analysis.status;
   const rText = Number.isFinite(analysis.rMultiple) ? ` (${analysis.rMultiple >= 0 ? "+" : ""}${analysis.rMultiple.toFixed(2)}R)` : "";
+  const amountText = Number.isFinite(analysis.brokerProfitAmount) ? ` · ${analysis.brokerProfitAmount >= 0 ? "+" : ""}${analysis.brokerProfitAmount.toFixed(2)}` : "";
   const payload = JSON.stringify({
     title: `Oracle Forex · ${analysis.pair}`,
-    body: `${outcomeLabel}${rText} · ${analysis.direction} ${formatLevel(analysis.entry, analysis.pair)}`,
+    body: `${originLabel(analysis.source)}${slotLabel(analysis.brokerSlot)}${outcomeLabel}${rText}${amountText} · ${analysis.direction} ${formatLevel(analysis.entry, analysis.pair)}`,
     url: "/dashboard.html",
   });
   await sendPushToSubscriptions(subs, payload);
@@ -9415,9 +9444,13 @@ async function notifyOrderOpened(order) {
   if (!pushConfigured || !order.userId) return;
   const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ? AND topics LIKE '%tp_sl%'`, [order.userId]);
   if (!subs.length) return;
+  // trade_orders itself doesn't carry source -- the one extra lookup this fire-
+  // and-forget path needs to tell a bot-opened position from a manually
+  // confirmed one in the notification text.
+  const analysis = order.analysisId ? await sqlGet(`SELECT source FROM analyses WHERE id = ?`, [order.analysisId]) : null;
   const payload = JSON.stringify({
     title: `Oracle Forex · ${order.pair}`,
-    body: `Position ouverte · ${order.direction} ${formatLevel(order.entry, order.pair)} · SL ${formatLevel(order.sl, order.pair)}`,
+    body: `${originLabel(analysis?.source)}${slotLabel(order.brokerSlot)}Position ouverte · ${order.direction} ${formatLevel(order.entry, order.pair)} · SL ${formatLevel(order.sl, order.pair)}`,
     url: "/dashboard.html",
   });
   await sendPushToSubscriptions(subs, payload);

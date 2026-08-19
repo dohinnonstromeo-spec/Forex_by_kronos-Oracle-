@@ -1068,7 +1068,10 @@
     }
     metrics.innerHTML = [
       ["Positions ouvertes", `${slotStatus.openPositions} / ${status.maxConcurrentPositions ?? "—"}`],
-      ["P&L du jour", `${slotStatus.dailyPnlPercent >= 0 ? "+" : ""}${slotStatus.dailyPnlPercent}%`],
+      // Real cumulative $ from actual broker-confirmed closes today, leading --
+      // requested directly ("voilà les gains de la journée", "le cumul vrai vrai
+      // des pertes et des profits"), not the R×risk% estimate alone anymore.
+      ["Gains du jour", `${slotStatus.dailyPnlAmount >= 0 ? "+" : ""}${slotStatus.dailyPnlAmount.toFixed(2)} (${slotStatus.dailyPnlPercent >= 0 ? "+" : ""}${slotStatus.dailyPnlPercent}%)`],
       ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
       ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
       ["Dernière évaluation", autoTradeTickSummary(slotStatus.lastTick)],
