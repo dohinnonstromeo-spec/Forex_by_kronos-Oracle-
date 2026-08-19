@@ -560,7 +560,8 @@
       list.innerHTML = `<div class="analysis-signal-card"><div class="signal-pair">Données marché en attente</div><div class="mt-2 text-sm text-muted-foreground">Kronos attend le serveur, l'API et l'historique nécessaire avant d'afficher un signal.</div></div>`;
       return;
     }
-    list.innerHTML = visible.map((signal) => {
+    const SIGNALS_VISIBLE = 5;
+    const cards = visible.map((signal) => {
       const buy = signal.direction === "ACHAT";
       const isDirect = signal.direct !== false;
       const suspended = signal.suspended || !isDirect;
@@ -578,7 +579,14 @@
         ${renderQuality(signal.quality)}
         <div class="mt-3 text-[10px] uppercase tracking-widest ${suspended ? "text-neon-orange" : "text-muted-foreground"}">${suspended ? suspensionFooter(signal) : "Propulsé par Kronos"}</div>
       </article>`;
-    }).join("");
+    });
+    const rest = cards.slice(SIGNALS_VISIBLE);
+    list.innerHTML = cards.slice(0, SIGNALS_VISIBLE).join("")
+      + (rest.length ? `<button type="button" class="dashboard-history-more" data-signals-more>Voir ${rest.length} paire${rest.length > 1 ? "s" : ""} de plus</button>` : "");
+    list.querySelector("[data-signals-more]")?.addEventListener("click", function () {
+      this.insertAdjacentHTML("beforebegin", rest.join(""));
+      this.remove();
+    });
   }
 
   function renderQuality(quality) {

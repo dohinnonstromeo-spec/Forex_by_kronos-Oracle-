@@ -78,8 +78,9 @@
       members.innerHTML = `<div class="dashboard-empty">Aucun compte à afficher.</div>`;
       return;
     }
-    members.innerHTML = items.map((user) => `
-      <article>
+    const MEMBERS_VISIBLE = 5;
+    const memberCards = items.map((user, index) => `
+      <article ${index >= MEMBERS_VISIBLE ? "hidden data-member-extra" : ""}>
         <div>
           <strong>${escapeHtml(user.name || "Compte")} · ${escapeHtml(user.email)}</strong>
           <span>${escapeHtml(user.role || "user")} · ${user.premiumUntil ? `Premium jusqu'au ${formatDate(user.premiumUntil)}` : "Free"} · ${user.manualPremium ? "Manuel" : "Standard"}</span>
@@ -89,7 +90,15 @@
         </div>
         <span class="${user.plan === "premium" ? "history-open" : "history-blocked"}">${escapeHtml(user.plan || "free")}</span>
       </article>
-    `).join("");
+    `);
+    const extraMembers = items.length - MEMBERS_VISIBLE;
+    members.innerHTML = memberCards.join("") + (extraMembers > 0 ? `
+      <button type="button" class="dashboard-history-more" data-members-more>Voir ${extraMembers} compte${extraMembers > 1 ? "s" : ""} de plus</button>
+    ` : "");
+    members.querySelector("[data-members-more]")?.addEventListener("click", function () {
+      members.querySelectorAll("[data-member-extra]").forEach((card) => card.removeAttribute("hidden"));
+      this.remove();
+    });
     members.querySelectorAll("[data-revoke-premium]").forEach((button) => {
       button.addEventListener("click", async () => {
         const email = button.dataset.revokePremium;
@@ -234,8 +243,9 @@
       autotradeRequests.innerHTML = `<div class="dashboard-empty">Aucune demande pour l'instant.</div>`;
       return;
     }
-    autotradeRequests.innerHTML = requests.map((request) => `
-      <article data-autotrade-request-card="${escapeHtml(request.userId)}">
+    const REQUESTS_VISIBLE = 5;
+    const requestCards = requests.map((request, index) => `
+      <article data-autotrade-request-card="${escapeHtml(request.userId)}" ${index >= REQUESTS_VISIBLE ? "hidden data-request-extra" : ""}>
         <div>
           <strong>${escapeHtml(request.userName || "Compte")} · ${escapeHtml(request.userEmail)}</strong>
           <span class="${request.approvalStatus === "approved" ? "history-open" : request.approvalStatus === "requested" ? "" : "history-blocked"}">
@@ -344,7 +354,15 @@
           </div>
         </div>
       </article>
-    `).join("");
+    `);
+    const extraRequests = requests.length - REQUESTS_VISIBLE;
+    autotradeRequests.innerHTML = requestCards.join("") + (extraRequests > 0 ? `
+      <button type="button" class="dashboard-history-more" data-requests-more>Voir ${extraRequests} demande${extraRequests > 1 ? "s" : ""} de plus</button>
+    ` : "");
+    autotradeRequests.querySelector("[data-requests-more]")?.addEventListener("click", function () {
+      autotradeRequests.querySelectorAll("[data-request-extra]").forEach((card) => card.removeAttribute("hidden"));
+      this.remove();
+    });
 
     autotradeRequests.querySelectorAll("[data-autotrade-approve]").forEach((button) => {
       button.addEventListener("click", async () => {

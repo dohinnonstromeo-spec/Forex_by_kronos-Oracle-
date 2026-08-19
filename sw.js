@@ -13,6 +13,15 @@ self.addEventListener("push", (event) => {
     self.registration.showNotification(data.title, {
       body: data.body,
       data: { url: data.url },
+      icon: "/assets/icon-192.png",
+      badge: "/assets/icon-192.png",
+      // Without an explicit vibrate pattern, several Android/Chrome combinations
+      // fall back to a silent, non-vibrating notification instead of the OS
+      // default -- this is what was actually missing, not a permission issue.
+      vibrate: [200, 100, 200],
+      tag: "oracle-forex-alert",
+      renotify: true,
+      requireInteraction: false,
     }),
   );
 });

@@ -9381,6 +9381,7 @@ function personalAnalysesPayload(log, userId) {
       outcome: item.outcome,
       outcomeReason: item.outcomeReason,
       rMultiple: Number.isFinite(item.rMultiple) ? item.rMultiple : null,
+      brokerProfitAmount: Number.isFinite(item.brokerProfitAmount) ? item.brokerProfitAmount : null,
       closePrice: Number.isFinite(item.closePrice) ? item.closePrice : null,
       closedAt: item.closedAt || null,
     })),

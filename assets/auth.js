@@ -179,7 +179,8 @@
       return;
     }
     document.querySelector("[data-user-greeting]").textContent = `Bienvenue ${me.user.name}. Ton espace Kronos est prêt.`;
-    document.querySelector("[data-user-plan]").textContent = String(me.user.plan || "free").toUpperCase();
+    const planLabel = String(me.user.plan || "free").toLowerCase() === "premium" ? "PREMIUM" : "GRATUIT";
+    document.querySelector("[data-user-plan]").textContent = planLabel;
 
     const performance = await fetchJson("/api/performance");
     const status = document.querySelector("[data-dashboard-status]");
@@ -281,10 +282,18 @@
     const empty = wrap.querySelector("[data-notif-empty]");
     const items = data.items || [];
     empty.hidden = items.length > 0;
-    list.innerHTML = items.map((item) => {
+    const NOTIF_VISIBLE = 5;
+    const cards = items.map((item) => {
       const label = item.type === "opened" ? "Position ouverte" : `${historyStatusIcon(item)}${historyStatusLabel(item)}`;
       return `<div class="auth-notif-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong><small>${formatDate(item.at)}</small></div>`;
-    }).join("");
+    });
+    const rest = cards.slice(NOTIF_VISIBLE);
+    list.innerHTML = cards.slice(0, NOTIF_VISIBLE).join("")
+      + (rest.length ? `<button type="button" class="dashboard-history-more" data-notif-more>Voir ${rest.length} de plus</button>` : "");
+    list.querySelector("[data-notif-more]")?.addEventListener("click", function () {
+      this.insertAdjacentHTML("beforebegin", rest.join(""));
+      this.remove();
+    });
   }
 
   async function markNotificationsSeen() {
@@ -561,10 +570,12 @@
       return;
     }
     const clearableCount = orders.filter((order) => order.status === "CANCELLED" || order.status === "FAILED").length;
-    host.innerHTML = (clearableCount ? `
-      <button type="button" class="dashboard-history-more" data-orders-clear-all>Vider les ${clearableCount} ordre${clearableCount > 1 ? "s" : ""} annulé${clearableCount > 1 ? "s" : ""}/échoué${clearableCount > 1 ? "s" : ""}</button>
-    ` : "") + orders.map((order) => `
-      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}">
+    // Cards beyond the 5th stay in the DOM (so their action handlers below still bind
+    // normally) but start hidden -- "voir plus" just removes the attribute, no re-render.
+    const VISIBLE_COUNT = 5;
+    const orderCards = orders.map((order, index) => `
+      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}" ${index >= VISIBLE_COUNT ? "hidden data-order-extra" : ""}>
+
         <div>
           <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}</strong>
           <span>${formatDate(order.createdAt)} · ${escapeHtml(TRADE_ORDER_LABELS[order.status] || order.status)}${order.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
@@ -589,6 +600,18 @@
         ` : ""}
       </article>
     `).join("");
+    const extraCount = orders.length - VISIBLE_COUNT;
+
+    host.innerHTML = (clearableCount ? `
+      <button type="button" class="dashboard-history-more" data-orders-clear-all>Vider les ${clearableCount} ordre${clearableCount > 1 ? "s" : ""} annulé${clearableCount > 1 ? "s" : ""}/échoué${clearableCount > 1 ? "s" : ""}</button>
+    ` : "") + orderCards + (extraCount > 0 ? `
+      <button type="button" class="dashboard-history-more" data-orders-more>Voir ${extraCount} ordre${extraCount > 1 ? "s" : ""} de plus</button>
+    ` : "");
+
+    host.querySelector("[data-orders-more]")?.addEventListener("click", function () {
+      host.querySelectorAll("[data-order-extra]").forEach((card) => card.removeAttribute("hidden"));
+      this.remove();
+    });
 
     host.querySelector("[data-orders-clear-all]")?.addEventListener("click", async function () {
       this.disabled = true;
@@ -955,7 +978,8 @@
       host.innerHTML = `<div class="dashboard-empty">Le robot n'a encore ouvert aucune position.</div>`;
       return;
     }
-    host.innerHTML = trades.slice(0, 20).map((item) => `
+    const HISTORY_VISIBLE = 5;
+    const cards = trades.slice(0, 20).map((item) => `
       <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}">
         <div>
           <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
@@ -967,7 +991,14 @@
           <span>TP1 ${escapeHtml(item.tp1 ?? "—")}</span>
         </div>
       </article>
-    `).join("");
+    `);
+    const rest = cards.slice(HISTORY_VISIBLE);
+    host.innerHTML = cards.slice(0, HISTORY_VISIBLE).join("")
+      + (rest.length ? `<button type="button" class="dashboard-history-more" data-autotrade-history-more>Voir ${rest.length} position${rest.length > 1 ? "s" : ""} de plus</button>` : "");
+    host.querySelector("[data-autotrade-history-more]")?.addEventListener("click", function () {
+      this.insertAdjacentHTML("beforebegin", rest.join(""));
+      this.remove();
+    });
   }
 
   // CLOSED_MANUALLY (position closed directly at the broker -- app, dealer, EA --
@@ -1009,8 +1040,21 @@
     return `${days} j${hours % 24 ? ` ${hours % 24} h` : ""}`;
   }
 
-  function historyStatusLabel(item) {
+  // Real broker-tracked $ leads whenever it's known (only ever set for trades the
+  // bot actually placed and closed with the broker -- see server.mjs brokerProfitAmount);
+  // the R-multiple is kept alongside as secondary context, not dropped, since it's
+  // still the only number available for manually-logged analyses with no broker fill.
+  function historyResultLabel(item) {
+    const amount = Number.isFinite(item.brokerProfitAmount)
+      ? `${item.brokerProfitAmount >= 0 ? "+" : ""}${item.brokerProfitAmount.toFixed(2)} $`
+      : null;
     const r = Number.isFinite(item.rMultiple) ? `${item.rMultiple >= 0 ? "+" : ""}${item.rMultiple.toFixed(2)}R` : null;
+    if (amount && r) return `${amount} (${r})`;
+    return amount || r;
+  }
+
+  function historyStatusLabel(item) {
+    const r = historyResultLabel(item);
     if (item.status === "TP1_HIT") return r ? `TP1 touché · ${r}` : "TP1 touché";
     if (item.status === "TP2_HIT") return r ? `TP2 touché · ${r}` : "TP2 touché";
     if (item.status === "SL_HIT") return r ? `Stop Loss touché · ${r}` : "Stop Loss touché";
