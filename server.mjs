@@ -2038,7 +2038,11 @@ async function handleApi(req, res, url) {
     if (!pairs.length) return sendJson(res, 400, { ok: false, error: "no_valid_pairs" });
     const riskPercent = Math.max(0.1, Math.min(3, Number(body?.riskPercent) || 0.5));
     const dailyLossLimitPercent = Math.max(1, Math.min(10, Number(body?.dailyLossLimitPercent) || 3));
-    const maxConcurrentPositions = Math.max(1, Math.min(5, Math.round(Number(body?.maxConcurrentPositions) || 2)));
+    // Ceiling raised from a hardcoded 5 to 20 (still a real sanity bound against
+    // a fat-fingered value, not a meaningful trading-risk decision) -- requested
+    // directly: the actual portfolio-risk ceiling is the admin's call to make,
+    // not something baked into the code past what they can even type.
+    const maxConcurrentPositions = Math.max(1, Math.min(20, Math.round(Number(body?.maxConcurrentPositions) || 2)));
     const minConfidenceFloor = Math.max(60, Math.min(95, Number(body?.minConfidenceFloor) || NEW_SIGNAL_ALERT_MIN_CONFIDENCE));
     // All four below are optional -- 0/absent means "no restriction on this axis",
     // same as before this feature existed, so approving an account without
@@ -2527,8 +2531,17 @@ async function handleApi(req, res, url) {
     const c = brokerSlotColumns(slot);
     // Verified before saving, never claimed "connected" on faith -- a bad token or
     // wrong account id is caught here, not silently discovered days later when the
-    // bot first tries to trade.
-    const check = await getBrokerAccountInformation({ token, accountId, region }).catch((error) => ({ error: error.message }));
+    // bot first tries to trade. Retried a few times with backoff, not a single
+    // shot: confirmed directly this session that a MetaApi account that hasn't
+    // been queried in a while (idle/"undeployed" on their side) routinely
+    // returns 504 on the very first call while it wakes up -- a single attempt
+    // here would make a perfectly valid connection look like a broken one.
+    let check = { error: "no_attempt" };
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      check = await getBrokerAccountInformation({ token, accountId, region }).catch((error) => ({ error: error.message }));
+      if (!check.error) break;
+      if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 6000));
+    }
     if (check.error) {
       await sqlRun(
         `INSERT INTO auto_trading_accounts (user_id, ${c.token}, ${c.accountId}, ${c.region}, ${c.lastCheckStatus}, ${c.lastCheckAt}, approval_status, created_at, updated_at)
@@ -2536,7 +2549,13 @@ async function handleApi(req, res, url) {
          ON CONFLICT(user_id) DO UPDATE SET ${c.token} = excluded.${c.token}, ${c.accountId} = excluded.${c.accountId}, ${c.region} = excluded.${c.region}, ${c.connectedAt} = NULL, ${c.lastCheckStatus} = excluded.${c.lastCheckStatus}, ${c.lastCheckAt} = excluded.${c.lastCheckAt}, updated_at = excluded.updated_at`,
         [session.user.id, token, accountId, region, `error: ${check.error}`, now, now, now],
       );
-      return sendJson(res, 502, { ok: false, error: "broker_check_failed", message: check.error });
+      // Credentials are already saved above -- the user can just resubmit the
+      // same form (or the server's own scheduler will pick it up once the
+      // account responds) without retyping the token.
+      const message = /504|timeout/i.test(check.error)
+        ? "Le compte MetaApi met du temps à démarrer (compte inactif depuis un moment) -- réessaie dans 1 à 2 minutes, pas besoin de retaper le jeton."
+        : check.error;
+      return sendJson(res, 502, { ok: false, error: "broker_check_failed", message });
     }
     await sqlRun(
       `INSERT INTO auto_trading_accounts (user_id, ${c.token}, ${c.accountId}, ${c.region}, ${c.connectedAt}, ${c.lastCheckStatus}, ${c.lastCheckAt}, approval_status, created_at, updated_at)
@@ -2681,7 +2700,7 @@ async function handleApi(req, res, url) {
     const clampInt = (value, min, max) => { const c = clamp(value, min, max); return c ? Math.round(c) : null; };
     const userMinConfidence = clamp(body?.userMinConfidence, 60, 99);
     const userRiskPercent = clamp(body?.userRiskPercent, 0.1, 3);
-    const userMaxConcurrentPositions = clampInt(body?.userMaxConcurrentPositions, 1, 5);
+    const userMaxConcurrentPositions = clampInt(body?.userMaxConcurrentPositions, 1, 20);
     const userMaxTradesPerDay = clampInt(body?.userMaxTradesPerDay, 1, 100);
     const userDailyLossLimitPercent = clamp(body?.userDailyLossLimitPercent, 1, 10);
     const userDailyLossLimitAmount = Number.isFinite(Number(body?.userDailyLossLimitAmount)) && Number(body.userDailyLossLimitAmount) > 0 ? Number(body.userDailyLossLimitAmount) : null;
