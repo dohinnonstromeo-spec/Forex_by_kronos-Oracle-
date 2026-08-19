@@ -939,10 +939,47 @@
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché à cet instant -- normal, pas une erreur",
   };
 
+  const TICK_DAY_NAMES = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]; // matches JS getUTCDay()
+
+  // The detail payload was always sent from server.mjs (see recordAutoTradeStatus
+  // call sites) but never actually read here -- confirmed live this session that
+  // "signal(s) repérés mais aucun n'a passé les vérifications finales" alone left
+  // no way to tell dedup/correlation/broker-spec/sizing/broker-rejection apart,
+  // which is exactly the numbers this breaks out.
+  function formatTickDetail(reason, detail) {
+    if (!detail) return "";
+    const parts = [];
+    if (reason === "no_valid_setup_this_tick") {
+      if (detail.candidateCount) parts.push(`${detail.candidateCount} signal(s) évalué(s)`);
+      if (detail.alreadyOpen) parts.push(`${detail.alreadyOpen} déjà ouvert(s)`);
+      if (detail.correlation) parts.push(`${detail.correlation} bloqué(s) par corrélation`);
+      if (detail.noSpec) parts.push(`${detail.noSpec} specs broker indisponibles`);
+      if (detail.noVolume) parts.push(`${detail.noVolume} taille de position trop petite`);
+      if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
+    } else if (reason === "no_signal_meets_confidence_or_rr") {
+      if (detail.minConfidence != null) parts.push(`seuil confiance ${detail.minConfidence}%`);
+      if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
+      if (detail.approvedPairs?.length) parts.push(`paires : ${detail.approvedPairs.join(", ")}`);
+    } else if (reason === "max_concurrent_positions_reached") {
+      parts.push(`${detail.openCount}/${detail.maxConcurrent}`);
+    } else if (reason === "max_trades_per_day_reached") {
+      parts.push(`${detail.tradesOpenedToday}/${detail.maxTradesPerDay}`);
+    } else if (reason === "daily_loss_limit_percent_reached") {
+      parts.push(`limite ${detail.dailyLossLimitPercent}%`);
+    } else if (reason === "daily_loss_limit_amount_reached") {
+      parts.push(`limite ${detail.dailyLossLimitAmount}`);
+    } else if (reason === "outside_admin_trading_hours" || reason === "outside_user_trading_hours") {
+      if (detail.tradingHoursStart && detail.tradingHoursEnd) parts.push(`${detail.tradingHoursStart}-${detail.tradingHoursEnd} UTC`);
+    } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {
+      if (detail.tradingDays) parts.push(`jours autorisés : ${String(detail.tradingDays).split(",").map((d) => TICK_DAY_NAMES[Number(d)]).join(", ")}`);
+    }
+    return parts.length ? ` [${parts.join(", ")}]` : "";
+  }
+
   function autoTradeTickSummary(lastTick) {
     if (!lastTick) return "Pas encore évalué depuis le dernier démarrage du serveur";
     const label = AUTOTRADE_TICK_REASON_LABELS[lastTick.reason] || lastTick.reason;
-    return `${label} (${formatDate(lastTick.at)})`;
+    return `${label}${formatTickDetail(lastTick.reason, lastTick.detail)} (${formatDate(lastTick.at)})`;
   }
 
   async function refreshAutoTradeStatus() {
