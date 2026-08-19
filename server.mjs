@@ -428,6 +428,18 @@ async function ensureRelationalTables() {
   } catch (error) {
     logOnce("schema", `backfill dual-broker échoué (${error.message})`);
   }
+  // One-time cleanup for the trade_orders.status bug found live this session
+  // (see tryResolveBrokerBackedOutcome): every position that had already
+  // closed before this fix existed left its trade_orders row stuck on 'SENT'
+  // forever, since nothing had ever transitioned it away. Safe to run on every
+  // startup -- only touches rows whose own linked analysis says it's already
+  // resolved, so a genuinely still-open position (analyses.status = 'OPEN')
+  // is never touched by this.
+  try {
+    await runStatement(`UPDATE trade_orders SET status = 'CLOSED' WHERE status = 'SENT' AND analysis_id IN (SELECT id FROM analyses WHERE status != 'OPEN')`);
+  } catch (error) {
+    logOnce("schema", `backfill trade_orders.status échoué (${error.message})`);
+  }
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -9179,6 +9191,18 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
     analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
     analysis.brokerProfitAmount = profit;
     await upsertAnalysisRow(analysis);
+    // Real bug found live this session: this function has always correctly
+    // resolved analyses.status away from OPEN, but never touched
+    // trade_orders.status -- it stayed 'SENT' forever after the position
+    // closed, which is exactly what correlationWarnings/checkScalpTimeouts/
+    // the reconcile queries below key off. In production, months of closed
+    // trades were still matching "currently open" correlation checks, silently
+    // blocking new signals that shared a currency with a position that had
+    // closed hours or days earlier. analyses stayed the correct source of
+    // truth throughout (countOpenAutoPositions reads that, not this), which is
+    // why "Positions ouvertes" always showed correctly while correlation
+    // blocked things that looked like they shouldn't be blocked.
+    await sqlRun(`UPDATE trade_orders SET status = 'CLOSED' WHERE analysis_id = ? AND status = 'SENT'`, [analysis.id]);
     return { closed: true };
   }
   return null; // broker query failed (e.g. temporarily unreachable) -- caller falls through rather than leaving the row stuck unevaluated

@@ -541,6 +541,7 @@
   const TRADE_ORDER_LABELS = {
     PENDING_CONFIRMATION: "À valider",
     SENT: "Envoyé au broker",
+    CLOSED: "Clôturé",
     FAILED: "Échec d'envoi",
     CANCELLED: "Annulé",
   };
