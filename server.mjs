@@ -1454,18 +1454,25 @@ async function dailyRealizedPnlAmount(userId, slot) {
 // user's own (narrower-only) window -- see processAutoTradeForUser, which
 // requires BOTH to independently allow the current moment, so a user's window
 // can only ever restrict further than the admin's, never widen it.
-function isWithinWindow(hoursStart, hoursEnd, days) {
+//
+// Returns null (allowed) or which axis blocked it ("day"/"hours") -- confirmed
+// live this session that collapsing both into one boolean produced a genuinely
+// misleading diagnostic: a user widened their hours to 00:00-23:59, the
+// scheduler kept reporting the exact same "outside trading hours" reason, and
+// there was no way from that single label to tell the real blocker was the
+// day-of-week checkboxes, not the hours at all.
+function windowBlockReason(hoursStart, hoursEnd, days) {
   const now = new Date();
   if (days) {
     const allowedDays = new Set(String(days).split(",").filter(Boolean).map(Number));
-    if (allowedDays.size && !allowedDays.has(now.getUTCDay())) return false;
+    if (allowedDays.size && !allowedDays.has(now.getUTCDay())) return "day";
   }
   if (hoursStart && hoursEnd) {
     const current = `${String(now.getUTCHours()).padStart(2, "0")}:${String(now.getUTCMinutes()).padStart(2, "0")}`;
     const withinWindow = hoursStart <= hoursEnd ? (current >= hoursStart && current <= hoursEnd) : (current >= hoursStart || current <= hoursEnd);
-    if (!withinWindow) return false;
+    if (!withinWindow) return "hours";
   }
-  return true;
+  return null;
 }
 
 // Every admin-set limit has a user-side counterpart the account owner can set
@@ -1505,10 +1512,14 @@ function resolveAdminRiskPercent(account, balance) {
 
 async function processAutoTradeForUser(account, signals, slot) {
   const userId = account.user_id;
-  if (!isWithinWindow(account.trading_hours_start, account.trading_hours_end, account.trading_days))
-    return recordAutoTradeStatus(userId, slot, "outside_admin_trading_hours");
-  if (!isWithinWindow(account.user_trading_hours_start, account.user_trading_hours_end, account.user_trading_days))
-    return recordAutoTradeStatus(userId, slot, "outside_user_trading_hours");
+  const adminWindowBlock = windowBlockReason(account.trading_hours_start, account.trading_hours_end, account.trading_days);
+  if (adminWindowBlock)
+    return recordAutoTradeStatus(userId, slot, adminWindowBlock === "day" ? "outside_admin_trading_days" : "outside_admin_trading_hours",
+      { tradingHoursStart: account.trading_hours_start, tradingHoursEnd: account.trading_hours_end, tradingDays: account.trading_days });
+  const userWindowBlock = windowBlockReason(account.user_trading_hours_start, account.user_trading_hours_end, account.user_trading_days);
+  if (userWindowBlock)
+    return recordAutoTradeStatus(userId, slot, userWindowBlock === "day" ? "outside_user_trading_days" : "outside_user_trading_hours",
+      { tradingHoursStart: account.user_trading_hours_start, tradingHoursEnd: account.user_trading_hours_end, tradingDays: account.user_trading_days });
   const approvedPairs = new Set(String(account.approved_pairs || "").split(",").filter(Boolean));
   if (!approvedPairs.size) return recordAutoTradeStatus(userId, slot, "no_approved_pairs");
   const minConfidence = combineTightened(account.min_confidence_floor || 70, account.user_min_confidence, "higher");

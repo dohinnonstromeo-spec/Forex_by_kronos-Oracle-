@@ -923,7 +923,9 @@
   // explanation).
   const AUTOTRADE_TICK_REASON_LABELS = {
     outside_admin_trading_hours: "Hors des horaires de trading définis par l'administrateur",
+    outside_admin_trading_days: "Aujourd'hui n'est pas un jour de trading autorisé par l'administrateur",
     outside_user_trading_hours: "Hors de tes horaires de trading personnalisés",
+    outside_user_trading_days: "Aujourd'hui n'est pas un de tes jours de trading personnalisés",
     no_approved_pairs: "Aucune paire approuvée sur ce compte",
     no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil de confiance ou de R:R requis",
     daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte -- reprend demain",

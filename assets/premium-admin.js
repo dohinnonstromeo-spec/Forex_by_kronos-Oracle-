@@ -228,7 +228,9 @@
   // reports -- limits looking ignored, 8h+ of silence -- that motivated this).
   const AUTOTRADE_TICK_REASON_LABELS = {
     outside_admin_trading_hours: "Hors horaires admin",
+    outside_admin_trading_days: "Jour non autorisé (admin)",
     outside_user_trading_hours: "Hors horaires utilisateur",
+    outside_user_trading_days: "Jour non autorisé (utilisateur)",
     no_approved_pairs: "Aucune paire approuvée",
     no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil confiance/R:R",
     daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte",
