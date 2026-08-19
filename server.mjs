@@ -292,6 +292,17 @@ async function ensureRelationalTables() {
   // open, and an in-flight trade must keep the timeout it was actually opened
   // under, not retroactively inherit a later edit. See startScalpTimeoutScheduler.
   await ensureColumn("trade_orders", "scalp_max_hold_seconds integer");
+  // Staged trailing stop for scalp positions, requested directly and backtested
+  // per-pair before shipping (see SCALP_PARAMS_BY_PAIR). trailing_stop_price is
+  // the CURRENT live stop as last set at the broker (starts equal to sl at
+  // creation); best_favorable_price is the best price reached in the trade's
+  // favor since entry, needed to compute the next trail level. Deliberately
+  // separate from trade_orders.sl / analyses.sl -- R-multiple math
+  // (markToMarketRMultiple) always anchors to the ORIGINAL entry/sl, which must
+  // never move, even though the real broker-side stop now does. See
+  // checkScalpTrailingStops.
+  await ensureColumn("trade_orders", "trailing_stop_price real");
+  await ensureColumn("trade_orders", "best_favorable_price real");
   // Marks how far a user has read into their own trade-open/close feed (see
   // /api/notifications/summary) -- the in-app fallback for anyone without an
   // active push subscription. NULL until they ever open the notifications panel,
@@ -1090,6 +1101,7 @@ createServer(async (req, res) => {
   startLearningOutcomesScheduler();
   startBrokerReconcileScheduler();
   startScalpTimeoutScheduler();
+  startScalpTrailingScheduler();
   startSignalsBroadcastScheduler();
   startNewSignalAlertScheduler();
   startAutoTradeScheduler();
@@ -1741,10 +1753,18 @@ async function processScalpForUser(account, credentials, slot) {
     const validatedHoldSeconds = signal.maxHoldBars * 60;
     const holdSeconds = account.scalp_max_hold_seconds > 0 ? Math.min(validatedHoldSeconds, account.scalp_max_hold_seconds) : validatedHoldSeconds;
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
+    // tp1 is deliberately NULL, not signal.tp -- sendOrderToBroker only ever
+    // sends a broker-side takeProfit when tp1 is set, and the backtested,
+    // validated exit for these two pairs is the trailing stop alone (no fixed
+    // target at all -- that's WHY it beats the old fixed-TP baseline, letting a
+    // winner run further than tp would have allowed). tp2 keeps the original
+    // mean-reversion target for reference/display only, never sent to the
+    // broker. trailing_stop_price/best_favorable_price start at sl/entry --
+    // checkScalpTrailingStops takes over from here.
     await sqlRun(
-      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds, broker_slot)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?)`,
-      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, signal.tp, signal.tp, new Date().toISOString(), holdSeconds, slot],
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds, broker_slot, trailing_stop_price, best_favorable_price)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?)`,
+      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, null, signal.tp, new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
@@ -4646,9 +4666,23 @@ async function deterministicCrossCheck(pair, livePrice) {
 // train-and-test-both-positive on more than one isolated combination each --
 // indistinguishable from chance, so they're excluded here on purpose, not an
 // oversight.
+// trailActivationR/trailR/trailBufferR: staged trailing stop, requested
+// directly and backtested per-pair before shipping (scripts/backtest-scalp-
+// trailing-stop.mjs, real M1 data, walk-forward 70/30, exhaustive grid
+// 0.2R-1.0R activation x 0.2R-0.75R trail) -- both beat the fixed tpR target
+// on train AND test, on two independent real periods (90d and 365d), so tpR
+// is kept only as a value for display/backfill, never sent to the broker for
+// these two pairs anymore (see processScalpForUser). Different optimum per
+// pair, not a coincidence: GBP/USD's edge wants room to develop before
+// protecting it (peak around 0.75-1R activation across both periods), XAU/USD's
+// edge is best protected immediately (0.2R activation is the unambiguous best
+// on every combination tested, both periods). trailBufferR is shared -- 0.15R
+// comfortably covers real spread cost on both pairs with room to spare, so the
+// worst case once the stop moves is a real, if small, locked-in gain, never a
+// bare breakeven.
 const SCALP_PARAMS_BY_PAIR = {
-  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 30 },
-  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 30 },
+  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 30, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
+  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 30, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
 };
 
 function computeScalpMeanReversionSignal(pair, price, history) {
@@ -8633,6 +8667,10 @@ function rowToTradeOrder(row) {
     confirmedAt: row.confirmed_at || null,
     sentAt: row.sent_at || null,
     brokerSlot: row.broker_slot || null,
+    // The CURRENT live stop once a trailing scalp has moved it -- null for
+    // every non-scalp order (sl there never changes, so there's nothing extra
+    // to show). See checkScalpTrailingStops.
+    trailingStopPrice: row.trailing_stop_price ?? null,
   };
 }
 
@@ -8793,6 +8831,31 @@ async function closeBrokerPosition(credentials, positionId) {
   }
 }
 
+// The trailing-stop counterpart to closeBrokerPosition -- same endpoint, same
+// response-shape handling, POSITION_MODIFY instead of POSITION_CLOSE_ID. Only
+// ever moves the stop, never the take-profit (there isn't one for a trailing
+// scalp position -- see processScalpForUser). A failed modify leaves the
+// position's stop exactly where it already was at the broker -- never
+// catastrophic, just a missed update that the next tick retries.
+async function modifyBrokerPositionStopLoss(credentials, positionId, newStopLoss) {
+  const region = credentials.region || "new-york";
+  const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/trade`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "auth-token": credentials.token },
+      body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: String(positionId), stopLoss: newStopLoss }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
+    if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: `broker_request_failed: ${error.message}` };
+  }
+}
+
 // The one function in this feature that can actually move money -- shared by
 // /api/trade/confirm (human clicks "Confirmer", credentials = null -> falls back to
 // the shared house account) and the autonomous scheduler (runAutoTradeTick,
@@ -8908,6 +8971,26 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
 
 // Real account balance for the autonomous bot's position sizing -- confirmed live
 // this session against a real connected MetaApi demo account.
+// Broker-direct price only, no fallback providers and no caching -- deliberately
+// NOT getAnalysisPrice, which is right for signal generation (some staleness is
+// fine there) but wrong for the trailing stop: confirmed live that
+// getAnalysisPrice's cache (up to 3min stale on an open market) let the
+// trailing-stop computation drift far enough from the broker's own real-time
+// price that a computed stop which looked safely behind the (stale) price
+// actually landed on the wrong side of where the market really was, and got
+// rejected with TRADE_RETCODE_INVALID_STOPS. checkScalpTrailingStops needs the
+// exact same price the broker will itself validate the modify request against.
+async function getBrokerCurrentPrice(credentials, pair) {
+  const region = credentials.region || "new-york";
+  const symbol = String(pair).replace("/", "");
+  const response = await fetch(`https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/symbols/${symbol}/current-price`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`broker_http_${response.status}`);
+  const data = await response.json();
+  const bid = Number(data?.bid), ask = Number(data?.ask);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask)) throw new Error("invalid_price");
+  return { bid, ask };
+}
+
 async function getBrokerAccountInformation(credentials) {
   const region = credentials.region || "new-york";
   const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/account-information`;
@@ -9324,6 +9407,114 @@ function startScalpTimeoutScheduler() {
   setInterval(() => {
     checkScalpTimeouts().catch((error) => logOnce("scalp-timeout-scheduler", `vérification timeout scalp échouée (${error.message})`));
   }, SCALP_TIMEOUT_INTERVAL_MS);
+}
+
+// The staged trailing stop itself (see SCALP_PARAMS_BY_PAIR for the per-pair
+// activation/trail/buffer values, and scripts/backtest-scalp-trailing-stop.mjs
+// for why these specific numbers). Pure function, no I/O, so it's the same
+// logic the backtest already proved -- not a live reimplementation that could
+// silently drift from what was actually validated. risk is the ORIGINAL
+// entry-to-sl distance (never changes); bestFavorablePrice is ratcheted by the
+// caller across ticks, this only ever computes what the stop SHOULD be for a
+// given best-so-far. Returns null while still below trailActivationR (nothing
+// to move yet).
+function computeTrailingStopPrice(entry, direction, risk, bestFavorablePrice, params) {
+  const buy = direction === "ACHAT";
+  const bestFavR = buy ? (bestFavorablePrice - entry) / risk : (entry - bestFavorablePrice) / risk;
+  if (bestFavR < params.trailActivationR) return null;
+  const breakevenStop = buy ? entry + params.trailBufferR * risk : entry - params.trailBufferR * risk;
+  if (bestFavR < params.trailActivationR + params.trailR) return breakevenStop;
+  const trailedStop = buy ? entry + (bestFavR - params.trailR) * risk : entry - (bestFavR - params.trailR) * risk;
+  return buy ? Math.max(breakevenStop, trailedStop) : Math.min(breakevenStop, trailedStop);
+}
+
+const SCALP_TRAILING_INTERVAL_MS = Number(env.SCALP_TRAILING_INTERVAL_SECONDS || 15) * 1000;
+let scalpTrailingInFlight = false;
+
+async function checkScalpTrailingStops() {
+  if (scalpTrailingInFlight) return;
+  scalpTrailingInFlight = true;
+  try {
+    await ensureRelationalTables();
+    const rows = await sqlAll(
+      `SELECT a.id as analysis_id, a.user_id as user_id, a.pair as pair, a.direction as direction, a.entry as entry, a.sl as sl, a.broker_slot as broker_slot,
+              o.id as order_id, o.broker_order_id as broker_order_id, o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price
+       FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+       WHERE a.status = 'OPEN' AND a.source = 'auto_scalp' AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
+      [],
+    );
+    if (!rows.length) return;
+    const credentialsCache = new Map();
+    for (const row of rows) {
+      const params = SCALP_PARAMS_BY_PAIR[row.pair];
+      if (!params) continue; // shouldn't happen (scalp only ever opens on validated pairs), fail closed if it somehow does
+      const buy = row.direction === "ACHAT";
+      const entry = Number(row.entry);
+      const risk = Math.abs(entry - Number(row.sl));
+      if (!(risk > 0)) continue;
+      // Credentials resolved BEFORE the price fetch now -- needed for the price
+      // itself, not just the eventual modify call.
+      const slot = row.broker_slot || "demo";
+      const cacheKey = `${row.user_id}:${slot}`;
+      if (!credentialsCache.has(cacheKey)) {
+        credentialsCache.set(cacheKey, await getUserBrokerCredentials(row.user_id, slot).catch(() => null));
+      }
+      const credentials = credentialsCache.get(cacheKey);
+      if (!credentials) continue;
+      // Broker-direct price, not getAnalysisPrice -- see getBrokerCurrentPrice's
+      // own comment for why: this needs the exact price the broker will itself
+      // validate the modify request against, not the (potentially minutes-stale)
+      // general market cache. A BUY position closes at bid, a SELL at ask --
+      // same side used for both the favorable-price tracking and the
+      // distance-to-stop safety check below, so both reason about the price the
+      // position would actually realize.
+      const brokerPrice = await getBrokerCurrentPrice(credentials, row.pair).catch(() => null);
+      if (!brokerPrice) continue;
+      const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
+      const priorBest = Number(row.best_favorable_price) || entry;
+      const newBest = buy ? Math.max(priorBest, currentPrice) : Math.min(priorBest, currentPrice);
+      let candidateStop = computeTrailingStopPrice(entry, row.direction, risk, newBest, params);
+      // Confirmed live: a stop this close to (or on the wrong side of) the
+      // CURRENT price gets rejected by the broker as TRADE_RETCODE_INVALID_STOPS
+      // -- a real MT5 rule (a protective stop can never sit past where the
+      // market already is), not something the R-based formula alone accounts
+      // for. Clamp to at least executionCostBuffer's real per-pair minimum
+      // distance behind the current price rather than trusting the peak-based
+      // math blindly.
+      if (candidateStop != null) {
+        const minDistance = executionCostBuffer(row.pair, "scalp");
+        const safeStop = buy ? currentPrice - minDistance : currentPrice + minDistance;
+        if (buy && candidateStop > safeStop) candidateStop = safeStop;
+        if (!buy && candidateStop < safeStop) candidateStop = safeStop;
+      }
+      const currentStop = Number(row.trailing_stop_price);
+      const stopImproved = candidateStop != null && (buy ? candidateStop > currentStop : candidateStop < currentStop);
+      if (!stopImproved) {
+        // Still record a new best-favorable-price even when the stop itself
+        // doesn't move yet (below trailActivationR, or between ratchet steps) --
+        // otherwise a price that later retraces before reaching the next step
+        // would wrongly look like it never got there.
+        if (newBest !== priorBest) {
+          await sqlRun(`UPDATE trade_orders SET best_favorable_price = ? WHERE id = ?`, [newBest, row.order_id]).catch(() => {});
+        }
+        continue;
+      }
+      const result = await modifyBrokerPositionStopLoss(credentials, row.broker_order_id, candidateStop).catch((error) => ({ ok: false, error: error.message }));
+      if (result.ok) {
+        await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ? WHERE id = ?`, [candidateStop, newBest, row.order_id]).catch(() => {});
+      } else {
+        logOnce(`scalp-trailing-${row.analysis_id}`, `déplacement du stop suiveur échoué (${result.error})`);
+      }
+    }
+  } finally {
+    scalpTrailingInFlight = false;
+  }
+}
+
+function startScalpTrailingScheduler() {
+  setInterval(() => {
+    checkScalpTrailingStops().catch((error) => logOnce("scalp-trailing-scheduler", `vérification stop suiveur échouée (${error.message})`));
+  }, SCALP_TRAILING_INTERVAL_MS);
 }
 
 async function updateLearningOutcomes(prices = null, histories = null) {

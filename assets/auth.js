@@ -588,7 +588,7 @@
         </div>
         <div class="dashboard-history-levels">
           <span>Entrée ${escapeHtml(order.entry)}</span>
-          <span>SL ${escapeHtml(order.sl)}</span>
+          <span>SL ${escapeHtml(order.trailingStopPrice ?? order.sl)}${order.trailingStopPrice != null && order.trailingStopPrice !== order.sl ? " (suiveur)" : ""}</span>
           <span>TP1 ${escapeHtml(order.tp1 ?? "—")}</span>
         </div>
         ${order.correlationWarning ? `<p class="dashboard-history-note dashboard-correlation-warning">⚠ ${escapeHtml(order.correlationWarning)}</p>` : ""}
