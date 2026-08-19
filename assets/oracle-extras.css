@@ -2175,6 +2175,66 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.dashboard-broker-slots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.dashboard-slot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dashboard-slot-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+
+.dashboard-live-authorize {
+  margin-top: 6px;
+}
+
+.dashboard-slot-switch input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--amber-neon);
+}
+
+.dashboard-live-locked {
+  color: var(--amber-neon) !important;
+}
+
+.dashboard-slot-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.dashboard-slot-tag-demo {
+  background: rgba(255, 255, 255, .08);
+  color: var(--muted-foreground);
+}
+
+.dashboard-slot-tag-live {
+  background: color-mix(in oklch, var(--amber-neon) 22%, transparent);
+  color: var(--amber-neon);
+}
+
+@media (max-width: 720px) {
+  .dashboard-broker-slots { grid-template-columns: 1fr; }
+}
+
 .dashboard-history-more {
   display: block;
   width: 100%;

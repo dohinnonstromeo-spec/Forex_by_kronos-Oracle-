@@ -276,9 +276,18 @@
           <span class="${request.approvalStatus === "approved" ? "history-open" : request.approvalStatus === "requested" ? "" : "history-blocked"}">
             ${escapeHtml(AUTOTRADE_STATUS_LABELS[request.approvalStatus] || request.approvalStatus)}
             ${request.approvalStatus === "approved" ? `· jusqu'au ${formatDate(request.approvedUntil)}` : ""}
-            · broker ${request.brokerConnected ? "connecté" : "non connecté"}
+            · démo ${request.demo?.brokerConnected ? "connecté" : "non connecté"} · réel ${request.live?.brokerConnected ? "connecté" : "non connecté"}
           </span>
-          ${request.approvalStatus === "approved" ? `<span class="dashboard-autotrade-hint">Dernier passage : ${escapeHtml(autoTradeTickSummary(request.lastTick))}</span>` : ""}
+          ${request.approvalStatus === "approved" ? `
+            <span class="dashboard-autotrade-hint">Démo -- dernier passage : ${escapeHtml(autoTradeTickSummary(request.demo?.lastTick))}</span>
+            <span class="dashboard-autotrade-hint">Réel -- dernier passage : ${escapeHtml(autoTradeTickSummary(request.live?.lastTick))}</span>
+          ` : ""}
+          <div class="dashboard-live-authorize">
+            <label class="dashboard-slot-switch">
+              <input type="checkbox" data-authorize-live ${request.live?.authorized ? "checked" : ""}>
+              Autoriser le réel${request.live?.authorized ? ` (accordé le ${formatDate(request.live.authorizedAt)}${request.live.authorizedBy ? ` par ${escapeHtml(request.live.authorizedBy)}` : ""})` : ""}
+            </label>
+          </div>
         </div>
         <div class="dashboard-autotrade-pairs" data-trading-pairs>
           ${AUTOTRADE_PAIRS.map((pair) => `
@@ -444,6 +453,30 @@
         button.disabled = false;
         if (!data?.ok) { setMessage(data?.message || data?.error || "Action impossible.", true); return; }
         setMessage("Accès révoqué.", false);
+        autotradeLoad?.click();
+      });
+    });
+
+    // One-time, durable grant -- unlike everything else in this card, this
+    // doesn't wait for "Approuver" to save. Checking it authorizes real money
+    // on this account immediately; unchecking it revokes immediately, live
+    // and demo bookkeeping otherwise untouched (see server.mjs activeBrokerSlots).
+    autotradeRequests.querySelectorAll("[data-authorize-live]").forEach((checkbox) => {
+      checkbox.addEventListener("change", async () => {
+        const card = checkbox.closest("[data-autotrade-request-card]");
+        const userId = card?.dataset.autotradeRequestCard;
+        const token = form?.elements?.token?.value || "";
+        if (!token) { setMessage("Renseigne le token admin avant d'autoriser le réel.", true); checkbox.checked = !checkbox.checked; return; }
+        const authorized = checkbox.checked;
+        if (authorized && !window.confirm("Autoriser ce compte à trader avec de l'ARGENT RÉEL ? Le propriétaire du compte pourra ensuite activer/désactiver le réel librement, sans repasser par toi à chaque fois.")) {
+          checkbox.checked = false;
+          return;
+        }
+        checkbox.disabled = true;
+        const data = await adminFetch("/api/admin/auto-trade/authorize-live", { token, userId, authorized });
+        checkbox.disabled = false;
+        if (!data?.ok) { setMessage(data?.message || data?.error || "Action impossible.", true); checkbox.checked = !authorized; return; }
+        setMessage(authorized ? "Réel autorisé pour ce compte." : "Autorisation du réel révoquée.", false);
         autotradeLoad?.click();
       });
     });

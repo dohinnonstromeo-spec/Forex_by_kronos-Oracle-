@@ -285,7 +285,8 @@
     const NOTIF_VISIBLE = 5;
     const cards = items.map((item) => {
       const label = item.type === "opened" ? "Position ouverte" : `${historyStatusIcon(item)}${historyStatusLabel(item)}`;
-      return `<div class="auth-notif-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong><small>${formatDate(item.at)}</small></div>`;
+      const slotTag = item.brokerSlot ? ` <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : "";
+      return `<div class="auth-notif-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${slotTag}</strong><small>${formatDate(item.at)}</small></div>`;
     });
     const rest = cards.slice(NOTIF_VISIBLE);
     list.innerHTML = cards.slice(0, NOTIF_VISIBLE).join("")
@@ -438,7 +439,7 @@
       <details class="dashboard-history-item">
         <summary>
           <span class="dashboard-history-summary-main">
-            <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
+            <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${item.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
             <span class="${historyStatusClass(item)}">${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}</span>
           </span>
           <span class="dashboard-history-summary-date">${formatDate(item.createdAt)}</span>
@@ -559,10 +560,14 @@
 
   function renderTradeOrders(orders, brokerConfigured) {
     const statusEl = document.querySelector("[data-trade-broker-status]");
-    if (statusEl) statusEl.textContent = brokerConfigured ? "Broker connecté" : "Broker non connecté";
+    if (statusEl) {
+      const parts = [];
+      if (brokerConfigured.demo) parts.push("Démo connecté");
+      if (brokerConfigured.live) parts.push("Réel connecté");
+      statusEl.textContent = parts.length ? parts.join(" · ") : "Broker non connecté";
+    }
     const prompt = document.querySelector("[data-trade-broker-prompt]");
-    if (prompt) prompt.hidden = brokerConfigured;
-    renderBrokerConnectStatus(brokerConfigured);
+    if (prompt) prompt.hidden = Boolean(brokerConfigured.demo || brokerConfigured.live);
     const host = document.querySelector("[data-trade-orders]");
     if (!host) return;
     if (!orders.length) {
@@ -577,7 +582,7 @@
       <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}" ${index >= VISIBLE_COUNT ? "hidden data-order-extra" : ""}>
 
         <div>
-          <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}</strong>
+          <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}${order.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(order.brokerSlot)}">${order.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
           <span>${formatDate(order.createdAt)} · ${escapeHtml(TRADE_ORDER_LABELS[order.status] || order.status)}${order.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
         </div>
         <div class="dashboard-history-levels">
@@ -588,6 +593,10 @@
         ${order.correlationWarning ? `<p class="dashboard-history-note dashboard-correlation-warning">⚠ ${escapeHtml(order.correlationWarning)}</p>` : ""}
         ${order.status === "PENDING_CONFIRMATION" ? `
           <div class="dashboard-trade-confirm">
+            <select data-order-slot>
+              ${brokerConfigured.demo ? `<option value="demo">Démo</option>` : ""}
+              ${brokerConfigured.live ? `<option value="live">Réel</option>` : ""}
+            </select>
             <input type="number" step="0.01" min="0.01" placeholder="Taille (lots)" data-order-volume>
             <button type="button" class="payment-method-button" data-order-confirm>Confirmer et envoyer</button>
             <button type="button" class="dashboard-trade-cancel" data-order-cancel>Annuler</button>
@@ -644,7 +653,9 @@
       levels_too_close_to_price: "Le SL ou le TP est trop proche du prix actuel pour être accepté par le broker maintenant. Relance une analyse.",
       trading_paused: "Trading suspendu temporairement par l'administrateur.",
       daily_order_cap_reached: "Limite quotidienne d'ordres atteinte.",
-      broker_not_connected: "Tu dois d'abord connecter ton broker (section \"Connexion broker\" ci-dessus) avant d'envoyer un ordre réel.",
+      broker_not_connected: "Tu dois d'abord connecter ce broker (section \"Connexion broker\" ci-dessus) avant d'envoyer un ordre.",
+      live_trading_not_authorized: "Le passage en réel n'est pas (ou plus) autorisé par l'administrateur pour ce compte.",
+      invalid_broker_slot: "Choisis démo ou réel avant de confirmer.",
     };
 
     host.querySelectorAll("[data-order-confirm]").forEach((button) => {
@@ -653,11 +664,17 @@
         const orderId = article.dataset.orderId;
         const volumeInput = article.querySelector("[data-order-volume]");
         const volume = Number(volumeInput.value);
+        const brokerSlot = article.querySelector("[data-order-slot]")?.value || "";
         const errorEl = article.querySelector("[data-confirm-error]");
         if (!Number.isFinite(volume) || volume <= 0) {
           volumeInput.focus();
           return;
         }
+        if (brokerSlot !== "demo" && brokerSlot !== "live") return;
+        // The one moment a manual order can move real money -- confirm explicitly,
+        // same as the bot's own live toggle, rather than trusting a dropdown pick
+        // someone might not have noticed.
+        if (brokerSlot === "live" && !window.confirm("Cet ordre va être envoyé sur ton compte RÉEL avec de l'argent réel. Confirmer ?")) return;
         button.disabled = true;
         if (errorEl) errorEl.hidden = true;
         // price_moved/price_unavailable/trading_paused/daily_order_cap_reached all
@@ -666,12 +683,12 @@
         // message off the screen the instant it appears, for no reason, since
         // nothing about the order actually changed. Only reload when the order's
         // real status did (sent/failed/expired).
-        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached", "broker_not_connected"]);
+        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached", "broker_not_connected", "live_trading_not_authorized", "invalid_broker_slot"]);
         try {
           const response = await fetch("/api/trade/confirm", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ orderId, volume }),
+            body: JSON.stringify({ orderId, volume, brokerSlot }),
           });
           const result = await response.json().catch(() => ({}));
           if (result.ok) {
@@ -744,51 +761,94 @@
 
   function bindAutoTradeBrokerForm() {
     bindAutoTradePreferences();
-    const form = document.querySelector("[data-autotrade-broker-form]");
-    if (!form || form.dataset.bound) return;
-    form.dataset.bound = "1";
-    const message = document.querySelector("[data-autotrade-broker-message]");
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const token = form.querySelector("[data-autotrade-token]").value.trim();
-      const accountId = form.querySelector("[data-autotrade-account-id]").value.trim();
-      const region = form.querySelector("[data-autotrade-region]").value.trim() || "london";
-      if (!token || !accountId) return;
-      const submitButton = form.querySelector('button[type="submit"]');
-      submitButton.disabled = true;
-      if (message) message.hidden = true;
-      try {
-        const response = await fetch("/api/auto-trade/broker/connect", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token, accountId, region }),
-        });
-        const result = await response.json();
-        if (result.ok) {
-          form.reset();
-          form.querySelector("[data-autotrade-region]").value = "london";
-        } else if (message) {
-          message.textContent = result.message ? `Connexion refusée : ${result.message}` : `Échec (${result.error || "erreur inconnue"}).`;
-          message.hidden = false;
+    // Two independent forms (demo/live) share this exact same binding logic --
+    // looped once instead of duplicated per slot.
+    document.querySelectorAll("[data-autotrade-broker-form]").forEach((form) => {
+      if (form.dataset.bound) return;
+      form.dataset.bound = "1";
+      const slot = form.dataset.autotradeBrokerForm;
+      const message = document.querySelector(`[data-autotrade-broker-message="${slot}"]`);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const token = form.querySelector("[data-autotrade-token]").value.trim();
+        const accountId = form.querySelector("[data-autotrade-account-id]").value.trim();
+        const region = form.querySelector("[data-autotrade-region]").value.trim() || "london";
+        if (!token || !accountId) return;
+        const submitButton = form.querySelector('button[type="submit"]');
+        submitButton.disabled = true;
+        if (message) message.hidden = true;
+        try {
+          const response = await fetch("/api/auto-trade/broker/connect", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token, accountId, region, slot }),
+          });
+          const result = await response.json();
+          if (result.ok) {
+            form.reset();
+            form.querySelector("[data-autotrade-region]").value = "london";
+          } else if (message) {
+            message.textContent = result.message ? `Connexion refusée : ${result.message}` : `Échec (${result.error || "erreur inconnue"}).`;
+            message.hidden = false;
+          }
+        } catch {
+          if (message) { message.textContent = "Impossible de contacter le serveur -- vérifie ta connexion."; message.hidden = false; }
+        } finally {
+          submitButton.disabled = false;
+          // Both flows (semi-automatic + bot) read the same connection -- reflect
+          // it in both panels immediately, not just the one the form lives in.
+          await Promise.all([refreshAutoTradeStatus(), loadTradeOrders(true)]);
         }
-      } catch {
-        if (message) { message.textContent = "Impossible de contacter le serveur -- vérifie ta connexion."; message.hidden = false; }
-      } finally {
-        submitButton.disabled = false;
-        // The broker connection is shared by both flows -- reflect it in both
-        // panels immediately, not just the one the form happens to live in.
-        await Promise.all([refreshAutoTradeStatus(), loadTradeOrders(true)]);
-      }
+      });
     });
 
-    document.querySelector("[data-autotrade-broker-disconnect]")?.addEventListener("click", async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        await fetch("/api/auto-trade/broker/disconnect", { method: "POST" });
-      } finally {
-        await Promise.all([refreshAutoTradeStatus(), loadTradeOrders(true)]);
-      }
+    document.querySelectorAll("[data-autotrade-broker-disconnect]").forEach((button) => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = "1";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await fetch("/api/auto-trade/broker/disconnect", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ slot: button.dataset.autotradeBrokerDisconnect }),
+          });
+        } finally {
+          button.disabled = false;
+          await Promise.all([refreshAutoTradeStatus(), loadTradeOrders(true)]);
+        }
+      });
+    });
+
+    document.querySelectorAll("[data-slot-toggle]").forEach((checkbox) => {
+      if (checkbox.dataset.bound) return;
+      checkbox.dataset.bound = "1";
+      checkbox.addEventListener("change", async () => {
+        const slot = checkbox.dataset.slotToggle;
+        const enabled = checkbox.checked;
+        // Turning REAL money on is the one action in this whole feature that
+        // needs an explicit "are you sure" -- everything else (demo, turning
+        // either one off) is reversible and free of consequence.
+        if (slot === "live" && enabled) {
+          const confirmed = window.confirm("Le robot va exécuter avec de l'ARGENT RÉEL sur ton compte broker réel connecté. Continuer ?");
+          if (!confirmed) { checkbox.checked = false; return; }
+        }
+        checkbox.disabled = true;
+        try {
+          const response = await fetch("/api/auto-trade/toggle-slot", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ slot, enabled }),
+          });
+          const result = await response.json();
+          if (!result.ok) checkbox.checked = !enabled; // revert on rejection (e.g. not authorized, not connected)
+        } catch {
+          checkbox.checked = !enabled;
+        } finally {
+          checkbox.disabled = false;
+          await refreshAutoTradeStatus();
+        }
+      });
     });
 
     document.querySelector("[data-autotrade-request]")?.addEventListener("click", async (event) => {
@@ -822,15 +882,18 @@
     });
   }
 
-  // The single broker connection (auto_trading_accounts) backs both the
-  // semi-automatic panel and the bot panel -- one function toggles the shared
-  // connect-form/"connected" display so both panels always agree, instead of each
-  // keeping its own copy of the same toggle logic.
-  function renderBrokerConnectStatus(connected) {
-    const brokerConnected = document.querySelector("[data-autotrade-broker-connected]");
-    const brokerForm = document.querySelector("[data-autotrade-broker-form]");
-    if (brokerConnected) brokerConnected.hidden = !connected;
-    if (brokerForm) brokerForm.hidden = connected;
+  // Two independent slots now -- each panel toggles its own connect-form/
+  // "connected" display, and the live panel additionally locks behind the
+  // admin's authorization (checked separately, not inferred from connection).
+  function renderBrokerConnectStatus(demo, live, liveAuthorized) {
+    for (const [slot, connected] of [["demo", demo], ["live", live]]) {
+      const connectedEl = document.querySelector(`[data-autotrade-broker-connected="${slot}"]`);
+      const formEl = document.querySelector(`[data-autotrade-broker-form="${slot}"]`);
+      if (connectedEl) connectedEl.hidden = !connected;
+      if (formEl) formEl.hidden = connected || (slot === "live" && !liveAuthorized);
+    }
+    const lockedNote = document.querySelector("[data-live-locked-note]");
+    if (lockedNote) lockedNote.hidden = liveAuthorized || live;
   }
 
   // Mirrors server.mjs's recordAutoTradeStatus reason codes -- answers "why hasn't
@@ -867,22 +930,23 @@
     const badge = document.querySelector("[data-autotrade-status-badge]");
     if (badge) badge.textContent = AUTOTRADE_STATUS_LABELS[status.approvalStatus] || status.approvalStatus;
 
-    renderBrokerConnectStatus(status.brokerConnected);
+    const anyBrokerConnected = Boolean(status.demo?.brokerConnected || status.live?.brokerConnected);
+    renderBrokerConnectStatus(status.demo?.brokerConnected, status.live?.brokerConnected, status.live?.authorized);
 
     const activationSection = document.querySelector("[data-autotrade-activation-section]");
-    if (activationSection) activationSection.hidden = !status.brokerConnected;
+    if (activationSection) activationSection.hidden = !anyBrokerConnected;
 
     const statusText = document.querySelector("[data-autotrade-status-text]");
     const requestButton = document.querySelector("[data-autotrade-request]");
     const pauseButton = document.querySelector("[data-autotrade-pause]");
     const resumeButton = document.querySelector("[data-autotrade-resume]");
-    const metrics = document.querySelector("[data-autotrade-metrics]");
+    const slotsSection = document.querySelector("[data-autotrade-slots-section]");
     const historySection = document.querySelector("[data-autotrade-history-section]");
 
     if (requestButton) requestButton.hidden = true;
     if (pauseButton) pauseButton.hidden = true;
     if (resumeButton) resumeButton.hidden = true;
-    if (metrics) metrics.hidden = true;
+    if (slotsSection) slotsSection.hidden = true;
     if (historySection) historySection.hidden = true;
 
     if (status.approvalStatus === "none" || status.approvalStatus === "rejected" || status.approvalStatus === "expired") {
@@ -905,20 +969,41 @@
       }
       if (pauseButton) pauseButton.hidden = status.userPaused;
       if (resumeButton) resumeButton.hidden = !status.userPaused;
-      if (metrics) {
-        metrics.hidden = false;
-        metrics.innerHTML = [
-          ["Positions ouvertes", `${status.openPositions} / ${status.maxConcurrentPositions ?? "—"}`],
-          ["P&L du jour", `${status.dailyPnlPercent >= 0 ? "+" : ""}${status.dailyPnlPercent}%`],
-          ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
-          ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
-          ["Dernière évaluation", autoTradeTickSummary(status.lastTick)],
-        ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+      if (slotsSection) {
+        slotsSection.hidden = false;
+        renderAutoTradeSlot("demo", status, status.demo);
+        renderAutoTradeSlot("live", status, status.live);
       }
       if (historySection) historySection.hidden = false;
       renderAutoTradePreferences(status);
       await loadAutoTradeHistory();
     }
+  }
+
+  // One shared renderer for both slot blocks -- demo and live differ only in
+  // whether the toggle can actually be switched on (live needs the admin's
+  // authorization on top of being connected) and in showing the lock note.
+  function renderAutoTradeSlot(slot, status, slotStatus) {
+    const toggle = document.querySelector(`[data-slot-toggle="${slot}"]`);
+    if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(slotStatus?.enabled);
+    if (toggle) toggle.disabled = !slotStatus?.brokerConnected || (slot === "live" && !slotStatus?.authorized);
+    if (slot === "live") {
+      const lockedNote = document.querySelector("[data-live-slot-locked-note]");
+      if (lockedNote) lockedNote.hidden = Boolean(slotStatus?.authorized);
+    }
+    const metrics = document.querySelector(`[data-slot-metrics="${slot}"]`);
+    if (!metrics) return;
+    if (!slotStatus?.brokerConnected) {
+      metrics.innerHTML = `<div><span>Statut</span><strong>Broker non connecté</strong></div>`;
+      return;
+    }
+    metrics.innerHTML = [
+      ["Positions ouvertes", `${slotStatus.openPositions} / ${status.maxConcurrentPositions ?? "—"}`],
+      ["P&L du jour", `${slotStatus.dailyPnlPercent >= 0 ? "+" : ""}${slotStatus.dailyPnlPercent}%`],
+      ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
+      ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
+      ["Dernière évaluation", autoTradeTickSummary(slotStatus.lastTick)],
+    ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
   }
 
   // Every admin-set bot parameter has a user-side counterpart the account owner
@@ -1010,7 +1095,7 @@
     const cards = trades.slice(0, 20).map((item) => `
       <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}">
         <div>
-          <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}</strong>
+          <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${item.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
           <span class="${historyStatusClass(item)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}${item.status === "OPEN" && item.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
         </div>
         <div class="dashboard-history-levels">

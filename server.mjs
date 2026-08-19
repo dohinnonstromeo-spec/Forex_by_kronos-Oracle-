@@ -371,6 +371,55 @@ async function ensureRelationalTables() {
   // change for anyone who hasn't opted in.
   await ensureColumn("auto_trading_accounts", "risk_tiers_enabled integer NOT NULL DEFAULT 0");
   await ensureColumn("auto_trading_accounts", "risk_tiers text");
+  // Two brokers per account, requested directly: demo to validate freely (no
+  // downside, so it stays enabled by default once connected -- same behavior
+  // as before this existed) and a separate, real-money slot that only starts
+  // mattering once BOTH an admin has authorized it once (live_trading_authorized
+  // -- a deliberate, durable grant, not re-asked every time the switch flips)
+  // AND the account owner has turned it on themselves (live_trading_enabled).
+  // Both slots can run at once -- see activeBrokerSlots -- each tracked
+  // completely independently (open positions, daily loss, trades/day: see the
+  // broker_slot column added to analyses/trade_orders below) so a demo loss can
+  // never count against a real-money cap or vice versa.
+  await ensureColumn("auto_trading_accounts", "broker_demo_token text");
+  await ensureColumn("auto_trading_accounts", "broker_demo_account_id text");
+  await ensureColumn("auto_trading_accounts", "broker_demo_region text");
+  await ensureColumn("auto_trading_accounts", "broker_demo_connected_at text");
+  await ensureColumn("auto_trading_accounts", "broker_demo_last_check_status text");
+  await ensureColumn("auto_trading_accounts", "broker_demo_last_check_at text");
+  await ensureColumn("auto_trading_accounts", "demo_trading_enabled integer NOT NULL DEFAULT 1");
+  await ensureColumn("auto_trading_accounts", "broker_live_token text");
+  await ensureColumn("auto_trading_accounts", "broker_live_account_id text");
+  await ensureColumn("auto_trading_accounts", "broker_live_region text");
+  await ensureColumn("auto_trading_accounts", "broker_live_connected_at text");
+  await ensureColumn("auto_trading_accounts", "broker_live_last_check_status text");
+  await ensureColumn("auto_trading_accounts", "broker_live_last_check_at text");
+  await ensureColumn("auto_trading_accounts", "live_trading_enabled integer NOT NULL DEFAULT 0");
+  await ensureColumn("auto_trading_accounts", "live_trading_authorized integer NOT NULL DEFAULT 0");
+  await ensureColumn("auto_trading_accounts", "live_trading_authorized_at text");
+  await ensureColumn("auto_trading_accounts", "live_trading_authorized_by text");
+  await ensureColumn("analyses", "broker_slot text");
+  await ensureColumn("trade_orders", "broker_slot text");
+  // One-time backfill: every broker connection made before the dual-slot system
+  // existed was, in practice, always a demo MT5 account (this project never had
+  // a live-money connection before this) -- so the single old broker_* column
+  // set becomes the demo slot, never the live one, on migration. Guarded by
+  // "broker_demo_token IS NULL" so this only ever does something on the first
+  // startup after this column existed; every startup after that is a no-op.
+  // The old singular columns are left in place (never dropped -- see
+  // ensureColumn's own no-destructive-migrations convention) but nothing reads
+  // them anymore past this point.
+  try {
+    await runStatement(`UPDATE auto_trading_accounts SET
+        broker_demo_token = broker_token, broker_demo_account_id = broker_account_id,
+        broker_demo_region = broker_region, broker_demo_connected_at = broker_connected_at,
+        broker_demo_last_check_status = broker_last_check_status, broker_demo_last_check_at = broker_last_check_at
+      WHERE broker_token IS NOT NULL AND broker_demo_token IS NULL`);
+    await runStatement(`UPDATE analyses SET broker_slot = 'demo' WHERE source IN ('auto_signal', 'auto_scalp') AND broker_slot IS NULL`);
+    await runStatement(`UPDATE trade_orders SET broker_slot = 'demo' WHERE broker_slot IS NULL`);
+  } catch (error) {
+    logOnce("schema", `backfill dual-broker échoué (${error.message})`);
+  }
   // Must run after the ensureColumn above, not in the main statements list --
   // on a genuinely fresh database (no prior "source" column) this index used to
   // run before "source" existed and silently failed every time (caught live
@@ -707,9 +756,12 @@ const exhaustedKeys = new Map();
 // entry is the single most recent reason processAutoTradeForUser (or the tick-level
 // gates in runAutoTradeTick, for reasons that skip per-account processing entirely)
 // stopped there instead of opening a trade.
+// Keyed by "userId:slot" ('demo'/'live' tracked completely independently, same
+// as every other per-slot counter -- see activeBrokerSlots) so the dashboard can
+// answer "why isn't demo trading" separately from "why isn't live trading".
 const autoTradeTickStatus = new Map();
-function recordAutoTradeStatus(userId, reason, detail = null) {
-  autoTradeTickStatus.set(userId, { at: new Date().toISOString(), reason, detail });
+function recordAutoTradeStatus(userId, slot, reason, detail = null) {
+  autoTradeTickStatus.set(`${userId}:${slot}`, { at: new Date().toISOString(), reason, detail });
 }
 // USD/JPY and USD/CHF added 2026-08-13: scripts/backtest.mjs confirmed positive R
 // moyen on both train AND held-out test across all 11 parameter variants tried, no
@@ -1239,17 +1291,21 @@ function startAutoTradeScheduler() {
 async function runAutoTradeTick() {
   await ensureRelationalTables();
   const nowIso = new Date().toISOString();
-  // broker_connected_at IS NOT NULL, not just token/account presence -- credentials
-  // that failed their verification check are still saved (so the user can fix a
-  // typo without retyping everything) but must never be trusted for real execution.
+  // Either slot having a verified connection is enough to fetch the row -- which
+  // of demo/live is actually enabled+authorized (and therefore actually processed
+  // this tick) is activeBrokerSlots' job below, not this query's. A connection
+  // that failed its verification check is still saved (so the user can fix a typo
+  // without retyping everything) but broker_*_connected_at is only ever set on a
+  // real, verified success, so it's never trusted for real execution here.
   const accounts = await sqlAll(
     `SELECT * FROM auto_trading_accounts WHERE approval_status = 'approved' AND approved_until > ?
-     AND user_paused = 0 AND broker_token IS NOT NULL AND broker_account_id IS NOT NULL AND broker_connected_at IS NOT NULL`,
+     AND user_paused = 0 AND (broker_demo_connected_at IS NOT NULL OR broker_live_connected_at IS NOT NULL)`,
     [nowIso],
   );
   if (!accounts.length) return;
-  if ((await getAppSetting("trading_paused", "false")) === "true") { // same global kill switch as manual confirms
-    for (const account of accounts) recordAutoTradeStatus(account.user_id, "globally_paused_by_admin");
+  const globallyPaused = (await getAppSetting("trading_paused", "false")) === "true"; // same global kill switch as manual confirms
+  if (globallyPaused) {
+    for (const account of accounts) for (const slot of activeBrokerSlots(account)) recordAutoTradeStatus(account.user_id, slot, "globally_paused_by_admin");
     return;
   }
   // Reuse the exact cache the SSE broadcaster reads -- never a second, redundant
@@ -1260,13 +1316,15 @@ async function runAutoTradeTick() {
   const payload = stale ? await computeSignalsPayload() : cached;
   const tradable = (payload?.signals || []).filter((s) => s.direct && !s.suspended);
   if (!tradable.length) {
-    for (const account of accounts) recordAutoTradeStatus(account.user_id, "no_tradable_market_signals_this_tick");
+    for (const account of accounts) for (const slot of activeBrokerSlots(account)) recordAutoTradeStatus(account.user_id, slot, "no_tradable_market_signals_this_tick");
     return;
   }
   for (const account of accounts) {
-    await processAutoTradeForUser(account, tradable).catch((error) => {
-      logOnce(`auto-trade-user-${account.user_id}`, `bot échoué pour un utilisateur (${error.message})`);
-    });
+    for (const slot of activeBrokerSlots(account)) {
+      await processAutoTradeForUser(account, tradable, slot).catch((error) => {
+        logOnce(`auto-trade-user-${account.user_id}-${slot}`, `bot échoué pour un utilisateur (${error.message})`);
+      });
+    }
   }
 }
 
@@ -1301,15 +1359,17 @@ async function runScalpTradingTick() {
   // same non-negotiable safety floor as every other execution path.
   const accounts = await sqlAll(
     `SELECT * FROM auto_trading_accounts WHERE scalp_enabled = 1
-     AND user_paused = 0 AND broker_token IS NOT NULL AND broker_account_id IS NOT NULL AND broker_connected_at IS NOT NULL`,
+     AND user_paused = 0 AND (broker_demo_connected_at IS NOT NULL OR broker_live_connected_at IS NOT NULL)`,
     [],
   );
   if (!accounts.length) return;
   for (const account of accounts) {
-    const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
-    await processScalpForUser(account, credentials).catch((error) => {
-      logOnce(`scalp-user-${account.user_id}`, `scalp échoué pour un utilisateur (${error.message})`);
-    });
+    for (const slot of activeBrokerSlots(account)) {
+      const credentials = resolveBrokerCredentialsFromAccount(account, slot);
+      await processScalpForUser(account, credentials, slot).catch((error) => {
+        logOnce(`scalp-user-${account.user_id}-${slot}`, `scalp échoué pour un utilisateur (${error.message})`);
+      });
+    }
   }
 }
 
@@ -1318,13 +1378,17 @@ async function runScalpTradingTick() {
 // trade_orders.risk_percent_at_trade) -- an honest approximation, not an exact
 // broker-reported ledger (see the plan's flagged risk #4). Resets naturally at UTC
 // midnight since the query always starts from todayStart; no explicit reset job.
-async function dailyRealizedPnlPercent(userId) {
+// Every counter below takes `slot` ('demo'/'live') and filters on
+// analyses.broker_slot -- demo and live are independent books, so a fake demo
+// loss/position/trade-count must never count against a real-money cap and vice
+// versa (and a real loss must never be masked by a demo win, or the reverse).
+async function dailyRealizedPnlPercent(userId, slot) {
   const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
   const rows = await sqlAll(
     `SELECT a.r_multiple as r_multiple, o.risk_percent_at_trade as risk_percent
      FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
-     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.closed_at >= ? AND a.r_multiple IS NOT NULL`,
-    [userId, todayStart.toISOString()],
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.broker_slot = ? AND a.closed_at >= ? AND a.r_multiple IS NOT NULL`,
+    [userId, slot, todayStart.toISOString()],
   );
   return rows.reduce((sum, row) => {
     const r = Number(row.r_multiple), pct = Number(row.risk_percent);
@@ -1332,10 +1396,10 @@ async function dailyRealizedPnlPercent(userId) {
   }, 0);
 }
 
-async function countOpenAutoPositions(userId) {
+async function countOpenAutoPositions(userId, slot) {
   const row = await sqlGet(
-    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source = 'auto_signal' AND status = 'OPEN' AND active = 1`,
-    [userId],
+    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source = 'auto_signal' AND broker_slot = ? AND status = 'OPEN' AND active = 1`,
+    [userId, slot],
   );
   return Number(row?.n || 0);
 }
@@ -1344,14 +1408,14 @@ async function countOpenAutoPositions(userId) {
 // (capped by max_concurrent_positions), this counts every trade opened today
 // regardless of whether it's since closed -- nothing stopped the bot from opening
 // and closing many trades in the same day before max_trades_per_day existed.
-async function countAutoTradesOpenedToday(userId) {
+async function countAutoTradesOpenedToday(userId, slot) {
   const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
   // Excludes BLOCKED: a rejected order attempt (price moved, broker error, ...)
   // never became a real trade, so it shouldn't eat into a "trades per day" budget
   // meant to cap real market exposure.
   const row = await sqlGet(
-    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source = 'auto_signal' AND created_at >= ? AND status != 'BLOCKED'`,
-    [userId, todayStart.toISOString()],
+    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source = 'auto_signal' AND broker_slot = ? AND created_at >= ? AND status != 'BLOCKED'`,
+    [userId, slot, todayStart.toISOString()],
   );
   return Number(row?.n || 0);
 }
@@ -1362,12 +1426,12 @@ async function countAutoTradesOpenedToday(userId) {
 // whatever) doesn't map cleanly onto a single shared percentage. Only sums
 // broker_profit_amount, which is only ever set for real broker-backed closes (see
 // tryResolveBrokerBackedOutcome) -- exactly the trades this cap is meant to guard.
-async function dailyRealizedPnlAmount(userId) {
+async function dailyRealizedPnlAmount(userId, slot) {
   const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
   const row = await sqlGet(
     `SELECT SUM(a.broker_profit_amount) as total FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
-     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
-    [userId, todayStart.toISOString()],
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.broker_slot = ? AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
+    [userId, slot, todayStart.toISOString()],
   );
   return Number(row?.total) || 0;
 }
@@ -1428,44 +1492,46 @@ function resolveAdminRiskPercent(account, balance) {
   return eligible.length ? Number(eligible[0].riskPercent) : account.risk_percent;
 }
 
-async function processAutoTradeForUser(account, signals) {
+async function processAutoTradeForUser(account, signals, slot) {
   const userId = account.user_id;
   if (!isWithinWindow(account.trading_hours_start, account.trading_hours_end, account.trading_days))
-    return recordAutoTradeStatus(userId, "outside_admin_trading_hours");
+    return recordAutoTradeStatus(userId, slot, "outside_admin_trading_hours");
   if (!isWithinWindow(account.user_trading_hours_start, account.user_trading_hours_end, account.user_trading_days))
-    return recordAutoTradeStatus(userId, "outside_user_trading_hours");
+    return recordAutoTradeStatus(userId, slot, "outside_user_trading_hours");
   const approvedPairs = new Set(String(account.approved_pairs || "").split(",").filter(Boolean));
-  if (!approvedPairs.size) return recordAutoTradeStatus(userId, "no_approved_pairs");
+  if (!approvedPairs.size) return recordAutoTradeStatus(userId, slot, "no_approved_pairs");
   const minConfidence = combineTightened(account.min_confidence_floor || 70, account.user_min_confidence, "higher");
   const minRiskReward = combineTightened(account.min_risk_reward, account.user_min_risk_reward, "higher");
   const candidates = signals.filter((s) =>
     approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || Number(s.rr) >= minRiskReward),
   );
   if (!candidates.length)
-    return recordAutoTradeStatus(userId, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
+    return recordAutoTradeStatus(userId, slot, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
 
   const dailyLossLimitPercent = combineTightened(account.daily_loss_limit_percent || 3, account.user_daily_loss_limit_percent, "lower");
-  if ((await dailyRealizedPnlPercent(userId)) <= -dailyLossLimitPercent)
-    return recordAutoTradeStatus(userId, "daily_loss_limit_percent_reached", { dailyLossLimitPercent });
+  if ((await dailyRealizedPnlPercent(userId, slot)) <= -dailyLossLimitPercent)
+    return recordAutoTradeStatus(userId, slot, "daily_loss_limit_percent_reached", { dailyLossLimitPercent });
   const dailyLossLimitAmount = combineTightened(account.daily_loss_limit_amount, account.user_daily_loss_limit_amount, "lower");
-  if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId)) <= -dailyLossLimitAmount)
-    return recordAutoTradeStatus(userId, "daily_loss_limit_amount_reached", { dailyLossLimitAmount });
+  if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId, slot)) <= -dailyLossLimitAmount)
+    return recordAutoTradeStatus(userId, slot, "daily_loss_limit_amount_reached", { dailyLossLimitAmount });
 
   const maxConcurrent = combineTightened(account.max_concurrent_positions || 2, account.user_max_concurrent_positions, "lower");
-  let openCount = await countOpenAutoPositions(userId);
-  if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, "max_concurrent_positions_reached", { maxConcurrent, openCount });
+  let openCount = await countOpenAutoPositions(userId, slot);
+  if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, slot, "max_concurrent_positions_reached", { maxConcurrent, openCount });
   const maxTradesPerDay = combineTightened(account.max_trades_per_day, account.user_max_trades_per_day, "lower");
-  let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId) : 0;
+  let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId, slot) : 0;
   if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay)
-    return recordAutoTradeStatus(userId, "max_trades_per_day_reached", { maxTradesPerDay, tradesOpenedToday });
+    return recordAutoTradeStatus(userId, slot, "max_trades_per_day_reached", { maxTradesPerDay, tradesOpenedToday });
 
-  const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
-  const accountInfo = await getBrokerAccountInformation(credentials).catch(() => null);
-  if (!accountInfo || !(accountInfo.balance > 0)) return recordAutoTradeStatus(userId, "broker_unreachable"); // fail closed: no confirmed real balance, no trade
+  const credentials = resolveBrokerCredentialsFromAccount(account, slot);
+  const accountInfo = credentials ? await getBrokerAccountInformation(credentials).catch(() => null) : null;
+  if (!accountInfo || !(accountInfo.balance > 0)) return recordAutoTradeStatus(userId, slot, "broker_unreachable"); // fail closed: no confirmed real balance, no trade
 
   // Tiers need the REAL balance just fetched above, not a cached/approval-time
   // figure -- resolved fresh every tick so a balance that just crossed a tier
-  // threshold takes effect on the very next trade, not after some delay.
+  // threshold takes effect on the very next trade, not after some delay. Demo and
+  // live have their own balances, so a tier crossed on one slot has zero effect
+  // on the other's sizing.
   const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, accountInfo.balance), account.user_risk_percent, "lower");
 
   let openedThisTick = 0;
@@ -1474,17 +1540,21 @@ async function processAutoTradeForUser(account, signals) {
     if (openCount >= maxConcurrent) break;
     if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
     // Dedup: reuses `analyses` directly instead of a separate tracking table -- an
-    // OPEN auto_signal position already exists for this pair means this signal (or
-    // one like it) has already been acted on; don't fire again every tick while it's
-    // still live.
+    // OPEN auto_signal position already exists for this pair ON THIS SLOT means
+    // this signal (or one like it) has already been acted on there; don't fire
+    // again every tick while it's still live. Scoped to broker_slot, not just
+    // pair, so the same signal can legitimately be open on demo AND live at once
+    // -- they're independent books, not a single position being double-counted.
     const alreadyOpen = await sqlGet(
-      `SELECT 1 FROM analyses WHERE user_id = ? AND pair = ? AND source = 'auto_signal' AND status = 'OPEN' AND active = 1 LIMIT 1`,
-      [userId, signal.paire],
+      `SELECT 1 FROM analyses WHERE user_id = ? AND pair = ? AND source = 'auto_signal' AND status = 'OPEN' AND active = 1 AND broker_slot = ? LIMIT 1`,
+      [userId, signal.paire, slot],
     );
     if (alreadyOpen) { skipped.alreadyOpen += 1; continue; }
     // Hard block here (unlike the manual flow, where this is only advisory) --
     // there's no human to read a correlation warning in an unattended path.
-    if (await correlationWarnings(userId, signal.paire, signal.direction)) { skipped.correlation += 1; continue; }
+    // Scoped to this slot: a demo position isn't real exposure, so it can't
+    // create a correlation warning against a real live trade or vice versa.
+    if (await correlationWarnings(userId, signal.paire, signal.direction, null, slot)) { skipped.correlation += 1; continue; }
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) { skipped.noSpec += 1; continue; }
@@ -1512,12 +1582,13 @@ async function processAutoTradeForUser(account, signals) {
       status: "OPEN",
       technicalSnapshot: signal.quality || null,
       source: "auto_signal",
+      brokerSlot: slot,
     });
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
     await sqlRun(
-      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, risk_percent_at_trade)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?)`,
-      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, signal.tp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent],
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, risk_percent_at_trade, broker_slot)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?)`,
+      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, signal.tp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent, slot],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
@@ -1530,7 +1601,7 @@ async function processAutoTradeForUser(account, signals) {
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
-  recordAutoTradeStatus(userId, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, ...skipped });
+  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, ...skipped });
 }
 
 // clampVolumeToSpec both callers below need: round down to the broker's
@@ -1552,18 +1623,19 @@ function clampVolumeToSpec(rawVolume, specification) {
 // conservative), sized either automatically (risk exactly
 // scalp_loss_limit_amount if the stop is hit) or to a fixed lot the admin
 // imposes -- "priorite tout petit lot pour ne pas cramer le compte d'un coup".
-async function processScalpForUser(account, credentials) {
+async function processScalpForUser(account, credentials, slot) {
   if (!Number(account.scalp_enabled)) return;
   const scalpPairs = String(account.scalp_pairs || "").split(",").filter((p) => SCALP_PARAMS_BY_PAIR[p]);
   if (!scalpPairs.length) return;
   const userId = account.user_id;
 
-  // One open scalp position at a time -- keeps worst-case exposure bounded to
-  // a single scalp_loss_limit_amount (or fixed-lot equivalent) regardless of
-  // how many validated pairs are enabled.
+  // One open scalp position at a time PER SLOT -- keeps worst-case exposure on
+  // each book bounded to a single scalp_loss_limit_amount (or fixed-lot
+  // equivalent) regardless of how many validated pairs are enabled, and demo
+  // being open never blocks live (or the reverse) since they're independent.
   const alreadyOpen = await sqlGet(
-    `SELECT 1 FROM analyses WHERE user_id = ? AND source = 'auto_scalp' AND status = 'OPEN' AND active = 1 LIMIT 1`,
-    [userId],
+    `SELECT 1 FROM analyses WHERE user_id = ? AND source = 'auto_scalp' AND status = 'OPEN' AND active = 1 AND broker_slot = ? LIMIT 1`,
+    [userId, slot],
   );
   if (alreadyOpen) return;
 
@@ -1600,8 +1672,8 @@ async function processScalpForUser(account, credentials) {
       const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
       const todayLoss = await sqlGet(
         `SELECT SUM(a.broker_profit_amount) as total FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
-         WHERE o.user_id = ? AND a.source = 'auto_scalp' AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
-        [userId, todayStart.toISOString()],
+         WHERE o.user_id = ? AND a.source = 'auto_scalp' AND a.broker_slot = ? AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
+        [userId, slot, todayStart.toISOString()],
       );
       if (Number(todayLoss?.total) <= -dailyLossLimitAmount * 3) continue; // circuit breaker: 3 real scalp losses worth in one day, stop for today
     }
@@ -1626,6 +1698,7 @@ async function processScalpForUser(account, credentials) {
       active: true,
       status: "OPEN",
       source: "auto_scalp",
+      brokerSlot: slot,
     });
     // The admin's scalp_max_hold_seconds may only shorten the validated
     // signal's own hold time (30min for both pairs), never extend it past what
@@ -1635,9 +1708,9 @@ async function processScalpForUser(account, credentials) {
     const holdSeconds = account.scalp_max_hold_seconds > 0 ? Math.min(validatedHoldSeconds, account.scalp_max_hold_seconds) : validatedHoldSeconds;
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
     await sqlRun(
-      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?)`,
-      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, signal.tp, signal.tp, new Date().toISOString(), holdSeconds],
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds, broker_slot)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?)`,
+      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, signal.tp, signal.tp, new Date().toISOString(), holdSeconds, slot],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
@@ -1882,11 +1955,58 @@ async function handleApi(req, res, url) {
       scalpLotMode: row.scalp_lot_mode || "auto",
       scalpFixedLot: row.scalp_fixed_lot ?? null,
       userPaused: Boolean(Number(row.user_paused)),
-      brokerConnected: Boolean(row.broker_token && row.broker_account_id && row.broker_connected_at),
-      brokerLastCheckStatus: row.broker_last_check_status,
-      lastTick: autoTradeTickStatus.get(row.user_id) || null,
+      demo: {
+        brokerConnected: Boolean(row.broker_demo_token && row.broker_demo_account_id && row.broker_demo_connected_at),
+        brokerLastCheckStatus: row.broker_demo_last_check_status,
+        enabled: Boolean(Number(row.demo_trading_enabled ?? 1)),
+        lastTick: autoTradeTickStatus.get(`${row.user_id}:demo`) || null,
+      },
+      live: {
+        brokerConnected: Boolean(row.broker_live_token && row.broker_live_account_id && row.broker_live_connected_at),
+        brokerLastCheckStatus: row.broker_live_last_check_status,
+        enabled: Boolean(Number(row.live_trading_enabled)),
+        authorized: Boolean(Number(row.live_trading_authorized)),
+        authorizedAt: row.live_trading_authorized_at || null,
+        authorizedBy: row.live_trading_authorized_by || null,
+        lastTick: autoTradeTickStatus.get(`${row.user_id}:live`) || null,
+      },
     }));
     sendJson(res, 200, { ok: true, requests });
+    return;
+  }
+
+  // The one-time, durable grant that makes real money possible on an account at
+  // all -- deliberately separate from approval_status (pairs/risk/limits) and
+  // from the user's own live_trading_enabled switch, so revoking it instantly
+  // blocks BOTH the bot and any future manual "confirm on live" regardless of
+  // what the user has toggled on their side. Requested directly: admin
+  // authorizes once, the user then flips demo/live freely without asking again
+  // each time. `authorized: false` revokes; the row (and demo) are untouched.
+  if (url.pathname === "/api/admin/auto-trade/authorize-live") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    const body = await readBody(req);
+    const userId = String(body?.userId || "");
+    const authorized = Boolean(body?.authorized);
+    if (!userId) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    const user = await sqlGet(`SELECT id FROM users WHERE id = ?`, [userId]);
+    if (!user) return sendJson(res, 404, { ok: false, error: "user_not_found" });
+    const now = new Date().toISOString();
+    // UPSERT, not a bare UPDATE -- an admin may want to authorize an account
+    // before it has ever connected a broker (no auto_trading_accounts row yet).
+    // A plain UPDATE would silently affect zero rows in that case, exactly the
+    // scalp-settings bug found and fixed earlier this session.
+    await sqlRun(
+      `INSERT INTO auto_trading_accounts (user_id, live_trading_authorized, live_trading_authorized_at, live_trading_authorized_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET live_trading_authorized = excluded.live_trading_authorized,
+         live_trading_authorized_at = excluded.live_trading_authorized_at, live_trading_authorized_by = excluded.live_trading_authorized_by,
+         updated_at = excluded.updated_at`,
+      [userId, authorized ? 1 : 0, authorized ? now : null, authorized ? (admin.user?.email || "token") : null, now, now],
+    );
+    sendJson(res, 200, { ok: true, authorized });
     return;
   }
 
@@ -2249,14 +2369,28 @@ async function handleApi(req, res, url) {
       [order.id, session.user.id, analysis.id, order.pair, order.direction, order.entry, order.sl, order.tp1, order.tp2, order.status, order.createdAt],
     );
     const correlationWarning = await correlationWarnings(session.user.id, order.pair, order.direction);
-    sendJson(res, 200, { ok: true, order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null }, brokerConfigured: Boolean(await getUserBrokerCredentials(session.user.id)), correlationWarning });
+    const [demoConfigured, liveConfigured, authRow] = await Promise.all([
+      getUserBrokerCredentials(session.user.id, "demo"),
+      getUserBrokerCredentials(session.user.id, "live"),
+      sqlGet(`SELECT live_trading_authorized FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]),
+    ]);
+    sendJson(res, 200, {
+      ok: true,
+      order: { ...order, userId: session.user.id, analysisId: analysis.id, volume: null, brokerOrderId: null, errorMessage: null, confirmedAt: null, sentAt: null },
+      // .live means "connected AND admin-authorized", same as /api/trade/orders --
+      // this only ever feeds the confirm-time slot picker.
+      brokerConfigured: { demo: Boolean(demoConfigured), live: Boolean(liveConfigured) && Boolean(Number(authRow?.live_trading_authorized)) },
+      correlationWarning,
+    });
     return;
   }
 
   // The one call in this feature that can actually move money -- requires an
-  // explicit, still-pending order the caller owns, and a volume the human chose
+  // explicit, still-pending order the caller owns, a volume the human chose
   // (never auto-computed from account balance/risk%, on purpose: one less place a
-  // sizing bug could turn into a real loss).
+  // sizing bug could turn into a real loss), and now an explicit brokerSlot --
+  // there is no default, so a client bug can never silently send to the wrong
+  // book (especially wrong in the demo->live direction).
   if (url.pathname === "/api/trade/confirm") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -2264,13 +2398,23 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     const orderId = String(body?.orderId || "");
     const volume = Number(body?.volume);
+    const brokerSlot = String(body?.brokerSlot || "");
     if (!orderId || !Number.isFinite(volume) || volume <= 0) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    if (brokerSlot !== "demo" && brokerSlot !== "live") return sendJson(res, 400, { ok: false, error: "invalid_broker_slot" });
+    // Real money requires the admin's one-time grant, checked fresh every confirm
+    // (not cached from page load) -- a revoked authorization takes effect on the
+    // very next confirm attempt, not just future page loads.
+    if (brokerSlot === "live") {
+      const authRow = await sqlGet(`SELECT live_trading_authorized FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
+      if (!Number(authRow?.live_trading_authorized)) return sendJson(res, 403, { ok: false, error: "live_trading_not_authorized" });
+    }
     // Every user's own connected broker, never the shared house account -- a
     // logged-in user with no broker connected is blocked here, before the order or
     // the per-user lock is ever touched, rather than silently executing against
     // someone else's account. See getUserBrokerCredentials.
-    const credentials = await getUserBrokerCredentials(session.user.id);
+    const credentials = await getUserBrokerCredentials(session.user.id, brokerSlot);
     if (!credentials) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
+    await sqlRun(`UPDATE trade_orders SET broker_slot = ? WHERE id = ? AND user_id = ? AND status = 'PENDING_CONFIRMATION'`, [brokerSlot, orderId, session.user.id]);
     const result = await confirmAndSendOrder({ orderId, userId: session.user.id, volume, credentials });
     sendJson(res, result.status, result.body);
     return;
@@ -2333,13 +2477,23 @@ async function handleApi(req, res, url) {
         : null;
       return order;
     }));
-    sendJson(res, 200, { ok: true, orders, brokerConfigured: Boolean(await getUserBrokerCredentials(session.user.id)) });
+    const [demoConfigured, liveConfigured, authRow] = await Promise.all([
+      getUserBrokerCredentials(session.user.id, "demo"),
+      getUserBrokerCredentials(session.user.id, "live"),
+      sqlGet(`SELECT live_trading_authorized FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]),
+    ]);
+    // brokerConfigured.live means "connected AND admin-authorized" (not just
+    // connected) -- the only thing this feeds is the confirm-time slot picker,
+    // which must never offer an option that /api/trade/confirm would reject.
+    sendJson(res, 200, { ok: true, orders, brokerConfigured: { demo: Boolean(demoConfigured), live: Boolean(liveConfigured) && Boolean(Number(authRow?.live_trading_authorized)) } });
     return;
   }
 
   // Autonomous trading: user-facing surface. Premium-gated same as the semi-
   // automatic flow, but activation itself additionally requires admin approval --
   // hasPremiumAccess alone is never enough to make the bot actually run.
+  // slot ('demo'/'live') is required, no default -- see broker/disconnect below
+  // for why there's no shared fallback here either.
   if (url.pathname === "/api/auto-trade/broker/connect") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -2349,26 +2503,34 @@ async function handleApi(req, res, url) {
     const token = String(body?.token || "").trim();
     const accountId = String(body?.accountId || "").trim();
     const region = String(body?.region || "london").trim() || "london";
+    const slot = String(body?.slot || "");
     if (!token || !accountId) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    if (slot !== "demo" && slot !== "live") return sendJson(res, 400, { ok: false, error: "invalid_broker_slot" });
+    // Connecting a broker to the live slot is not the same as being allowed to
+    // trade it -- that's live_trading_authorized, granted separately by an admin
+    // (see /api/admin/auto-trade/authorize-live). A user can verify and save
+    // live credentials ahead of time; they just can't do anything with them
+    // until authorized.
     await ensureRelationalTables();
     const now = new Date().toISOString();
+    const c = brokerSlotColumns(slot);
     // Verified before saving, never claimed "connected" on faith -- a bad token or
     // wrong account id is caught here, not silently discovered days later when the
     // bot first tries to trade.
     const check = await getBrokerAccountInformation({ token, accountId, region }).catch((error) => ({ error: error.message }));
     if (check.error) {
       await sqlRun(
-        `INSERT INTO auto_trading_accounts (user_id, broker_token, broker_account_id, broker_region, broker_last_check_status, broker_last_check_at, approval_status, created_at, updated_at)
+        `INSERT INTO auto_trading_accounts (user_id, ${c.token}, ${c.accountId}, ${c.region}, ${c.lastCheckStatus}, ${c.lastCheckAt}, approval_status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'none', ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET broker_token = excluded.broker_token, broker_account_id = excluded.broker_account_id, broker_region = excluded.broker_region, broker_connected_at = NULL, broker_last_check_status = excluded.broker_last_check_status, broker_last_check_at = excluded.broker_last_check_at, updated_at = excluded.updated_at`,
+         ON CONFLICT(user_id) DO UPDATE SET ${c.token} = excluded.${c.token}, ${c.accountId} = excluded.${c.accountId}, ${c.region} = excluded.${c.region}, ${c.connectedAt} = NULL, ${c.lastCheckStatus} = excluded.${c.lastCheckStatus}, ${c.lastCheckAt} = excluded.${c.lastCheckAt}, updated_at = excluded.updated_at`,
         [session.user.id, token, accountId, region, `error: ${check.error}`, now, now, now],
       );
       return sendJson(res, 502, { ok: false, error: "broker_check_failed", message: check.error });
     }
     await sqlRun(
-      `INSERT INTO auto_trading_accounts (user_id, broker_token, broker_account_id, broker_region, broker_connected_at, broker_last_check_status, broker_last_check_at, approval_status, created_at, updated_at)
+      `INSERT INTO auto_trading_accounts (user_id, ${c.token}, ${c.accountId}, ${c.region}, ${c.connectedAt}, ${c.lastCheckStatus}, ${c.lastCheckAt}, approval_status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'ok', ?, 'none', ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET broker_token = excluded.broker_token, broker_account_id = excluded.broker_account_id, broker_region = excluded.broker_region, broker_connected_at = excluded.broker_connected_at, broker_last_check_status = 'ok', broker_last_check_at = excluded.broker_last_check_at, updated_at = excluded.updated_at`,
+       ON CONFLICT(user_id) DO UPDATE SET ${c.token} = excluded.${c.token}, ${c.accountId} = excluded.${c.accountId}, ${c.region} = excluded.${c.region}, ${c.connectedAt} = excluded.${c.connectedAt}, ${c.lastCheckStatus} = 'ok', ${c.lastCheckAt} = excluded.${c.lastCheckAt}, updated_at = excluded.updated_at`,
       [session.user.id, token, accountId, region, now, now, now, now],
     );
     sendJson(res, 200, { ok: true, balance: check.balance, currency: check.currency });
@@ -2379,12 +2541,17 @@ async function handleApi(req, res, url) {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const slot = String(body?.slot || "");
+    if (slot !== "demo" && slot !== "live") return sendJson(res, 400, { ok: false, error: "invalid_broker_slot" });
     await ensureRelationalTables();
-    // Nulling the credentials alone (not touching approval_status) means the
-    // scheduler's `broker_token IS NOT NULL` filter excludes this user immediately,
-    // and reconnecting later resumes without needing a fresh admin approval.
+    const c = brokerSlotColumns(slot);
+    // Nulling the credentials alone (not touching approval_status) means
+    // activeBrokerSlots excludes this user/slot immediately, and reconnecting
+    // later resumes without needing a fresh admin approval. The other slot (if
+    // connected) is completely untouched.
     await sqlRun(
-      `UPDATE auto_trading_accounts SET broker_token = NULL, broker_account_id = NULL, broker_connected_at = NULL, broker_last_check_status = NULL, updated_at = ? WHERE user_id = ?`,
+      `UPDATE auto_trading_accounts SET ${c.token} = NULL, ${c.accountId} = NULL, ${c.connectedAt} = NULL, ${c.lastCheckStatus} = NULL, updated_at = ? WHERE user_id = ?`,
       [new Date().toISOString(), session.user.id],
     );
     sendJson(res, 200, { ok: true });
@@ -2397,8 +2564,15 @@ async function handleApi(req, res, url) {
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     if (!hasPremiumAccess(session.user)) return sendJson(res, 403, { ok: false, error: "premium_required" });
     await ensureRelationalTables();
-    const row = await sqlGet(`SELECT broker_token, broker_account_id, broker_connected_at FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
-    if (!row?.broker_token || !row?.broker_account_id || !row?.broker_connected_at) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
+    // Either slot connected is enough to ask an admin for pairs/risk/limits
+    // approval -- that approval applies to the account, not to one specific
+    // slot (see activeBrokerSlots: it's demo/live enablement, not approval_status,
+    // that decides which slot the bot actually uses once approved).
+    const row = await sqlGet(
+      `SELECT broker_demo_connected_at, broker_live_connected_at FROM auto_trading_accounts WHERE user_id = ?`,
+      [session.user.id],
+    );
+    if (!row?.broker_demo_connected_at && !row?.broker_live_connected_at) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
     const now = new Date().toISOString();
     await sqlRun(
       `UPDATE auto_trading_accounts SET approval_status = 'requested', requested_at = ?, updated_at = ? WHERE user_id = ?`,
@@ -2416,6 +2590,37 @@ async function handleApi(req, res, url) {
     await sqlRun(
       `UPDATE auto_trading_accounts SET user_paused = ?, updated_at = ? WHERE user_id = ?`,
       [url.pathname === "/api/auto-trade/pause" ? 1 : 0, new Date().toISOString(), session.user.id],
+    );
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  // The account owner's own fast switch, requested directly so reacting to a
+  // market moment never waits on an admin round-trip: once live_trading_authorized
+  // is granted (once, by an admin -- see /api/admin/auto-trade/authorize-live),
+  // the owner flips demo/live on and off themselves, as often as they want. Turning
+  // live ON still requires the grant to be in place *right now* (checked fresh
+  // every call, not cached) and the live broker to already be connected --
+  // enabling a slot with nothing behind it would just silently do nothing later.
+  if (url.pathname === "/api/auto-trade/toggle-slot") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const slot = String(body?.slot || "");
+    const enabled = Boolean(body?.enabled);
+    if (slot !== "demo" && slot !== "live") return sendJson(res, 400, { ok: false, error: "invalid_broker_slot" });
+    await ensureRelationalTables();
+    const row = await sqlGet(`SELECT * FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
+    if (enabled) {
+      if (slot === "live" && !Number(row?.live_trading_authorized)) return sendJson(res, 403, { ok: false, error: "live_trading_not_authorized" });
+      if (!resolveBrokerCredentialsFromAccount(row || {}, slot)) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
+    }
+    const column = slot === "live" ? "live_trading_enabled" : "demo_trading_enabled";
+    await sqlRun(
+      `INSERT INTO auto_trading_accounts (user_id, ${column}, created_at, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET ${column} = excluded.${column}, updated_at = excluded.updated_at`,
+      [session.user.id, enabled ? 1 : 0, new Date().toISOString(), new Date().toISOString()],
     );
     sendJson(res, 200, { ok: true });
     return;
@@ -2478,10 +2683,11 @@ async function handleApi(req, res, url) {
     // Credentials that failed their verification check are still saved (so a user
     // fixing a typo doesn't have to retype everything -- see
     // /api/auto-trade/broker/connect), but their mere presence must never read as
-    // "connected": broker_connected_at is only set on a real, verified success.
+    // "connected": broker_*_connected_at is only set on a real, verified success.
     // Confirmed live this session: presence-only would show "✓ Broker connecté"
     // right after a 401 rejection.
-    const brokerConnected = Boolean(row?.broker_token && row?.broker_account_id && row?.broker_connected_at);
+    const demoConnected = Boolean(row?.broker_demo_token && row?.broker_demo_account_id && row?.broker_demo_connected_at);
+    const liveConnected = Boolean(row?.broker_live_token && row?.broker_live_account_id && row?.broker_live_connected_at);
     const now = new Date();
     const approvedUntil = row?.approved_until ? new Date(row.approved_until) : null;
     // Purely a display concept -- the scheduler's own `approved_until > now` filter
@@ -2520,15 +2726,28 @@ async function handleApi(req, res, url) {
       scalpLossLimitAmount: row?.scalp_loss_limit_amount ?? null,
       scalpMaxHoldSeconds: row?.scalp_max_hold_seconds ?? null,
       userPaused: Boolean(Number(row?.user_paused)),
-      brokerConnected,
-      brokerLastCheckStatus: row?.broker_last_check_status || null,
+      // Two independent books from here down -- demo always available once
+      // connected, live gated behind the admin's one-time grant (liveAuthorized)
+      // on top of the owner's own switch (liveTradingEnabled). See
+      // activeBrokerSlots: both can run at once, tracked completely separately.
+      demo: {
+        brokerConnected: demoConnected,
+        brokerLastCheckStatus: row?.broker_demo_last_check_status || null,
+        enabled: Boolean(Number(row?.demo_trading_enabled ?? 1)),
+        dailyPnlPercent: demoConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id, "demo")) * 100) / 100 : 0,
+        openPositions: demoConnected ? await countOpenAutoPositions(session.user.id, "demo") : 0,
+        lastTick: autoTradeTickStatus.get(`${session.user.id}:demo`) || null,
+      },
+      live: {
+        brokerConnected: liveConnected,
+        brokerLastCheckStatus: row?.broker_live_last_check_status || null,
+        authorized: Boolean(Number(row?.live_trading_authorized)),
+        enabled: Boolean(Number(row?.live_trading_enabled)),
+        dailyPnlPercent: liveConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id, "live")) * 100) / 100 : 0,
+        openPositions: liveConnected ? await countOpenAutoPositions(session.user.id, "live") : 0,
+        lastTick: autoTradeTickStatus.get(`${session.user.id}:live`) || null,
+      },
       rejectReason: row?.reject_reason || null,
-      dailyPnlPercent: brokerConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id)) * 100) / 100 : 0,
-      openPositions: brokerConnected ? await countOpenAutoPositions(session.user.id) : 0,
-      // "Why isn't it trading right now" -- see recordAutoTradeStatus. In-memory only
-      // (resets on restart/deploy), so a null here just means the tick loop hasn't run
-      // for this account since the server last started, not that something is wrong.
-      lastTick: autoTradeTickStatus.get(session.user.id) || null,
     });
     return;
   }
@@ -2562,21 +2781,26 @@ async function handleApi(req, res, url) {
   if (url.pathname === "/api/trade/live-positions") {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
-    const credentials = await getUserBrokerCredentials(session.user.id);
-    if (!credentials) return sendJson(res, 200, { ok: true, positions: [] });
-    const positions = await getBrokerOpenPositions(credentials).catch(() => null);
-    if (!positions) return sendJson(res, 200, { ok: true, positions: [], stale: true });
-    sendJson(res, 200, {
-      ok: true,
-      positions: positions.map((p) => ({
+    // Both connected slots polled in parallel and merged, each position tagged
+    // with which book it belongs to -- a real-money position must always be
+    // visually distinguishable from a demo one, never just mixed into one list.
+    let anyStale = false;
+    const bySlot = await Promise.all(["demo", "live"].map(async (slot) => {
+      const credentials = await getUserBrokerCredentials(session.user.id, slot);
+      if (!credentials) return [];
+      const positions = await getBrokerOpenPositions(credentials).catch(() => null);
+      if (!positions) { anyStale = true; return []; }
+      return positions.map((p) => ({
         id: String(p.id),
         symbol: p.symbol,
         currentPrice: Number(p.currentPrice),
         profit: Number(p.profit),
         stopLoss: Number.isFinite(Number(p.stopLoss)) ? Number(p.stopLoss) : null,
         takeProfit: Number.isFinite(Number(p.takeProfit)) ? Number(p.takeProfit) : null,
-      })),
-    });
+        brokerSlot: slot,
+      }));
+    }));
+    sendJson(res, 200, { ok: true, positions: bySlot.flat(), stale: anyStale });
     return;
   }
 
@@ -2682,20 +2906,20 @@ async function handleApi(req, res, url) {
     const userRow = await sqlGet(`SELECT notifications_seen_at, created_at FROM users WHERE id = ?`, [session.user.id]);
     const seenAt = userRow?.notifications_seen_at || userRow?.created_at || "1970-01-01T00:00:00.000Z";
     const opens = await sqlAll(
-      `SELECT id, pair, direction, entry, sl, sent_at as at FROM trade_orders
+      `SELECT id, pair, direction, entry, sl, sent_at as at, broker_slot FROM trade_orders
        WHERE user_id = ? AND status = 'SENT' AND broker_order_id IS NOT NULL AND sent_at IS NOT NULL
        ORDER BY sent_at DESC LIMIT 20`,
       [session.user.id],
     );
     const closes = await sqlAll(
-      `SELECT id, pair, direction, outcome, r_multiple, status, closed_at as at FROM analyses
+      `SELECT id, pair, direction, outcome, r_multiple, status, closed_at as at, broker_slot FROM analyses
        WHERE user_id = ? AND status != 'OPEN' AND closed_at IS NOT NULL AND is_test = ?
        ORDER BY closed_at DESC LIMIT 20`,
       [session.user.id, 0],
     );
     const items = [
-      ...opens.map((row) => ({ type: "opened", pair: row.pair, direction: row.direction, entry: row.entry, sl: row.sl, at: row.at })),
-      ...closes.map((row) => ({ type: "closed", pair: row.pair, direction: row.direction, status: row.status, outcome: row.outcome, rMultiple: row.r_multiple, at: row.at })),
+      ...opens.map((row) => ({ type: "opened", pair: row.pair, direction: row.direction, entry: row.entry, sl: row.sl, at: row.at, brokerSlot: row.broker_slot || null })),
+      ...closes.map((row) => ({ type: "closed", pair: row.pair, direction: row.direction, status: row.status, outcome: row.outcome, rMultiple: row.r_multiple, at: row.at, brokerSlot: row.broker_slot || null })),
     ].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 20);
     const count = items.filter((item) => new Date(item.at) > new Date(seenAt)).length;
     sendJson(res, 200, { ok: true, count, items });
@@ -8180,6 +8404,7 @@ function rowToAnalysis(row) {
     brokerProfitAmount: row.broker_profit_amount ?? null,
     isTest: Boolean(Number(row.is_test)),
     source: row.source || "manual",
+    brokerSlot: row.broker_slot || null,
   };
 }
 
@@ -8188,8 +8413,8 @@ async function upsertAnalysisRow(analysis) {
     `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth,
        direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal,
        image_quality, calibration, validation, technical_snapshot, multi_timeframe,
-       closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount, is_test, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount, is_test, source, broker_slot)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        user_id = excluded.user_id, status = excluded.status, block_reason = excluded.block_reason,
        closed_at = excluded.closed_at, close_price = excluded.close_price,
@@ -8230,6 +8455,7 @@ async function upsertAnalysisRow(analysis) {
       Number.isFinite(analysis.brokerProfitAmount) ? analysis.brokerProfitAmount : null,
       analysis.isTest ? 1 : 0,
       analysis.source || "manual",
+      analysis.brokerSlot || null,
     ],
   );
 }
@@ -8261,8 +8487,15 @@ function currencyExposure(pair, direction) {
 // check), this is a judgment call the trader should see and decide on, not something
 // Kronos can objectively call "wrong". Semi-automatic execution makes it easy to fire
 // off several orders in a row without noticing they're all the same underlying bet.
-async function correlationWarnings(userId, pair, direction, excludeOrderId = null) {
-  const rows = await sqlAll(`SELECT * FROM trade_orders WHERE user_id = ? AND status = 'SENT'`, [userId]);
+// slot is optional: omitted (prepare-time, advisory-only, nothing committed yet)
+// checks across both books combined since the user hasn't picked one yet; passed
+// (the autonomous bot's hard block, and confirm-time's authoritative re-check)
+// scopes to that one book -- a demo position is not real exposure and must never
+// warn against (or be warned against by) a real one.
+async function correlationWarnings(userId, pair, direction, excludeOrderId = null, slot = null) {
+  const rows = slot
+    ? await sqlAll(`SELECT * FROM trade_orders WHERE user_id = ? AND status = 'SENT' AND broker_slot = ?`, [userId, slot])
+    : await sqlAll(`SELECT * FROM trade_orders WHERE user_id = ? AND status = 'SENT'`, [userId]);
   const candidate = currencyExposure(pair, direction);
   const overlaps = [];
   for (const row of rows) {
@@ -8298,6 +8531,7 @@ function rowToTradeOrder(row) {
     createdAt: row.created_at,
     confirmedAt: row.confirmed_at || null,
     sentAt: row.sent_at || null,
+    brokerSlot: row.broker_slot || null,
   };
 }
 
@@ -8353,16 +8587,48 @@ function resolveBrokerCredentials(explicit) {
 // IS NOT NULL, not just token/account presence -- a failed verification still saves
 // the row so the user can retry without retyping, but must never be trusted for real
 // execution). Shared by /api/trade/confirm (semi-automatic) and the bot scheduler's
-// account list, so both flows read the exact same connection.
-async function getUserBrokerCredentials(userId) {
+// account list, so both flows read the exact same connection. `slot` is required
+// ('demo' or 'live') -- there is no "give me whichever is connected" fallback on
+// purpose, so a caller can never silently execute against the wrong money by
+// forgetting to specify one.
+function brokerSlotColumns(slot) {
+  if (slot !== "demo" && slot !== "live") throw new Error(`invalid_broker_slot: ${slot}`);
+  return {
+    token: `broker_${slot}_token`, accountId: `broker_${slot}_account_id`, region: `broker_${slot}_region`,
+    connectedAt: `broker_${slot}_connected_at`, lastCheckStatus: `broker_${slot}_last_check_status`, lastCheckAt: `broker_${slot}_last_check_at`,
+  };
+}
+
+// Row-level version -- no DB round trip, used where the account row is already in
+// hand (the bot schedulers, which already fetched the whole row for a tick).
+function resolveBrokerCredentialsFromAccount(account, slot) {
+  const c = brokerSlotColumns(slot);
+  if (!account[c.token] || !account[c.accountId] || !account[c.connectedAt]) return null;
+  return { token: account[c.token], accountId: account[c.accountId], region: account[c.region] || "new-york" };
+}
+
+// Which slots the autonomous bot should actually process this tick for a given
+// account: connected AND the owner has turned that slot on, and -- for live --
+// only after an admin's one-time authorization. Order matters nowhere downstream
+// (both processed independently), but demo first keeps logs/diagnostics reading
+// in the order most people think about them.
+function activeBrokerSlots(account) {
+  const slots = [];
+  if (Number(account.demo_trading_enabled) && resolveBrokerCredentialsFromAccount(account, "demo")) slots.push("demo");
+  if (Number(account.live_trading_enabled) && Number(account.live_trading_authorized) && resolveBrokerCredentialsFromAccount(account, "live")) slots.push("live");
+  return slots;
+}
+
+async function getUserBrokerCredentials(userId, slot) {
   await ensureRelationalTables();
+  const c = brokerSlotColumns(slot);
   const row = await sqlGet(
-    `SELECT broker_token, broker_account_id, broker_region FROM auto_trading_accounts
-     WHERE user_id = ? AND broker_token IS NOT NULL AND broker_account_id IS NOT NULL AND broker_connected_at IS NOT NULL`,
+    `SELECT ${c.token} as token, ${c.accountId} as account_id, ${c.region} as region FROM auto_trading_accounts
+     WHERE user_id = ? AND ${c.token} IS NOT NULL AND ${c.accountId} IS NOT NULL AND ${c.connectedAt} IS NOT NULL`,
     [userId],
   );
   if (!row) return null;
-  return { token: row.broker_token, accountId: row.broker_account_id, region: row.broker_region || "new-york" };
+  return { token: row.token, accountId: row.account_id, region: row.region || "new-york" };
 }
 
 async function sendOrderToBroker(order, credentials = null) {
@@ -8816,10 +9082,12 @@ async function recordLearningAnalysis(result, body, context) {
 async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, credentialsCache) {
   const brokerOrder = brokerOrderByAnalysisId.get(analysis.id);
   if (!brokerOrder) return null;
-  if (!credentialsCache.has(brokerOrder.user_id)) {
-    credentialsCache.set(brokerOrder.user_id, await getUserBrokerCredentials(brokerOrder.user_id).catch(() => null));
+  const slot = brokerOrder.broker_slot || "demo"; // pre-dual-broker rows have no slot -- backfilled to demo, see ensureRelationalTables
+  const cacheKey = `${brokerOrder.user_id}:${slot}`;
+  if (!credentialsCache.has(cacheKey)) {
+    credentialsCache.set(cacheKey, await getUserBrokerCredentials(brokerOrder.user_id, slot).catch(() => null));
   }
-  const credentials = credentialsCache.get(brokerOrder.user_id);
+  const credentials = credentialsCache.get(cacheKey);
   if (!credentials) return null;
   const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
   if (brokerOutcome?.status === "still_open") return { stillOpen: true }; // confirmed still live at the broker -- no 24h EXPIRED fallback needed, this is authoritative
@@ -8862,7 +9130,7 @@ async function reconcileBrokerBackedOutcomes() {
     await withFileLock("learning-log", async () => {
       await ensureRelationalTables();
       const brokerOrderRows = await sqlAll(
-        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id
+        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id, o.broker_slot as broker_slot
          FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
         [],
       );
@@ -8909,7 +9177,7 @@ async function checkScalpTimeouts() {
   try {
     await ensureRelationalTables();
     const rows = await sqlAll(
-      `SELECT a.id as analysis_id, a.user_id as user_id, o.broker_order_id as broker_order_id, o.sent_at as sent_at, o.scalp_max_hold_seconds as scalp_max_hold_seconds
+      `SELECT a.id as analysis_id, a.user_id as user_id, a.broker_slot as broker_slot, o.broker_order_id as broker_order_id, o.sent_at as sent_at, o.scalp_max_hold_seconds as scalp_max_hold_seconds
        FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
        WHERE a.status = 'OPEN' AND a.source = 'auto_scalp' AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL AND o.sent_at IS NOT NULL`,
       [],
@@ -8920,10 +9188,12 @@ async function checkScalpTimeouts() {
       const heldSeconds = (Date.now() - new Date(row.sent_at).getTime()) / 1000;
       const maxHold = Number(row.scalp_max_hold_seconds) || 0;
       if (!maxHold || heldSeconds < maxHold) continue;
-      if (!credentialsCache.has(row.user_id)) {
-        credentialsCache.set(row.user_id, await getUserBrokerCredentials(row.user_id).catch(() => null));
+      const slot = row.broker_slot || "demo";
+      const cacheKey = `${row.user_id}:${slot}`;
+      if (!credentialsCache.has(cacheKey)) {
+        credentialsCache.set(cacheKey, await getUserBrokerCredentials(row.user_id, slot).catch(() => null));
       }
-      const credentials = credentialsCache.get(row.user_id);
+      const credentials = credentialsCache.get(cacheKey);
       if (!credentials) continue;
       // Not resolved here -- just asks the broker to close it; the existing fast
       // reconcile scheduler picks up the resulting close (real price, real
@@ -8956,7 +9226,7 @@ async function updateLearningOutcomes(prices = null, histories = null) {
     if (openRows.length) {
       const livePrices = prices || await getPrices();
       const brokerOrderRows = await sqlAll(
-        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id
+        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id, o.broker_slot as broker_slot
          FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
         [],
       );
@@ -9419,6 +9689,7 @@ function personalAnalysesPayload(log, userId) {
       brokerProfitAmount: Number.isFinite(item.brokerProfitAmount) ? item.brokerProfitAmount : null,
       closePrice: Number.isFinite(item.closePrice) ? item.closePrice : null,
       closedAt: item.closedAt || null,
+      brokerSlot: item.brokerSlot || null,
     })),
   };
 }

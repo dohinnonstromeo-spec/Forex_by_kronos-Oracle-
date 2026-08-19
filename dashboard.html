@@ -122,19 +122,37 @@
               <h2 class="analysis-title" data-cms="dashboard.broker.title">Connexion broker</h2>
             </div>
           </div>
-          <p class="dashboard-trade-note" data-cms="dashboard.broker.intro">Connecte ton propre compte broker une seule fois ici — il sert aussi bien à l'exécution semi-automatique (ci-dessous) qu'au robot 100% automatique (plus bas). Aucun ordre n'utilise jamais un autre compte que le tien.</p>
-          <div class="dashboard-autotrade-section">
-            <p class="dashboard-history-note" data-cms="dashboard.broker.instructions" data-cms-html>Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
-            <form class="dashboard-autotrade-form" data-autotrade-broker-form>
-              <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
-              <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
-              <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
-              <button type="submit" class="payment-method-button">Connecter mon broker</button>
-            </form>
-            <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message hidden></p>
-            <div class="dashboard-autotrade-connected" data-autotrade-broker-connected hidden>
-              <span>✓ Broker connecté</span>
-              <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect>Déconnecter</button>
+          <p class="dashboard-trade-note" data-cms="dashboard.broker.intro">Connecte jusqu'à deux comptes broker : un <strong>démo</strong> pour tester librement, et un <strong>réel</strong> une fois prêt (nécessite une autorisation admin -- section Robot Kronos plus bas). Les deux servent à l'exécution semi-automatique et au robot. Aucun ordre n'utilise jamais un autre compte que le tien.</p>
+          <p class="dashboard-history-note" data-cms="dashboard.broker.instructions" data-cms-html>Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
+          <div class="dashboard-broker-slots">
+            <div class="dashboard-autotrade-section" data-broker-slot-panel="demo">
+              <h3>Compte démo</h3>
+              <form class="dashboard-autotrade-form" data-autotrade-broker-form="demo">
+                <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
+                <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
+                <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
+                <button type="submit" class="payment-method-button">Connecter le démo</button>
+              </form>
+              <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message="demo" hidden></p>
+              <div class="dashboard-autotrade-connected" data-autotrade-broker-connected="demo" hidden>
+                <span>✓ Démo connecté</span>
+                <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect="demo">Déconnecter</button>
+              </div>
+            </div>
+            <div class="dashboard-autotrade-section" data-broker-slot-panel="live">
+              <h3>Compte réel</h3>
+              <p class="dashboard-history-note dashboard-live-locked" data-live-locked-note hidden>🔒 Réservé : demande à l'administrateur d'autoriser ce compte pour le réel (section Robot Kronos) avant de pouvoir connecter un vrai compte broker ici.</p>
+              <form class="dashboard-autotrade-form" data-autotrade-broker-form="live" hidden>
+                <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
+                <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
+                <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
+                <button type="submit" class="payment-method-button">Connecter le réel</button>
+              </form>
+              <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message="live" hidden></p>
+              <div class="dashboard-autotrade-connected" data-autotrade-broker-connected="live" hidden>
+                <span>✓ Réel connecté</span>
+                <button type="button" class="dashboard-trade-cancel" data-autotrade-broker-disconnect="live">Déconnecter</button>
+              </div>
             </div>
           </div>
         </section>
@@ -168,10 +186,27 @@
           <div class="dashboard-autotrade-section" data-autotrade-activation-section hidden>
             <h3 data-cms="dashboard.autotrade.activation_title">Activation</h3>
             <p class="dashboard-history-note" data-autotrade-status-text></p>
-            <div class="dashboard-autotrade-metrics" data-autotrade-metrics hidden></div>
             <button type="button" class="payment-method-button" data-autotrade-request hidden>Demander l'activation</button>
             <button type="button" class="dashboard-trade-cancel" data-autotrade-pause hidden>Mettre en pause</button>
             <button type="button" class="payment-method-button" data-autotrade-resume hidden>Reprendre</button>
+          </div>
+
+          <div class="dashboard-autotrade-section dashboard-broker-slots" data-autotrade-slots-section hidden>
+            <div data-autotrade-slot-block="demo">
+              <div class="dashboard-slot-head">
+                <h3>Démo</h3>
+                <label class="dashboard-slot-switch"><input type="checkbox" data-slot-toggle="demo"> Actif</label>
+              </div>
+              <div class="dashboard-autotrade-metrics" data-slot-metrics="demo"></div>
+            </div>
+            <div data-autotrade-slot-block="live">
+              <div class="dashboard-slot-head">
+                <h3>Réel</h3>
+                <label class="dashboard-slot-switch"><input type="checkbox" data-slot-toggle="live"> Actif</label>
+              </div>
+              <p class="dashboard-history-note dashboard-live-locked" data-live-slot-locked-note hidden>🔒 Pas encore autorisé par l'administrateur -- demande l'autorisation avant de pouvoir activer le réel ici.</p>
+              <div class="dashboard-autotrade-metrics" data-slot-metrics="live"></div>
+            </div>
           </div>
 
           <div class="dashboard-autotrade-section" data-autotrade-preferences-section hidden>
