@@ -698,6 +698,19 @@ const rotationCounters = {
   marketaux: 0,
 };
 const exhaustedKeys = new Map();
+
+// In-memory, not persisted -- resets on restart, which is fine: this answers "why
+// isn't the bot trading *right now*", not an audit trail. Requested directly after
+// two reports that looked like bugs (limits "not applying", the bot going silent for
+// 8h+) but turned out, on live testing, to be the gating logic working exactly as
+// configured with zero visibility into which gate was active. Keyed by userId; each
+// entry is the single most recent reason processAutoTradeForUser (or the tick-level
+// gates in runAutoTradeTick, for reasons that skip per-account processing entirely)
+// stopped there instead of opening a trade.
+const autoTradeTickStatus = new Map();
+function recordAutoTradeStatus(userId, reason, detail = null) {
+  autoTradeTickStatus.set(userId, { at: new Date().toISOString(), reason, detail });
+}
 // USD/JPY and USD/CHF added 2026-08-13: scripts/backtest.mjs confirmed positive R
 // moyen on both train AND held-out test across all 11 parameter variants tried, no
 // exceptions (USD/JPY: +0.129 to +0.374 train / +0.018 to +0.446 test; USD/CHF:
@@ -1224,7 +1237,6 @@ function startAutoTradeScheduler() {
 }
 
 async function runAutoTradeTick() {
-  if ((await getAppSetting("trading_paused", "false")) === "true") return; // same global kill switch as manual confirms
   await ensureRelationalTables();
   const nowIso = new Date().toISOString();
   // broker_connected_at IS NOT NULL, not just token/account presence -- credentials
@@ -1236,6 +1248,10 @@ async function runAutoTradeTick() {
     [nowIso],
   );
   if (!accounts.length) return;
+  if ((await getAppSetting("trading_paused", "false")) === "true") { // same global kill switch as manual confirms
+    for (const account of accounts) recordAutoTradeStatus(account.user_id, "globally_paused_by_admin");
+    return;
+  }
   // Reuse the exact cache the SSE broadcaster reads -- never a second, redundant
   // computeSignalsPayload() cycle running in parallel to the one the homepage
   // already triggers.
@@ -1243,7 +1259,10 @@ async function runAutoTradeTick() {
   const stale = !cached || Date.now() >= memoryCache.signals.expiresAt;
   const payload = stale ? await computeSignalsPayload() : cached;
   const tradable = (payload?.signals || []).filter((s) => s.direct && !s.suspended);
-  if (!tradable.length) return;
+  if (!tradable.length) {
+    for (const account of accounts) recordAutoTradeStatus(account.user_id, "no_tradable_market_signals_this_tick");
+    return;
+  }
   for (const account of accounts) {
     await processAutoTradeForUser(account, tradable).catch((error) => {
       logOnce(`auto-trade-user-${account.user_id}`, `bot échoué pour un utilisateur (${error.message})`);
@@ -1411,38 +1430,46 @@ function resolveAdminRiskPercent(account, balance) {
 
 async function processAutoTradeForUser(account, signals) {
   const userId = account.user_id;
-  if (!isWithinWindow(account.trading_hours_start, account.trading_hours_end, account.trading_days)) return;
-  if (!isWithinWindow(account.user_trading_hours_start, account.user_trading_hours_end, account.user_trading_days)) return;
+  if (!isWithinWindow(account.trading_hours_start, account.trading_hours_end, account.trading_days))
+    return recordAutoTradeStatus(userId, "outside_admin_trading_hours");
+  if (!isWithinWindow(account.user_trading_hours_start, account.user_trading_hours_end, account.user_trading_days))
+    return recordAutoTradeStatus(userId, "outside_user_trading_hours");
   const approvedPairs = new Set(String(account.approved_pairs || "").split(",").filter(Boolean));
-  if (!approvedPairs.size) return;
+  if (!approvedPairs.size) return recordAutoTradeStatus(userId, "no_approved_pairs");
   const minConfidence = combineTightened(account.min_confidence_floor || 70, account.user_min_confidence, "higher");
   const minRiskReward = combineTightened(account.min_risk_reward, account.user_min_risk_reward, "higher");
   const candidates = signals.filter((s) =>
     approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || Number(s.rr) >= minRiskReward),
   );
-  if (!candidates.length) return;
+  if (!candidates.length)
+    return recordAutoTradeStatus(userId, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
 
   const dailyLossLimitPercent = combineTightened(account.daily_loss_limit_percent || 3, account.user_daily_loss_limit_percent, "lower");
-  if ((await dailyRealizedPnlPercent(userId)) <= -dailyLossLimitPercent) return;
+  if ((await dailyRealizedPnlPercent(userId)) <= -dailyLossLimitPercent)
+    return recordAutoTradeStatus(userId, "daily_loss_limit_percent_reached", { dailyLossLimitPercent });
   const dailyLossLimitAmount = combineTightened(account.daily_loss_limit_amount, account.user_daily_loss_limit_amount, "lower");
-  if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId)) <= -dailyLossLimitAmount) return;
+  if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId)) <= -dailyLossLimitAmount)
+    return recordAutoTradeStatus(userId, "daily_loss_limit_amount_reached", { dailyLossLimitAmount });
 
   const maxConcurrent = combineTightened(account.max_concurrent_positions || 2, account.user_max_concurrent_positions, "lower");
   let openCount = await countOpenAutoPositions(userId);
-  if (openCount >= maxConcurrent) return;
+  if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, "max_concurrent_positions_reached", { maxConcurrent, openCount });
   const maxTradesPerDay = combineTightened(account.max_trades_per_day, account.user_max_trades_per_day, "lower");
   let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId) : 0;
-  if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) return;
+  if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay)
+    return recordAutoTradeStatus(userId, "max_trades_per_day_reached", { maxTradesPerDay, tradesOpenedToday });
 
   const credentials = { token: account.broker_token, accountId: account.broker_account_id, region: account.broker_region || "new-york" };
   const accountInfo = await getBrokerAccountInformation(credentials).catch(() => null);
-  if (!accountInfo || !(accountInfo.balance > 0)) return; // fail closed: no confirmed real balance, no trade
+  if (!accountInfo || !(accountInfo.balance > 0)) return recordAutoTradeStatus(userId, "broker_unreachable"); // fail closed: no confirmed real balance, no trade
 
   // Tiers need the REAL balance just fetched above, not a cached/approval-time
   // figure -- resolved fresh every tick so a balance that just crossed a tier
   // threshold takes effect on the very next trade, not after some delay.
   const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, accountInfo.balance), account.user_risk_percent, "lower");
 
+  let openedThisTick = 0;
+  const skipped = { alreadyOpen: 0, correlation: 0, noSpec: 0, noVolume: 0, rejected: 0 };
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
     if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
@@ -1454,15 +1481,15 @@ async function processAutoTradeForUser(account, signals) {
       `SELECT 1 FROM analyses WHERE user_id = ? AND pair = ? AND source = 'auto_signal' AND status = 'OPEN' AND active = 1 LIMIT 1`,
       [userId, signal.paire],
     );
-    if (alreadyOpen) continue;
+    if (alreadyOpen) { skipped.alreadyOpen += 1; continue; }
     // Hard block here (unlike the manual flow, where this is only advisory) --
     // there's no human to read a correlation warning in an unattended path.
-    if (await correlationWarnings(userId, signal.paire, signal.direction)) continue;
+    if (await correlationWarnings(userId, signal.paire, signal.direction)) { skipped.correlation += 1; continue; }
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
-    if (!specification) continue;
+    if (!specification) { skipped.noSpec += 1; continue; }
     const volume = computeAutoTradeVolume({ balance: accountInfo.balance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification });
-    if (!volume) continue;
+    if (!volume) { skipped.noVolume += 1; continue; }
 
     const analysisId = `auto_${Date.now()}_${randomBytes(4).toString("hex")}`;
     await upsertAnalysisRow({
@@ -1497,10 +1524,13 @@ async function processAutoTradeForUser(account, signals) {
     if (result.status === 200) {
       openCount += 1;
       tradesOpenedToday += 1;
+      openedThisTick += 1;
     } else {
+      skipped.rejected += 1;
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
+  recordAutoTradeStatus(userId, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, ...skipped });
 }
 
 // clampVolumeToSpec both callers below need: round down to the broker's
@@ -1854,6 +1884,7 @@ async function handleApi(req, res, url) {
       userPaused: Boolean(Number(row.user_paused)),
       brokerConnected: Boolean(row.broker_token && row.broker_account_id && row.broker_connected_at),
       brokerLastCheckStatus: row.broker_last_check_status,
+      lastTick: autoTradeTickStatus.get(row.user_id) || null,
     }));
     sendJson(res, 200, { ok: true, requests });
     return;
@@ -2494,6 +2525,10 @@ async function handleApi(req, res, url) {
       rejectReason: row?.reject_reason || null,
       dailyPnlPercent: brokerConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id)) * 100) / 100 : 0,
       openPositions: brokerConnected ? await countOpenAutoPositions(session.user.id) : 0,
+      // "Why isn't it trading right now" -- see recordAutoTradeStatus. In-memory only
+      // (resets on restart/deploy), so a null here just means the tick loop hasn't run
+      // for this account since the server last started, not that something is wrong.
+      lastTick: autoTradeTickStatus.get(session.user.id) || null,
     });
     return;
   }

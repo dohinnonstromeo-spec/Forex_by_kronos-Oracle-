@@ -833,6 +833,33 @@
     if (brokerForm) brokerForm.hidden = connected;
   }
 
+  // Mirrors server.mjs's recordAutoTradeStatus reason codes -- answers "why hasn't
+  // it traded in the last N hours" without the user having to guess between a bug
+  // and the bot correctly waiting for a real setup (the two reports that motivated
+  // building this: limits that looked ignored, and long quiet stretches with zero
+  // explanation).
+  const AUTOTRADE_TICK_REASON_LABELS = {
+    outside_admin_trading_hours: "Hors des horaires de trading définis par l'administrateur",
+    outside_user_trading_hours: "Hors de tes horaires de trading personnalisés",
+    no_approved_pairs: "Aucune paire approuvée sur ce compte",
+    no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil de confiance ou de R:R requis",
+    daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte -- reprend demain",
+    daily_loss_limit_amount_reached: "Limite de perte quotidienne ($) atteinte -- reprend demain",
+    max_concurrent_positions_reached: "Nombre maximum de positions ouvertes déjà atteint",
+    max_trades_per_day_reached: "Nombre maximum de trades/jour déjà atteint",
+    broker_unreachable: "Broker injoignable au dernier passage (solde non confirmé)",
+    opened_trade: "Position ouverte lors de la dernière évaluation",
+    no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
+    globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
+    no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché à cet instant -- normal, pas une erreur",
+  };
+
+  function autoTradeTickSummary(lastTick) {
+    if (!lastTick) return "Pas encore évalué depuis le dernier démarrage du serveur";
+    const label = AUTOTRADE_TICK_REASON_LABELS[lastTick.reason] || lastTick.reason;
+    return `${label} (${formatDate(lastTick.at)})`;
+  }
+
   async function refreshAutoTradeStatus() {
     const status = await fetchJson("/api/auto-trade/status");
     if (!status?.ok) return;
@@ -885,6 +912,7 @@
           ["P&L du jour", `${status.dailyPnlPercent >= 0 ? "+" : ""}${status.dailyPnlPercent}%`],
           ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
           ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
+          ["Dernière évaluation", autoTradeTickSummary(status.lastTick)],
         ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
       }
       if (historySection) historySection.hidden = false;

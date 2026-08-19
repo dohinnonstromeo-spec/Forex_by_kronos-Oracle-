@@ -222,6 +222,31 @@
     revoked: "Révoqué",
   };
 
+  // Mirrors server.mjs's recordAutoTradeStatus reason codes -- lets the admin see
+  // directly, per account, why the bot did or didn't trade on its last pass instead
+  // of guessing between "a limit is bugged" and "it's correctly waiting" (the two
+  // reports -- limits looking ignored, 8h+ of silence -- that motivated this).
+  const AUTOTRADE_TICK_REASON_LABELS = {
+    outside_admin_trading_hours: "Hors horaires admin",
+    outside_user_trading_hours: "Hors horaires utilisateur",
+    no_approved_pairs: "Aucune paire approuvée",
+    no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil confiance/R:R",
+    daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte",
+    daily_loss_limit_amount_reached: "Limite de perte quotidienne ($) atteinte",
+    max_concurrent_positions_reached: "Max positions ouvertes atteint",
+    max_trades_per_day_reached: "Max trades/jour atteint",
+    broker_unreachable: "Broker injoignable au dernier passage",
+    opened_trade: "Position ouverte au dernier passage",
+    no_valid_setup_this_tick: "Signal(s) repéré(s), aucun n'a passé les vérifications finales",
+    globally_paused_by_admin: "Trading suspendu globalement",
+    no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché (normal)",
+  };
+  function autoTradeTickSummary(lastTick) {
+    if (!lastTick) return "Pas encore évalué depuis le dernier démarrage serveur";
+    const label = AUTOTRADE_TICK_REASON_LABELS[lastTick.reason] || lastTick.reason;
+    return `${label} (${formatDate(lastTick.at)})`;
+  }
+
   const autotradeLoad = document.querySelector("[data-autotrade-load]");
   const autotradeRequests = document.querySelector("[data-autotrade-requests]");
 
@@ -253,6 +278,7 @@
             ${request.approvalStatus === "approved" ? `· jusqu'au ${formatDate(request.approvedUntil)}` : ""}
             · broker ${request.brokerConnected ? "connecté" : "non connecté"}
           </span>
+          ${request.approvalStatus === "approved" ? `<span class="dashboard-autotrade-hint">Dernier passage : ${escapeHtml(autoTradeTickSummary(request.lastTick))}</span>` : ""}
         </div>
         <div class="dashboard-autotrade-pairs" data-trading-pairs>
           ${AUTOTRADE_PAIRS.map((pair) => `
