@@ -851,6 +851,26 @@
       });
     });
 
+    document.querySelector("[data-scalp-toggle]")?.addEventListener("change", async (event) => {
+      const checkbox = event.currentTarget;
+      const enabled = checkbox.checked;
+      checkbox.disabled = true;
+      try {
+        const response = await fetch("/api/auto-trade/toggle-scalp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await response.json();
+        if (!result.ok) checkbox.checked = !enabled; // revert on rejection (e.g. not yet authorized)
+      } catch {
+        checkbox.checked = !enabled;
+      } finally {
+        checkbox.disabled = false;
+        await refreshAutoTradeStatus();
+      }
+    });
+
     document.querySelector("[data-autotrade-request]")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -936,6 +956,15 @@
     const activationSection = document.querySelector("[data-autotrade-activation-section]");
     if (activationSection) activationSection.hidden = !anyBrokerConnected;
 
+    // Scalp is deliberately independent of the swing bot's own approval_status
+    // (see server.mjs) -- shown as soon as a broker is connected at all, not
+    // gated behind swing being approved.
+    const scalpSection = document.querySelector("[data-scalp-section]");
+    if (scalpSection) {
+      scalpSection.hidden = !anyBrokerConnected;
+      if (anyBrokerConnected) renderScalpSection(status);
+    }
+
     const statusText = document.querySelector("[data-autotrade-status-text]");
     const requestButton = document.querySelector("[data-autotrade-request]");
     const pauseButton = document.querySelector("[data-autotrade-pause]");
@@ -1003,6 +1032,30 @@
       ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
       ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
       ["Dernière évaluation", autoTradeTickSummary(slotStatus.lastTick)],
+    ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+  }
+
+  // Same authorize-once/enable-freely split as the demo/live slots, but for
+  // scalp mode: scalpEnabled is the admin's grant (and where pairs/lot mode/
+  // amounts come from -- all read-only here, configured admin-side only),
+  // scalpUserEnabled is the owner's own switch.
+  function renderScalpSection(status) {
+    const toggle = document.querySelector("[data-scalp-toggle]");
+    if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.scalpUserEnabled);
+    if (toggle) toggle.disabled = !status.scalpEnabled;
+    const lockedNote = document.querySelector("[data-scalp-locked-note]");
+    if (lockedNote) lockedNote.hidden = Boolean(status.scalpEnabled);
+    const metrics = document.querySelector("[data-scalp-metrics]");
+    if (!metrics) return;
+    if (!status.scalpEnabled) {
+      metrics.innerHTML = "";
+      return;
+    }
+    metrics.innerHTML = [
+      ["Paires", status.scalpPairs?.length ? status.scalpPairs.join(", ") : "—"],
+      ["Mode de lot", status.scalpLotMode === "fixed" ? `Fixe (${status.scalpFixedLot ?? "—"})` : "Automatique"],
+      ["Perte max / trade", status.scalpLossLimitAmount != null ? `${status.scalpLossLimitAmount}` : "—"],
+      ["Durée max de tenue", status.scalpMaxHoldSeconds ? `${Math.round(status.scalpMaxHoldSeconds / 60)} min` : "—"],
     ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
   }
 

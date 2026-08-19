@@ -361,6 +361,14 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "scalp_pairs text");
   await ensureColumn("auto_trading_accounts", "scalp_lot_mode text NOT NULL DEFAULT 'auto'");
   await ensureColumn("auto_trading_accounts", "scalp_fixed_lot real");
+  // Same self-service pattern as live_trading_enabled/authorized, requested
+  // directly right after that one shipped: scalp_enabled (above) is now the
+  // admin's one-time authorization + configuration (pairs, lot mode, amounts --
+  // all unchanged), user_scalp_enabled is the owner's own fast switch on top of
+  // it. Defaults off, same as live -- turning scalp on is still a deliberate
+  // owner action, just one that no longer needs a fresh admin round-trip each
+  // time. See runScalpTradingTick: both must be true for a tick to process.
+  await ensureColumn("auto_trading_accounts", "user_scalp_enabled integer NOT NULL DEFAULT 0");
   // Progressive risk by capital tier, requested directly: as the real account
   // balance crosses thresholds the admin defines, risk% per trade steps up
   // automatically -- e.g. 0.3% under $100, 1% past $1000. Stored as a JSON array
@@ -1354,11 +1362,14 @@ async function runScalpTradingTick() {
   // Deliberately independent of approval_status/approved_until (the swing
   // bot's own approval workflow) -- scalp_enabled is its own gate, set via
   // /api/admin/auto-trade/scalp-settings, so an admin can turn scalp on for an
-  // account without that account needing separate swing approval too. Still
+  // account without that account needing separate swing approval too.
+  // user_scalp_enabled is the owner's own switch on top of that (see
+  // /api/auto-trade/toggle-scalp) -- both must be true, same
+  // authorize-once/enable-freely split as live_trading_enabled/authorized. Still
   // requires real, verified broker credentials and the user not being paused,
   // same non-negotiable safety floor as every other execution path.
   const accounts = await sqlAll(
-    `SELECT * FROM auto_trading_accounts WHERE scalp_enabled = 1
+    `SELECT * FROM auto_trading_accounts WHERE scalp_enabled = 1 AND user_scalp_enabled = 1
      AND user_paused = 0 AND (broker_demo_connected_at IS NOT NULL OR broker_live_connected_at IS NOT NULL)`,
     [],
   );
@@ -1624,7 +1635,7 @@ function clampVolumeToSpec(rawVolume, specification) {
 // scalp_loss_limit_amount if the stop is hit) or to a fixed lot the admin
 // imposes -- "priorite tout petit lot pour ne pas cramer le compte d'un coup".
 async function processScalpForUser(account, credentials, slot) {
-  if (!Number(account.scalp_enabled)) return;
+  if (!Number(account.scalp_enabled) || !Number(account.user_scalp_enabled)) return;
   const scalpPairs = String(account.scalp_pairs || "").split(",").filter((p) => SCALP_PARAMS_BY_PAIR[p]);
   if (!scalpPairs.length) return;
   const userId = account.user_id;
@@ -2626,6 +2637,30 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // Same self-service switch as toggle-slot, for scalp mode: requires the
+  // admin's scalp_enabled (pairs/lot mode/amounts configured there too) before
+  // the owner can turn their own switch on -- same authorize-once/enable-freely
+  // split as live_trading_enabled/authorized.
+  if (url.pathname === "/api/auto-trade/toggle-scalp") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const enabled = Boolean(body?.enabled);
+    await ensureRelationalTables();
+    if (enabled) {
+      const row = await sqlGet(`SELECT scalp_enabled FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
+      if (!Number(row?.scalp_enabled)) return sendJson(res, 403, { ok: false, error: "scalp_not_authorized" });
+    }
+    await sqlRun(
+      `INSERT INTO auto_trading_accounts (user_id, user_scalp_enabled, created_at, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET user_scalp_enabled = excluded.user_scalp_enabled, updated_at = excluded.updated_at`,
+      [session.user.id, enabled ? 1 : 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
   // A user may only ever tighten one of these past whatever the admin approved,
   // never loosen it -- processAutoTradeForUser's combineTightened() takes the
   // stricter of the two at read time regardless of what's stored here, so this
@@ -2721,7 +2756,15 @@ async function handleApi(req, res, url) {
       userTradingHoursStart: row?.user_trading_hours_start || null,
       userTradingHoursEnd: row?.user_trading_hours_end || null,
       userTradingDays: row?.user_trading_days ? row.user_trading_days.split(",").filter(Boolean).map(Number) : null,
+      // scalpEnabled: the admin's authorization + configuration (pairs/lot mode/
+      // amounts below all come from there too). scalpUserEnabled: the owner's own
+      // switch on top of it -- both must be true for the scheduler to run scalp
+      // for this account (see runScalpTradingTick).
       scalpEnabled: Boolean(Number(row?.scalp_enabled)),
+      scalpUserEnabled: Boolean(Number(row?.user_scalp_enabled)),
+      scalpPairs: row?.scalp_pairs ? row.scalp_pairs.split(",").filter(Boolean) : [],
+      scalpLotMode: row?.scalp_lot_mode || "auto",
+      scalpFixedLot: row?.scalp_fixed_lot ?? null,
       scalpProfitTargetAmount: row?.scalp_profit_target_amount ?? null,
       scalpLossLimitAmount: row?.scalp_loss_limit_amount ?? null,
       scalpMaxHoldSeconds: row?.scalp_max_hold_seconds ?? null,

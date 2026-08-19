@@ -209,6 +209,16 @@
             </div>
           </div>
 
+          <div class="dashboard-autotrade-section" data-scalp-section hidden>
+            <div class="dashboard-slot-head">
+              <h3>Mode scalping</h3>
+              <label class="dashboard-slot-switch"><input type="checkbox" data-scalp-toggle> Actif</label>
+            </div>
+            <p class="dashboard-history-note" data-cms="dashboard.autotrade.scalp_intro">Mean-reversion à edge validé par backtest, paires et paramètres définis par l'administrateur -- tu actives/désactives librement une fois autorisé.</p>
+            <p class="dashboard-history-note dashboard-live-locked" data-scalp-locked-note hidden>🔒 Pas encore autorisé par l'administrateur pour ce compte.</p>
+            <div class="dashboard-autotrade-metrics" data-scalp-metrics></div>
+          </div>
+
           <div class="dashboard-autotrade-section" data-autotrade-preferences-section hidden>
             <h3>Tes préférences</h3>
             <p class="dashboard-history-note">Resserre le robot pour ton propre compte, dans la limite fixée par l'administrateur pour chaque paramètre. Un champ laissé vide utilise directement le réglage admin.</p>
