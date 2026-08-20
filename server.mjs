@@ -341,6 +341,12 @@ async function ensureRelationalTables() {
   // the admin's value" -- see the tightenAgainst* combining logic in
   // processAutoTradeForUser.
   await ensureColumn("auto_trading_accounts", "user_risk_percent real");
+  // Not a "tighten the admin's limit" field like the others in this block --
+  // there's no admin-set ceiling to tighten against. Purely a self-imposed
+  // sizing basis: "trade my real account, but size positions as if it only
+  // held $X" (see sizingBalance in processAutoTradeForUser). NULL/0 means the
+  // real broker balance is used as-is, unchanged from before this existed.
+  await ensureColumn("auto_trading_accounts", "user_capital_cap real");
   await ensureColumn("auto_trading_accounts", "user_max_concurrent_positions integer");
   await ensureColumn("auto_trading_accounts", "user_max_trades_per_day integer");
   await ensureColumn("auto_trading_accounts", "user_daily_loss_limit_percent real");
@@ -1575,12 +1581,24 @@ async function processAutoTradeForUser(account, signals, slot) {
   const accountInfo = credentials ? await getBrokerAccountInformation(credentials).catch(() => null) : null;
   if (!accountInfo || !(accountInfo.balance > 0)) return recordAutoTradeStatus(userId, slot, "broker_unreachable"); // fail closed: no confirmed real balance, no trade
 
-  // Tiers need the REAL balance just fetched above, not a cached/approval-time
-  // figure -- resolved fresh every tick so a balance that just crossed a tier
-  // threshold takes effect on the very next trade, not after some delay. Demo and
-  // live have their own balances, so a tier crossed on one slot has zero effect
-  // on the other's sizing.
-  const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, accountInfo.balance), account.user_risk_percent, "lower");
+  // user_capital_cap: "trade this real account, but size every position as if
+  // it only held $X" -- requested directly so someone with e.g. a real $45,000
+  // account can start on $50-$100 worth of real constraints instead of the
+  // account's full balance. Math.min, never the cap alone: if real balance
+  // ever falls BELOW the chosen cap (losses, withdrawal), sizing must still
+  // follow the smaller, real number -- never size as if money exists that
+  // doesn't. Unset/0 (the default) changes nothing, full real balance as
+  // before. Deliberately only affects sizing math (tiers + volume) below, not
+  // the balance>0 connectivity check above -- that must always reflect the
+  // real broker connection, capped or not.
+  const sizingBalance = account.user_capital_cap > 0 ? Math.min(accountInfo.balance, account.user_capital_cap) : accountInfo.balance;
+
+  // Tiers need the REAL (or capped) balance just fetched above, not a cached/
+  // approval-time figure -- resolved fresh every tick so a balance that just
+  // crossed a tier threshold takes effect on the very next trade, not after
+  // some delay. Demo and live have their own balances, so a tier crossed on
+  // one slot has zero effect on the other's sizing.
+  const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, sizingBalance), account.user_risk_percent, "lower");
 
   let openedThisTick = 0;
   const skipped = { alreadyOpen: 0, correlation: 0, noSpec: 0, noVolume: 0, rejected: 0 };
@@ -1606,7 +1624,7 @@ async function processAutoTradeForUser(account, signals, slot) {
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) { skipped.noSpec += 1; continue; }
-    const volume = computeAutoTradeVolume({ balance: accountInfo.balance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification });
+    const volume = computeAutoTradeVolume({ balance: sizingBalance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification });
     if (!volume) { skipped.noVolume += 1; continue; }
 
     // SWING_TRAILING_PARAMS_BY_PAIR pairs skip the broker-side TP1 entirely --
@@ -2755,6 +2773,7 @@ async function handleApi(req, res, url) {
     const clampInt = (value, min, max) => { const c = clamp(value, min, max); return c ? Math.round(c) : null; };
     const userMinConfidence = clamp(body?.userMinConfidence, 60, 99);
     const userRiskPercent = clamp(body?.userRiskPercent, 0.1, 3);
+    const userCapitalCap = clamp(body?.userCapitalCap, 1, 10000000);
     const userMaxConcurrentPositions = clampInt(body?.userMaxConcurrentPositions, 1, 20);
     const userMaxTradesPerDay = clampInt(body?.userMaxTradesPerDay, 1, 100);
     const userDailyLossLimitPercent = clamp(body?.userDailyLossLimitPercent, 1, 10);
@@ -2766,17 +2785,32 @@ async function handleApi(req, res, url) {
     const userTradingDaysInput = Array.isArray(body?.userTradingDays) ? [...new Set(body.userTradingDays.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))] : [];
     const userTradingDays = userTradingDaysInput.length && userTradingDaysInput.length < 7 ? userTradingDaysInput.join(",") : null;
     await ensureRelationalTables();
+    // Found live while testing userCapitalCap: this was a plain UPDATE with no
+    // row-existence guarantee -- the exact same silent-no-op bug class already
+    // fixed elsewhere this session (broker connect, scalp settings,
+    // toggle-slot), just never applied here. A user who saves preferences
+    // before ever connecting a broker or being touched by admin/approve has no
+    // auto_trading_accounts row yet, so the UPDATE affected zero rows, still
+    // returned ok:true, and every preference silently vanished -- confirmed by
+    // querying a fresh test account's row directly (empty) after a "successful"
+    // save. INSERT ... ON CONFLICT DO UPDATE, same pattern as the other fixes.
     await sqlRun(
-      `UPDATE auto_trading_accounts SET
-         user_min_confidence = ?, user_risk_percent = ?, user_max_concurrent_positions = ?, user_max_trades_per_day = ?,
-         user_daily_loss_limit_percent = ?, user_daily_loss_limit_amount = ?, user_min_risk_reward = ?,
-         user_trading_hours_start = ?, user_trading_hours_end = ?, user_trading_days = ?, updated_at = ?
-       WHERE user_id = ?`,
+      `INSERT INTO auto_trading_accounts (
+         user_id, user_min_confidence, user_risk_percent, user_capital_cap, user_max_concurrent_positions, user_max_trades_per_day,
+         user_daily_loss_limit_percent, user_daily_loss_limit_amount, user_min_risk_reward,
+         user_trading_hours_start, user_trading_hours_end, user_trading_days, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         user_min_confidence = excluded.user_min_confidence, user_risk_percent = excluded.user_risk_percent,
+         user_capital_cap = excluded.user_capital_cap, user_max_concurrent_positions = excluded.user_max_concurrent_positions,
+         user_max_trades_per_day = excluded.user_max_trades_per_day, user_daily_loss_limit_percent = excluded.user_daily_loss_limit_percent,
+         user_daily_loss_limit_amount = excluded.user_daily_loss_limit_amount, user_min_risk_reward = excluded.user_min_risk_reward,
+         user_trading_hours_start = excluded.user_trading_hours_start, user_trading_hours_end = excluded.user_trading_hours_end,
+         user_trading_days = excluded.user_trading_days, updated_at = excluded.updated_at`,
       [
-        userMinConfidence, userRiskPercent, userMaxConcurrentPositions, userMaxTradesPerDay,
+        session.user.id, userMinConfidence, userRiskPercent, userCapitalCap, userMaxConcurrentPositions, userMaxTradesPerDay,
         userDailyLossLimitPercent, userDailyLossLimitAmount, userMinRiskReward,
-        userTradingHoursStart, userTradingHoursEnd, userTradingDays, new Date().toISOString(),
-        session.user.id,
+        userTradingHoursStart, userTradingHoursEnd, userTradingDays, new Date().toISOString(), new Date().toISOString(),
       ],
     );
     sendJson(res, 200, { ok: true });
@@ -2822,6 +2856,7 @@ async function handleApi(req, res, url) {
       // only ever tightens the admin value above, never loosens it.
       userMinConfidence: row?.user_min_confidence ?? null,
       userRiskPercent: row?.user_risk_percent ?? null,
+      userCapitalCap: row?.user_capital_cap ?? null,
       userMaxConcurrentPositions: row?.user_max_concurrent_positions ?? null,
       userMaxTradesPerDay: row?.user_max_trades_per_day ?? null,
       userDailyLossLimitPercent: row?.user_daily_loss_limit_percent ?? null,

@@ -1128,6 +1128,11 @@
       const hint = section.querySelector(`[data-pref-hint="${adminKey}"]`);
       if (hint) hint.textContent = status[adminKey] != null ? `(admin : ${format(status[adminKey])})` : "(admin : aucune limite)";
     }
+    // No admin counterpart to hint against -- this isn't a "tighten the admin's
+    // limit" field, it's a self-imposed sizing basis on top of the real broker
+    // balance (see sizingBalance in processAutoTradeForUser).
+    const capitalCap = section.querySelector('[data-pref="userCapitalCap"]');
+    if (capitalCap && document.activeElement !== capitalCap) capitalCap.value = status.userCapitalCap ?? "";
     const hoursStart = section.querySelector('[data-pref="userTradingHoursStart"]');
     const hoursEnd = section.querySelector('[data-pref="userTradingHoursEnd"]');
     if (hoursStart && document.activeElement !== hoursStart) hoursStart.value = status.userTradingHoursStart || "";
@@ -1156,7 +1161,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            userRiskPercent: field("userRiskPercent"), userMinConfidence: field("userMinConfidence"),
+            userRiskPercent: field("userRiskPercent"), userCapitalCap: field("userCapitalCap"), userMinConfidence: field("userMinConfidence"),
             userMinRiskReward: field("userMinRiskReward"), userMaxConcurrentPositions: field("userMaxConcurrentPositions"),
             userMaxTradesPerDay: field("userMaxTradesPerDay"), userDailyLossLimitPercent: field("userDailyLossLimitPercent"),
             userDailyLossLimitAmount: field("userDailyLossLimitAmount"), userTradingHoursStart: field("userTradingHoursStart"),
