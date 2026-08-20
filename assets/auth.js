@@ -933,6 +933,36 @@
       }
     });
 
+    document.querySelector("[data-secure-half-priority-toggle]")?.addEventListener("change", async (event) => {
+      const checkbox = event.currentTarget;
+      const enabled = checkbox.checked;
+      const messageEl = document.querySelector("[data-secure-half-priority-message]");
+      if (messageEl) messageEl.hidden = true;
+      checkbox.disabled = true;
+      try {
+        const response = await fetch("/api/auto-trade/toggle-secure-half", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await response.json();
+        if (!result.ok) {
+          checkbox.checked = !enabled;
+        } else if (messageEl && enabled) {
+          messageEl.textContent = result.securedCount > 0
+            ? `✓ Activé -- ${result.securedCount} position${result.securedCount > 1 ? "s" : ""} déjà ouverte${result.securedCount > 1 ? "s" : ""} sécurisée${result.securedCount > 1 ? "s" : ""} immédiatement à mi-objectif.`
+            : "✓ Activé -- s'appliquera aux prochaines positions et aux positions actuelles dès que le prix atteint la moitié de l'objectif.";
+          messageEl.classList.remove("dashboard-prepare-error");
+          messageEl.hidden = false;
+        }
+      } catch {
+        checkbox.checked = !enabled;
+      } finally {
+        checkbox.disabled = false;
+        await refreshAutoTradeStatus();
+      }
+    });
+
     document.querySelector("[data-autotrade-request]")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -1076,6 +1106,16 @@
     if (scalpSection) {
       scalpSection.hidden = !anyBrokerConnected;
       if (anyBrokerConnected) renderScalpSection(status);
+    }
+
+    // Pure user choice, no admin authorization needed (unlike scalp/live
+    // trading) -- this only ever reduces risk/target, never increases
+    // exposure. Same "shown once any broker is connected" gate as scalp.
+    const secureHalfSection = document.querySelector("[data-autotrade-preferences-section-secure-half]");
+    if (secureHalfSection) {
+      secureHalfSection.hidden = !anyBrokerConnected;
+      const toggle = document.querySelector("[data-secure-half-priority-toggle]");
+      if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.secureHalfPriorityEnabled);
     }
 
     const statusText = document.querySelector("[data-autotrade-status-text]");

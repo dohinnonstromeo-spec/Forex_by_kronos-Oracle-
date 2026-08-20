@@ -468,5 +468,17 @@ check("mid-month resolves to the 1st of that month", startOfMonthUtc(new Date("2
 check("the 1st itself resolves to itself", startOfMonthUtc(new Date("2026-08-01T00:00:01Z")).toISOString() === "2026-08-01T00:00:00.000Z");
 check("crosses a real year boundary correctly (Jan 2027)", startOfMonthUtc(new Date("2027-01-15T00:00:00Z")).toISOString() === "2027-01-01T00:00:00.000Z");
 
+console.log("\n=== secure_half_priority_enabled: half-target formulas (Case A open-time, Case B trigger) ===");
+
+// Copy of processAutoTradeForUser's Case A open-time formula.
+function halfTpAtOpen(entry, tp1) { return entry + (tp1 - entry) * 0.5; }
+// Copy of checkTrailingStops' Case B halfway-to-tp2 trigger formula.
+function halfTargetFromTp2(buy, entry, tp2) { return buy ? entry + (tp2 - entry) * 0.5 : entry - (entry - tp2) * 0.5; }
+
+check("Case A, BUY: half TP sits exactly midway between entry and the full 1.6R target", halfTpAtOpen(1.1000, 1.1160) === 1.1080);
+check("Case A, SELL: half TP sits exactly midway (entry above tp1)", Math.round(halfTpAtOpen(1.1000, 1.0840) * 10000) / 10000 === 1.0920);
+check("Case B, BUY: half-target trigger sits midway between entry and tp2 (2.5R reference)", halfTargetFromTp2(true, 4400, 4450) === 4425);
+check("Case B, SELL: half-target trigger sits midway (tp2 below entry)", halfTargetFromTp2(false, 4400, 4350) === 4375);
+
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

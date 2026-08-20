@@ -79,6 +79,20 @@ async function openRealPosition({ direction, symbol, volume = 0.01, stopLoss, ta
   return positionId;
 }
 
+// Closes a position at the end of the SAME test that opened it, rather than
+// letting every test's position pile up until the file's after(). Found live
+// while debugging this suite: with several tests' positions still open at
+// once, later checkTrailingStops ticks have more real rows to iterate (each
+// a real broker HTTP call), which pushed timing-sensitive tests past their
+// wait window in a full-suite run even though they passed in isolation. Also
+// keeps real (if demo) exposure to what one test actually needs, not
+// whatever has accumulated so far.
+async function closeReal(positionId) {
+  await brokerFetch("/trade", { method: "POST", body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId: String(positionId) }) }).catch(() => {});
+  const idx = openedPositions.indexOf(positionId);
+  if (idx !== -1) openedPositions.splice(idx, 1);
+}
+
 async function getRealPositions() {
   return brokerFetch("/positions");
 }
@@ -132,6 +146,13 @@ before(async () => {
   if (!ready) throw new Error("server did not become ready in time");
 
   db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA busy_timeout = 5000"); // see the identical pragma added to server.mjs's getSqliteDb() -- same "database is locked" flakiness class, now on both sides of every DB access this suite does concurrently with the spawned server.
+  // Re-running this suite repeatedly during development trips the real
+  // signup rate limiter (SIGNUP_MAX_ATTEMPTS) from this same local IP --
+  // that limiter is doing its real job, not a bug, but it shouldn't block
+  // iterating on this specific suite. Same reset api-tests.mjs's own
+  // resetRateLimits() does for the same reason.
+  db.prepare(`DELETE FROM rate_limit_attempts`).run();
   testEmail = `broker_e2e_${Date.now()}@example.com`;
   const signupRes = await fetch(`${BASE}/api/signup`, {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -185,7 +206,7 @@ test("confirm: BUY with NO broker TP opens successfully -- regression test for t
   assert.equal(data.ok, true);
   assert.equal(data.order.status, "SENT");
   assert.ok(data.order.brokerOrderId, "expected a real brokerOrderId");
-  openedPositions.push(data.order.brokerOrderId);
+  await closeReal(data.order.brokerOrderId);
 });
 
 test("confirm: SELL with NO broker TP opens successfully (this direction always worked -- symmetry check)", { skip: !hasSecrets }, async () => {
@@ -197,7 +218,7 @@ test("confirm: SELL with NO broker TP opens successfully (this direction always 
   assert.equal(status, 200, `expected 200, got ${status}: ${JSON.stringify(data)}`);
   assert.equal(data.ok, true);
   assert.equal(data.order.status, "SENT");
-  openedPositions.push(data.order.brokerOrderId);
+  await closeReal(data.order.brokerOrderId);
 });
 
 test("confirm: BUY WITH a real broker TP (fixed-TP pairs) opens successfully", { skip: !hasSecrets }, async () => {
@@ -209,7 +230,7 @@ test("confirm: BUY WITH a real broker TP (fixed-TP pairs) opens successfully", {
   const { status, data } = await postJson("/api/trade/confirm", { orderId, volume: 0.01, brokerSlot: "demo" });
   assert.equal(status, 200, `expected 200, got ${status}: ${JSON.stringify(data)}`);
   assert.equal(data.order.status, "SENT");
-  openedPositions.push(data.order.brokerOrderId);
+  await closeReal(data.order.brokerOrderId);
 });
 
 test("secure-half: halves a real broker TP", { skip: !hasSecrets }, async () => {
@@ -222,12 +243,18 @@ test("secure-half: halves a real broker TP", { skip: !hasSecrets }, async () => 
   const { data } = await postJson("/api/trade/secure-half", { orderId });
   assert.equal(data.ok, true, JSON.stringify(data));
   assert.equal(data.mode, "tp_halved");
-  const expected = Math.round((entry + (tp1 - entry) * 0.5) * 100000) / 100000;
-  assert.equal(data.newTakeProfit, expected);
+  // The server computes the raw, unrounded midpoint (see secureHalfForOrder)
+  // -- comparing with an epsilon rather than strict equality, since
+  // Math.round(...*100000)/100000 on the test's side can legitimately differ
+  // from the server's raw float in the last decimal (e.g. 1.17067 vs
+  // 1.1706699999999999), which is not a real discrepancy.
+  const expected = entry + (tp1 - entry) * 0.5;
+  assert.ok(Math.abs(data.newTakeProfit - expected) < 0.00001, `reported newTakeProfit ${data.newTakeProfit} should match expected ${expected}`);
   const positions = await getRealPositions();
   const real = positions.find((p) => String(p.id) === brokerOrderId);
   assert.ok(real, "position should still be open at the broker");
   assert.ok(Math.abs(real.takeProfit - expected) < 0.0001, `real broker TP ${real.takeProfit} should match expected ${expected}`);
+  await closeReal(brokerOrderId);
 });
 
 test("secure-half: locks half of unrealized profit via the stop when there is no broker TP", { skip: !hasSecrets }, async () => {
@@ -249,7 +276,12 @@ test("secure-half: locks half of unrealized profit via the stop when there is no
   const real = positions.find((p) => String(p.id) === brokerOrderId);
   assert.ok(real, "position should still be open at the broker");
   assert.ok(Math.abs(real.stopLoss - data.newStopLoss) < 0.0001, `real broker stop ${real.stopLoss} should match reported ${data.newStopLoss}`);
-  assert.ok(real.stopLoss < seededSl, "the new stop should be an improvement over the original (closer to price, in profit)");
+  // Compared against realSl (the REAL stop the broker actually set at open),
+  // not seededSl (a fictional test input) -- seededSl is deliberately far
+  // wider than any real stop this scenario would produce, so comparing
+  // against it would pass trivially regardless of whether anything moved.
+  assert.ok(real.stopLoss < realSl, `the new stop (${real.stopLoss}) should improve on the REAL initial stop (${realSl})`);
+  await closeReal(brokerOrderId);
 });
 
 test("trailing-stop scheduler moves a real position's stop on its own, on a real tick", { skip: !hasSecrets }, async () => {
@@ -271,7 +303,64 @@ test("trailing-stop scheduler moves a real position's stop on its own, on a real
   const positions = await getRealPositions();
   const real = positions.find((p) => String(p.id) === brokerOrderId);
   assert.ok(real, "position should still be open at the broker");
-  assert.ok(real.stopLoss < seededSl, `scheduler should have moved the stop favorably (from ${seededSl}, now ${real.stopLoss})`);
+  // Compared against realSl, the REAL stop set at open -- see the identical
+  // note on the secure-half profit test above.
+  assert.ok(real.stopLoss < realSl, `scheduler should have moved the stop favorably (real initial ${realSl}, now ${real.stopLoss})`);
   const dbRow = db.prepare(`SELECT trailing_stop_price FROM trade_orders WHERE broker_order_id = ?`).get(brokerOrderId);
   assert.ok(Math.abs(dbRow.trailing_stop_price - real.stopLoss) < 0.0001, "our own DB record should match the real broker stop the scheduler set");
+  await closeReal(brokerOrderId);
+});
+
+test("secure-half priority: turning the toggle ON retroactively halves an already-open fixed-TP position", { skip: !hasSecrets }, async () => {
+  const price = await getRealPrice("EURUSD");
+  const entry = price.ask;
+  const sl = Math.round((entry - 0.0030) * 100000) / 100000;
+  const tp1 = Math.round((entry + 0.0050) * 100000) / 100000;
+  const brokerOrderId = await openRealPosition({ direction: "ACHAT", symbol: "EURUSD", stopLoss: sl, takeProfit: tp1 });
+  seedOrder({ pair: "EUR/USD", direction: "ACHAT", entry, sl, tp1, status: "SENT", brokerOrderId });
+  const { data } = await postJson("/api/auto-trade/toggle-secure-half", { enabled: true });
+  assert.equal(data.ok, true, JSON.stringify(data));
+  assert.ok(data.securedCount >= 1, `expected at least 1 position secured, got ${data.securedCount}`);
+  const expected = Math.round((entry + (tp1 - entry) * 0.5) * 100000) / 100000;
+  const positions = await getRealPositions();
+  const real = positions.find((p) => String(p.id) === brokerOrderId);
+  assert.ok(real, "position should still be open at the broker");
+  assert.ok(Math.abs(real.takeProfit - expected) < 0.0001, `real broker TP ${real.takeProfit} should match expected ${expected} after toggling on`);
+  await closeReal(brokerOrderId);
+});
+
+test("secure-half priority: with the toggle on, the scheduler locks the stop once price has reached halfway to the reference target (tp2)", { skip: !hasSecrets }, async () => {
+  // Toggle already ON from the previous test, but explicit here so this test
+  // is self-contained regardless of run order.
+  await postJson("/api/auto-trade/toggle-secure-half", { enabled: true });
+
+  const price = await getRealPrice("EURUSD");
+  const realAsk = price.ask;
+  const realEntry = price.bid;
+  const realSl = Math.round((realEntry + 0.0030) * 100000) / 100000;
+  const brokerOrderId = await openRealPosition({ direction: "VENTE", symbol: "EURUSD", stopLoss: realSl, takeProfit: undefined });
+  // Seeded so the halfway point (between seededEntry and tp2) sits ~25 pips
+  // ABOVE the real current ask -- i.e. already comfortably "reached" for a
+  // SELL (whose close side is ask) the moment the scheduler looks, with
+  // margin against normal tick noise between this fetch and its own.
+  const seededEntry = Math.round((realAsk + 0.0060) * 100000) / 100000;
+  const seededSl = Math.round((seededEntry + 0.0030) * 100000) / 100000;
+  const tp2 = Math.round((realAsk - 0.0010) * 100000) / 100000;
+  const { orderId } = seedOrder({ pair: "EUR/USD", direction: "VENTE", entry: seededEntry, sl: seededSl, tp1: null, status: "SENT", brokerOrderId, trailingStopPrice: seededSl, bestFavorablePrice: seededEntry });
+  db.prepare(`UPDATE trade_orders SET tp2 = ? WHERE id = ?`).run(tp2, orderId);
+
+  await new Promise((r) => setTimeout(r, 7000));
+  const positions = await getRealPositions();
+  const real = positions.find((p) => String(p.id) === brokerOrderId);
+  assert.ok(real, "position should still be open at the broker");
+  // Compared against realSl, the REAL stop set at open -- seededSl is a
+  // fictional test input, deliberately far wider than any real stop this
+  // scenario would produce, so comparing against it would pass trivially
+  // (found live: the first version of this test did exactly that, and
+  // silently proved nothing).
+  assert.ok(real.stopLoss < realSl, `half-target lock should have moved the stop favorably (real initial ${realSl}, now ${real.stopLoss})`);
+  const dbRow = db.prepare(`SELECT trailing_stop_price, half_target_secured FROM trade_orders WHERE broker_order_id = ?`).get(brokerOrderId);
+  assert.equal(dbRow.half_target_secured, 1, "half_target_secured should be marked so this never re-triggers");
+  assert.ok(Math.abs(dbRow.trailing_stop_price - real.stopLoss) < 0.0001, "our own DB record should match the real broker stop");
+  await closeReal(brokerOrderId);
 });

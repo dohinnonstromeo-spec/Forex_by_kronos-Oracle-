@@ -219,6 +219,15 @@
             <div class="dashboard-autotrade-metrics" data-scalp-metrics></div>
           </div>
 
+          <div class="dashboard-autotrade-section" data-autotrade-preferences-section-secure-half hidden>
+            <div class="dashboard-slot-head">
+              <h3>Sécuriser à mi-TP (priorité du robot)</h3>
+              <label class="dashboard-slot-switch"><input type="checkbox" data-secure-half-priority-toggle> Actif</label>
+            </div>
+            <p class="dashboard-history-note">Une fois activé : toute nouvelle position sur une paire à TP fixe (US500, BTC/USD, USD/JPY) part directement avec son objectif réduit de moitié. Pour XAU/USD, USD/CHF, EUR/USD et le scalp (pas de TP fixe), le stop se resserre automatiquement dès que le prix atteint la moitié de l'objectif de référence. Les positions déjà ouvertes à TP fixe sont sécurisées immédiatement à l'activation.</p>
+            <p class="dashboard-history-note dashboard-prepare-error" data-secure-half-priority-message hidden></p>
+          </div>
+
           <div class="dashboard-autotrade-section" data-autotrade-preferences-section hidden>
             <h3>Tes préférences</h3>
             <p class="dashboard-history-note">Resserre le robot pour ton propre compte, dans la limite fixée par l'administrateur pour chaque paramètre. Un champ laissé vide utilise directement le réglage admin.</p>

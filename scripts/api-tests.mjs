@@ -72,6 +72,7 @@ before(async () => {
 after(async () => {
   if (existsSync(dbPath)) {
     const db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA busy_timeout = 5000"); // see the identical pragma in server.mjs's getSqliteDb() -- reduces the already-documented "database is locked" flakiness from this cleanup racing the spawned server's own writes.
     for (const email of createdEmails) {
       db.prepare("DELETE FROM push_subscriptions WHERE user_id IN (SELECT id FROM users WHERE email = ?)").run(email);
       db.prepare("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE email = ?)").run(email);
@@ -114,6 +115,7 @@ async function postJson(path, body, headers = {}) {
 function resetRateLimits() {
   if (!existsSync(dbPath)) return;
   const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA busy_timeout = 5000");
   db.prepare("DELETE FROM rate_limit_attempts").run();
   db.prepare("DELETE FROM anonymous_usage").run();
   db.close();

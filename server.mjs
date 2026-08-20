@@ -54,6 +54,16 @@ function getSqliteDb() {
     // database file" before anything else in the app got a chance to run.
     mkdirSync(dataDir, { recursive: true });
     sqliteDb = new DatabaseSync(sqliteDbPath);
+    // Default is 0 -- SQLITE_BUSY (surfaced here as "database is locked") is
+    // raised IMMEDIATELY the instant another connection holds the write lock,
+    // even for a write that would have cleared in milliseconds. Recurring,
+    // already-documented flakiness this whole session (multiple local dev
+    // instances/test scripts hitting the same file, especially right at
+    // server startup while schema init is still running) -- this makes
+    // SQLite itself wait and retry internally for up to 5s before actually
+    // failing, which is what every other real sqlite-backed app does by
+    // default; node:sqlite's DatabaseSync just doesn't set it for you.
+    sqliteDb.exec("PRAGMA busy_timeout = 5000");
   }
   return sqliteDb;
 }
@@ -305,6 +315,14 @@ async function ensureRelationalTables() {
   // checkTrailingStops.
   await ensureColumn("trade_orders", "trailing_stop_price real");
   await ensureColumn("trade_orders", "best_favorable_price real");
+  // One-time flag for secure_half_priority_enabled (see its own comment
+  // above): once a position's target/stop has been secured at half via
+  // either mechanism (Case A: opened pre-halved or retroactively halved;
+  // Case B: checkTrailingStops caught price reaching the halfway point),
+  // never re-trigger on it again -- the normal trailing stop (for pairs that
+  // have one) keeps improving on top of this floor exactly as before,
+  // untouched.
+  await ensureColumn("trade_orders", "half_target_secured integer NOT NULL DEFAULT 0");
   // Marks how far a user has read into their own trade-open/close feed (see
   // /api/notifications/summary) -- the in-app fallback for anyone without an
   // active push subscription. NULL until they ever open the notifications panel,
@@ -341,6 +359,27 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "weekly_loss_limit_amount real");
   await ensureColumn("auto_trading_accounts", "monthly_loss_limit_percent real");
   await ensureColumn("auto_trading_accounts", "monthly_loss_limit_amount real");
+  // "Securiser a mi-TP" as the bot's own automatic priority, requested
+  // directly: "Securiser a mi-TP maintenant quand c'est actif devrait etre
+  // donc la priorite du robot... meme avant de lancer n'importe quelle
+  // position... quand c'est active bien sur avant qu'il ne lance les
+  // positions suivantes automatiquement". A pure user choice, not admin-gated
+  // like live trading -- this only ever REDUCES risk/target (never increases
+  // exposure), same reasoning user_capital_cap and the small-account floor
+  // exception used. Applied in 3 places when on: new fixed-TP orders
+  // (US500/BTC/USD/USD/JPY) are opened with the broker TP already at half
+  // distance from the very start (see processAutoTradeForUser); turning the
+  // toggle on retroactively halves every currently open fixed-TP position's
+  // real broker TP too (see /api/auto-trade/toggle-secure-half); and for the
+  // 3 trailing-stop pairs + scalp (no fixed broker TP to halve up front),
+  // checkTrailingStops watches for price actually reaching halfway to the
+  // reference target (tp2) and locks the stop there the moment it does. Off
+  // by default -- no existing account's behavior changes until this is
+  // explicitly turned on, and it deliberately has NOT been backtested the
+  // way every other exit-mechanism change this session was (see the comment
+  // on half_target_secured below) -- ship transparently, not silently as
+  // "validated".
+  await ensureColumn("auto_trading_accounts", "secure_half_priority_enabled integer NOT NULL DEFAULT 0");
   // The user-side half of every admin-set bot parameter above (plus the
   // pre-existing user_min_confidence) -- each one lets the account owner
   // tighten their own bot's behavior, never loosen it past whatever the admin
@@ -1845,13 +1884,20 @@ async function processAutoTradeForUser(account, signals, slot) {
       brokerSlot: slot,
     });
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
-    const orderTp1 = swingTrailingParams ? null : signal.tp1;
+    // secure_half_priority_enabled, fixed-TP pairs only (swingTrailingParams
+    // pairs already have no broker TP to halve -- checkTrailingStops handles
+    // those live, once price actually reaches halfway to tp2). "Baked in from
+    // the start" per the direct request ("meme avant de lancer n'importe
+    // quelle position... avant qu'il ne lance les positions suivantes
+    // automatiquement") -- the broker never even sees the full target.
+    const securingHalfAtOpen = !swingTrailingParams && Number(account.secure_half_priority_enabled) === 1;
+    const orderTp1 = swingTrailingParams ? null : securingHalfAtOpen ? signal.entree + (signal.tp1 - signal.entree) * 0.5 : signal.tp1;
     const orderTrailingStopPrice = swingTrailingParams ? signal.sl : null;
     const orderBestFavorablePrice = swingTrailingParams ? signal.entree : null;
     await sqlRun(
-      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, risk_percent_at_trade, broker_slot, trailing_stop_price, best_favorable_price)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?)`,
-      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice],
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, risk_percent_at_trade, broker_slot, trailing_stop_price, best_favorable_price, half_target_secured)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?, ?)`,
+      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice, securingHalfAtOpen ? 1 : 0],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
@@ -2751,9 +2797,6 @@ async function handleApi(req, res, url) {
     const orderId = String(body?.orderId || "");
     if (!orderId) return sendJson(res, 400, { ok: false, error: "invalid_request" });
     await ensureRelationalTables();
-    // Joined with analyses for `source` (auto_scalp vs auto_signal) --
-    // trade_orders itself doesn't carry it, and Case B below needs it to pick
-    // the right executionCostBuffer strategy, same as checkTrailingStops does.
     const orderRow = await sqlGet(`SELECT o.*, a.source as source FROM trade_orders o LEFT JOIN analyses a ON a.id = o.analysis_id WHERE o.id = ? AND o.user_id = ?`, [orderId, session.user.id]);
     const order = rowToTradeOrder(orderRow);
     if (!order) return sendJson(res, 404, { ok: false, error: "order_not_found" });
@@ -2761,58 +2804,8 @@ async function handleApi(req, res, url) {
     const slot = order.brokerSlot || "demo";
     const credentials = await getUserBrokerCredentials(session.user.id, slot);
     if (!credentials) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
-    const buy = order.direction === "ACHAT";
-    const brokerPrice = await getBrokerCurrentPrice(credentials, order.pair).catch(() => null);
-    if (!brokerPrice) return sendJson(res, 502, { ok: false, error: "broker_price_unavailable" });
-    const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
-
-    if (Number.isFinite(order.tp1)) {
-      // Case A: a real broker TP exists -- halve its distance from entry.
-      const halfTp = order.entry + (order.tp1 - order.entry) * 0.5;
-      const minDistance = executionCostBuffer(order.pair);
-      const sideOk = buy ? halfTp > currentPrice + minDistance : halfTp < currentPrice - minDistance;
-      if (!sideOk) {
-        return sendJson(res, 409, {
-          ok: false, error: "half_tp_already_passed",
-          message: "Le prix a déjà dépassé (ou est trop proche de) la moitié de l'objectif -- rien à sécuriser via le TP, envisage de clôturer directement.",
-        });
-      }
-      const result = await modifyBrokerPositionTakeProfit(credentials, order.brokerOrderId, halfTp);
-      if (!result.ok) return sendJson(res, 502, { ok: false, error: "broker_modify_failed", message: result.error });
-      await sqlRun(`UPDATE trade_orders SET tp1 = ? WHERE id = ?`, [halfTp, order.id]);
-      return sendJson(res, 200, { ok: true, mode: "tp_halved", newTakeProfit: halfTp });
-    }
-
-    // Case B: no broker-side TP -- lock in half of the CURRENT unrealized
-    // profit via the position's real stop instead. entry/sl on trade_orders
-    // are the ORIGINAL, unmoved levels (see checkTrailingStops), so risk here
-    // is always the position's real original risk distance, never a moved value.
-    const risk = Math.abs(order.entry - order.sl);
-    if (!(risk > 0)) return sendJson(res, 400, { ok: false, error: "invalid_position_levels" });
-    const favorableR = buy ? (currentPrice - order.entry) / risk : (order.entry - currentPrice) / risk;
-    if (favorableR <= 0) {
-      return sendJson(res, 409, {
-        ok: false, error: "not_currently_profitable",
-        message: "La position n'est pas en profit actuellement -- rien à sécuriser.",
-      });
-    }
-    let halfLockStop = buy ? order.entry + (favorableR / 2) * risk : order.entry - (favorableR / 2) * risk;
-    const minDistance = executionCostBuffer(order.pair, orderRow.source === "auto_scalp" ? "scalp" : "swing");
-    const safeStop = buy ? currentPrice - minDistance : currentPrice + minDistance;
-    if (buy && halfLockStop > safeStop) halfLockStop = safeStop;
-    if (!buy && halfLockStop < safeStop) halfLockStop = safeStop;
-    const currentStop = Number.isFinite(order.trailingStopPrice) ? order.trailingStopPrice : order.sl;
-    const improves = buy ? halfLockStop > currentStop : halfLockStop < currentStop;
-    if (!improves) {
-      return sendJson(res, 409, {
-        ok: false, error: "already_secured_more",
-        message: "Le stop suiveur protège déjà plus que la moitié du profit actuel -- rien à faire.",
-      });
-    }
-    const result = await modifyBrokerPositionStopLoss(credentials, order.brokerOrderId, halfLockStop);
-    if (!result.ok) return sendJson(res, 502, { ok: false, error: "broker_modify_failed", message: result.error });
-    await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ? WHERE id = ?`, [halfLockStop, currentPrice, order.id]);
-    return sendJson(res, 200, { ok: true, mode: "stop_locked_half_profit", newStopLoss: halfLockStop });
+    const result = await secureHalfForOrder(order, orderRow, credentials);
+    return sendJson(res, result.status, result.body);
   }
 
   if (url.pathname === "/api/trade/cancel") {
@@ -3040,6 +3033,48 @@ async function handleApi(req, res, url) {
   // admin's scalp_enabled (pairs/lot mode/amounts configured there too) before
   // the owner can turn their own switch on -- same authorize-once/enable-freely
   // split as live_trading_enabled/authorized.
+  // "Securiser a mi-TP" as the bot's own priority (see
+  // secure_half_priority_enabled's schema comment for the full request and
+  // reasoning). Turning this ON retroactively halves every currently open
+  // fixed-TP position's real broker TP right away -- requested directly
+  // ("meme avec des positions ouverte deja de base") -- using the exact same
+  // secureHalfForOrder the manual button and future auto-opened positions
+  // both go through, never a separate reimplementation. Turning it OFF only
+  // stops the behavior going forward; it deliberately never un-halves a TP
+  // that's already been moved (there's no "original" to restore once the
+  // broker TP itself has changed).
+  if (url.pathname === "/api/auto-trade/toggle-secure-half") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const enabled = Boolean(body?.enabled);
+    await ensureRelationalTables();
+    await sqlRun(
+      `INSERT INTO auto_trading_accounts (user_id, secure_half_priority_enabled, created_at, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET secure_half_priority_enabled = excluded.secure_half_priority_enabled, updated_at = excluded.updated_at`,
+      [session.user.id, enabled ? 1 : 0, new Date().toISOString(), new Date().toISOString()],
+    );
+    let securedCount = 0;
+    if (enabled) {
+      const openRows = await sqlAll(
+        `SELECT o.*, a.source as source FROM trade_orders o LEFT JOIN analyses a ON a.id = o.analysis_id
+         WHERE o.user_id = ? AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL AND o.tp1 IS NOT NULL AND o.half_target_secured = 0`,
+        [session.user.id],
+      );
+      for (const row of openRows) {
+        const order = rowToTradeOrder(row);
+        const slot = order.brokerSlot || "demo";
+        const credentials = await getUserBrokerCredentials(session.user.id, slot).catch(() => null);
+        if (!credentials) continue;
+        const result = await secureHalfForOrder(order, row, credentials).catch((error) => ({ status: 502, body: { ok: false, error: error.message } }));
+        if (result.body?.ok) securedCount += 1;
+      }
+    }
+    sendJson(res, 200, { ok: true, securedCount });
+    return;
+  }
+
   if (url.pathname === "/api/auto-trade/toggle-scalp") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -3195,6 +3230,7 @@ async function handleApi(req, res, url) {
       // for this account (see runScalpTradingTick).
       scalpEnabled: Boolean(Number(row?.scalp_enabled)),
       scalpUserEnabled: Boolean(Number(row?.user_scalp_enabled)),
+      secureHalfPriorityEnabled: Boolean(Number(row?.secure_half_priority_enabled)),
       scalpPairs: row?.scalp_pairs ? row.scalp_pairs.split(",").filter(Boolean) : [],
       scalpLotMode: row?.scalp_lot_mode || "auto",
       scalpFixedLot: row?.scalp_fixed_lot ?? null,
@@ -9306,6 +9342,65 @@ async function modifyBrokerPositionTakeProfit(credentials, positionId, newTakePr
   }
 }
 
+// Extracted from /api/trade/secure-half so the SAME logic (not a
+// reimplementation that could drift) also powers the automatic "priority"
+// version -- see secure_half_priority_enabled: applied retroactively to
+// every already-open Case A position the instant a user turns the toggle on
+// (POST /api/auto-trade/toggle-secure-half), not just the on-demand manual
+// button. Case B (no broker TP) has no open-time equivalent -- it can only
+// ever be triggered live, once price actually reaches the halfway point, see
+// checkTrailingStops.
+async function secureHalfForOrder(order, orderRow, credentials) {
+  const buy = order.direction === "ACHAT";
+  const brokerPrice = await getBrokerCurrentPrice(credentials, order.pair).catch(() => null);
+  if (!brokerPrice) return { status: 502, body: { ok: false, error: "broker_price_unavailable" } };
+  const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
+
+  if (Number.isFinite(order.tp1)) {
+    // Case A: a real broker TP exists -- halve its distance from entry.
+    const halfTp = order.entry + (order.tp1 - order.entry) * 0.5;
+    const minDistance = executionCostBuffer(order.pair);
+    const sideOk = buy ? halfTp > currentPrice + minDistance : halfTp < currentPrice - minDistance;
+    if (!sideOk) {
+      return {
+        status: 409, body: {
+          ok: false, error: "half_tp_already_passed",
+          message: "Le prix a déjà dépassé (ou est trop proche de) la moitié de l'objectif -- rien à sécuriser via le TP, envisage de clôturer directement.",
+        },
+      };
+    }
+    const result = await modifyBrokerPositionTakeProfit(credentials, order.brokerOrderId, halfTp);
+    if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: result.error } };
+    await sqlRun(`UPDATE trade_orders SET tp1 = ?, half_target_secured = 1 WHERE id = ?`, [halfTp, order.id]);
+    return { status: 200, body: { ok: true, mode: "tp_halved", newTakeProfit: halfTp } };
+  }
+
+  // Case B: no broker-side TP -- lock in half of the CURRENT unrealized
+  // profit via the position's real stop instead. entry/sl on trade_orders
+  // are the ORIGINAL, unmoved levels (see checkTrailingStops), so risk here
+  // is always the position's real original risk distance, never a moved value.
+  const risk = Math.abs(order.entry - order.sl);
+  if (!(risk > 0)) return { status: 400, body: { ok: false, error: "invalid_position_levels" } };
+  const favorableR = buy ? (currentPrice - order.entry) / risk : (order.entry - currentPrice) / risk;
+  if (favorableR <= 0) {
+    return { status: 409, body: { ok: false, error: "not_currently_profitable", message: "La position n'est pas en profit actuellement -- rien à sécuriser." } };
+  }
+  let halfLockStop = buy ? order.entry + (favorableR / 2) * risk : order.entry - (favorableR / 2) * risk;
+  const minDistance = executionCostBuffer(order.pair, orderRow.source === "auto_scalp" ? "scalp" : "swing");
+  const safeStop = buy ? currentPrice - minDistance : currentPrice + minDistance;
+  if (buy && halfLockStop > safeStop) halfLockStop = safeStop;
+  if (!buy && halfLockStop < safeStop) halfLockStop = safeStop;
+  const currentStop = Number.isFinite(order.trailingStopPrice) ? order.trailingStopPrice : order.sl;
+  const improves = buy ? halfLockStop > currentStop : halfLockStop < currentStop;
+  if (!improves) {
+    return { status: 409, body: { ok: false, error: "already_secured_more", message: "Le stop suiveur protège déjà plus que la moitié du profit actuel -- rien à faire." } };
+  }
+  const result = await modifyBrokerPositionStopLoss(credentials, order.brokerOrderId, halfLockStop);
+  if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: result.error } };
+  await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ?, half_target_secured = 1 WHERE id = ?`, [halfLockStop, currentPrice, order.id]);
+  return { status: 200, body: { ok: true, mode: "stop_locked_half_profit", newStopLoss: halfLockStop } };
+}
+
 // The one function in this feature that can actually move money -- shared by
 // /api/trade/confirm (human clicks "Confirmer", credentials = null -> falls back to
 // the shared house account) and the autonomous scheduler (runAutoTradeTick,
@@ -9942,8 +10037,10 @@ async function checkTrailingStops() {
     await ensureRelationalTables();
     const rows = await sqlAll(
       `SELECT a.id as analysis_id, a.user_id as user_id, a.pair as pair, a.direction as direction, a.entry as entry, a.sl as sl, a.broker_slot as broker_slot, a.source as source,
-              o.id as order_id, o.broker_order_id as broker_order_id, o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price
+              o.id as order_id, o.broker_order_id as broker_order_id, o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price,
+              o.tp1 as tp1, o.tp2 as tp2, o.half_target_secured as half_target_secured, acc.secure_half_priority_enabled as secure_half_priority_enabled
        FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+       LEFT JOIN auto_trading_accounts acc ON acc.user_id = a.user_id
        WHERE a.status = 'OPEN' AND a.source IN ('auto_scalp', 'auto_signal') AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
       [],
     );
@@ -9979,6 +10076,24 @@ async function checkTrailingStops() {
       const priorBest = Number(row.best_favorable_price) || entry;
       const newBest = buy ? Math.max(priorBest, currentPrice) : Math.min(priorBest, currentPrice);
       let candidateStop = computeTrailingStopPrice(entry, row.direction, risk, newBest, params);
+
+      // secure_half_priority_enabled, Case B (see its schema comment): this
+      // row has no broker TP to pre-halve at open time (that's Case A, handled
+      // in processAutoTradeForUser/toggle-secure-half), so watch for price
+      // actually reaching halfway to the reference target (tp2) and lock the
+      // stop there the moment it does -- a one-time floor, folded into the
+      // SAME candidateStop the normal trailing curve already computed (never a
+      // second, competing modify call), taking whichever is more favorable.
+      let justSecuredHalf = false;
+      if (row.tp1 == null && Number(row.secure_half_priority_enabled) === 1 && !Number(row.half_target_secured) && Number.isFinite(row.tp2)) {
+        const halfTarget = buy ? entry + (row.tp2 - entry) * 0.5 : entry - (entry - row.tp2) * 0.5;
+        const reached = buy ? currentPrice >= halfTarget : currentPrice <= halfTarget;
+        if (reached) {
+          justSecuredHalf = true;
+          candidateStop = candidateStop == null ? halfTarget : (buy ? Math.max(candidateStop, halfTarget) : Math.min(candidateStop, halfTarget));
+        }
+      }
+
       // Confirmed live: a stop this close to (or on the wrong side of) the
       // CURRENT price gets rejected by the broker as TRADE_RETCODE_INVALID_STOPS
       // -- a real MT5 rule (a protective stop can never sit past where the
@@ -9998,15 +10113,25 @@ async function checkTrailingStops() {
         // Still record a new best-favorable-price even when the stop itself
         // doesn't move yet (below trailActivationR, or between ratchet steps) --
         // otherwise a price that later retraces before reaching the next step
-        // would wrongly look like it never got there.
-        if (newBest !== priorBest) {
-          await sqlRun(`UPDATE trade_orders SET best_favorable_price = ? WHERE id = ?`, [newBest, row.order_id]).catch(() => {});
+        // would wrongly look like it never got there. half_target_secured is
+        // still marked if price reached halfway this tick, even on the rare
+        // case the normal trailing curve's own stop was already just as good
+        // (or better) -- the TRIGGER condition (reached halfway) happened
+        // regardless of which candidate ultimately won the clamp/compare.
+        if (newBest !== priorBest || justSecuredHalf) {
+          await sqlRun(
+            `UPDATE trade_orders SET best_favorable_price = ?${justSecuredHalf ? ", half_target_secured = 1" : ""} WHERE id = ?`,
+            [newBest, row.order_id],
+          ).catch(() => {});
         }
         continue;
       }
       const result = await modifyBrokerPositionStopLoss(credentials, row.broker_order_id, candidateStop).catch((error) => ({ ok: false, error: error.message }));
       if (result.ok) {
-        await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ? WHERE id = ?`, [candidateStop, newBest, row.order_id]).catch(() => {});
+        await sqlRun(
+          `UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ?${justSecuredHalf ? ", half_target_secured = 1" : ""} WHERE id = ?`,
+          [candidateStop, newBest, row.order_id],
+        ).catch(() => {});
       } else {
         logOnce(`trailing-${row.analysis_id}`, `déplacement du stop suiveur échoué (${result.error})`);
       }
