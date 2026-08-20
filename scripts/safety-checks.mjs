@@ -448,5 +448,25 @@ check("alerts once the scheduler has been silent past the stale threshold (11 mi
 check("does NOT re-alert immediately after already alerting (still silent, but within the cooldown)", shouldAlertHeartbeat(T0, T0 - 11 * 60_000, T0 - 5 * 60_000) === false);
 check("DOES alert again once the cooldown has passed and it's still silent (a real ongoing outage keeps getting reported)", shouldAlertHeartbeat(T0, T0 - 11 * 60_000, T0 - 61 * 60_000) === true);
 
+console.log("\n=== startOfWeekUtc/startOfMonthUtc: weekly/monthly loss-cap window boundaries ===");
+
+// Copy of both from server.mjs.
+function startOfWeekUtc(now = new Date()) {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const day = d.getUTCDay();
+  d.setUTCDate(d.getUTCDate() - (day === 0 ? 6 : day - 1));
+  return d;
+}
+function startOfMonthUtc(now = new Date()) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+}
+
+check("a Wednesday resolves to that same week's Monday", startOfWeekUtc(new Date("2026-08-19T15:00:00Z")).toISOString() === "2026-08-17T00:00:00.000Z");
+check("a Monday itself resolves to itself (00:00), not the previous week", startOfWeekUtc(new Date("2026-08-17T23:59:00Z")).toISOString() === "2026-08-17T00:00:00.000Z");
+check("a Sunday resolves to the Monday that started ITS week (6 days back), not the upcoming one", startOfWeekUtc(new Date("2026-08-23T05:00:00Z")).toISOString() === "2026-08-17T00:00:00.000Z");
+check("mid-month resolves to the 1st of that month", startOfMonthUtc(new Date("2026-08-19T15:00:00Z")).toISOString() === "2026-08-01T00:00:00.000Z");
+check("the 1st itself resolves to itself", startOfMonthUtc(new Date("2026-08-01T00:00:01Z")).toISOString() === "2026-08-01T00:00:00.000Z");
+check("crosses a real year boundary correctly (Jan 2027)", startOfMonthUtc(new Date("2027-01-15T00:00:00Z")).toISOString() === "2027-01-01T00:00:00.000Z");
+
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

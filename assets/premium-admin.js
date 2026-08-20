@@ -235,6 +235,10 @@
     no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil confiance/R:R",
     daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte",
     daily_loss_limit_amount_reached: "Limite de perte quotidienne ($) atteinte",
+    weekly_loss_limit_percent_reached: "Limite de perte hebdomadaire (%) atteinte",
+    weekly_loss_limit_amount_reached: "Limite de perte hebdomadaire ($) atteinte",
+    monthly_loss_limit_percent_reached: "Limite de perte mensuelle (%) atteinte",
+    monthly_loss_limit_amount_reached: "Limite de perte mensuelle ($) atteinte",
     max_concurrent_positions_reached: "Max positions ouvertes atteint",
     max_trades_per_day_reached: "Max trades/jour atteint",
     broker_unreachable: "Broker injoignable au dernier passage",
@@ -270,6 +274,14 @@
       parts.push(`limite ${detail.dailyLossLimitPercent}%`);
     } else if (reason === "daily_loss_limit_amount_reached") {
       parts.push(`limite ${detail.dailyLossLimitAmount}`);
+    } else if (reason === "weekly_loss_limit_percent_reached") {
+      parts.push(`limite ${detail.weeklyLossLimitPercent}%`);
+    } else if (reason === "weekly_loss_limit_amount_reached") {
+      parts.push(`limite ${detail.weeklyLossLimitAmount}`);
+    } else if (reason === "monthly_loss_limit_percent_reached") {
+      parts.push(`limite ${detail.monthlyLossLimitPercent}%`);
+    } else if (reason === "monthly_loss_limit_amount_reached") {
+      parts.push(`limite ${detail.monthlyLossLimitAmount}`);
     } else if (reason === "outside_admin_trading_hours" || reason === "outside_user_trading_hours") {
       if (detail.tradingHoursStart && detail.tradingHoursEnd) parts.push(`${detail.tradingHoursStart}-${detail.tradingHoursEnd} UTC`);
     } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {
@@ -360,6 +372,18 @@
           </label>
           <label class="dashboard-autotrade-field">Perte max / jour (montant) <span class="dashboard-autotrade-hint">(0 = pas de plafond, devise du broker)</span>
             <input type="number" min="0" step="1" value="${request.dailyLossLimitAmount ?? 0}" data-field="dailyLossLimitAmount">
+          </label>
+          <label class="dashboard-autotrade-field">Perte max / semaine (%) <span class="dashboard-autotrade-hint">(0 = pas de plafond)</span>
+            <input type="number" min="0" max="50" step="0.5" value="${request.weeklyLossLimitPercent ?? 0}" data-field="weeklyLossLimitPercent">
+          </label>
+          <label class="dashboard-autotrade-field">Perte max / semaine (montant) <span class="dashboard-autotrade-hint">(0 = pas de plafond)</span>
+            <input type="number" min="0" step="1" value="${request.weeklyLossLimitAmount ?? 0}" data-field="weeklyLossLimitAmount">
+          </label>
+          <label class="dashboard-autotrade-field">Perte max / mois (%) <span class="dashboard-autotrade-hint">(0 = pas de plafond)</span>
+            <input type="number" min="0" max="90" step="0.5" value="${request.monthlyLossLimitPercent ?? 0}" data-field="monthlyLossLimitPercent">
+          </label>
+          <label class="dashboard-autotrade-field">Perte max / mois (montant) <span class="dashboard-autotrade-hint">(0 = pas de plafond)</span>
+            <input type="number" min="0" step="1" value="${request.monthlyLossLimitAmount ?? 0}" data-field="monthlyLossLimitAmount">
           </label>
           <label class="dashboard-autotrade-field">Heure de début <span class="dashboard-autotrade-hint">(UTC)</span>
             <input type="time" value="${escapeHtml(request.tradingHoursStart || "")}" data-field="tradingHoursStart">
@@ -455,6 +479,8 @@
           days: field("days"), riskPercent: field("riskPercent"), dailyLossLimitPercent: field("dailyLossLimitPercent"),
           maxConcurrentPositions: field("maxConcurrentPositions"), minConfidenceFloor: field("minConfidenceFloor"),
           maxTradesPerDay: field("maxTradesPerDay"), minRiskReward: field("minRiskReward"), dailyLossLimitAmount: field("dailyLossLimitAmount"),
+          weeklyLossLimitPercent: field("weeklyLossLimitPercent"), weeklyLossLimitAmount: field("weeklyLossLimitAmount"),
+          monthlyLossLimitPercent: field("monthlyLossLimitPercent"), monthlyLossLimitAmount: field("monthlyLossLimitAmount"),
           tradingHoursStart: timeField("tradingHoursStart"), tradingHoursEnd: timeField("tradingHoursEnd"),
         });
         button.disabled = false;

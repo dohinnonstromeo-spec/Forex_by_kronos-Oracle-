@@ -931,6 +931,10 @@
     no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil de confiance ou de R:R requis",
     daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte -- reprend demain",
     daily_loss_limit_amount_reached: "Limite de perte quotidienne ($) atteinte -- reprend demain",
+    weekly_loss_limit_percent_reached: "Limite de perte hebdomadaire (%) atteinte -- reprend lundi",
+    weekly_loss_limit_amount_reached: "Limite de perte hebdomadaire ($) atteinte -- reprend lundi",
+    monthly_loss_limit_percent_reached: "Limite de perte mensuelle (%) atteinte -- reprend le mois prochain",
+    monthly_loss_limit_amount_reached: "Limite de perte mensuelle ($) atteinte -- reprend le mois prochain",
     max_concurrent_positions_reached: "Nombre maximum de positions ouvertes déjà atteint",
     max_trades_per_day_reached: "Nombre maximum de trades/jour déjà atteint",
     broker_unreachable: "Broker injoignable au dernier passage (solde non confirmé)",
@@ -969,6 +973,14 @@
       parts.push(`limite ${detail.dailyLossLimitPercent}%`);
     } else if (reason === "daily_loss_limit_amount_reached") {
       parts.push(`limite ${detail.dailyLossLimitAmount}`);
+    } else if (reason === "weekly_loss_limit_percent_reached") {
+      parts.push(`limite ${detail.weeklyLossLimitPercent}%`);
+    } else if (reason === "weekly_loss_limit_amount_reached") {
+      parts.push(`limite ${detail.weeklyLossLimitAmount}`);
+    } else if (reason === "monthly_loss_limit_percent_reached") {
+      parts.push(`limite ${detail.monthlyLossLimitPercent}%`);
+    } else if (reason === "monthly_loss_limit_amount_reached") {
+      parts.push(`limite ${detail.monthlyLossLimitAmount}`);
     } else if (reason === "outside_admin_trading_hours" || reason === "outside_user_trading_hours") {
       if (detail.tradingHoursStart && detail.tradingHoursEnd) parts.push(`${detail.tradingHoursStart}-${detail.tradingHoursEnd} UTC`);
     } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {
@@ -1116,6 +1128,10 @@
     ["userMaxTradesPerDay", "maxTradesPerDay", (v) => v],
     ["userDailyLossLimitPercent", "dailyLossLimitPercent", (v) => `${v}%`],
     ["userDailyLossLimitAmount", "dailyLossLimitAmount", (v) => v],
+    ["userWeeklyLossLimitPercent", "weeklyLossLimitPercent", (v) => `${v}%`],
+    ["userWeeklyLossLimitAmount", "weeklyLossLimitAmount", (v) => v],
+    ["userMonthlyLossLimitPercent", "monthlyLossLimitPercent", (v) => `${v}%`],
+    ["userMonthlyLossLimitAmount", "monthlyLossLimitAmount", (v) => v],
   ];
 
   function renderAutoTradePreferences(status) {
@@ -1164,7 +1180,10 @@
             userRiskPercent: field("userRiskPercent"), userCapitalCap: field("userCapitalCap"), userMinConfidence: field("userMinConfidence"),
             userMinRiskReward: field("userMinRiskReward"), userMaxConcurrentPositions: field("userMaxConcurrentPositions"),
             userMaxTradesPerDay: field("userMaxTradesPerDay"), userDailyLossLimitPercent: field("userDailyLossLimitPercent"),
-            userDailyLossLimitAmount: field("userDailyLossLimitAmount"), userTradingHoursStart: field("userTradingHoursStart"),
+            userDailyLossLimitAmount: field("userDailyLossLimitAmount"),
+            userWeeklyLossLimitPercent: field("userWeeklyLossLimitPercent"), userWeeklyLossLimitAmount: field("userWeeklyLossLimitAmount"),
+            userMonthlyLossLimitPercent: field("userMonthlyLossLimitPercent"), userMonthlyLossLimitAmount: field("userMonthlyLossLimitAmount"),
+            userTradingHoursStart: field("userTradingHoursStart"),
             userTradingHoursEnd: field("userTradingHoursEnd"), userTradingDays,
           }),
         });

@@ -247,6 +247,18 @@
               <label class="dashboard-autotrade-field">Perte max / jour (montant) <span class="dashboard-autotrade-hint" data-pref-hint="dailyLossLimitAmount"></span>
                 <input type="number" min="0" step="1" data-pref="userDailyLossLimitAmount" placeholder="réglage admin">
               </label>
+              <label class="dashboard-autotrade-field">Perte max / semaine (%) <span class="dashboard-autotrade-hint" data-pref-hint="weeklyLossLimitPercent"></span>
+                <input type="number" min="1" max="50" step="0.5" data-pref="userWeeklyLossLimitPercent" placeholder="aucune limite">
+              </label>
+              <label class="dashboard-autotrade-field">Perte max / semaine (montant) <span class="dashboard-autotrade-hint" data-pref-hint="weeklyLossLimitAmount"></span>
+                <input type="number" min="0" step="1" data-pref="userWeeklyLossLimitAmount" placeholder="aucune limite">
+              </label>
+              <label class="dashboard-autotrade-field">Perte max / mois (%) <span class="dashboard-autotrade-hint" data-pref-hint="monthlyLossLimitPercent"></span>
+                <input type="number" min="1" max="90" step="0.5" data-pref="userMonthlyLossLimitPercent" placeholder="aucune limite">
+              </label>
+              <label class="dashboard-autotrade-field">Perte max / mois (montant) <span class="dashboard-autotrade-hint" data-pref-hint="monthlyLossLimitAmount"></span>
+                <input type="number" min="0" step="1" data-pref="userMonthlyLossLimitAmount" placeholder="aucune limite">
+              </label>
               <label class="dashboard-autotrade-field">Heure de début <span class="dashboard-autotrade-hint">(UTC)</span>
                 <input type="time" data-pref="userTradingHoursStart">
               </label>

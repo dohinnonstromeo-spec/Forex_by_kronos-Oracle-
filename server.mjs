@@ -332,6 +332,15 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "trading_hours_end text");
   await ensureColumn("auto_trading_accounts", "trading_days text");
   await ensureColumn("auto_trading_accounts", "daily_loss_limit_amount real");
+  // Insufficiency #4 from an engine audit: the daily cap above resets to zero
+  // every UTC midnight, so nothing stopped hitting it 5 days running and
+  // losing a real cumulative amount while each individual day still looked
+  // compliant. Same NULL/0 = no restriction convention, same weekly-Monday /
+  // calendar-month UTC windows as weeklyRealizedPnlPercent/monthlyRealizedPnlPercent.
+  await ensureColumn("auto_trading_accounts", "weekly_loss_limit_percent real");
+  await ensureColumn("auto_trading_accounts", "weekly_loss_limit_amount real");
+  await ensureColumn("auto_trading_accounts", "monthly_loss_limit_percent real");
+  await ensureColumn("auto_trading_accounts", "monthly_loss_limit_amount real");
   // The user-side half of every admin-set bot parameter above (plus the
   // pre-existing user_min_confidence) -- each one lets the account owner
   // tighten their own bot's behavior, never loosen it past whatever the admin
@@ -351,6 +360,10 @@ async function ensureRelationalTables() {
   await ensureColumn("auto_trading_accounts", "user_max_trades_per_day integer");
   await ensureColumn("auto_trading_accounts", "user_daily_loss_limit_percent real");
   await ensureColumn("auto_trading_accounts", "user_daily_loss_limit_amount real");
+  await ensureColumn("auto_trading_accounts", "user_weekly_loss_limit_percent real");
+  await ensureColumn("auto_trading_accounts", "user_weekly_loss_limit_amount real");
+  await ensureColumn("auto_trading_accounts", "user_monthly_loss_limit_percent real");
+  await ensureColumn("auto_trading_accounts", "user_monthly_loss_limit_amount real");
   await ensureColumn("auto_trading_accounts", "user_min_risk_reward real");
   await ensureColumn("auto_trading_accounts", "user_trading_hours_start text");
   await ensureColumn("auto_trading_accounts", "user_trading_hours_end text");
@@ -1557,6 +1570,69 @@ async function dailyRealizedPnlAmount(userId, slot) {
   return Number(row?.total) || 0;
 }
 
+// Insufficiency #4 from an engine audit: only a DAILY loss cap existed,
+// resetting to zero every UTC midnight -- nothing stopped hitting that daily
+// limit 5 days in a row and losing a real amount cumulatively while each
+// individual day still looked compliant. weekStart is the most recent Monday
+// 00:00 UTC (forex's own trading week starts Sunday evening/Monday, matching
+// how a trader actually thinks about "this week"); monthStart is the 1st of
+// the current UTC month. Same query shape as the daily functions above, on
+// purpose -- only the window start differs, everything else (real
+// r_multiple*risk_percent approximation for the % version, real broker
+// profit sum for the $ version, auto_signal only, slot-scoped) stays
+// identical so the two respect the exact same semantics at a different
+// timescale.
+function startOfWeekUtc(now = new Date()) {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const day = d.getUTCDay(); // 0=Sunday..6=Saturday
+  d.setUTCDate(d.getUTCDate() - (day === 0 ? 6 : day - 1)); // back to the most recent Monday
+  return d;
+}
+function startOfMonthUtc(now = new Date()) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+}
+
+async function weeklyRealizedPnlPercent(userId, slot) {
+  const rows = await sqlAll(
+    `SELECT a.r_multiple as r_multiple, o.risk_percent_at_trade as risk_percent
+     FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.broker_slot = ? AND a.closed_at >= ? AND a.r_multiple IS NOT NULL`,
+    [userId, slot, startOfWeekUtc().toISOString()],
+  );
+  return rows.reduce((sum, row) => {
+    const r = Number(row.r_multiple), pct = Number(row.risk_percent);
+    return Number.isFinite(r) && Number.isFinite(pct) ? sum + r * pct : sum;
+  }, 0);
+}
+async function weeklyRealizedPnlAmount(userId, slot) {
+  const row = await sqlGet(
+    `SELECT SUM(a.broker_profit_amount) as total FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.broker_slot = ? AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
+    [userId, slot, startOfWeekUtc().toISOString()],
+  );
+  return Number(row?.total) || 0;
+}
+async function monthlyRealizedPnlPercent(userId, slot) {
+  const rows = await sqlAll(
+    `SELECT a.r_multiple as r_multiple, o.risk_percent_at_trade as risk_percent
+     FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.broker_slot = ? AND a.closed_at >= ? AND a.r_multiple IS NOT NULL`,
+    [userId, slot, startOfMonthUtc().toISOString()],
+  );
+  return rows.reduce((sum, row) => {
+    const r = Number(row.r_multiple), pct = Number(row.risk_percent);
+    return Number.isFinite(r) && Number.isFinite(pct) ? sum + r * pct : sum;
+  }, 0);
+}
+async function monthlyRealizedPnlAmount(userId, slot) {
+  const row = await sqlGet(
+    `SELECT SUM(a.broker_profit_amount) as total FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
+     WHERE o.user_id = ? AND a.source = 'auto_signal' AND a.broker_slot = ? AND a.closed_at >= ? AND a.broker_profit_amount IS NOT NULL`,
+    [userId, slot, startOfMonthUtc().toISOString()],
+  );
+  return Number(row?.total) || 0;
+}
+
 // hoursStart/End are "HH:MM" in UTC; a start > end window is treated as
 // spanning midnight (e.g. 22:00-06:00), not rejected. days is a comma-separated
 // list of JS getUTCDay() values (0=Sunday..6=Saturday). Either left unset (null)
@@ -1653,6 +1729,22 @@ async function processAutoTradeForUser(account, signals, slot) {
   const dailyLossLimitAmount = combineTightened(account.daily_loss_limit_amount, account.user_daily_loss_limit_amount, "lower");
   if (dailyLossLimitAmount > 0 && (await dailyRealizedPnlAmount(userId, slot)) <= -dailyLossLimitAmount)
     return recordAutoTradeStatus(userId, slot, "daily_loss_limit_amount_reached", { dailyLossLimitAmount });
+  // Same checks, wider windows -- catches a losing streak that clears the
+  // daily cap every single day (each day individually "compliant") but adds
+  // up to a real cumulative loss across the week/month. Off by default
+  // (0/unset), same as every other limit added this session.
+  const weeklyLossLimitPercent = combineTightened(account.weekly_loss_limit_percent, account.user_weekly_loss_limit_percent, "lower");
+  if (weeklyLossLimitPercent > 0 && (await weeklyRealizedPnlPercent(userId, slot)) <= -weeklyLossLimitPercent)
+    return recordAutoTradeStatus(userId, slot, "weekly_loss_limit_percent_reached", { weeklyLossLimitPercent });
+  const weeklyLossLimitAmount = combineTightened(account.weekly_loss_limit_amount, account.user_weekly_loss_limit_amount, "lower");
+  if (weeklyLossLimitAmount > 0 && (await weeklyRealizedPnlAmount(userId, slot)) <= -weeklyLossLimitAmount)
+    return recordAutoTradeStatus(userId, slot, "weekly_loss_limit_amount_reached", { weeklyLossLimitAmount });
+  const monthlyLossLimitPercent = combineTightened(account.monthly_loss_limit_percent, account.user_monthly_loss_limit_percent, "lower");
+  if (monthlyLossLimitPercent > 0 && (await monthlyRealizedPnlPercent(userId, slot)) <= -monthlyLossLimitPercent)
+    return recordAutoTradeStatus(userId, slot, "monthly_loss_limit_percent_reached", { monthlyLossLimitPercent });
+  const monthlyLossLimitAmount = combineTightened(account.monthly_loss_limit_amount, account.user_monthly_loss_limit_amount, "lower");
+  if (monthlyLossLimitAmount > 0 && (await monthlyRealizedPnlAmount(userId, slot)) <= -monthlyLossLimitAmount)
+    return recordAutoTradeStatus(userId, slot, "monthly_loss_limit_amount_reached", { monthlyLossLimitAmount });
 
   const maxConcurrent = combineTightened(account.max_concurrent_positions || 2, account.user_max_concurrent_positions, "lower");
   let openCount = await countOpenAutoPositions(userId, slot);
@@ -2138,6 +2230,10 @@ async function handleApi(req, res, url) {
       tradingHoursEnd: row.trading_hours_end || null,
       tradingDays: row.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
       dailyLossLimitAmount: row.daily_loss_limit_amount ?? null,
+      weeklyLossLimitPercent: row.weekly_loss_limit_percent ?? null,
+      weeklyLossLimitAmount: row.weekly_loss_limit_amount ?? null,
+      monthlyLossLimitPercent: row.monthly_loss_limit_percent ?? null,
+      monthlyLossLimitAmount: row.monthly_loss_limit_amount ?? null,
       scalpEnabled: Boolean(Number(row.scalp_enabled)),
       scalpProfitTargetAmount: row.scalp_profit_target_amount ?? null,
       scalpLossLimitAmount: row.scalp_loss_limit_amount ?? null,
@@ -2243,6 +2339,17 @@ async function handleApi(req, res, url) {
     const tradingDays = uniqueTradingDays.length && uniqueTradingDays.length < 7 ? uniqueTradingDays.join(",") : null;
     const dailyLossLimitAmountRaw = Number(body?.dailyLossLimitAmount) || 0;
     const dailyLossLimitAmount = dailyLossLimitAmountRaw > 0 ? dailyLossLimitAmountRaw : null;
+    // Same "0/absent = no restriction" convention as the daily fields above --
+    // insufficiency #4 from an engine audit (a daily-only cap lets a losing
+    // streak clear it every single day while still adding up over a week/month).
+    const weeklyLossLimitPercentRaw = Number(body?.weeklyLossLimitPercent) || 0;
+    const weeklyLossLimitPercent = weeklyLossLimitPercentRaw > 0 ? Math.max(1, Math.min(50, weeklyLossLimitPercentRaw)) : null;
+    const weeklyLossLimitAmountRaw = Number(body?.weeklyLossLimitAmount) || 0;
+    const weeklyLossLimitAmount = weeklyLossLimitAmountRaw > 0 ? weeklyLossLimitAmountRaw : null;
+    const monthlyLossLimitPercentRaw = Number(body?.monthlyLossLimitPercent) || 0;
+    const monthlyLossLimitPercent = monthlyLossLimitPercentRaw > 0 ? Math.max(1, Math.min(90, monthlyLossLimitPercentRaw)) : null;
+    const monthlyLossLimitAmountRaw = Number(body?.monthlyLossLimitAmount) || 0;
+    const monthlyLossLimitAmount = monthlyLossLimitAmountRaw > 0 ? monthlyLossLimitAmountRaw : null;
     // Progressive risk tiers: each {minBalance, riskPercent} clamped the same way
     // the flat riskPercent above is, so a tier can never grant more risk than a
     // single flat approval could -- just lets it start lower and step up with
@@ -2258,8 +2365,8 @@ async function handleApi(req, res, url) {
     const approvedUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
     await sqlRun(
-      `INSERT INTO auto_trading_accounts (user_id, approval_status, requested_at, decided_at, decided_by, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, max_trades_per_day, min_risk_reward, trading_hours_start, trading_hours_end, trading_days, daily_loss_limit_amount, risk_tiers_enabled, risk_tiers, user_paused, created_at, updated_at)
-       VALUES (?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `INSERT INTO auto_trading_accounts (user_id, approval_status, requested_at, decided_at, decided_by, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, max_trades_per_day, min_risk_reward, trading_hours_start, trading_hours_end, trading_days, daily_loss_limit_amount, weekly_loss_limit_percent, weekly_loss_limit_amount, monthly_loss_limit_percent, monthly_loss_limit_amount, risk_tiers_enabled, risk_tiers, user_paused, created_at, updated_at)
+       VALUES (?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          approval_status = 'approved', decided_at = excluded.decided_at, decided_by = excluded.decided_by,
          reject_reason = NULL, approved_until = excluded.approved_until, approved_pairs = excluded.approved_pairs,
@@ -2268,12 +2375,15 @@ async function handleApi(req, res, url) {
          max_trades_per_day = excluded.max_trades_per_day, min_risk_reward = excluded.min_risk_reward,
          trading_hours_start = excluded.trading_hours_start, trading_hours_end = excluded.trading_hours_end,
          trading_days = excluded.trading_days, daily_loss_limit_amount = excluded.daily_loss_limit_amount,
+         weekly_loss_limit_percent = excluded.weekly_loss_limit_percent, weekly_loss_limit_amount = excluded.weekly_loss_limit_amount,
+         monthly_loss_limit_percent = excluded.monthly_loss_limit_percent, monthly_loss_limit_amount = excluded.monthly_loss_limit_amount,
          risk_tiers_enabled = excluded.risk_tiers_enabled, risk_tiers = excluded.risk_tiers,
          user_paused = 0, updated_at = excluded.updated_at`,
       [
         userId, now, now, admin.user?.email || "token", approvedUntil, pairs.join(","), riskPercent, dailyLossLimitPercent,
         maxConcurrentPositions, minConfidenceFloor, maxTradesPerDay, minRiskReward, tradingHoursStart, tradingHoursEnd,
-        tradingDays, dailyLossLimitAmount, riskTiersEnabled ? 1 : 0, riskTiersJson, now, now,
+        tradingDays, dailyLossLimitAmount, weeklyLossLimitPercent, weeklyLossLimitAmount, monthlyLossLimitPercent, monthlyLossLimitAmount,
+        riskTiersEnabled ? 1 : 0, riskTiersJson, now, now,
       ],
     );
     sendJson(res, 200, { ok: true, approvedUntil });
@@ -2885,6 +2995,10 @@ async function handleApi(req, res, url) {
     const userMaxTradesPerDay = clampInt(body?.userMaxTradesPerDay, 1, 100);
     const userDailyLossLimitPercent = clamp(body?.userDailyLossLimitPercent, 1, 10);
     const userDailyLossLimitAmount = Number.isFinite(Number(body?.userDailyLossLimitAmount)) && Number(body.userDailyLossLimitAmount) > 0 ? Number(body.userDailyLossLimitAmount) : null;
+    const userWeeklyLossLimitPercent = clamp(body?.userWeeklyLossLimitPercent, 1, 50);
+    const userWeeklyLossLimitAmount = Number.isFinite(Number(body?.userWeeklyLossLimitAmount)) && Number(body.userWeeklyLossLimitAmount) > 0 ? Number(body.userWeeklyLossLimitAmount) : null;
+    const userMonthlyLossLimitPercent = clamp(body?.userMonthlyLossLimitPercent, 1, 90);
+    const userMonthlyLossLimitAmount = Number.isFinite(Number(body?.userMonthlyLossLimitAmount)) && Number(body.userMonthlyLossLimitAmount) > 0 ? Number(body.userMonthlyLossLimitAmount) : null;
     const userMinRiskReward = clamp(body?.userMinRiskReward, 0.1, 10);
     const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
     const userTradingHoursStart = timePattern.test(body?.userTradingHoursStart) && timePattern.test(body?.userTradingHoursEnd) ? body.userTradingHoursStart : null;
@@ -2904,20 +3018,25 @@ async function handleApi(req, res, url) {
     await sqlRun(
       `INSERT INTO auto_trading_accounts (
          user_id, user_min_confidence, user_risk_percent, user_capital_cap, user_max_concurrent_positions, user_max_trades_per_day,
-         user_daily_loss_limit_percent, user_daily_loss_limit_amount, user_min_risk_reward,
-         user_trading_hours_start, user_trading_hours_end, user_trading_days, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         user_daily_loss_limit_percent, user_daily_loss_limit_amount,
+         user_weekly_loss_limit_percent, user_weekly_loss_limit_amount, user_monthly_loss_limit_percent, user_monthly_loss_limit_amount,
+         user_min_risk_reward, user_trading_hours_start, user_trading_hours_end, user_trading_days, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          user_min_confidence = excluded.user_min_confidence, user_risk_percent = excluded.user_risk_percent,
          user_capital_cap = excluded.user_capital_cap, user_max_concurrent_positions = excluded.user_max_concurrent_positions,
          user_max_trades_per_day = excluded.user_max_trades_per_day, user_daily_loss_limit_percent = excluded.user_daily_loss_limit_percent,
-         user_daily_loss_limit_amount = excluded.user_daily_loss_limit_amount, user_min_risk_reward = excluded.user_min_risk_reward,
+         user_daily_loss_limit_amount = excluded.user_daily_loss_limit_amount,
+         user_weekly_loss_limit_percent = excluded.user_weekly_loss_limit_percent, user_weekly_loss_limit_amount = excluded.user_weekly_loss_limit_amount,
+         user_monthly_loss_limit_percent = excluded.user_monthly_loss_limit_percent, user_monthly_loss_limit_amount = excluded.user_monthly_loss_limit_amount,
+         user_min_risk_reward = excluded.user_min_risk_reward,
          user_trading_hours_start = excluded.user_trading_hours_start, user_trading_hours_end = excluded.user_trading_hours_end,
          user_trading_days = excluded.user_trading_days, updated_at = excluded.updated_at`,
       [
         session.user.id, userMinConfidence, userRiskPercent, userCapitalCap, userMaxConcurrentPositions, userMaxTradesPerDay,
-        userDailyLossLimitPercent, userDailyLossLimitAmount, userMinRiskReward,
-        userTradingHoursStart, userTradingHoursEnd, userTradingDays, new Date().toISOString(), new Date().toISOString(),
+        userDailyLossLimitPercent, userDailyLossLimitAmount,
+        userWeeklyLossLimitPercent, userWeeklyLossLimitAmount, userMonthlyLossLimitPercent, userMonthlyLossLimitAmount,
+        userMinRiskReward, userTradingHoursStart, userTradingHoursEnd, userTradingDays, new Date().toISOString(), new Date().toISOString(),
       ],
     );
     sendJson(res, 200, { ok: true });
@@ -2959,6 +3078,10 @@ async function handleApi(req, res, url) {
       tradingHoursEnd: row?.trading_hours_end || null,
       tradingDays: row?.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
       dailyLossLimitAmount: row?.daily_loss_limit_amount ?? null,
+      weeklyLossLimitPercent: row?.weekly_loss_limit_percent ?? null,
+      weeklyLossLimitAmount: row?.weekly_loss_limit_amount ?? null,
+      monthlyLossLimitPercent: row?.monthly_loss_limit_percent ?? null,
+      monthlyLossLimitAmount: row?.monthly_loss_limit_amount ?? null,
       // The user's own preferences (see /api/auto-trade/preferences) -- each one
       // only ever tightens the admin value above, never loosens it.
       userMinConfidence: row?.user_min_confidence ?? null,
@@ -2968,6 +3091,10 @@ async function handleApi(req, res, url) {
       userMaxTradesPerDay: row?.user_max_trades_per_day ?? null,
       userDailyLossLimitPercent: row?.user_daily_loss_limit_percent ?? null,
       userDailyLossLimitAmount: row?.user_daily_loss_limit_amount ?? null,
+      userWeeklyLossLimitPercent: row?.user_weekly_loss_limit_percent ?? null,
+      userWeeklyLossLimitAmount: row?.user_weekly_loss_limit_amount ?? null,
+      userMonthlyLossLimitPercent: row?.user_monthly_loss_limit_percent ?? null,
+      userMonthlyLossLimitAmount: row?.user_monthly_loss_limit_amount ?? null,
       userMinRiskReward: row?.user_min_risk_reward ?? null,
       userTradingHoursStart: row?.user_trading_hours_start || null,
       userTradingHoursEnd: row?.user_trading_hours_end || null,
