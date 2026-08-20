@@ -429,5 +429,24 @@ check("parseRr correctly extracts 1.4 from cautiousSignal's rr format", parseRr(
 check("with the fix, a signal genuinely meeting a 1.5 min R:R now correctly passes", parseRr("1:2.0") >= 1.5);
 check("with the fix, a signal genuinely below a 1.5 min R:R is still correctly rejected", !(parseRr("1:1.4") >= 1.5));
 
+console.log("\n=== checkSchedulerHeartbeat: alert once a scheduler goes silent, without spamming while it stays silent ===");
+
+// Copy of the staleness/cooldown decision from checkSchedulerHeartbeat() in
+// server.mjs, as a pure function of (now, lastAttemptAt, lastAlertAt) so it's
+// testable without real setInterval timing.
+function shouldAlertHeartbeat(now, lastAttemptAt, lastAlertAt, staleMs = 10 * 60 * 1000, cooldownMs = 60 * 60 * 1000) {
+  if (!lastAttemptAt) return false;
+  if (now - lastAttemptAt < staleMs) return false;
+  if (now - lastAlertAt < cooldownMs) return false;
+  return true;
+}
+
+const T0 = 1_800_000_000_000; // arbitrary fixed reference instant
+check("never alerts before the scheduler has ticked even once (server just started)", shouldAlertHeartbeat(T0, null, 0) === false);
+check("does not alert while the scheduler is still ticking normally (last attempt 1 min ago)", shouldAlertHeartbeat(T0, T0 - 60_000, 0) === false);
+check("alerts once the scheduler has been silent past the stale threshold (11 min, threshold 10)", shouldAlertHeartbeat(T0, T0 - 11 * 60_000, 0) === true);
+check("does NOT re-alert immediately after already alerting (still silent, but within the cooldown)", shouldAlertHeartbeat(T0, T0 - 11 * 60_000, T0 - 5 * 60_000) === false);
+check("DOES alert again once the cooldown has passed and it's still silent (a real ongoing outage keeps getting reported)", shouldAlertHeartbeat(T0, T0 - 11 * 60_000, T0 - 61 * 60_000) === true);
+
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

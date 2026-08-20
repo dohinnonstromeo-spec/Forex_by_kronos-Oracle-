@@ -1123,6 +1123,7 @@ createServer(async (req, res) => {
   startNewSignalAlertScheduler();
   startAutoTradeScheduler();
   startScalpTradingScheduler();
+  startHeartbeatScheduler();
   startRateLimitMapSweeper();
 });
 
@@ -1325,8 +1326,17 @@ function startNewSignalAlertScheduler() {
 // plan this implements.
 const AUTO_TRADE_INTERVAL_MS = Number(env.AUTO_TRADE_INTERVAL_SECONDS || 60) * 1000;
 
+// Heartbeat for checkSchedulerHeartbeat below -- set at the START of every tick
+// attempt, success or failure, so it answers "is setInterval still actually
+// firing" (the process/event loop is alive) rather than "did the last tick
+// succeed" (which logOnce's throttled console errors already cover, but only
+// for whoever remembers to check logs -- a genuinely stopped scheduler
+// produces total silence otherwise, the worse and more insidious failure).
+let lastAutoTradeTickAttemptAt = null;
+
 function startAutoTradeScheduler() {
   const tick = async () => {
+    lastAutoTradeTickAttemptAt = Date.now();
     try {
       await runAutoTradeTick();
     } catch (error) {
@@ -1385,8 +1395,12 @@ async function runAutoTradeTick() {
 // still mean "stop everything" / "no real credentials, no real trade".
 const SCALP_TRADING_INTERVAL_MS = Number(env.SCALP_TRADING_INTERVAL_SECONDS || 60) * 1000;
 
+// Same heartbeat purpose as lastAutoTradeTickAttemptAt above.
+let lastScalpTickAttemptAt = null;
+
 function startScalpTradingScheduler() {
   const tick = async () => {
+    lastScalpTickAttemptAt = Date.now();
     try {
       await runScalpTradingTick();
     } catch (error) {
@@ -1395,6 +1409,47 @@ function startScalpTradingScheduler() {
   };
   tick();
   setInterval(tick, SCALP_TRADING_INTERVAL_MS);
+}
+
+// Insufficiency #3 from an engine audit: nothing ever told the operator if the
+// trading schedulers silently stopped ticking (a hang, a persistent failure
+// inside runAutoTradeTick/runScalpTradingTick's try block, or the platform
+// keeping the process alive but wedged) -- the existing hosting/console log
+// was the only signal, and only for whoever remembered to go check it. Reuses
+// sendCrashAlert (already wired for uncaughtException/unhandledRejection) so
+// this rides the SAME Discord/Telegram channel the operator already has to
+// configure for crash alerts to reach them at all -- no separate alert
+// pipeline to set up. Checked well below the real tick interval (10 min vs
+// 60s) so one slow tick or a brief provider hiccup never false-alarms; a
+// silent scheduler generates repeat 5-min checks but only actually alerts
+// once per hour while the condition persists, so a real outage doesn't spam.
+const HEARTBEAT_STALE_MS = Number(env.HEARTBEAT_STALE_MINUTES || 10) * 60 * 1000;
+const HEARTBEAT_ALERT_COOLDOWN_MS = 60 * 60 * 1000;
+const lastHeartbeatAlertAt = { autoTrade: 0, scalp: 0 };
+
+async function checkSchedulerHeartbeat() {
+  const now = Date.now();
+  const checks = [
+    { key: "autoTrade", name: "auto-trade (swing)", lastAttemptAt: lastAutoTradeTickAttemptAt, intervalSeconds: AUTO_TRADE_INTERVAL_MS / 1000 },
+    { key: "scalp", name: "scalp", lastAttemptAt: lastScalpTickAttemptAt, intervalSeconds: SCALP_TRADING_INTERVAL_MS / 1000 },
+  ];
+  for (const check of checks) {
+    if (!check.lastAttemptAt) continue; // hasn't ticked even once yet (server just started) -- nothing stale to report
+    const silentForMs = now - check.lastAttemptAt;
+    if (silentForMs < HEARTBEAT_STALE_MS) continue;
+    if (now - lastHeartbeatAlertAt[check.key] < HEARTBEAT_ALERT_COOLDOWN_MS) continue;
+    lastHeartbeatAlertAt[check.key] = now;
+    const silentMinutes = Math.round(silentForMs / 60000);
+    await sendCrashAlert(`🟠 Oracle Forex — le cycle "${check.name}" n'a pas tourné depuis ${silentMinutes} min (normalement toutes les ${check.intervalSeconds}s). Le bot est peut-être bloqué.`);
+  }
+}
+
+const HEARTBEAT_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
+function startHeartbeatScheduler() {
+  setInterval(() => {
+    checkSchedulerHeartbeat().catch((error) => logOnce("heartbeat-scheduler", `vérification heartbeat échouée (${error.message})`));
+  }, HEARTBEAT_CHECK_INTERVAL_MS);
 }
 
 async function runScalpTradingTick() {
