@@ -300,7 +300,7 @@ check("bars from before the analysis existed are ignored, not treated as a touch
 console.log("\n=== computeAutoTradeVolume: autonomous bot position sizing never risks more than approved ===");
 
 // Copy of computeAutoTradeVolume() from server.mjs.
-function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification }) {
+function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification, allowMinVolumeFloor = false, maxRiskAmount = null }) {
   const slDistance = Math.abs(Number(entry) - Number(sl));
   if (!(slDistance > 0) || !(balance > 0) || !(Number(riskPercent) > 0)) return null;
   const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
@@ -309,7 +309,12 @@ function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification
   const rawVolume = riskAmount / (slDistance * valuePerUnitPerLot);
   const steppedVolume = Math.floor(rawVolume / specification.volumeStep) * specification.volumeStep;
   const volume = Math.min(steppedVolume, specification.maxVolume);
-  return volume >= specification.minVolume ? Math.round(volume * 100) / 100 : null;
+  if (volume >= specification.minVolume) return Math.round(volume * 100) / 100;
+  if (allowMinVolumeFloor && maxRiskAmount > 0) {
+    const minVolumeRisk = specification.minVolume * slDistance * valuePerUnitPerLot;
+    if (minVolumeRisk <= maxRiskAmount) return specification.minVolume;
+  }
+  return null;
 }
 
 // Real numbers confirmed live this session against the connected MetaApi demo
@@ -342,6 +347,29 @@ check(
 
 check("no balance -- fails closed instead of guessing a size", computeAutoTradeVolume({ balance: 0, riskPercent: 0.5, entry: 4400, sl: 4385, specification: xauSpec }) === null);
 check("zero SL distance (entry === sl, malformed signal) -- fails closed, would otherwise divide by zero", computeAutoTradeVolume({ balance: 43230, riskPercent: 0.5, entry: 4400, sl: 4400, specification: xauSpec }) === null);
+
+// Small-account min-lot floor (allowMinVolumeFloor/maxRiskAmount) -- real
+// EUR/USD spec fetched live from the connected MetaApi demo account
+// (tickSize 0.00001, lossTickValue 1) while building
+// scripts/backtest-small-account-swing.mjs. $50 capital, 1% risk, 70-pip stop
+// -> target risk $0.50, far below the broker's real $7 min-lot floor.
+const eurusdSpec = { tickSize: 0.00001, lossTickValue: 1, minVolume: 0.01, maxVolume: 20, volumeStep: 0.01 };
+check(
+  "small-account floor OFF by default -- a target too small to reach min lot is still skipped, not risked anyway",
+  computeAutoTradeVolume({ balance: 50, riskPercent: 1, entry: 1.1000, sl: 1.0930, specification: eurusdSpec }) === null,
+);
+check(
+  "small-account floor ON, min-lot's real risk ($7) fits under the ceiling ($7.50 = 15% of $50) -- floors to minVolume",
+  computeAutoTradeVolume({ balance: 50, riskPercent: 1, entry: 1.1000, sl: 1.0930, specification: eurusdSpec, allowMinVolumeFloor: true, maxRiskAmount: 7.5 }) === 0.01,
+);
+check(
+  "small-account floor ON but min-lot's real risk ($7) exceeds a tighter ceiling ($5) -- still skipped, never forced past the ceiling",
+  computeAutoTradeVolume({ balance: 50, riskPercent: 1, entry: 1.1000, sl: 1.0930, specification: eurusdSpec, allowMinVolumeFloor: true, maxRiskAmount: 5 }) === null,
+);
+check(
+  "small-account floor ON but the target already sizes above min lot on its own -- returns the normally-computed volume, not forced down to minVolume",
+  computeAutoTradeVolume({ balance: 43230.85, riskPercent: 0.1, entry: 4400.13601, sl: 4385.13601, specification: xauSpec, allowMinVolumeFloor: true, maxRiskAmount: 1000000 }) === 0.02,
+);
 
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

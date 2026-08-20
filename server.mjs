@@ -1624,7 +1624,17 @@ async function processAutoTradeForUser(account, signals, slot) {
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) { skipped.noSpec += 1; continue; }
-    const volume = computeAutoTradeVolume({ balance: sizingBalance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification });
+    // Only these two pairs, only when a capital cap is actually active -- see
+    // computeAutoTradeVolume's comment and scripts/backtest-small-account-swing.mjs
+    // for why XAU/USD is deliberately excluded (no proven edge at any small-account
+    // size) and why 15% is the ceiling (the highest of the tested ceilings that
+    // still held a positive edge on BOTH independent periods, train and test).
+    const smallAccountFloorEligible = account.user_capital_cap > 0 && SMALL_ACCOUNT_MIN_LOT_PAIRS.has(signal.paire);
+    const volume = computeAutoTradeVolume({
+      balance: sizingBalance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification,
+      allowMinVolumeFloor: smallAccountFloorEligible,
+      maxRiskAmount: smallAccountFloorEligible ? sizingBalance * (SMALL_ACCOUNT_MIN_LOT_RISK_PCT / 100) : null,
+    });
     if (!volume) { skipped.noVolume += 1; continue; }
 
     // SWING_TRAILING_PARAMS_BY_PAIR pairs skip the broker-side TP1 entirely --
@@ -4751,6 +4761,26 @@ const SWING_TRAILING_PARAMS_BY_PAIR = {
   "USD/CHF": { trailActivationR: 0.2, trailR: 0.3, trailBufferR: 0.15 },
   "EUR/USD": { trailActivationR: 0.2, trailR: 0.3, trailBufferR: 0.15 },
 };
+
+// Small-account mode (see user_capital_cap / computeAutoTradeVolume's
+// allowMinVolumeFloor): which pairs are allowed to floor to the broker's
+// minimum lot when the target risk% would otherwise round to zero, and how
+// much of the capped capital that floored trade is allowed to risk at worst.
+// Requested directly ("il arrive quand meme a trader meme les 30 dollard") and
+// backtested before shipping (scripts/backtest-small-account-swing.mjs, real
+// Yahoo daily data, two independent 5-year periods, signals filtered to only
+// those whose real min-lot dollar risk stays under each tested ceiling):
+// EUR/USD and USD/CHF both held a positive edge on BOTH periods, train AND
+// test, at a 15% ceiling (higher ceilings tested too, 15% was the tightest
+// that still unlocked most of the population -- 94-97% of all EUR/USD and
+// USD/CHF signals became eligible at $100). XAU/USD never cleared the bar at
+// ANY capital/ceiling combination tried -- today's much higher gold price
+// (vs. when this backtest's older period started) means its natural stop is
+// simply too wide for a small account, confirmed by an empty out-of-sample
+// test split every time it was tried, not a guess. Deliberately excluded, not
+// an oversight -- XAU/USD keeps the old strict skip-if-too-small behavior.
+const SMALL_ACCOUNT_MIN_LOT_PAIRS = new Set(["EUR/USD", "USD/CHF"]);
+const SMALL_ACCOUNT_MIN_LOT_RISK_PCT = 15;
 
 function computeScalpMeanReversionSignal(pair, price, history) {
   const params = SCALP_PARAMS_BY_PAIR[pair];
@@ -9188,7 +9218,22 @@ async function getBrokerPositionOutcome(credentials, positionId) {
 // Rounds DOWN to the broker's volume step and never up to its minimum -- a sizing
 // bug that silently risks MORE than approved is the one thing this must never do, so
 // a setup too small to reach the broker's minimum volume is skipped, not rounded up.
-function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification }) {
+//
+// allowMinVolumeFloor/maxRiskAmount: opt-in exception to that, for capital-capped
+// small accounts only (see SMALL_ACCOUNT_MIN_LOT_PAIRS in processAutoTradeForUser).
+// The broker's minimum lot (0.01) has a real dollar-risk floor of its own,
+// independent of riskPercent -- on a $45k account this never matters (the target
+// volume is always well above it), but on a genuinely small account (the whole
+// point of user_capital_cap) it routinely does, and refusing every such trade
+// defeats the purpose of capping capital to try real small-account constraints.
+// Backtested before shipping (scripts/backtest-small-account-swing.mjs, real
+// Yahoo daily data, two independent 5-year periods): flooring to minVolume only
+// when its real dollar risk stays under a hard ceiling (15% of capped capital)
+// keeps a positive, both-periods edge on EUR/USD and USD/CHF; XAU/USD never
+// cleared that bar (today's elevated gold price means its natural stop is too
+// wide, confirmed by an empty out-of-sample test split at every capital/ceiling
+// combination tried) and is deliberately excluded from this exception entirely.
+function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification, allowMinVolumeFloor = false, maxRiskAmount = null }) {
   const slDistance = Math.abs(Number(entry) - Number(sl));
   if (!(slDistance > 0) || !(balance > 0) || !(Number(riskPercent) > 0)) return null;
   const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
@@ -9197,7 +9242,12 @@ function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification
   const rawVolume = riskAmount / (slDistance * valuePerUnitPerLot);
   const steppedVolume = Math.floor(rawVolume / specification.volumeStep) * specification.volumeStep;
   const volume = Math.min(steppedVolume, specification.maxVolume);
-  return volume >= specification.minVolume ? Math.round(volume * 100) / 100 : null;
+  if (volume >= specification.minVolume) return Math.round(volume * 100) / 100;
+  if (allowMinVolumeFloor && maxRiskAmount > 0) {
+    const minVolumeRisk = specification.minVolume * slDistance * valuePerUnitPerLot;
+    if (minVolumeRisk <= maxRiskAmount) return specification.minVolume;
+  }
+  return null;
 }
 
 // outcomes was historically a second array, populated only when an analysis closed.
