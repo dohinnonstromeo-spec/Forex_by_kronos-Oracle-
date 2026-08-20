@@ -1748,6 +1748,18 @@ async function processScalpForUser(account, credentials, slot) {
     const signal = computeScalpMeanReversionSignal(pair, price, history);
     if (!signal) continue;
 
+    // Found during an engine audit: correlationWarnings was only ever called
+    // from the swing side (processAutoTradeForUser) and the manual flow, never
+    // here. That's not as bad as it first looked -- correlationWarnings' query
+    // pulls every SENT trade_orders row for this slot regardless of source, so
+    // an open SCALP position was already correctly blocking a correlated SWING
+    // one. But the reverse never happened: scalp could open a position that
+    // doubled up on an existing SWING position's currency exposure (e.g. a
+    // scalp GBP/USD long while swing already holds a EUR/USD long -- both
+    // effectively short USD) with zero check. Same hard block swing already
+    // uses -- there's no human here to read a warning and decide.
+    if (await correlationWarnings(userId, pair, signal.direction, null, slot)) continue;
+
     const specification = await getBrokerSymbolSpecification(credentials, pair).catch(() => null);
     if (!specification) continue;
 
