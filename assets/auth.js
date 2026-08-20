@@ -604,6 +604,13 @@
           </div>
           <p class="dashboard-history-note dashboard-prepare-error" data-confirm-error hidden></p>
         ` : ""}
+        ${order.status === "SENT" && order.brokerOrderId ? `
+          <div class="dashboard-trade-confirm">
+            <button type="button" class="dashboard-trade-cancel" data-order-secure-half>Sécuriser à mi-TP maintenant</button>
+          </div>
+          <p class="dashboard-history-note dashboard-prepare-error" data-secure-half-error hidden></p>
+          <p class="dashboard-history-note" data-secure-half-message hidden></p>
+        ` : ""}
         ${order.status === "FAILED" && order.errorMessage ? `<p class="dashboard-history-note">${escapeHtml(order.errorMessage)}</p>` : ""}
         ${order.status === "CANCELLED" || order.status === "FAILED" ? `
           <button type="button" class="dashboard-trade-cancel" data-order-clear>Retirer de la liste</button>
@@ -643,6 +650,60 @@
           });
         } finally {
           await loadTradeOrders(true);
+        }
+      });
+    });
+
+    const SECURE_HALF_ERROR_LABELS = {
+      order_not_open: "Cette position n'est plus ouverte.",
+      broker_not_connected: "Broker non connecté pour ce book.",
+      broker_price_unavailable: "Prix broker indisponible à l'instant -- réessaie dans quelques secondes.",
+      half_tp_already_passed: "Le prix a déjà dépassé (ou est trop proche de) la moitié de l'objectif -- rien à sécuriser via le TP, envisage de clôturer directement.",
+      not_currently_profitable: "La position n'est pas en profit actuellement -- rien à sécuriser.",
+      already_secured_more: "Le stop suiveur protège déjà plus que la moitié du profit actuel -- rien à faire.",
+      broker_modify_failed: "Le broker a refusé la modification -- réessaie dans quelques secondes.",
+      invalid_position_levels: "Niveaux de position invalides.",
+    };
+
+    host.querySelectorAll("[data-order-secure-half]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const article = button.closest("[data-order-id]");
+        const orderId = article.dataset.orderId;
+        const errorEl = article.querySelector("[data-secure-half-error]");
+        const messageEl = article.querySelector("[data-secure-half-message]");
+        if (errorEl) errorEl.hidden = true;
+        if (messageEl) messageEl.hidden = true;
+        button.disabled = true;
+        try {
+          const response = await fetch("/api/trade/secure-half", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ orderId }),
+          });
+          const result = await response.json().catch(() => ({}));
+          if (!result.ok) {
+            if (errorEl) {
+              errorEl.textContent = SECURE_HALF_ERROR_LABELS[result.error] || result.message || "Impossible de sécuriser cette position pour le moment.";
+              errorEl.hidden = false;
+            }
+            return;
+          }
+          if (messageEl) {
+            messageEl.textContent = result.mode === "tp_halved"
+              ? `✓ Objectif réduit de moitié -- nouveau TP ${result.newTakeProfit}.`
+              : `✓ Stop remonté pour sécuriser la moitié du profit actuel -- nouveau stop ${result.newStopLoss}.`;
+            messageEl.hidden = false;
+          }
+          // Reload after a delay, not immediately -- loadTradeOrders() fully
+          // re-renders this list from scratch, which would wipe the success
+          // message the instant it's shown otherwise. Long enough to actually
+          // read it, short enough that the card's displayed SL/TP still
+          // catches up soon.
+          setTimeout(() => loadTradeOrders(true), 4000);
+        } catch {
+          if (errorEl) { errorEl.textContent = "Impossible de contacter le serveur -- vérifie ta connexion."; errorEl.hidden = false; }
+        } finally {
+          button.disabled = false;
         }
       });
     });

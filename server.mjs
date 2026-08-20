@@ -2725,6 +2725,96 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  // Requested directly: "je veux mettre en place un systeme qui autorisera le
+  // robot a couper telle position a la moitie du TP (tp/2)... il modifie
+  // automatiquement le tp de la position prise" -- an on-demand, immediate
+  // (no scheduled tick involved, this IS the action) reduction of a specific
+  // ALREADY-OPEN position's real target to half its original distance from
+  // entry. Two genuinely different mechanisms depending on what the position
+  // actually has at the broker:
+  // - A real broker-side TP (tp1 set -- the 3 fixed-TP pairs still trading:
+  //   US500, BTC/USD, USD/JPY): moves that TP order itself, halfway between
+  //   entry and its current level. This is the literal ask.
+  // - No broker-side TP (the 3 trailing-stop swing pairs + scalp, tp1 is
+  //   deliberately null -- see processScalpForUser/processAutoTradeForUser):
+  //   there's no TP order to halve, so the honest equivalent is moving the
+  //   position's real stop (the only order it has) to lock in exactly half of
+  //   whatever unrealized favorable move exists right now -- same real
+  //   broker-side mechanism checkTrailingStops already uses, just triggered
+  //   on demand instead of waiting up to 15s for the next tick, and computed
+  //   directly off current profit instead of the pair's normal staged curve.
+  if (url.pathname === "/api/trade/secure-half") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    const orderId = String(body?.orderId || "");
+    if (!orderId) return sendJson(res, 400, { ok: false, error: "invalid_request" });
+    await ensureRelationalTables();
+    // Joined with analyses for `source` (auto_scalp vs auto_signal) --
+    // trade_orders itself doesn't carry it, and Case B below needs it to pick
+    // the right executionCostBuffer strategy, same as checkTrailingStops does.
+    const orderRow = await sqlGet(`SELECT o.*, a.source as source FROM trade_orders o LEFT JOIN analyses a ON a.id = o.analysis_id WHERE o.id = ? AND o.user_id = ?`, [orderId, session.user.id]);
+    const order = rowToTradeOrder(orderRow);
+    if (!order) return sendJson(res, 404, { ok: false, error: "order_not_found" });
+    if (order.status !== "SENT" || !order.brokerOrderId) return sendJson(res, 400, { ok: false, error: "order_not_open" });
+    const slot = order.brokerSlot || "demo";
+    const credentials = await getUserBrokerCredentials(session.user.id, slot);
+    if (!credentials) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
+    const buy = order.direction === "ACHAT";
+    const brokerPrice = await getBrokerCurrentPrice(credentials, order.pair).catch(() => null);
+    if (!brokerPrice) return sendJson(res, 502, { ok: false, error: "broker_price_unavailable" });
+    const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
+
+    if (Number.isFinite(order.tp1)) {
+      // Case A: a real broker TP exists -- halve its distance from entry.
+      const halfTp = order.entry + (order.tp1 - order.entry) * 0.5;
+      const minDistance = executionCostBuffer(order.pair);
+      const sideOk = buy ? halfTp > currentPrice + minDistance : halfTp < currentPrice - minDistance;
+      if (!sideOk) {
+        return sendJson(res, 409, {
+          ok: false, error: "half_tp_already_passed",
+          message: "Le prix a déjà dépassé (ou est trop proche de) la moitié de l'objectif -- rien à sécuriser via le TP, envisage de clôturer directement.",
+        });
+      }
+      const result = await modifyBrokerPositionTakeProfit(credentials, order.brokerOrderId, halfTp);
+      if (!result.ok) return sendJson(res, 502, { ok: false, error: "broker_modify_failed", message: result.error });
+      await sqlRun(`UPDATE trade_orders SET tp1 = ? WHERE id = ?`, [halfTp, order.id]);
+      return sendJson(res, 200, { ok: true, mode: "tp_halved", newTakeProfit: halfTp });
+    }
+
+    // Case B: no broker-side TP -- lock in half of the CURRENT unrealized
+    // profit via the position's real stop instead. entry/sl on trade_orders
+    // are the ORIGINAL, unmoved levels (see checkTrailingStops), so risk here
+    // is always the position's real original risk distance, never a moved value.
+    const risk = Math.abs(order.entry - order.sl);
+    if (!(risk > 0)) return sendJson(res, 400, { ok: false, error: "invalid_position_levels" });
+    const favorableR = buy ? (currentPrice - order.entry) / risk : (order.entry - currentPrice) / risk;
+    if (favorableR <= 0) {
+      return sendJson(res, 409, {
+        ok: false, error: "not_currently_profitable",
+        message: "La position n'est pas en profit actuellement -- rien à sécuriser.",
+      });
+    }
+    let halfLockStop = buy ? order.entry + (favorableR / 2) * risk : order.entry - (favorableR / 2) * risk;
+    const minDistance = executionCostBuffer(order.pair, orderRow.source === "auto_scalp" ? "scalp" : "swing");
+    const safeStop = buy ? currentPrice - minDistance : currentPrice + minDistance;
+    if (buy && halfLockStop > safeStop) halfLockStop = safeStop;
+    if (!buy && halfLockStop < safeStop) halfLockStop = safeStop;
+    const currentStop = Number.isFinite(order.trailingStopPrice) ? order.trailingStopPrice : order.sl;
+    const improves = buy ? halfLockStop > currentStop : halfLockStop < currentStop;
+    if (!improves) {
+      return sendJson(res, 409, {
+        ok: false, error: "already_secured_more",
+        message: "Le stop suiveur protège déjà plus que la moitié du profit actuel -- rien à faire.",
+      });
+    }
+    const result = await modifyBrokerPositionStopLoss(credentials, order.brokerOrderId, halfLockStop);
+    if (!result.ok) return sendJson(res, 502, { ok: false, error: "broker_modify_failed", message: result.error });
+    await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ? WHERE id = ?`, [halfLockStop, currentPrice, order.id]);
+    return sendJson(res, 200, { ok: true, mode: "stop_locked_half_profit", newStopLoss: halfLockStop });
+  }
+
   if (url.pathname === "/api/trade/cancel") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -9177,6 +9267,34 @@ async function modifyBrokerPositionStopLoss(credentials, positionId, newStopLoss
       method: "POST",
       headers: { "Content-Type": "application/json", "auth-token": credentials.token },
       body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: String(positionId), stopLoss: newStopLoss }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
+    if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: `broker_request_failed: ${error.message}` };
+  }
+}
+
+// The take-profit counterpart -- same endpoint/response handling, POSITION_MODIFY
+// with takeProfit instead of stopLoss. Powers /api/trade/secure-half: requested
+// directly, "je veux mettre en place un systeme qui autorisera le robot a couper
+// telle position a la moitie du TP" -- a user-triggered, immediate (not waiting
+// for any scheduled tick) reduction of an already-open position's real
+// broker-side target to halfway between entry and its current TP, for the fixed-
+// TP pairs that actually have one (see /api/trade/secure-half for the
+// trailing-stop-pairs equivalent, which modifies the stop instead since those
+// never had a broker TP to begin with).
+async function modifyBrokerPositionTakeProfit(credentials, positionId, newTakeProfit) {
+  const region = credentials.region || "new-york";
+  const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/trade`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "auth-token": credentials.token },
+      body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: String(positionId), takeProfit: newTakeProfit }),
       signal: AbortSignal.timeout(15000),
     });
     const data = await response.json().catch(() => ({}));
