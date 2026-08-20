@@ -1217,15 +1217,23 @@
 
   // CLOSED_MANUALLY (position closed directly at the broker -- app, dealer, EA --
   // instead of an automatic SL/TP hit, see getBrokerPositionOutcome server-side)
-  // has no fixed win/loss direction the way TP1_HIT/SL_HIT do: it could be a manual
+  // has no fixed win/loss direction the way TP1_HIT does: it could be a manual
   // close in profit or at a loss, so it reads the real rMultiple sign instead of a
-  // hardcoded class.
+  // hardcoded class. SL_HIT used to get the same hardcoded "always a loss"
+  // treatment -- wrong for a staged trailing stop (see checkTrailingStops
+  // server-side), which closes via a real broker stop-loss even once that stop
+  // has moved into profit, so its close reason is still SL_HIT on a winning
+  // trade. Found during an engine audit; same profit-sign check as
+  // CLOSED_MANUALLY, not a hardcoded assumption.
+  function isProfitableClose(item) {
+    if (Number.isFinite(item.brokerProfitAmount)) return item.brokerProfitAmount > 0;
+    return Number(item.rMultiple) >= 0;
+  }
   function historyStatusClass(item) {
     const status = item.status;
     if (status === "OPEN") return "history-open";
     if (status === "TP1_HIT" || status === "TP2_HIT") return "history-win";
-    if (status === "SL_HIT") return "history-loss";
-    if (status === "CLOSED_MANUALLY") return Number(item.rMultiple) >= 0 ? "history-win" : "history-loss";
+    if (status === "SL_HIT" || status === "CLOSED_MANUALLY") return isProfitableClose(item) ? "history-win" : "history-loss";
     if (status === "EXPIRED") return "history-expired";
     return "history-blocked";
   }
@@ -1235,8 +1243,7 @@
   function historyStatusIcon(item) {
     const status = item.status;
     if (status === "TP1_HIT" || status === "TP2_HIT") return "✓ ";
-    if (status === "SL_HIT") return "✕ ";
-    if (status === "CLOSED_MANUALLY") return Number(item.rMultiple) >= 0 ? "✓ " : "✕ ";
+    if (status === "SL_HIT" || status === "CLOSED_MANUALLY") return isProfitableClose(item) ? "✓ " : "✕ ";
     return "";
   }
 
@@ -1271,7 +1278,7 @@
     const r = historyResultLabel(item);
     if (item.status === "TP1_HIT") return r ? `TP1 touché · ${r}` : "TP1 touché";
     if (item.status === "TP2_HIT") return r ? `TP2 touché · ${r}` : "TP2 touché";
-    if (item.status === "SL_HIT") return r ? `Stop Loss touché · ${r}` : "Stop Loss touché";
+    if (item.status === "SL_HIT") return isProfitableClose(item) ? (r ? `Stop suiveur (profit sécurisé) · ${r}` : "Stop suiveur (profit sécurisé)") : (r ? `Stop Loss touché · ${r}` : "Stop Loss touché");
     if (item.status === "CLOSED_MANUALLY") return r ? `Clôturé manuellement · ${r}` : "Clôturé manuellement";
     if (item.status === "EXPIRED") return r ? `Expiré · ${r}` : "Expiré";
     if (item.status === "BLOCKED") return "Bloquée";

@@ -371,5 +371,63 @@ check(
   computeAutoTradeVolume({ balance: 43230.85, riskPercent: 0.1, entry: 4400.13601, sl: 4385.13601, specification: xauSpec, allowMinVolumeFloor: true, maxRiskAmount: 1000000 }) === 0.02,
 );
 
+console.log("\n=== confirmAndSendOrder's sideValid: a BUY order with no broker-side TP (tp1=null) must not be spuriously rejected ===");
+
+// Copy of the sideValid logic from confirmAndSendOrder() in server.mjs. Found live
+// during an engine audit: order.tp1 is deliberately NULL for scalp and the
+// trailing-stop swing pairs (XAU/USD, USD/CHF, EUR/USD -- see processScalpForUser /
+// processAutoTradeForUser). The old check was `currentPrice < order.tp1` for a BUY
+// unconditionally -- JS coerces null to 0 in a relational comparison, so that
+// silently became `currentPrice < 0`, always false for a real price, rejecting
+// EVERY such BUY order with a misleading "levels_crossed_by_price" error. SELL
+// orders happened to pass by the same coincidence (`price > null` -> `price > 0`),
+// which is why this went unnoticed through this session's live scalp/trailing-stop
+// testing (that testing used seeded positions and/or SELL-direction trades).
+function sideValid({ buyOrder, tp1, sl, currentPrice }) {
+  const hasBrokerTp = Number.isFinite(tp1);
+  return buyOrder
+    ? (!hasBrokerTp || currentPrice < tp1) && currentPrice > sl
+    : (!hasBrokerTp || currentPrice > tp1) && currentPrice < sl;
+}
+
+check(
+  "a BUY order with tp1=null (scalp/trailing-stop pairs) now correctly passes based on sl alone",
+  sideValid({ buyOrder: true, tp1: null, sl: 4380, currentPrice: 4400 }) === true,
+);
+check(
+  "a BUY order with tp1=null is still correctly rejected once price has already crossed its sl",
+  sideValid({ buyOrder: true, tp1: null, sl: 4400, currentPrice: 4380 }) === false,
+);
+check(
+  "a SELL order with tp1=null is unaffected by the fix -- still passes based on sl alone",
+  sideValid({ buyOrder: false, tp1: null, sl: 4420, currentPrice: 4400 }) === true,
+);
+check(
+  "a normal BUY order WITH a real tp1 is unaffected by the fix -- still rejects once price is past tp1",
+  sideValid({ buyOrder: true, tp1: 4390, sl: 4380, currentPrice: 4400 }) === false,
+);
+check(
+  "a normal BUY order WITH a real tp1 still passes when price sits between sl and tp1",
+  sideValid({ buyOrder: true, tp1: 4410, sl: 4380, currentPrice: 4400 }) === true,
+);
+
+console.log("\n=== processAutoTradeForUser's R:R filter: signal.rr is always a \"1:X\" string, never a bare number ===");
+
+// Copy of parseRr() from server.mjs.
+function parseRr(value) {
+  const match = String(value ?? "").replace(",", ".").match(/([0-9]+(?:\.[0-9]+)?)/g);
+  if (!match?.length) return NaN;
+  return Number(match.at(-1));
+}
+
+check(
+  "real bug found live: Number(\"1:2.0\") is NaN, never >= a real minRiskReward -- used to silently empty out every account's candidates the moment any min R:R was set",
+  !(Number("1:2.0") >= 1.5),
+);
+check("parseRr correctly extracts 2.0 from computeDeterministicSignal's real rr format", parseRr("1:2.0") === 2.0);
+check("parseRr correctly extracts 1.4 from cautiousSignal's rr format", parseRr("1:1.4") === 1.4);
+check("with the fix, a signal genuinely meeting a 1.5 min R:R now correctly passes", parseRr("1:2.0") >= 1.5);
+check("with the fix, a signal genuinely below a 1.5 min R:R is still correctly rejected", !(parseRr("1:1.4") >= 1.5));
+
 console.log(`\n${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

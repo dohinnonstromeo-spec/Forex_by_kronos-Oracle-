@@ -818,13 +818,22 @@ const symbols = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD",
 // cautious/non-direct signal instead of silently shipping a known-losing setup. Not a
 // verdict on the pair itself -- a different strategy family (mean-reversion, range,
 // volatility-breakout) might still work there; that's unresearched, not ruled out.
-// EUR/USD added 2026-08-13: a fresh walk-forward run (test window shifts forward with
-// real time, so this isn't static) showed negative held-out test R across all 11
-// variants re-checked that day (-0.038 to -0.288), the same pattern that got GBP/JPY
-// excluded originally -- applying the same standard here rather than leaving a
-// known-negative-edge pair shipping "direct" signals just because it wasn't the one
-// originally flagged.
-const PAIRS_WITHOUT_VALIDATED_EDGE = new Set(["GBP/JPY", "EUR/USD"]);
+// EUR/USD removed 2026-08-20: it was excluded on 2026-08-13 for a negative held-out
+// test R against the FIXED-TP baseline (TP1 1.6R/TP2 2.5R) -- true, but incomplete.
+// scripts/backtest-swing-trailing-stop.mjs later found the SAME entry logic (same
+// momentum/RSI/confluence thresholds, verified identical) genuinely profitable on
+// EUR/USD once the exit is the staged trailing stop instead of that fixed TP:
+// positive avgR train AND test, on two independent non-overlapping 5-year periods
+// (2016-2021 and 2021-2026), 10/20 of the tested activation/trail combinations
+// robust across both. The entry was never the problem for this pair -- the fixed
+// exit was. Since the trailing stop is now what SWING_TRAILING_PARAMS_BY_PAIR
+// actually ships for EUR/USD, excluding it here made that already-built,
+// already-proven feature permanently unreachable (this filter runs upstream of
+// processAutoTradeForUser, in runAutoTradeTick's `tradable` filter -- a signal never
+// generated as `direct:true` here never gets that far, regardless of any account's
+// settings). Re-enabled specifically because a real edge now exists end-to-end, not
+// because the original 2026-08-13 finding was wrong.
+const PAIRS_WITHOUT_VALIDATED_EDGE = new Set(["GBP/JPY"]);
 
 // Static fallback only: emergency display values when every live source fails.
 // They are intentionally low-reliability and must never validate a direct setup.
@@ -1556,8 +1565,15 @@ async function processAutoTradeForUser(account, signals, slot) {
   if (!approvedPairs.size) return recordAutoTradeStatus(userId, slot, "no_approved_pairs");
   const minConfidence = combineTightened(account.min_confidence_floor || 70, account.user_min_confidence, "higher");
   const minRiskReward = combineTightened(account.min_risk_reward, account.user_min_risk_reward, "higher");
+  // Found live during an engine audit: signal.rr is always a "1:X" string here
+  // (e.g. "1:2.0", see computeDeterministicSignal/cautiousSignal), never a bare
+  // number -- Number("1:2.0") is NaN, which is never >= anything, so this used to
+  // silently empty out `candidates` completely the moment ANY min R:R (admin's
+  // min_risk_reward or a user's own preference, both real, live-settable fields)
+  // was set above 0. parseRr already exists for exactly this format elsewhere in
+  // the file (inspectSuspiciousLevels) -- just never used here.
   const candidates = signals.filter((s) =>
-    approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || Number(s.rr) >= minRiskReward),
+    approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || parseRr(s.rr) >= minRiskReward),
   );
   if (!candidates.length)
     return recordAutoTradeStatus(userId, slot, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
@@ -9022,14 +9038,27 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     // not "entry", so SL/TP have to be validated against live price directly, not
     // just checked for being "close enough" to a number that's about to be ignored.
     const buyOrder = order.direction === "ACHAT";
+    // Found live during an engine audit: order.tp1 is deliberately NULL for scalp
+    // and the trailing-stop swing pairs (no broker-side TP, see processScalpForUser
+    // / processAutoTradeForUser) -- but a BUY order's check below used to be
+    // `currentPrice.price < order.tp1` unconditionally. JS coerces `null` to `0` in
+    // a relational comparison, so that became `currentPrice.price < 0`, always
+    // false for any real price -- every BUY order with no tp1 was rejected here,
+    // 100% of the time, with a "levels_crossed_by_price" error that had nothing to
+    // do with the real cause. SELL orders happened to pass by the same coincidence
+    // (`price > null` -> `price > 0`, always true), which is why this went
+    // unnoticed through this session's live scalp/trailing-stop testing. Skip the
+    // tp1 side of the check entirely when there's no broker-side TP to validate
+    // against, on both sides, instead of silently degenerating into a bogus bound.
+    const hasBrokerTp = Number.isFinite(order.tp1);
     const sideValid = buyOrder
-      ? currentPrice.price < order.tp1 && currentPrice.price > order.sl
-      : currentPrice.price > order.tp1 && currentPrice.price < order.sl;
+      ? (!hasBrokerTp || currentPrice.price < order.tp1) && currentPrice.price > order.sl
+      : (!hasBrokerTp || currentPrice.price > order.tp1) && currentPrice.price < order.sl;
     if (!sideValid) {
       return { status: 409, body: { ok: false, error: "levels_crossed_by_price" } };
     }
     const minDistance = executionCostBuffer(order.pair);
-    if (Math.abs(currentPrice.price - order.sl) < minDistance || Math.abs(order.tp1 - currentPrice.price) < minDistance) {
+    if (Math.abs(currentPrice.price - order.sl) < minDistance || (hasBrokerTp && Math.abs(order.tp1 - currentPrice.price) < minDistance)) {
       return { status: 409, body: { ok: false, error: "levels_too_close_to_price" } };
     }
     // Safety net, not a business limit: caps how many real orders one account can
@@ -9402,9 +9431,17 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
     analysis.closedAt = brokerOutcome.closedAt;
     analysis.closePrice = brokerOutcome.closePrice;
     analysis.outcome = profit > 0 ? "win" : profit < 0 ? "loss" : "neutral";
+    // SL_HIT + profit > 0 is a genuinely winning trailing-stop exit (see
+    // checkTrailingStops) -- the broker's own close reason is still DEAL_REASON_SL
+    // even once that stop has moved into profit, so the plain "Stop Loss touché"
+    // wording reads as a loss even though it isn't. Same disambiguation as
+    // notifyAnalysisClosed, applied here since this is what actually gets stored
+    // and shown in the trade history, not just the push notification.
     analysis.outcomeReason = brokerStatus === "CLOSED_MANUALLY"
       ? `Clôturé manuellement au broker (${profit >= 0 ? "+" : ""}${profit.toFixed(2)}).`
-      : brokerStatus === "SL_HIT" ? "Stop Loss touché (confirmé par le broker)." : "TP1 touché (confirmé par le broker).";
+      : brokerStatus === "SL_HIT"
+        ? (profit > 0 ? "Stop suiveur : profit sécurisé (confirmé par le broker)." : "Stop Loss touché (confirmé par le broker).")
+        : "TP1 touché (confirmé par le broker).";
     analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
     analysis.brokerProfitAmount = profit;
     await upsertAnalysisRow(analysis);
@@ -9744,7 +9781,19 @@ async function notifyAnalysisClosed(analysis) {
   if (!pushConfigured) return;
   const subs = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ? AND topics LIKE '%tp_sl%'`, [analysis.userId]);
   if (!subs.length) return;
-  const outcomeLabel = { TP1_HIT: "TP1 touché", TP2_HIT: "TP2 touché", SL_HIT: "Stop Loss touché", CLOSED_MANUALLY: "Clôturé manuellement", EXPIRED: "Expiré" }[analysis.status] || analysis.status;
+  // SL_HIT is technically correct even for a WINNING trailing-stop exit -- the
+  // staged trailing stop (see checkTrailingStops) closes a position by moving its
+  // real broker-side stop-loss favorably, so the broker's own close reason is
+  // still DEAL_REASON_SL regardless of whether that stop had already moved into
+  // profit. Labeling that "Stop Loss touché" reads as a loss to anyone skimming
+  // the notification, even though the R-multiple/amount right after it are
+  // correct -- found during an engine audit. Disambiguate on the real broker
+  // profit, the same signal the outcome (win/loss/neutral) itself is already
+  // derived from.
+  const isProfitableTrailingExit = analysis.status === "SL_HIT" && Number(analysis.brokerProfitAmount) > 0;
+  const outcomeLabel = isProfitableTrailingExit
+    ? "Stop suiveur (profit sécurisé)"
+    : { TP1_HIT: "TP1 touché", TP2_HIT: "TP2 touché", SL_HIT: "Stop Loss touché", CLOSED_MANUALLY: "Clôturé manuellement", EXPIRED: "Expiré" }[analysis.status] || analysis.status;
   const rText = Number.isFinite(analysis.rMultiple) ? ` (${analysis.rMultiple >= 0 ? "+" : ""}${analysis.rMultiple.toFixed(2)}R)` : "";
   const amountText = Number.isFinite(analysis.brokerProfitAmount) ? ` · ${analysis.brokerProfitAmount >= 0 ? "+" : ""}${analysis.brokerProfitAmount.toFixed(2)}` : "";
   const payload = JSON.stringify({
