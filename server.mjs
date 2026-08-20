@@ -833,7 +833,21 @@ const symbols = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD",
 // generated as `direct:true` here never gets that far, regardless of any account's
 // settings). Re-enabled specifically because a real edge now exists end-to-end, not
 // because the original 2026-08-13 finding was wrong.
-const PAIRS_WITHOUT_VALIDATED_EDGE = new Set(["GBP/JPY"]);
+// ETH/USD added 2026-08-20: DETERMINISTIC_ENGINE_STATS_BY_PAIR's own comment
+// already flagged "bon sur train mais quasi nul sur test -- signe classique
+// de sur-apprentissage" (2026-08-13 finding), but nothing in the code had
+// ever actually acted on that warning -- it stayed fully tradable as a
+// "direct" signal. Re-checked with a dedicated two-independent-period test
+// (scripts/backtest-eth-recheck.mjs, real Binance daily data, fixed TP1
+// 1.6R/TP2 2.5R -- ETH/USD isn't one of the 3 trailing-stop pairs, so no
+// rescue mechanism like EUR/USD's applies here): only 2 of 4
+// train/test-x-2-periods cells came back positive, win rate 33-39% in three
+// of the four, the one strong cell (69.5% win rate, avgR +0.701) sits on a
+// smaller sample (131) from the SAME period whose larger train split (198)
+// showed the opposite (33.3% win rate, avgR -0.19) -- exactly the kind of
+// unstable, sample-dependent result the original overfitting warning called
+// out, now confirmed directly rather than left as an unactioned comment.
+const PAIRS_WITHOUT_VALIDATED_EDGE = new Set(["GBP/JPY", "ETH/USD"]);
 
 // Static fallback only: emergency display values when every live source fails.
 // They are intentionally low-reliability and must never validate a direct setup.
@@ -4678,7 +4692,15 @@ function computeDeterministicSignal(symbol, price, history) {
     if (dataQuality.score < 70) return cautiousSignal(symbol, price, base, `Fiabilité données insuffisante (${dataQuality.score}%, grade ${dataQuality.grade}) · aucun signal direct validé.`, history);
     if (history.length < 50) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
     if (PAIRS_WITHOUT_VALIDATED_EDGE.has(symbol)) {
-      return cautiousSignal(symbol, price, base, "Backtest (scripts/backtest.mjs) : cette logique n'a pas d'edge validé sur cette paire (R moyen négatif sur ~8 variantes testées, confluence/RSI/momentum/SL) · signal direct désactivé par prudence.", history);
+      // Two genuinely different findings share this gate -- said honestly
+      // rather than reusing one generic reason for both (GBP/JPY's original
+      // ~8-variant momentum-parameter sweep vs ETH/USD's two-independent-
+      // period train/test recheck, see PAIRS_WITHOUT_VALIDATED_EDGE's own
+      // comment for the real numbers behind each).
+      const reason = symbol === "ETH/USD"
+        ? "Backtest (scripts/backtest-eth-recheck.mjs) : edge instable sur deux périodes indépendantes (2/4 cellules train/test positives, sur-apprentissage confirmé) · signal direct désactivé par prudence."
+        : "Backtest (scripts/backtest.mjs) : cette logique n'a pas d'edge validé sur cette paire (R moyen négatif sur ~8 variantes testées, confluence/RSI/momentum/SL) · signal direct désactivé par prudence.";
+      return cautiousSignal(symbol, price, base, reason, history);
     }
 
     const closes = history.map((bar) => bar.close);
@@ -4755,17 +4777,19 @@ function buildDeterministicSignals(prices, histories) {
 // scripts/backtest.mjs (momentum 0.04 + confluence 4/4, train/held-out-test split on
 // ~5y real history). Deliberately per-pair, not the flattering GLOBAL blend
 // (+0.042/+0.055): that global figure is carried almost entirely by XAU/USD
-// (+0.458 test) and would have misrepresented, e.g., a US500 or ETH/USD signal as
-// having the same edge XAU/USD has. EUR/USD and GBP/JPY are excluded upstream
-// (PAIRS_WITHOUT_VALIDATED_EDGE) so they never reach this map. Static facts about a
-// specific backtest run, not recomputed per request -- re-run scripts/backtest.mjs
-// periodically and update this if the numbers drift (walk-forward test window moves
-// with real time).
+// (+0.458 test) and would have misrepresented, e.g., a US500 signal as having
+// the same edge XAU/USD has. EUR/USD, GBP/JPY and (2026-08-20) ETH/USD are
+// excluded upstream (PAIRS_WITHOUT_VALIDATED_EDGE) so they never reach this
+// map -- ETH/USD's own entry used to sit right here with a hand-written
+// overfitting warning that nothing in the code actually acted on; see
+// PAIRS_WITHOUT_VALIDATED_EDGE's comment for the dedicated recheck that
+// finally did. Static facts about a specific backtest run, not recomputed per
+// request -- re-run scripts/backtest.mjs periodically and update this if the
+// numbers drift (walk-forward test window moves with real time).
 const DETERMINISTIC_ENGINE_STATS_BY_PAIR = {
   "XAU/USD": { rMoyenTrain: 0.153, rMoyenTest: 0.458, note: "Edge le plus fort du moteur, confirmé train et test." },
   "US500": { rMoyenTrain: 0.031, rMoyenTest: 0.08, note: "Edge modeste mais cohérent train/test." },
   "BTC/USD": { rMoyenTrain: 0.003, rMoyenTest: 0.079, note: "Edge faible sur train, correct sur test." },
-  "ETH/USD": { rMoyenTrain: 0.14, rMoyenTest: -0.004, note: "Attention : bon sur train mais quasi nul sur test hors-échantillon -- signe classique de sur-apprentissage, à traiter avec prudence." },
   // Added 2026-08-13 after a dedicated coverage-expansion backtest (see the `symbols`
   // comment above for the full GBP/USD/AUD/USD rejection context).
   "USD/JPY": { rMoyenTrain: 0.209, rMoyenTest: 0.018, note: "Edge le plus robuste et cohérent du moteur : positif sur train ET test dans les 11 variantes testées, sans exception." },
