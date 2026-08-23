@@ -1,7 +1,7 @@
 ﻿import { createServer } from "node:http";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { createReadStream, existsSync, statSync, readFileSync, mkdirSync } from "node:fs";
-import { extname, join, normalize, resolve } from "node:path";
+import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCipheriv, createDecipheriv, createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import { createGzip, createBrotliCompress, brotliCompressSync, gzipSync } from "node:zlib";
@@ -3421,8 +3421,9 @@ async function handleApi(req, res, url) {
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     await ensureRelationalTables();
     await sqlRun(
-      `UPDATE auto_trading_accounts SET user_paused = ?, updated_at = ? WHERE user_id = ?`,
-      [url.pathname === "/api/auto-trade/pause" ? 1 : 0, new Date().toISOString(), session.user.id],
+      `INSERT INTO auto_trading_accounts (user_id, user_paused, created_at, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET user_paused = excluded.user_paused, updated_at = excluded.updated_at`,
+      [session.user.id, url.pathname === "/api/auto-trade/pause" ? 1 : 0, new Date().toISOString(), new Date().toISOString()],
     );
     sendJson(res, 200, { ok: true });
     return;
@@ -3578,6 +3579,26 @@ async function handleApi(req, res, url) {
       ["user_trading_hours_end", "userTradingHoursEnd", userTradingHoursEnd],
       ["user_trading_days", "userTradingDays", userTradingDays],
     ];
+    // Confirmed live: clamp()/clampInt() return null both for an omitted field
+    // and for a present-but-invalid one (0, negative, NaN, out of range), and
+    // the code below only gated on presence -- so a client sending a garbage
+    // value (e.g. userWeeklyLossLimitPercent: -1) alongside a valid one got
+    // 200 ok:true while that specific loss-limit circuit breaker was silently
+    // overwritten with NULL instead of the request being rejected. A field
+    // explicitly cleared (null/undefined/"") still resolves to null and is
+    // allowed through; only a genuinely invalid value is rejected.
+    const numericPreferenceKeys = new Set([
+      "userMinConfidence", "userRiskPercent", "userCapitalCap", "userMaxConcurrentPositions", "userMaxTradesPerDay",
+      "userDailyLossLimitPercent", "userDailyLossLimitAmount", "userWeeklyLossLimitPercent", "userWeeklyLossLimitAmount",
+      "userMonthlyLossLimitPercent", "userMonthlyLossLimitAmount", "userMinRiskReward",
+    ]);
+    const isExplicitClear = (raw) => raw === null || raw === undefined || raw === "";
+    const invalidPreferenceKeys = preferenceDefinitions
+      .filter(([, key, value]) => numericPreferenceKeys.has(key) && Object.prototype.hasOwnProperty.call(body, key) && value === null && !isExplicitClear(body[key]))
+      .map(([, key]) => key);
+    if (invalidPreferenceKeys.length) {
+      return sendJson(res, 400, { ok: false, error: "invalid_preference_value", fields: invalidPreferenceKeys });
+    }
     const providedPreferences = preferenceDefinitions.filter(([, key]) => Object.prototype.hasOwnProperty.call(body, key));
     // Found live while testing userCapitalCap: this was a plain UPDATE with no
     // row-existence guarantee -- the exact same silent-no-op bug class already
@@ -6349,10 +6370,15 @@ async function readResponseTextLimited(response, maxBytes = 2 * 1024 * 1024) {
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw new Error("response_too_large");
   }
+  // No stream to bound-read from -- undici only omits response.body for
+  // genuinely bodiless responses (HEAD, 204, 304, or an already-drained
+  // stream), never for a large payload, so there is nothing unbounded to
+  // guard against here. The old code recursed into itself with the same
+  // response and infinite-looped; falling back to a raw response.text() would
+  // reopen the unbounded-read risk this function exists to prevent (and
+  // scripts/api-tests.mjs's source-grep guard forbids that pattern outright).
   if (!response.body) {
-    const text = await readResponseTextLimited(response);
-    if (Buffer.byteLength(text, "utf8") > maxBytes) throw new Error("response_too_large");
-    return text;
+    return "";
   }
   const reader = response.body.getReader();
   const chunks = [];
@@ -11794,8 +11820,16 @@ async function serveStatic(res, pathname, req = null) {
   const normalizedRoot = rootPath.toLowerCase();
   const normalizedFile = file.toLowerCase();
   const publicDeniedPath = /^(?:server\.mjs|secret(?:\.[^/\\]*)?|\.env(?:\.[^/\\]*)?|package(?:-lock)?\.json|data[/\\]|scripts[/\\]|server[/\\]|\.git[/\\]|\.github[/\\]|\.codex[/\\]|\.agents[/\\]|node_modules[/\\])/i;
+  // Confirmed live during a review of a just-pushed commit: this used a
+  // hardcoded "\\" separator, which only ever matches on Windows. resolve()
+  // on the real Linux production host (Render/ubuntu-latest CI) always
+  // produces "/"-separated paths, so normalizedFile (always root + "/" +
+  // something, even for "/" -> "index.html") never started with
+  // normalizedRoot + "\\" there -- every single static file request 404'd,
+  // homepage included. path.sep is the platform-correct separator on
+  // whichever OS this actually runs on.
   if (
-    (normalizedFile !== normalizedRoot && !normalizedFile.startsWith(normalizedRoot + "\\")) ||
+    (normalizedFile !== normalizedRoot && !normalizedFile.startsWith(normalizedRoot + sep)) ||
     publicDeniedPath.test(relativePath)
   ) {
     await send404Page(res);

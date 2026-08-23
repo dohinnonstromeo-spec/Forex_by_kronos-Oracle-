@@ -31,6 +31,26 @@
     })[ch]);
   }
 
+  function filterContent() {
+    if (!host) return;
+    const query = String(searchInput?.value || '').trim().toLowerCase();
+    let visibleFields = 0;
+    host.querySelectorAll('.site-content-page-group').forEach((group) => {
+      let groupVisible = false;
+      group.querySelectorAll('[data-field-key]').forEach((field) => {
+        const matches = !query || field.textContent.toLowerCase().includes(query) || String(field.dataset.fieldKey || '').toLowerCase().includes(query);
+        field.hidden = !matches;
+        if (matches) { groupVisible = true; visibleFields += 1; }
+      });
+      group.hidden = !groupVisible;
+    });
+    let empty = host.querySelector('[data-content-search-empty]');
+    if (query && !visibleFields) {
+      if (!empty) { empty = document.createElement('p'); empty.className = 'site-content-search-empty'; empty.dataset.contentSearchEmpty = 'true'; host.append(empty); }
+      empty.textContent = 'Aucun champ ne correspond a cette recherche.';
+    } else if (empty) empty.remove();
+  }
+
   loadButton?.addEventListener("click", load);
   searchInput?.addEventListener("input", filterContent);
 
@@ -122,24 +142,5 @@
         setTimeout(() => { if (status.textContent.startsWith("✓")) status.textContent = ""; }, 3000);
       });
     });
-  function filterContent() {
-    if (!host) return;
-    const query = String(searchInput?.value || '').trim().toLowerCase();
-    let visibleFields = 0;
-    host.querySelectorAll('.site-content-page-group').forEach((group) => {
-      let groupVisible = false;
-      group.querySelectorAll('[data-field-key]').forEach((field) => {
-        const matches = !query || field.textContent.toLowerCase().includes(query) || String(field.dataset.fieldKey || '').toLowerCase().includes(query);
-        field.hidden = !matches;
-        if (matches) { groupVisible = true; visibleFields += 1; }
-      });
-      group.hidden = !groupVisible;
-    });
-    let empty = host.querySelector('[data-content-search-empty]');
-    if (query && !visibleFields) {
-      if (!empty) { empty = document.createElement('p'); empty.className = 'site-content-search-empty'; empty.dataset.contentSearchEmpty = 'true'; host.append(empty); }
-      empty.textContent = 'Aucun champ ne correspond a cette recherche.';
-    } else if (empty) empty.remove();
-  }
   }
 })();

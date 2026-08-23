@@ -243,13 +243,17 @@
     }
     tradingCapSave.disabled = true;
     setMessage("Enregistrement du plafond...", false);
-    const data = await adminFetch("/api/admin/trading-pause", { token, dailyOrderCap: cap });
-    if (!data?.ok) {
-      setMessage(data?.message || data?.error || "Action impossible.", true);
-      return;
+    try {
+      const data = await adminFetch("/api/admin/trading-pause", { token, dailyOrderCap: cap });
+      if (!data?.ok) {
+        setMessage(data?.message || data?.error || "Action impossible.", true);
+        return;
+      }
+      setMessage(`Plafond mis à jour : ${data.dailyCapPerUser} ordre(s)/compte/jour.`, false);
+      refreshTradingStatus();
+    } finally {
+      tradingCapSave.disabled = false;
     }
-    setMessage(`Plafond mis à jour : ${data.dailyCapPerUser} ordre(s)/compte/jour.`, false);
-    refreshTradingStatus();
   });
 
   async function setTradingPause(paused) {
