@@ -167,7 +167,7 @@
   function renderPreviews() {
     const previews = document.querySelector(".oracle-chat-previews");
     previews.classList.toggle("has-files", files.length > 0);
-    previews.innerHTML = files.map((src) => `<img src="${src}" alt="Graphique joint">`).join("");
+    previews.innerHTML = files.map((src) => `<img src="${src}" alt="Graphique joint" loading="lazy" decoding="async">`).join("");
   }
 
   async function filesToDataUrls(items) {

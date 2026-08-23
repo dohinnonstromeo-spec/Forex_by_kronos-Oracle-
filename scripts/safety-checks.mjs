@@ -8,6 +8,8 @@
 // buildQualityGate() force-passed other checks (and relaxed its danger threshold) in
 // quick mode based on the same false signal.
 //
+import { readFile } from "node:fs/promises";
+
 // Standalone on purpose, same reason as scripts/backtest.mjs: importing server.mjs
 // starts a real HTTP server as a side effect. The functions below are copied from
 // server.mjs, not imported -- if you change validateTradeLevels, pricePayload,
@@ -110,7 +112,7 @@ function qualityGateLivePriceChecks({ meta, quickMode }) {
 
 let pass = 0, fail = 0;
 function check(label, cond, extra) {
-  console.log(`${cond ? "PASS" : "FAIL"} - ${label}${extra ? ` (${extra})` : ""}`);
+  console.log((cond ? "PASS" : "FAIL") + " - " + label + (extra ? " (" + extra + ")" : ""));
   if (cond) pass++; else fail++;
 }
 
@@ -480,5 +482,174 @@ check("Case A, SELL: half TP sits exactly midway (entry above tp1)", Math.round(
 check("Case B, BUY: half-target trigger sits midway between entry and tp2 (2.5R reference)", halfTargetFromTp2(true, 4400, 4450) === 4425);
 check("Case B, SELL: half-target trigger sits midway (tp2 below entry)", halfTargetFromTp2(false, 4400, 4350) === 4375);
 
-console.log(`\n${pass} passed, ${fail} failed.`);
+console.log("=== distributed scheduler lease: autonomous execution stays single-flight across replicas ===");
+const serverSource = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
+const ciSource = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const apiTestSource = await readFile(new URL("../scripts/api-tests.mjs", import.meta.url), "utf8");
+check("durable auto-trade lease table exists", /CREATE TABLE IF NOT EXISTS auto_trade_leases/.test(serverSource));
+check("lease acquisition uses an expiry condition", /auto_trade_leases SET[\s\S]{0,300}lease_until < \?/.test(serverSource));
+check("swing scheduler acquires a lease before processing a user", /tryAcquireAutoTradeLease\(account\.user_id, slot\)[\s\S]{0,300}processAutoTradeForUser/.test(serverSource));
+check("scalp scheduler acquires a lease before processing a user", /tryAcquireAutoTradeLease\(account\.user_id, slot\)[\s\S]{0,300}processScalpForUser/.test(serverSource));
+check("password reset claims the token atomically", /UPDATE password_reset_tokens SET used_at = \? WHERE id = \? AND used_at IS NULL/.test(serverSource));
+check("daily order usage is durable", /CREATE TABLE IF NOT EXISTS trade_daily_usage/.test(serverSource));
+check("daily order cap increments conditionally in SQL", /trade_daily_usage[\s\S]{0,1200}confirmed_count < \?/.test(serverSource));
+check("maintenance scheduler lease table exists", /CREATE TABLE IF NOT EXISTS scheduler_leases/.test(serverSource));
+check("broker reconciliation uses a durable lease", /tryAcquireSchedulerLease\("broker-reconcile"\)/.test(serverSource));
+check("scalp timeout uses a durable lease", /tryAcquireSchedulerLease\("scalp-timeouts"\)/.test(serverSource));
+check("trailing stop uses a durable lease", /tryAcquireSchedulerLease\("trailing-stops"\)/.test(serverSource));
+check("learning outcomes uses a durable lease", /tryAcquireSchedulerLease\("learning-outcomes"\)/.test(serverSource));
+check("position modification lease table exists", /CREATE TABLE IF NOT EXISTS trade_operation_leases/.test(serverSource));
+check("secure-half acquires a durable position lease", /tryAcquireTradeOperationLease\(order\.id, "position-modify"\)/.test(serverSource));
+check("trailing acquires a durable position lease per order", /tryAcquireTradeOperationLease\(row\.order_id, "position-modify"\)/.test(serverSource));
+check("position modification leases are always released", /releaseTradeOperationLease\(row\.order_id, "position-modify", positionLeaseToken\)/.test(serverSource) && /releaseTradeOperationLease\(order\.id, "position-modify", leaseToken\)/.test(serverSource));
+check("scalp timeout shares the position mutex with trailing", /closeBrokerPosition\(credentials, latestRow\.broker_order_id\)/.test(serverSource) && /tryAcquireTradeOperationLease\(row\.order_id, "position-modify"\)/.test(serverSource));
+check("scalp close network failures are marked uncertain", /async function closeBrokerPosition[\s\S]{0,1800}broker_request_uncertain/.test(serverSource));
+check("secure-half and trailing share one mutex namespace", serverSource.includes('"position-modify"'));
+check("trailing rereads the order after locking", /const latestOrderRow = await sqlGet/.test(serverSource) && /Object\.assign\(row, latestOrderRow\)/.test(serverSource));
+check("secure-half refuses a position already secured", /Number\(latestRow\.half_target_secured\) === 1/.test(serverSource));
+console.log("=== broker delivery uncertainty: never retry an ambiguous order ===");
+check("broker timeouts are marked uncertain", /broker_request_uncertain/.test(serverSource) && /uncertain: true/.test(serverSource));
+check("simulation flags are disabled in production", serverSource.includes("MOCK_BROKER_ENABLED") && serverSource.includes("MOCK_MARKET_DATA") && serverSource.includes('NODE_ENV !== "production"'));
+check("file locks release resolved keys", serverSource.includes("const settled = run.then") && serverSource.includes("fileLocks.delete(key)"));
+check("auto-trade status map is bounded and pruned", serverSource.includes("AUTO_TRADE_STATUS_TTL_MS") && serverSource.includes("MAX_AUTO_TRADE_STATUS_ENTRIES") && serverSource.includes("pruneAutoTradeTickStatus"));
+check("deployment intervals and body size are bounded", serverSource.includes("function boundedEnvNumber") && serverSource.includes("MAX_BODY_BYTES = Math.trunc(boundedEnvNumber") && serverSource.includes("AUTO_TRADE_INTERVAL_MS = boundedEnvNumber"));
+check("Supabase table identifier is constrained", serverSource.includes("requestedSupabaseStateTable") && serverSource.includes("/^[A-Za-z_][A-Za-z0-9_]{0,62}$/"));
+check("request body reads have a bounded timeout", serverSource.includes("BODY_READ_TIMEOUT_MS") && serverSource.includes("req.destroy(bodyReadTimeoutError())") && serverSource.includes("clearTimeout(timeout)"));
+check("free and trade quotas are bounded", serverSource.includes("FREE_DAILY_ANALYSES_LIMIT = Math.trunc(boundedEnvNumber") && serverSource.includes("VISITOR_DAILY_DETECTIONS_LIMIT = Math.trunc(boundedEnvNumber") && serverSource.includes("Math.min(10_000, Math.max(1, Math.trunc(cap)))"));
+check("browser isolation headers are present", serverSource.includes("X-DNS-Prefetch-Control") && serverSource.includes("Cross-Origin-Resource-Policy"));
+check("lease and recovery intervals are bounded", serverSource.includes("AUTO_TRADE_LEASE_MS = boundedEnvNumber") && serverSource.includes("SCHEDULER_LEASE_MS = boundedEnvNumber") && serverSource.includes("TRADE_OPERATION_LEASE_MS = boundedEnvNumber") && serverSource.includes("HEARTBEAT_STALE_MS = boundedEnvNumber") && serverSource.includes("SENDING_RECOVERY_INTERVAL_MS = boundedEnvNumber") && serverSource.includes("SENDING_RECOVERY_AFTER_MS = boundedEnvNumber"));
+check("relational readiness waits for legacy migration", serverSource.indexOf("await migrateLegacyJsonIntoRelationalTables();") < serverSource.indexOf("relationalTablesReady = true;"));
+check("chat prompts are bounded", serverSource.includes("sanitizeUserText(cleanLine") && serverSource.includes(".slice(0, 4000)"));
+check("image payloads are bounded before decoding", serverSource.includes("MAX_IMAGE_DATA_URL_CHARS = 8 * 1024 * 1024") && serverSource.includes("image.length > MAX_IMAGE_DATA_URL_CHARS"));
+check("SSE clients cannot create an unbounded backlog", serverSource.includes("if (!client.write(message)) client.destroy()") && serverSource.includes("client.writableEnded"));
+check("recent log cache is bounded and pruned", serverSource.includes("MAX_RECENT_LOG_ENTRIES") && serverSource.includes("RECENT_LOG_TTL_MS") && serverSource.includes("pruneRecentLogs"));
+check("provider health errors are bounded", serverSource.includes("String(error).slice(0, 240)") && serverSource.includes("lastError: ok ? null : safeError"));
+check("production requires durable database storage", serverSource.includes("IS_PRODUCTION && !databaseUrl"));
+check("readiness verifies relational storage", serverSource.includes('url.pathname === "/api/ready"') && serverSource.includes('await sqlGet("SELECT 1")') && serverSource.includes("storage_unavailable"));
+check("HTTP server has explicit resource timeouts", serverSource.includes("httpServer.headersTimeout = 15_000") && serverSource.includes("httpServer.requestTimeout = 120_000") && serverSource.includes("httpServer.keepAliveTimeout = 65_000"));
+check("shutdown closes SSE and database resources", serverSource.includes("async function gracefulShutdown") && serverSource.includes("client.destroy()") && serverSource.includes("pgPool.end()"));
+check("CI probes readiness instead of liveness only", ciSource.includes("/api/ready"));
+check("integration tests force a non-production environment", apiTestSource.includes('NODE_ENV: "test"'));
+const robotsSource = await readFile(new URL("../robots.txt", import.meta.url), "utf8");
+const sitemapSource = await readFile(new URL("../sitemap.xml", import.meta.url), "utf8");
+const indexHtmlSource = await readFile(new URL("../index.html", import.meta.url), "utf8");
+const legalHtmlSource = await readFile(new URL("../legal.html", import.meta.url), "utf8");
+const privateHtmlSources = await Promise.all(["dashboard.html", "login.html", "signup.html", "forgot-password.html"].map((file) => readFile(new URL("../" + file, import.meta.url), "utf8")));
+check("robots and sitemap are present", robotsSource.includes("Sitemap:") && sitemapSource.includes("<urlset"));
+check("public legal page has canonical and social metadata", legalHtmlSource.includes('rel="canonical"') && legalHtmlSource.includes("og:title") && legalHtmlSource.includes("twitter:card"));
+check("private auth surfaces are noindex", privateHtmlSources.every((source) => source.includes('name="robots" content="noindex, nofollow"')));
+check("homepage has WebSite structured data", indexHtmlSource.includes('id="website-jsonld"') && indexHtmlSource.includes('"@type": "WebSite"'));
+check("successful broker acknowledgements require an order id", /broker_ack_missing_order_id/.test(serverSource));
+check("ambiguous broker responses transition to DELIVERY_UNKNOWN", serverSource.includes('broker.uncertain ? "DELIVERY_UNKNOWN"'));
+check("stale SENDING orders have a recovery scheduler", /recoverStaleSendingOrders/.test(serverSource) && /status = 'DELIVERY_UNKNOWN'/.test(serverSource));
+const recoveryStart = serverSource.indexOf("async function recoverStaleSendingOrders");
+const recoveryEnd = serverSource.indexOf("function startSendingRecoveryScheduler");
+const recoveryBlock = recoveryStart >= 0 && recoveryEnd > recoveryStart ? serverSource.slice(recoveryStart, recoveryEnd) : "";
+check("recovery never resends a stale SENDING order", recoveryBlock.length > 0 && !recoveryBlock.includes("sendOrderToBroker"));
+check("delivery-unknown orders stay active and cannot be prepared again", serverSource.includes("status IN ('PENDING_CONFIRMATION', 'SENDING', 'SENT', 'DELIVERY_UNKNOWN')"));
+check("late broker responses cannot overwrite DELIVERY_UNKNOWN", serverSource.includes("WHERE id = ? AND status = 'SENDING'"));
+check("prepare claims are retained for uncertain delivery", serverSource.includes("if (!broker.ok && !broker.uncertain)"));
+check("static files stay confined and internal paths are denied", serverSource.includes("const publicDeniedPath") && serverSource.includes("decodedPathname = decodeURIComponent(pathname)") && serverSource.includes("const rootPath = resolve(root)"));
+check("session deletion preserves Secure", serverSource.includes("clearSessionCookie(res, req = null)") && serverSource.includes("Max-Age=0\" + secure"));
+check("news requests are normalized and bounded", serverSource.includes("normalizedSymbol = normalizePair") && serverSource.includes("const newsInFlight = new Map()") && serverSource.includes("memoryCache.news.size > 32"));
+const authClientSource = await readFile(new URL("../assets/auth.js", import.meta.url), "utf8");
+check("authenticated frontend requests have bounded timeouts", authClientSource.includes("function fetchWithTimeout(url, options = {})") && authClientSource.includes("AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS)") && !/await fetch\(/.test(authClientSource));
+check("external alert and email calls have bounded timeouts", serverSource.includes("signal: AbortSignal.timeout(3500)") && serverSource.includes("signal: AbortSignal.timeout(10000)"));
+check("production PostgreSQL TLS verifies certificates", serverSource.includes("allowInsecureDatabaseTls") && serverSource.includes("env.NODE_ENV !== \"production\"") && serverSource.includes("rejectUnauthorized: !allowInsecureDatabaseTls"));
+const boundedFrontendSources = await Promise.all(["admin-content.js", "premium-admin.js", "admin-health.js", "site-content.js"].map((file) => readFile(new URL("../assets/" + file, import.meta.url), "utf8")));
+check("admin and public frontend requests have bounded timeouts", boundedFrontendSources.every((source) => source.includes("AbortSignal.timeout")));
+const pauseSettingsStart = serverSource.indexOf("const requestedCap = hasCapUpdate");
+const pauseSettingsEnd = serverSource.indexOf("sendJson(res, 200, { ok: true, paused", pauseSettingsStart);
+const pauseSettingsBlock = pauseSettingsStart >= 0 && pauseSettingsEnd > pauseSettingsStart ? serverSource.slice(pauseSettingsStart, pauseSettingsEnd) : "";
+check("invalid admin cap is rejected before pause mutation", pauseSettingsBlock.indexOf("if (hasCapUpdate &&") >= 0 && pauseSettingsBlock.indexOf("if (hasCapUpdate &&") < pauseSettingsBlock.indexOf('setAppSetting("trading_paused"'));
+check("partial user preferences preserve omitted fields", /const providedPreferences =/.test(serverSource) && /Object\.prototype\.hasOwnProperty\.call\(body, key\)/.test(serverSource) && serverSource.includes("providedPreferences.map(([column]) => column)"));
+check("broker-backed reconciliation fails closed when state is unknown", /brokerUnavailable/.test(serverSource) && /brokerResult\?\.stillOpen \|\| brokerResult\?\.brokerUnavailable/.test(serverSource));
+const frontendAuditSources = await Promise.all([
+  readFile(new URL("../assets/analyse-page.js", import.meta.url), "utf8"),
+  readFile(new URL("../assets/kronos-live.js", import.meta.url), "utf8"),
+  readFile(new URL("../assets/oracle-tabs.js", import.meta.url), "utf8"),
+  readFile(new URL("../assets/oracle-chatbot.js", import.meta.url), "utf8"),
+]);
+const frontendAnalyseSource = frontendAuditSources[0];
+const frontendHomeSource = frontendAuditSources[1];
+const frontendTabsSource = frontendAuditSources[2];
+const frontendChatSource = frontendAuditSources[3];
+const frontendHtmlSources = await Promise.all(
+  ["index.html", "analyse.html", "dashboard.html", "legal.html", "404.html", "paiement.html", "admin-contenu.html", "admin-health.html", "premium-admin.html"].map((file) => readFile(new URL("../" + file, import.meta.url), "utf8")),
+);
+check("frontend analysis refresh is single-flight", frontendAnalyseSource.includes("let signalsRefreshInFlight = false") && frontendAnalyseSource.includes("if (signalsRefreshInFlight) return"));
+check("homepage live refreshes are single-flight", frontendHomeSource.includes("let pricesRefreshInFlight = false") && frontendHomeSource.includes("let signalsRefreshInFlight = false") && frontendHomeSource.includes("let signalScoresRefreshInFlight = false"));
+check("dashboard order refresh is single-flight", authClientSource.includes("let tradeOrdersRefreshInFlight = false") && authClientSource.includes("if (tradeOrdersRefreshInFlight) return"));
+check("robot action buttons are re-enabled", authClientSource.includes("/api/auto-trade/request") && authClientSource.includes("/api/auto-trade/pause") && authClientSource.includes("/api/auto-trade/resume") && (authClientSource.match(/button\.disabled = false/g) || []).length >= 3);
+check("tab keyboard and ARIA contract is present", frontendTabsSource.includes("aria-controls") && frontendTabsSource.includes("ArrowRight") && frontendTabsSource.includes("role"));
+check("chat and analysis previews stay lazy", frontendChatSource.includes('loading="lazy"') && frontendAnalyseSource.includes('loading="lazy"'));
+check("public and internal pages expose skip links", frontendHtmlSources.every((source) => source.includes('class="oracle-skip-link"') && source.includes('id="main-content"')));
+check("forms declare an HTTP method", frontendHtmlSources.concat(privateHtmlSources).every((source) => !/<form\\b(?![^>]*\\bmethod=)[^>]*>/i.test(source)));
+check("private pages keep noindex", privateHtmlSources.every((source) => source.includes('name="robots" content="noindex, nofollow"')));
+const adminContentPageSource = await readFile(new URL('../admin-contenu.html', import.meta.url), 'utf8');
+const adminHealthPageSource = await readFile(new URL('../admin-health.html', import.meta.url), 'utf8');
+const adminPremiumSource = await readFile(new URL('../assets/premium-admin.js', import.meta.url), 'utf8');
+const adminHealthSource = await readFile(new URL('../assets/admin-health.js', import.meta.url), 'utf8');
+const adminContentSource = await readFile(new URL('../assets/admin-content.js', import.meta.url), 'utf8');
+const adminStylesSource = await readFile(new URL('../assets/oracle-extras.css', import.meta.url), 'utf8');
+check('admin member detail endpoint is protected', serverSource.includes('url.pathname.startsWith("/api/admin/members/")') && serverSource.includes('const admin = await requireAdmin(req)') && serverSource.includes('broker_last_check_status') && !serverSource.includes('broker_token:'));
+check('admin member detail exposes pair performance', serverSource.includes('GROUP BY pair') && serverSource.includes('LIMIT 20') && adminPremiumSource.includes('data.byPair') && adminPremiumSource.includes('Performance par paire'));
+check('admin member detail exposes a bounded activity timeline', adminPremiumSource.includes('const activity = [...analyses') && adminPremiumSource.includes('slice(0, 12)') && adminPremiumSource.includes('member-timeline'));
+check('admin member detail UI keeps personal data escaped', adminContentPageSource.includes('data-member-drawer') && adminPremiumSource.includes('/api/admin/members/') && adminPremiumSource.includes('escapeHtml(user.email') && adminPremiumSource.includes('member-detail-table'));
+check('admin member dossier URLs use internal ids', adminPremiumSource.includes('data-member-details="${escapeHtml(user.id)}"') && adminPremiumSource.includes('const userId = button.dataset.memberDetails') && adminPremiumSource.includes('encodeURIComponent(userId)'));
+check('admin member detail restores keyboard focus', adminContentPageSource.includes('tabindex="-1"') && adminPremiumSource.includes('event.key === "Escape"') && adminPremiumSource.includes('lastMemberTrigger.focus()'));
+check('admin command center keeps existing contracts', adminContentPageSource.includes('data-premium-admin-form') && adminContentPageSource.includes('data-trading-pause') && adminContentPageSource.includes('data-autotrade-requests') && adminContentPageSource.includes('data-site-content-sections'));
+check('admin command center exposes a protected overview state', adminContentPageSource.includes('data-admin-overview-refresh') && adminContentPageSource.includes('data-admin-overall-status') && adminContentPageSource.includes('data-admin-alerts') && adminPremiumSource.includes('/api/admin/members') && adminPremiumSource.includes('/api/admin/trading-status'));
+check('admin overview remains single-flight and restores its button', adminPremiumSource.includes('if (adminOverviewRefresh) adminOverviewRefresh.disabled = true') && adminPremiumSource.includes('} finally {') && adminPremiumSource.includes('adminOverviewRefresh) adminOverviewRefresh.disabled = false'));
+check('health console keeps refresh and output contracts', adminHealthPageSource.includes('id="refreshHealth"') && adminHealthPageSource.includes('id="healthOutput"') && adminHealthPageSource.includes('data-health-score') && adminHealthPageSource.includes('data-health-alerts'));
+check('health console classifies provider states', adminHealthSource.includes('function stateFor(status)') && adminHealthSource.includes("['ok', 'up', 'healthy']") && adminHealthSource.includes('data-state="'));
+check('health console bounds requests and escapes provider data', adminHealthSource.includes('AbortSignal.timeout(7000)') && adminHealthSource.includes('escapeHtml(item?.source') && adminHealthSource.includes('health.recommendations.map'));
+check('content CMS always restores its load button', adminContentSource.includes('try {') && adminContentSource.includes('} finally {') && adminContentSource.includes('if (loadButton) loadButton.disabled = false'));
+check('content CMS search remains client-side bounded', adminContentPageSource.includes('data-site-content-search') && adminContentSource.includes('filterContent()') && adminContentSource.includes('field.hidden = !matches') && adminStylesSource.includes('.admin-content-search'));
+check('admin member directory filters locally', adminContentPageSource.includes('data-member-search') && adminContentPageSource.includes('data-member-plan-filter') && adminPremiumSource.includes('currentMemberItems()') && adminPremiumSource.includes('renderMemberDirectory'));
+check('admin pages stay airy and responsive', adminContentPageSource.includes('admin-summary-grid') && adminHealthPageSource.includes('health-summary-grid') && adminStylesSource.includes('@media (max-width: 620px)') && adminStylesSource.includes('.health-detail-card--wide'));
+console.log("=== requestOrigin: password-reset links never trust an attacker-controlled production Host ===");
+
+// Copy of requestOrigin() from server.mjs, with the logger omitted because this
+// standalone suite only checks the returned origin.
+function requestOriginForTest(req, runtimeEnv = {}, runtimePort = 4174) {
+  let configuredOrigin = String(runtimeEnv.PUBLIC_ORIGIN || runtimeEnv.APP_URL || "").trim();
+  while (configuredOrigin.endsWith("/")) configuredOrigin = configuredOrigin.slice(0, -1);
+  if (configuredOrigin) {
+    try {
+      const parsed = new URL(configuredOrigin);
+      if ((parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password) {
+        return parsed.origin;
+      }
+    } catch {
+      // Production fallback below remains safe when configuration is invalid.
+    }
+  }
+  if (runtimeEnv.NODE_ENV === "production") return "https://forex-by-kronos-oracle.onrender.com";
+  const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  const protocol = forwardedProto === "https" || runtimeEnv.NODE_ENV === "production" ? "https" : "http";
+  const candidateHost = String(req?.headers?.host || ("127.0.0.1:" + runtimePort));
+  const host = candidateHost.includes("/") || candidateHost.includes(" ") ? ("127.0.0.1:" + runtimePort) : candidateHost;
+  return protocol + "://" + host;
+}
+
+check(
+  "production ignores an attacker-controlled Host header",
+  requestOriginForTest({ headers: { host: "evil.example/reset" } }, { NODE_ENV: "production" }) === "https://forex-by-kronos-oracle.onrender.com",
+);
+check(
+  "configured PUBLIC_ORIGIN wins over request headers",
+  requestOriginForTest({ headers: { host: "evil.example" } }, { NODE_ENV: "production", PUBLIC_ORIGIN: "https://oracle.example/" }) === "https://oracle.example",
+);
+check(
+  "invalid production PUBLIC_ORIGIN still falls back to the safe canonical origin",
+  requestOriginForTest({ headers: { host: "evil.example" } }, { NODE_ENV: "production", PUBLIC_ORIGIN: "javascript:alert(1)" }) === "https://forex-by-kronos-oracle.onrender.com",
+);
+check(
+  "development keeps a valid local Host for reset-link testing",
+  requestOriginForTest({ headers: { host: "127.0.0.1:4174" } }, { NODE_ENV: "development" }) === "http://127.0.0.1:4174",
+);
+
+console.log(`
+${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);

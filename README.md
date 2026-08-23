@@ -25,14 +25,21 @@ TWELVE_DATA_API_KEY=...
 FINNHUB_API_KEY=...
 NEWS_API_KEY=...
 DATABASE_URL=postgres://...
+DATABASE_SSL_REJECT_UNAUTHORIZED=false  # developpement uniquement; ignore en production
 SUPABASE_URL=https://PROJECT_REF.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=...
 SUPABASE_STATE_TABLE=oracle_app_state
 SUPABASE_TIMEOUT_MS=5000
 ADMIN_TOKEN=une_phrase_secrete_longue
+PUBLIC_ORIGIN=https://forex-by-kronos-oracle.onrender.com
+BROKER_CREDENTIALS_ENCRYPTION_KEY=genere_un_secret_aleatoire_d_au_moins_32_caracteres
+BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS=ancienne_cle_pendant_une_rotation
+BROKER_CREDENTIALS_ENCRYPTION_REQUIRED=true
 ```
 
 Le navigateur appelle seulement `/api/...`; les cles restent cote serveur local.
+
+Les jetons MetaApi des utilisateurs sont chiffres au repos avec AES-256-GCM lorsque BROKER_CREDENTIALS_ENCRYPTION_KEY est configure. En production, le mode obligatoire est actif par defaut : sans cette cle, une nouvelle connexion broker est refusee plutot que d enregistrer un secret en clair. Les anciennes valeurs sont relues pour assurer la migration puis rechiffrees automatiquement. Conserver cette cle dans le gestionnaire de secrets de l hebergeur et hors du depot. Pendant une rotation, renseigner la nouvelle cle dans BROKER_CREDENTIALS_ENCRYPTION_KEY et l ancienne dans BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS. Le serveur relit puis rechiffre automatiquement les valeurs encore protegees par l ancienne cle. Apres verification, retirer la variable PREVIOUS. Conserver ces cles dans le gestionnaire de secrets de l hebergeur et hors du depot.
 
 Table Supabase attendue pour la persistance serveur:
 

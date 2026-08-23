@@ -1,23 +1,111 @@
-import { createServer } from "node:http";
+﻿import { createServer } from "node:http";
 import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { createReadStream, existsSync, statSync, readFileSync, mkdirSync } from "node:fs";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import { createGzip, createBrotliCompress, brotliCompressSync, gzipSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import pg from "pg";
-import { imageSize } from "image-size";
 import webpush from "web-push";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
-const port = Number(env.PORT || 4174);
+const IS_PRODUCTION = String(env.NODE_ENV || "").toLowerCase() === "production";
+const BROKER_CREDENTIALS_ENCRYPTION_REQUIRED = env.BROKER_CREDENTIALS_ENCRYPTION_REQUIRED === "true" || IS_PRODUCTION;
+const BROKER_CREDENTIALS_ENCRYPTION_KEY = deriveBrokerCredentialKey(env.BROKER_CREDENTIALS_ENCRYPTION_KEY || "");
+const BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS = deriveBrokerCredentialKey(env.BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS || "");
+const BROKER_CREDENTIALS_ENCRYPTION_PREFIX = "enc:v1:";
+
+function deriveBrokerCredentialKey(rawKey) {
+  const value = String(rawKey || "").trim();
+  if (!value || value.length < 32) return null;
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+function encryptBrokerCredential(value) {
+  const plaintext = String(value || "");
+  if (!plaintext) return plaintext;
+  if (!BROKER_CREDENTIALS_ENCRYPTION_KEY) {
+    if (BROKER_CREDENTIALS_ENCRYPTION_REQUIRED) throw new Error("broker_credentials_encryption_key_required");
+    return plaintext;
+  }
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", BROKER_CREDENTIALS_ENCRYPTION_KEY, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return BROKER_CREDENTIALS_ENCRYPTION_PREFIX
+    + iv.toString("base64url") + ":" + cipher.getAuthTag().toString("base64url")
+    + ":" + ciphertext.toString("base64url");
+}
+
+function decryptBrokerCredentialWithKey(value, key) {
+  if (!key) throw new Error("broker_credentials_encryption_key_missing");
+  const parts = String(value || "").slice(BROKER_CREDENTIALS_ENCRYPTION_PREFIX.length).split(":");
+  if (parts.length !== 3) throw new Error("broker_credentials_ciphertext_invalid");
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(parts[0], "base64url"));
+  decipher.setAuthTag(Buffer.from(parts[1], "base64url"));
+  return Buffer.concat([decipher.update(Buffer.from(parts[2], "base64url")), decipher.final()]).toString("utf8");
+}
+
+function decryptBrokerCredential(value) {
+  const stored = String(value || "");
+  if (!stored || !stored.startsWith(BROKER_CREDENTIALS_ENCRYPTION_PREFIX)) return stored;
+  const keys = [BROKER_CREDENTIALS_ENCRYPTION_KEY, BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS].filter(Boolean);
+  if (!keys.length) throw new Error("broker_credentials_encryption_key_missing");
+  for (const key of keys) {
+    try {
+      return decryptBrokerCredentialWithKey(stored, key);
+    } catch {
+      // A failed current key can be a legitimate rotation case; try the previous key.
+    }
+  }
+  throw new Error("broker_credentials_decryption_failed");
+}
+function isEncryptedBrokerCredential(value) {
+  return String(value || "").startsWith(BROKER_CREDENTIALS_ENCRYPTION_PREFIX);
+}
+
+function brokerCredentialUsesPreviousKey(value) {
+  if (!BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS || !isEncryptedBrokerCredential(value)) return false;
+  try {
+    decryptBrokerCredentialWithKey(value, BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function migratePlaintextBrokerCredentials() {
+  if (!BROKER_CREDENTIALS_ENCRYPTION_KEY) return;
+  try {
+    const rows = await sqlAll("SELECT user_id, broker_token, broker_demo_token, broker_live_token FROM auto_trading_accounts");
+    for (const row of rows) {
+      const updates = [];
+      const params = [];
+      for (const column of ["broker_token", "broker_demo_token", "broker_live_token"]) {
+        if (row[column] && (!isEncryptedBrokerCredential(row[column]) || brokerCredentialUsesPreviousKey(row[column]))) {
+          updates.push(column + " = ?");
+          params.push(encryptBrokerCredential(decryptBrokerCredential(row[column])));
+        }
+      }
+      if (!updates.length) continue;
+      params.push(row.user_id);
+      await sqlRun("UPDATE auto_trading_accounts SET " + updates.join(", ") + " WHERE user_id = ?", params);
+    }
+  } catch (error) {
+    logOnce("broker-credential-migration", "chiffrement des identifiants broker echoue (" + error.message + ")");
+  }
+}
+function boundedEnvNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+const port = Math.trunc(boundedEnvNumber(env.PORT, 4174, 1, 65535));
 const dataDir = join(root, "data");
 const learningPath = join(dataDir, "learning-log.json");
 const marketCachePath = join(dataDir, "market-cache.json");
 const authPath = join(dataDir, "auth-store.json");
-const sqliteDbPath = join(dataDir, "oracle.db");
+const sqliteDbPath = env.SQLITE_DB_PATH ? resolve(env.SQLITE_DB_PATH) : join(dataDir, "oracle.db");
 const supabaseUrl = normalizeSupabaseUrl(env.SUPABASE_URL || env.SUPABASE_PROJECT_URL || "");
 const supabaseProjectRef = env.SUPABASE_PROJECT_REF || inferSupabaseProjectRef(supabaseUrl);
 const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY || "";
@@ -35,7 +123,9 @@ if (pushConfigured) {
 
 const { Pool } = pg;
 const databaseUrl = env.DATABASE_URL || "";
-const pgPool = databaseUrl ? new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false } }) : null;
+const allowInsecureDatabaseTls = env.NODE_ENV !== "production" && env.DATABASE_SSL_REJECT_UNAUTHORIZED === "false";
+const pgPool = databaseUrl ? new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: !allowInsecureDatabaseTls } }) : null;
+if (IS_PRODUCTION && !databaseUrl) throw new Error("DATABASE_URL is required in production; refusing ephemeral local storage.");
 let pgTableReady = false;
 
 // Users/sessions/analyses live in real per-row tables (not a single JSON blob) so
@@ -75,10 +165,9 @@ function toPgPlaceholders(sql) {
 
 async function sqlRun(sql, params = []) {
   if (pgPool) {
-    await pgPool.query(toPgPlaceholders(sql), params);
-    return;
+    return pgPool.query(toPgPlaceholders(sql), params);
   }
-  getSqliteDb().prepare(sql).run(...params);
+  return getSqliteDb().prepare(sql).run(...params);
 }
 
 async function sqlGet(sql, params = []) {
@@ -98,7 +187,19 @@ async function sqlAll(sql, params = []) {
 }
 
 let relationalTablesReady = false;
+let relationalTablesPromise = null;
 async function ensureRelationalTables() {
+  if (relationalTablesReady) return;
+  if (relationalTablesPromise) return relationalTablesPromise;
+  relationalTablesPromise = ensureRelationalTablesImpl();
+  try {
+    await relationalTablesPromise;
+  } finally {
+    relationalTablesPromise = null;
+  }
+}
+
+async function ensureRelationalTablesImpl() {
   if (relationalTablesReady) return;
   const statements = [
     `CREATE TABLE IF NOT EXISTS users (
@@ -164,6 +265,15 @@ async function ensureRelationalTables() {
       updated_at text NOT NULL,
       PRIMARY KEY (fingerprint, date)
     )`,
+     `CREATE TABLE IF NOT EXISTS user_usage (
+      user_id text NOT NULL,
+      date text NOT NULL,
+      analysis integer NOT NULL DEFAULT 0,
+      chat integer NOT NULL DEFAULT 0,
+      detection integer NOT NULL DEFAULT 0,
+      updated_at text NOT NULL,
+      PRIMARY KEY (user_id, date)
+    )`,
     `CREATE TABLE IF NOT EXISTS rate_limit_attempts (
       kind text NOT NULL,
       rate_key text NOT NULL,
@@ -216,6 +326,44 @@ async function ensureRelationalTables() {
     // halt every trade confirmation instantly (a runtime toggle, not a redeploy) if
     // something looks wrong, without that also depending on the broker or any other
     // external service being reachable.
+    `CREATE TABLE IF NOT EXISTS trade_prepare_claims (
+      analysis_id text PRIMARY KEY,
+      user_id text NOT NULL,
+      order_id text NOT NULL UNIQUE,
+      created_at text NOT NULL
+    )`,
+    // Durable mutex for autonomous execution across replicas.
+    `CREATE TABLE IF NOT EXISTS auto_trade_leases (
+      user_id text NOT NULL,
+      broker_slot text NOT NULL,
+      lease_token text NOT NULL,
+      lease_until text NOT NULL,
+      updated_at text NOT NULL,
+      PRIMARY KEY (user_id, broker_slot)
+    )`,
+    `CREATE TABLE IF NOT EXISTS trade_daily_usage (
+      user_id text NOT NULL,
+      date text NOT NULL,
+      confirmed_count integer NOT NULL DEFAULT 0,
+      updated_at text NOT NULL,
+      PRIMARY KEY (user_id, date)
+    )`,
+    `CREATE TABLE IF NOT EXISTS scheduler_leases (
+      lease_key text PRIMARY KEY,
+      lease_token text NOT NULL,
+      lease_until text NOT NULL,
+      updated_at text NOT NULL
+    )`,
+    // Durable per-order mutex for broker-side position modifications. Unlike
+    // withFileLock, this also coordinates separate server replicas.
+    `CREATE TABLE IF NOT EXISTS trade_operation_leases (
+      order_id text NOT NULL,
+      operation text NOT NULL,
+      lease_token text NOT NULL,
+      lease_until text NOT NULL,
+      updated_at text NOT NULL,
+      PRIMARY KEY (order_id, operation)
+    )`,
     `CREATE TABLE IF NOT EXISTS app_settings (
       key text PRIMARY KEY,
       value text NOT NULL,
@@ -523,8 +671,11 @@ async function ensureRelationalTables() {
   } catch (error) {
     logOnce("schema", `index idx_analyses_user_source_status échoué (${error.message})`);
   }
-  relationalTablesReady = true;
+  await migratePlaintextBrokerCredentials()
   await migrateLegacyJsonIntoRelationalTables();
+  // Publish readiness only after legacy data is fully imported so concurrent requests
+  // cannot write rate limits or users while the initial migration is still running.
+  relationalTablesReady = true;
 }
 
 async function ensureColumn(table, columnDef) {
@@ -739,7 +890,7 @@ function sanitizeRichContent(html) {
       let safeAttrs = "";
       if (lowerTag === "a") {
         const href = attrs.match(/href\s*=\s*"([^"]*)"/i)?.[1] || attrs.match(/href\s*=\s*'([^']*)'/i)?.[1];
-        if (href && /^(https?:|mailto:|\/)/i.test(href.trim())) safeAttrs += ` href="${href.replace(/"/g, "&quot;")}"`;
+        if (href && /^(?:https?:\/\/|mailto:|\/(?!\/))/i.test(href.trim())) safeAttrs += ` href="${href.replace(/"/g, "&quot;")}"`;
         if (/target\s*=\s*["']_blank["']/i.test(attrs)) safeAttrs += ` target="_blank" rel="noopener"`;
       }
       if (lowerTag === "span") {
@@ -772,7 +923,8 @@ async function ensureStateTable() {
   pgTableReady = true;
 }
 
-const supabaseStateTable = env.SUPABASE_STATE_TABLE || "oracle_app_state";
+const requestedSupabaseStateTable = String(env.SUPABASE_STATE_TABLE || "oracle_app_state").trim();
+const supabaseStateTable = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(requestedSupabaseStateTable) ? requestedSupabaseStateTable : "oracle_app_state";
 let supabaseUnavailable = false;
 let supabaseLastError = null;
 const providerHealth = new Map();
@@ -781,23 +933,25 @@ const providerHealth = new Map();
 // reset to zero on every deploy and would diverge independently per instance under
 // >1 replica. Moved to real SQL tables (anonymous_usage, rate_limit_attempts); see
 // consumeAnonymousQuota/checkLoginRateLimit/checkSignupRateLimit.
-const LOGIN_MAX_ATTEMPTS = Number(env.LOGIN_MAX_ATTEMPTS || 5);
-const LOGIN_WINDOW_MS = Number(env.LOGIN_WINDOW_MINUTES || 15) * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = Math.trunc(boundedEnvNumber(env.LOGIN_MAX_ATTEMPTS, 5, 1, 100));
+const LOGIN_WINDOW_MS = boundedEnvNumber(env.LOGIN_WINDOW_MINUTES, 15, 1, 1440) * 60 * 1000;
 // /api/signup had no rate limit at all -- confirmed live, 10 accounts created back
 // to back with no throttling, each starting with a fresh free-tier quota. This
 // doesn't add email verification (no email-sending infra exists here), but it does
 // close the "just sign up again when the quota runs out" bypass by making repeated
 // signups from the same source expensive in time, same mechanism as the login limiter.
-const SIGNUP_MAX_ATTEMPTS = Number(env.SIGNUP_MAX_ATTEMPTS || 5);
-const SIGNUP_WINDOW_MS = Number(env.SIGNUP_WINDOW_MINUTES || 60) * 60 * 1000;
+const SIGNUP_MAX_ATTEMPTS = Math.trunc(boundedEnvNumber(env.SIGNUP_MAX_ATTEMPTS, 5, 1, 100));
+const SIGNUP_WINDOW_MS = boundedEnvNumber(env.SIGNUP_WINDOW_MINUTES, 60, 1, 1440) * 60 * 1000;
 const memoryCache = {
   prices: { value: null, expiresAt: 0 },
   histories: { key: "", value: null, expiresAt: 0 },
   calendar: { value: null, expiresAt: 0 },
+  news: new Map(),
   signals: { value: null, expiresAt: 0 },
   performance: { value: null, expiresAt: 0 },
 };
 
+const newsInFlight = new Map();
 const GROQ_MODEL = env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile";
 // Confirmed live (2026-08-11, both configured GROQ_KEY_* values): this Groq
@@ -853,6 +1007,18 @@ const exhaustedKeys = new Map();
 const autoTradeTickStatus = new Map();
 function recordAutoTradeStatus(userId, slot, reason, detail = null) {
   autoTradeTickStatus.set(`${userId}:${slot}`, { at: new Date().toISOString(), reason, detail });
+}
+const AUTO_TRADE_STATUS_TTL_MS = 2 * 60 * 60 * 1000;
+const MAX_AUTO_TRADE_STATUS_ENTRIES = 10000;
+function pruneAutoTradeTickStatus(now = Date.now()) {
+  for (const [key, value] of autoTradeTickStatus) {
+    if (!value?.at || now - new Date(value.at).getTime() > AUTO_TRADE_STATUS_TTL_MS) autoTradeTickStatus.delete(key);
+  }
+  if (autoTradeTickStatus.size <= MAX_AUTO_TRADE_STATUS_ENTRIES) return;
+  const oldest = [...autoTradeTickStatus.entries()]
+    .sort((a, b) => new Date(a[1]?.at || 0) - new Date(b[1]?.at || 0))
+    .slice(0, autoTradeTickStatus.size - MAX_AUTO_TRADE_STATUS_ENTRIES);
+  for (const [key] of oldest) autoTradeTickStatus.delete(key);
 }
 // USD/JPY and USD/CHF added 2026-08-13: scripts/backtest.mjs confirmed positive R
 // moyen on both train AND held-out test across all 11 parameter variants tried, no
@@ -1142,16 +1308,21 @@ const SECURITY_CSP = [
 function applySecurityHeaders(res, req) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()");
   res.setHeader("Content-Security-Policy", SECURITY_CSP);
+  if (String(req?.url || "").split("?", 1)[0].startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store");
+  }
   const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
   if (env.NODE_ENV === "production" || forwardedProto === "https") {
     res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
   }
 }
 
-createServer(async (req, res) => {
+const httpServer = createServer(async (req, res) => {
   try {
     applySecurityHeaders(res, req);
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
@@ -1174,15 +1345,25 @@ createServer(async (req, res) => {
     // the client gets is a stable, French, non-technical message instead.
     logOnce("http-error", `requête non gérée (${error.statusCode || 500}): ${error.message}`);
     const isPayloadTooLarge = error.statusCode === 413;
+    const isInvalidJson = error.publicCode === "invalid_json";
     sendJson(res, error.statusCode || 500, {
-      error: isPayloadTooLarge ? "payload_too_large" : "server_error",
-      message: isPayloadTooLarge ? "Fichier envoyé trop volumineux." : "Une erreur est survenue côté serveur. Réessaie dans un instant.",
+      error: isPayloadTooLarge ? "payload_too_large" : isInvalidJson ? "invalid_json" : "server_error",
+      message: isPayloadTooLarge ? "Fichier envoyé trop volumineux." : isInvalidJson ? "JSON invalide." : "Une erreur est survenue côté serveur. Réessaie dans un instant.",
     });
   }
-}).listen(port, () => {
+});
+
+// Keep slow headers, stalled uploads, and idle keep-alive sockets from consuming
+// a worker indefinitely. SSE responses remain active because they continue writing.
+httpServer.headersTimeout = 15_000;
+httpServer.requestTimeout = 120_000;
+httpServer.keepAliveTimeout = 65_000;
+
+httpServer.listen(port, () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
   startLearningOutcomesScheduler();
   startBrokerReconcileScheduler();
+  startSendingRecoveryScheduler();
   startScalpTimeoutScheduler();
   startTrailingStopScheduler();
   startSignalsBroadcastScheduler();
@@ -1192,6 +1373,29 @@ createServer(async (req, res) => {
   startHeartbeatScheduler();
   startRateLimitMapSweeper();
 });
+
+let shutdownPromise = null;
+async function gracefulShutdown(signal) {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    console.warn("[shutdown] " + signal + ": fermeture propre du serveur");
+    for (const client of signalStreamClients) client.destroy();
+    httpServer.closeIdleConnections?.();
+    await new Promise((resolve) => {
+      try { httpServer.close(() => resolve()); } catch { resolve(); }
+    });
+    if (pgPool) {
+      await Promise.race([pgPool.end().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 5000))]);
+    } else if (sqliteDb) {
+      try { sqliteDb.close(); } catch {}
+    }
+  })();
+  await shutdownPromise;
+}
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => gracefulShutdown(signal).then(() => process.exit(0)).catch(() => process.exit(1)));
+}
 
 // Everything inside handleApi/serveStatic is already try/caught (the top-level
 // request handler above catches per-request errors and returns a 500, both
@@ -1211,14 +1415,16 @@ process.on("unhandledRejection", (reason) => {
 });
 
 function handleFatalError(kind, error) {
-  const message = `${error?.message || error}\n${error?.stack || ""}`;
+  const message = `${error?.message || error}
+${error?.stack || ""}`;
   console.error(`[FATAL:${kind}] ${message}`);
   // Fire-and-forget with a hard timeout: exiting must not hang waiting on a slow or
   // unreachable webhook. Node's default uncaughtException behavior is to exit after
   // this handler returns anyway (per-spec, once no other listener is registered) --
   // this just makes sure the alert has a real chance to leave the process first.
   Promise.race([
-    sendCrashAlert(`🔴 Oracle Forex — ${kind}\n${message.slice(0, 1500)}`),
+    sendCrashAlert(`🔴 Oracle Forex — ${kind}
+${message.slice(0, 1500)}`),
     new Promise((resolve) => setTimeout(resolve, 4000)),
   ]).finally(() => process.exit(1));
 }
@@ -1230,6 +1436,7 @@ async function sendCrashAlert(message) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: message.slice(0, 1900) }),
+        signal: AbortSignal.timeout(3500),
       });
       return;
     }
@@ -1238,6 +1445,7 @@ async function sendCrashAlert(message) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message.slice(0, 4000) }),
+        signal: AbortSignal.timeout(3500),
       });
     }
     // Neither configured: the console.error above is still real, durable in
@@ -1252,7 +1460,7 @@ async function sendCrashAlert(message) {
 // anonymous_usage row per unique visitor per day), same growth problem, just durable
 // instead of RAM-only. Deletes expired rows on the same schedule the old in-memory
 // sweep used.
-const RATE_LIMIT_SWEEP_INTERVAL_MS = Number(env.RATE_LIMIT_SWEEP_INTERVAL_MINUTES || 30) * 60 * 1000;
+const RATE_LIMIT_SWEEP_INTERVAL_MS = boundedEnvNumber(env.RATE_LIMIT_SWEEP_INTERVAL_MINUTES, 30, 1, 1440) * 60 * 1000;
 
 function startRateLimitMapSweeper() {
   const sweep = async () => {
@@ -1273,6 +1481,7 @@ function startRateLimitMapSweeper() {
       for (const [key, lastSeen] of recentLogs) {
         if (lastSeen < logCutoff) recentLogs.delete(key);
       }
+      pruneAutoTradeTickStatus();
     } catch (error) {
       logOnce("rate-limit-sweep", `nettoyage échoué (${error.message})`);
     }
@@ -1281,7 +1490,7 @@ function startRateLimitMapSweeper() {
   setInterval(sweep, RATE_LIMIT_SWEEP_INTERVAL_MS);
 }
 
-const LEARNING_OUTCOMES_INTERVAL_MS = Number(env.LEARNING_OUTCOMES_INTERVAL_SECONDS || 90) * 1000;
+const LEARNING_OUTCOMES_INTERVAL_MS = boundedEnvNumber(env.LEARNING_OUTCOMES_INTERVAL_SECONDS, 90, 10, 86400) * 1000;
 
 function startLearningOutcomesScheduler() {
   const tick = async () => {
@@ -1328,13 +1537,13 @@ async function computeSignalsPayload() {
 }
 
 const signalStreamClients = new Set();
-const MAX_SIGNAL_STREAM_CLIENTS = Number(env.MAX_SIGNAL_STREAM_CLIENTS || 500);
+const MAX_SIGNAL_STREAM_CLIENTS = Math.trunc(boundedEnvNumber(env.MAX_SIGNAL_STREAM_CLIENTS, 500, 1, 10000));
 // The global cap alone meant a single unauthenticated script could open all 500
 // slots itself and lock every real visitor out of the live feed with a 503. This
 // caps how many of those slots any one source can hold at once.
 const signalStreamByClient = new Map();
-const MAX_SIGNAL_STREAM_PER_CLIENT = Number(env.MAX_SIGNAL_STREAM_PER_CLIENT || 3);
-const SIGNALS_BROADCAST_INTERVAL_MS = Number(env.SIGNALS_BROADCAST_INTERVAL_SECONDS || 60) * 1000;
+const MAX_SIGNAL_STREAM_PER_CLIENT = Math.trunc(boundedEnvNumber(env.MAX_SIGNAL_STREAM_PER_CLIENT, 3, 1, 50));
+const SIGNALS_BROADCAST_INTERVAL_MS = boundedEnvNumber(env.SIGNALS_BROADCAST_INTERVAL_SECONDS, 60, 5, 3600) * 1000;
 
 function startSignalsBroadcastScheduler() {
   const tick = async () => {
@@ -1343,8 +1552,21 @@ function startSignalsBroadcastScheduler() {
       const cached = memoryCache.signals.value;
       const stale = !cached || Date.now() >= memoryCache.signals.expiresAt;
       const payload = stale ? await computeSignalsPayload() : cached;
-      const message = `data: ${JSON.stringify(payload)}\n\n`;
-      for (const client of signalStreamClients) client.write(message);
+      const message = `data: ${JSON.stringify(payload)}
+
+`;
+      for (const client of signalStreamClients) {
+        if (client.destroyed || client.writableEnded) {
+          client.destroy();
+          continue;
+        }
+        try {
+          // Drop slow consumers instead of allowing Node to buffer an unbounded SSE backlog.
+          if (!client.write(message)) client.destroy();
+        } catch {
+          client.destroy();
+        }
+      }
     } catch (error) {
       logOnce("signals_stream", `diffusion échouée (${error.message})`);
     }
@@ -1365,7 +1587,7 @@ function startSignalsBroadcastScheduler() {
 // the same kind of "quota-conscious, don't run unless it can actually reach
 // someone" gate the ticker scheduler uses, just checking for an actual new_signal
 // subscriber instead of an SSE connection.
-const NEW_SIGNAL_CHECK_INTERVAL_MS = Number(env.NEW_SIGNAL_CHECK_INTERVAL_SECONDS || 60) * 1000;
+const NEW_SIGNAL_CHECK_INTERVAL_MS = boundedEnvNumber(env.NEW_SIGNAL_CHECK_INTERVAL_SECONDS, 60, 10, 3600) * 1000;
 
 function startNewSignalAlertScheduler() {
   const tick = async () => {
@@ -1390,7 +1612,108 @@ function startNewSignalAlertScheduler() {
 // signals through the exact same confirmAndSendOrder guard chain the manual flow
 // uses. See auto_trading_accounts (ensureRelationalTables) for the schema and the
 // plan this implements.
-const AUTO_TRADE_INTERVAL_MS = Number(env.AUTO_TRADE_INTERVAL_SECONDS || 60) * 1000;
+const AUTO_TRADE_INTERVAL_MS = boundedEnvNumber(env.AUTO_TRADE_INTERVAL_SECONDS, 60, 10, 3600) * 1000;
+const AUTO_TRADE_LEASE_MS = boundedEnvNumber(env.AUTO_TRADE_LEASE_SECONDS, 300, 120, 86400) * 1000;
+
+async function tryAcquireAutoTradeLease(userId, brokerSlot) {
+  await ensureRelationalTables();
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const leaseUntil = new Date(now + AUTO_TRADE_LEASE_MS).toISOString();
+  const leaseToken = randomBytes(18).toString("hex");
+  const updated = await sqlRun(
+    `UPDATE auto_trade_leases SET lease_token = ?, lease_until = ?, updated_at = ?
+     WHERE user_id = ? AND broker_slot = ? AND lease_until < ?`,
+    [leaseToken, leaseUntil, nowIso, userId, brokerSlot, nowIso],
+  );
+  if (Number(pgPool ? updated.rowCount : updated.changes) === 1) return leaseToken;
+  try {
+    await sqlRun(
+      `INSERT INTO auto_trade_leases (user_id, broker_slot, lease_token, lease_until, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId, brokerSlot, leaseToken, leaseUntil, nowIso],
+    );
+    return leaseToken;
+  } catch {
+    return null;
+  }
+}
+
+async function releaseAutoTradeLease(userId, brokerSlot, leaseToken) {
+  if (!leaseToken) return;
+  await sqlRun(
+    `DELETE FROM auto_trade_leases WHERE user_id = ? AND broker_slot = ? AND lease_token = ?`,
+    [userId, brokerSlot, leaseToken],
+  );
+}
+
+const SCHEDULER_LEASE_MS = boundedEnvNumber(env.SCHEDULER_LEASE_SECONDS, 120, 120, 86400) * 1000;
+
+async function tryAcquireSchedulerLease(leaseKey) {
+  await ensureRelationalTables();
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const leaseUntil = new Date(now + SCHEDULER_LEASE_MS).toISOString();
+  const leaseToken = randomBytes(18).toString("hex");
+  const updated = await sqlRun(
+    `UPDATE scheduler_leases SET lease_token = ?, lease_until = ?, updated_at = ?
+     WHERE lease_key = ? AND lease_until < ?`,
+    [leaseToken, leaseUntil, nowIso, leaseKey, nowIso],
+  );
+  if (Number(pgPool ? updated.rowCount : updated.changes) === 1) return leaseToken;
+  try {
+    await sqlRun(
+      `INSERT INTO scheduler_leases (lease_key, lease_token, lease_until, updated_at)
+       VALUES (?, ?, ?, ?)`,
+      [leaseKey, leaseToken, leaseUntil, nowIso],
+    );
+    return leaseToken;
+  } catch {
+    return null;
+  }
+}
+
+async function releaseSchedulerLease(leaseKey, leaseToken) {
+  if (!leaseToken) return;
+  await sqlRun(
+    `DELETE FROM scheduler_leases WHERE lease_key = ? AND lease_token = ?`,
+    [leaseKey, leaseToken],
+  );
+}
+
+const TRADE_OPERATION_LEASE_MS = boundedEnvNumber(env.TRADE_OPERATION_LEASE_SECONDS, 180, 60, 86400) * 1000;
+
+async function tryAcquireTradeOperationLease(orderId, operation) {
+  await ensureRelationalTables();
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const leaseUntil = new Date(now + TRADE_OPERATION_LEASE_MS).toISOString();
+  const leaseToken = randomBytes(18).toString("hex");
+  const updated = await sqlRun(
+    `UPDATE trade_operation_leases SET lease_token = ?, lease_until = ?, updated_at = ?
+     WHERE order_id = ? AND operation = ? AND lease_until < ?`,
+    [leaseToken, leaseUntil, nowIso, orderId, operation, nowIso],
+  );
+  if (Number(pgPool ? updated.rowCount : updated.changes) === 1) return leaseToken;
+  try {
+    await sqlRun(
+      `INSERT INTO trade_operation_leases (order_id, operation, lease_token, lease_until, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [orderId, operation, leaseToken, leaseUntil, nowIso],
+    );
+    return leaseToken;
+  } catch {
+    return null;
+  }
+}
+
+async function releaseTradeOperationLease(orderId, operation, leaseToken) {
+  if (!leaseToken) return;
+  await sqlRun(
+    `DELETE FROM trade_operation_leases WHERE order_id = ? AND operation = ? AND lease_token = ?`,
+    [orderId, operation, leaseToken],
+  );
+}
 
 // Heartbeat for checkSchedulerHeartbeat below -- set at the START of every tick
 // attempt, success or failure, so it answers "is setInterval still actually
@@ -1446,9 +1769,19 @@ async function runAutoTradeTick() {
   }
   for (const account of accounts) {
     for (const slot of activeBrokerSlots(account)) {
-      await processAutoTradeForUser(account, tradable, slot).catch((error) => {
+      const leaseToken = await tryAcquireAutoTradeLease(account.user_id, slot);
+      if (!leaseToken) {
+        recordAutoTradeStatus(account.user_id, slot, "another_execution_instance_running");
+        continue;
+      }
+      try {
+        await processAutoTradeForUser(account, tradable, slot);
+      } catch (error) {
         logOnce(`auto-trade-user-${account.user_id}-${slot}`, `bot échoué pour un utilisateur (${error.message})`);
-      });
+      } finally {
+        await releaseAutoTradeLease(account.user_id, slot, leaseToken).catch((error) =>
+          logOnce(`auto-trade-lease-release-${account.user_id}-${slot}`, `libération du verrou auto-trade échouée (${error.message})`));
+      }
     }
   }
 }
@@ -1459,7 +1792,7 @@ async function runAutoTradeTick() {
 // change bolted onto the existing one. Uses the same global kill switch
 // (trading_paused) and broker-connection requirement as swing, since both
 // still mean "stop everything" / "no real credentials, no real trade".
-const SCALP_TRADING_INTERVAL_MS = Number(env.SCALP_TRADING_INTERVAL_SECONDS || 60) * 1000;
+const SCALP_TRADING_INTERVAL_MS = boundedEnvNumber(env.SCALP_TRADING_INTERVAL_SECONDS, 60, 5, 3600) * 1000;
 
 // Same heartbeat purpose as lastAutoTradeTickAttemptAt above.
 let lastScalpTickAttemptAt = null;
@@ -1489,7 +1822,7 @@ function startScalpTradingScheduler() {
 // 60s) so one slow tick or a brief provider hiccup never false-alarms; a
 // silent scheduler generates repeat 5-min checks but only actually alerts
 // once per hour while the condition persists, so a real outage doesn't spam.
-const HEARTBEAT_STALE_MS = Number(env.HEARTBEAT_STALE_MINUTES || 10) * 60 * 1000;
+const HEARTBEAT_STALE_MS = boundedEnvNumber(env.HEARTBEAT_STALE_MINUTES, 10, 1, 1440) * 60 * 1000;
 const HEARTBEAT_ALERT_COOLDOWN_MS = 60 * 60 * 1000;
 const lastHeartbeatAlertAt = { autoTrade: 0, scalp: 0 };
 
@@ -1539,9 +1872,19 @@ async function runScalpTradingTick() {
   for (const account of accounts) {
     for (const slot of activeBrokerSlots(account)) {
       const credentials = resolveBrokerCredentialsFromAccount(account, slot);
-      await processScalpForUser(account, credentials, slot).catch((error) => {
+      const leaseToken = await tryAcquireAutoTradeLease(account.user_id, slot);
+      if (!leaseToken) {
+        recordAutoTradeStatus(account.user_id, slot, "another_execution_instance_running");
+        continue;
+      }
+      try {
+        await processScalpForUser(account, credentials, slot);
+      } catch (error) {
         logOnce(`scalp-user-${account.user_id}-${slot}`, `scalp échoué pour un utilisateur (${error.message})`);
-      });
+      } finally {
+        await releaseAutoTradeLease(account.user_id, slot, leaseToken).catch((error) =>
+          logOnce(`scalp-lease-release-${account.user_id}-${slot}`, `libération du verrou scalp échouée (${error.message})`));
+      }
     }
   }
 }
@@ -1900,7 +2243,7 @@ async function processAutoTradeForUser(account, signals, slot) {
       [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice, securingHalfAtOpen ? 1 : 0],
     );
 
-    const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
+    const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
     if (result.status === 200) {
       openCount += 1;
       tradesOpenedToday += 1;
@@ -2042,7 +2385,7 @@ async function processScalpForUser(account, credentials, slot) {
       [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, null, signal.tp, new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry],
     );
 
-    const result = await confirmAndSendOrder({ orderId, userId, volume, credentials });
+    const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
     if (result.status !== 200) {
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "scalp_trade_rejected", analysisId]);
     }
@@ -2051,6 +2394,12 @@ async function processScalpForUser(account, credentials, slot) {
 }
 
 async function handleApi(req, res, url) {
+  const mutatingMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+  if (mutatingMethods.has(req.method) && cookieValue(req, "oracle_session") && !isSameOriginRequest(req)) {
+    return sendJson(res, 403, { ok: false, error: "csrf_origin_invalid" });
+  }
+
+
   if (url.pathname === "/api/signup") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const rateLimit = await checkSignupRateLimit(req);
@@ -2111,7 +2460,7 @@ async function handleApi(req, res, url) {
   if (url.pathname === "/api/logout") {
     const token = cookieValue(req, "oracle_session");
     if (token) await destroySession(token);
-    clearSessionCookie(res);
+    clearSessionCookie(res, req);
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -2183,6 +2532,29 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname.startsWith("/api/admin/members/")) {
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    let memberId;
+    try { memberId = decodeURIComponent(url.pathname.slice("/api/admin/members/".length)); } catch { return sendJson(res, 400, { ok: false, error: "invalid_member_id" }); }
+    if (!memberId || memberId.length > 160) return sendJson(res, 400, { ok: false, error: "invalid_member_id" });
+    await ensureRelationalTables();
+    const row = await sqlGet("SELECT id, name, email, plan, role, premium_until, manual_premium, created_at, updated_at, last_login_at FROM users WHERE id = ? OR email = ?", [memberId, memberId]);
+    if (!row) return sendJson(res, 404, { ok: false, error: "member_not_found" });
+    const now = new Date().toISOString();
+    const [a, o, sessions, bot, recentAnalyses, recentOrders, pairBreakdown] = await Promise.all([
+      sqlGet("SELECT COUNT(*) as total, SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses, SUM(CASE WHEN outcome IS NULL AND status = 'OPEN' THEN 1 ELSE 0 END) as open, COALESCE(SUM(r_multiple), 0) as net_r, COALESCE(SUM(CASE WHEN r_multiple > 0 THEN r_multiple ELSE 0 END), 0) as gross_win_r, COALESCE(SUM(CASE WHEN r_multiple < 0 THEN r_multiple ELSE 0 END), 0) as gross_loss_r, COALESCE(SUM(broker_profit_amount), 0) as broker_profit FROM analyses WHERE user_id = ? AND is_test = 0", [memberId]),
+      sqlGet("SELECT COUNT(*) as total, SUM(CASE WHEN status = 'SENT' THEN 1 ELSE 0 END) as sent, SUM(CASE WHEN status = 'DELIVERY_UNKNOWN' THEN 1 ELSE 0 END) as uncertain, SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed, SUM(CASE WHEN status = 'PENDING_CONFIRMATION' THEN 1 ELSE 0 END) as pending FROM trade_orders WHERE user_id = ?", [memberId]),
+      sqlGet("SELECT COUNT(*) as active, MAX(created_at) as last_session_at FROM sessions WHERE user_id = ? AND expires_at > ?", [memberId, now]),
+      sqlGet("SELECT approval_status, requested_at, decided_at, approved_until, approved_pairs, risk_percent, daily_loss_limit_percent, max_concurrent_positions, min_confidence_floor, user_paused, broker_connected_at, broker_last_check_status, broker_last_check_at FROM auto_trading_accounts WHERE user_id = ?", [memberId]),
+      sqlAll("SELECT id, pair, direction, status, outcome, r_multiple, broker_profit_amount, score, source, broker_slot, created_at, closed_at FROM analyses WHERE user_id = ? AND is_test = 0 ORDER BY created_at DESC LIMIT 30", [memberId]),
+      sqlAll("SELECT id, pair, direction, volume, status, broker_slot, created_at, confirmed_at, sent_at, error_message FROM trade_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 30", [memberId]),
+      sqlAll("SELECT pair, COUNT(*) as total, SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses, COALESCE(SUM(r_multiple), 0) as net_r FROM analyses WHERE user_id = ? AND is_test = 0 AND pair IS NOT NULL GROUP BY pair ORDER BY total DESC LIMIT 20", [memberId])
+    ]);
+    const user = adminUserPayload({ id: row.id, name: row.name, email: row.email, plan: row.plan, role: row.role, premiumUntil: row.premium_until, manualPremium: Boolean(row.manual_premium), createdAt: row.created_at, lastLoginAt: row.last_login_at });
+    sendJson(res, 200, { ok: true, user, account: { createdAt: row.created_at, updatedAt: row.updated_at, lastLoginAt: row.last_login_at, activeSessions: Number(sessions?.active || 0), lastSessionAt: sessions?.last_session_at || null }, performance: { totalAnalyses: Number(a?.total || 0), wins: Number(a?.wins || 0), losses: Number(a?.losses || 0), open: Number(a?.open || 0), netR: Number(a?.net_r || 0), grossWinR: Number(a?.gross_win_r || 0), grossLossR: Number(a?.gross_loss_r || 0), brokerProfit: Number(a?.broker_profit || 0) }, trading: { totalOrders: Number(o?.total || 0), sent: Number(o?.sent || 0), uncertain: Number(o?.uncertain || 0), failed: Number(o?.failed || 0), pending: Number(o?.pending || 0) }, autoTrade: bot ? { approvalStatus: bot.approval_status, requestedAt: bot.requested_at, decidedAt: bot.decided_at, approvedUntil: bot.approved_until, approvedPairs: bot.approved_pairs, riskPercent: bot.risk_percent, dailyLossLimitPercent: bot.daily_loss_limit_percent, maxConcurrentPositions: bot.max_concurrent_positions, minConfidenceFloor: bot.min_confidence_floor, userPaused: Boolean(bot.user_paused), brokerConnectedAt: bot.broker_connected_at, brokerLastCheckStatus: bot.broker_last_check_status, brokerLastCheckAt: bot.broker_last_check_at } : null, analyses: recentAnalyses, orders: recentOrders.map((item) => ({ ...item, error_message: item.error_message ? String(item.error_message).slice(0, 180) : null })), byPair: pairBreakdown });
+    return;
+  }
   if (url.pathname === "/api/admin/grant-premium") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const admin = await requireAdmin(req);
@@ -2212,16 +2584,20 @@ async function handleApi(req, res, url) {
     // controls in the admin UI -- only touch whichever one was actually present in
     // this request, so saving the cap alone can never silently flip pause state.
     let paused = (await getAppSetting("trading_paused", "false")) === "true";
-    if (body?.paused !== undefined) {
+    const hasPausedUpdate = body?.paused !== undefined;
+    const hasCapUpdate = body?.dailyOrderCap !== undefined;
+    const requestedCap = hasCapUpdate ? Math.round(Number(body.dailyOrderCap)) : null;
+    // Validate every requested field before mutating either setting. A malformed
+    // combined request must be a true no-op, especially for the emergency pause.
+    if (hasCapUpdate && (!Number.isFinite(requestedCap) || requestedCap < 1 || requestedCap > 200)) {
+      return sendJson(res, 400, { ok: false, error: "invalid_cap" });
+    }
+    if (hasPausedUpdate) {
       paused = Boolean(body.paused);
       await setAppSetting("trading_paused", paused ? "true" : "false");
     }
-    if (body?.dailyOrderCap !== undefined) {
-      const cap = Math.round(Number(body.dailyOrderCap));
-      if (!Number.isFinite(cap) || cap < 1 || cap > 200) {
-        return sendJson(res, 400, { ok: false, error: "invalid_cap" });
-      }
-      await setAppSetting("trade_daily_order_cap", String(cap));
+    if (hasCapUpdate) {
+      await setAppSetting("trade_daily_order_cap", String(requestedCap));
     }
     sendJson(res, 200, { ok: true, paused, dailyCapPerUser: await getTradeDailyOrderCap() });
     return;
@@ -2233,10 +2609,23 @@ async function handleApi(req, res, url) {
     const paused = (await getAppSetting("trading_paused", "false")) === "true";
     const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
     const sentToday = await sqlGet(
-      `SELECT COUNT(*) as n FROM trade_orders WHERE confirmed_at >= ? AND status IN ('SENT', 'FAILED')`,
+      `SELECT COUNT(*) as n FROM trade_orders WHERE confirmed_at >= ? AND status IN ('SENT', 'FAILED', 'DELIVERY_UNKNOWN')`,
       [todayStart.toISOString()],
     );
-    sendJson(res, 200, { ok: true, paused, ordersConfirmedToday: Number(sentToday?.n || 0), dailyCapPerUser: await getTradeDailyOrderCap(), brokerConfigured: BROKER_CONFIGURED });
+    const uncertainRows = await sqlAll(`SELECT o.id, o.user_id, o.pair, o.direction, o.volume, o.broker_slot, o.confirmed_at, o.error_message, u.email as user_email
+       FROM trade_orders o LEFT JOIN users u ON u.id = o.user_id
+       WHERE o.status = 'DELIVERY_UNKNOWN' ORDER BY o.confirmed_at DESC LIMIT 50`);
+    const deliveryUnknownOrders = uncertainRows.map((row) => ({
+      id: row.id,
+      userEmail: row.user_email || null,
+      pair: row.pair,
+      direction: row.direction,
+      volume: row.volume ?? null,
+      brokerSlot: row.broker_slot || null,
+      confirmedAt: row.confirmed_at || null,
+      errorMessage: row.error_message || "broker_delivery_uncertain",
+    }));
+    sendJson(res, 200, { ok: true, paused, ordersConfirmedToday: Number(sentToday?.n || 0), dailyCapPerUser: await getTradeDailyOrderCap(), brokerConfigured: BROKER_CONFIGURED, deliveryUnknownOrders });
     return;
   }
 
@@ -2564,6 +2953,17 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/ready") {
+    try {
+      await ensureRelationalTables();
+      await sqlGet("SELECT 1");
+      sendJson(res, 200, { ok: true, ready: true });
+    } catch {
+      sendJson(res, 503, { ok: false, ready: false, error: "storage_unavailable" });
+    }
+    return;
+  }
+
   if (url.pathname === "/api/health") {
     // /admin-health.html is gated behind this same flag (serveStatic()), but the API
     // it fetches from wasn't -- confirmed live: this returned full internals
@@ -2637,13 +3037,15 @@ async function handleApi(req, res, url) {
     signalStreamByClient.set(fingerprint, currentForClient + 1);
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
+      "Cache-Control": "no-store",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
     });
     res.write(": connected\n\n");
     const cached = memoryCache.signals.value;
-    if (cached) res.write(`data: ${JSON.stringify(cached)}\n\n`);
+    if (cached) res.write(`data: ${JSON.stringify(cached)}
+
+`);
     signalStreamClients.add(res);
     req.on("close", () => {
       signalStreamClients.delete(res);
@@ -2704,6 +3106,15 @@ async function handleApi(req, res, url) {
     const analysis = rowToAnalysis(await sqlGet(`SELECT * FROM analyses WHERE id = ? AND user_id = ?`, [analysisId, session.user.id]));
     if (!analysis) return sendJson(res, 404, { ok: false, error: "analysis_not_found" });
     if (analysis.status !== "OPEN" || !analysis.active) return sendJson(res, 400, { ok: false, error: "analysis_not_open" });
+    const existingOrder = await sqlGet(
+      `SELECT id, status FROM trade_orders
+       WHERE analysis_id = ? AND user_id = ? AND status IN ('PENDING_CONFIRMATION', 'SENDING', 'SENT', 'DELIVERY_UNKNOWN')
+       ORDER BY created_at DESC LIMIT 1`,
+      [analysis.id, session.user.id],
+    );
+    if (existingOrder) {
+      return sendJson(res, 409, { ok: false, error: "order_already_prepared", orderId: existingOrder.id, status: existingOrder.status });
+    }
     const order = {
       id: `ord_${Date.now()}_${randomBytes(4).toString("hex")}`,
       pair: analysis.pair,
@@ -2719,6 +3130,17 @@ async function handleApi(req, res, url) {
       `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [order.id, session.user.id, analysis.id, order.pair, order.direction, order.entry, order.sl, order.tp1, order.tp2, order.status, order.createdAt],
     );
+    try {
+      await sqlRun(
+        `INSERT INTO trade_prepare_claims (analysis_id, user_id, order_id, created_at) VALUES (?, ?, ?, ?)`,
+        [analysis.id, session.user.id, order.id, order.createdAt],
+      );
+    } catch (error) {
+      const winningClaim = await sqlGet("SELECT order_id FROM trade_prepare_claims WHERE analysis_id = ?", [analysis.id]);
+      if (!winningClaim) throw error;
+      await sqlRun("DELETE FROM trade_orders WHERE id = ?", [order.id]);
+      return sendJson(res, 409, { ok: false, error: "order_already_prepared", orderId: winningClaim.order_id });
+    }
     const correlationWarning = await correlationWarnings(session.user.id, order.pair, order.direction);
     const [demoConfigured, liveConfigured, authRow] = await Promise.all([
       getUserBrokerCredentials(session.user.id, "demo"),
@@ -2765,8 +3187,7 @@ async function handleApi(req, res, url) {
     // someone else's account. See getUserBrokerCredentials.
     const credentials = await getUserBrokerCredentials(session.user.id, brokerSlot);
     if (!credentials) return sendJson(res, 400, { ok: false, error: "broker_not_connected" });
-    await sqlRun(`UPDATE trade_orders SET broker_slot = ? WHERE id = ? AND user_id = ? AND status = 'PENDING_CONFIRMATION'`, [brokerSlot, orderId, session.user.id]);
-    const result = await confirmAndSendOrder({ orderId, userId: session.user.id, volume, credentials });
+    const result = await confirmAndSendOrder({ orderId, userId: session.user.id, volume, credentials, brokerSlot });
     sendJson(res, result.status, result.body);
     return;
   }
@@ -2819,6 +3240,7 @@ async function handleApi(req, res, url) {
     if (!row) return sendJson(res, 404, { ok: false, error: "order_not_found" });
     if (row.status !== "PENDING_CONFIRMATION") return sendJson(res, 400, { ok: false, error: "order_not_pending" });
     await sqlRun(`UPDATE trade_orders SET status = 'CANCELLED' WHERE id = ?`, [orderId]);
+    await sqlRun("DELETE FROM trade_prepare_claims WHERE order_id = ?", [orderId]);
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -2838,6 +3260,7 @@ async function handleApi(req, res, url) {
     const row = await sqlGet(`SELECT * FROM trade_orders WHERE id = ? AND user_id = ?`, [orderId, session.user.id]);
     if (!row) return sendJson(res, 404, { ok: false, error: "order_not_found" });
     if (!["CANCELLED", "FAILED"].includes(row.status)) return sendJson(res, 400, { ok: false, error: "order_not_clearable" });
+    await sqlRun("DELETE FROM trade_prepare_claims WHERE order_id = ?", [orderId]);
     await sqlRun(`DELETE FROM trade_orders WHERE id = ?`, [orderId]);
     sendJson(res, 200, { ok: true });
     return;
@@ -2848,6 +3271,7 @@ async function handleApi(req, res, url) {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     await ensureRelationalTables();
+    await sqlRun("DELETE FROM trade_prepare_claims WHERE order_id IN (SELECT id FROM trade_orders WHERE user_id = ? AND status IN ('CANCELLED', 'FAILED'))", [session.user.id]);
     await sqlRun(`DELETE FROM trade_orders WHERE user_id = ? AND status IN ('CANCELLED', 'FAILED')`, [session.user.id]);
     sendJson(res, 200, { ok: true });
     return;
@@ -2902,6 +3326,12 @@ async function handleApi(req, res, url) {
     await ensureRelationalTables();
     const now = new Date().toISOString();
     const c = brokerSlotColumns(slot);
+    let storedToken;
+    try {
+      storedToken = encryptBrokerCredential(token);
+    } catch {
+      return sendJson(res, 503, { ok: false, error: "broker_credentials_security_not_configured" });
+    }
     // Verified before saving, never claimed "connected" on faith -- a bad token or
     // wrong account id is caught here, not silently discovered days later when the
     // bot first tries to trade. Retried a few times with backoff, not a single
@@ -2911,7 +3341,7 @@ async function handleApi(req, res, url) {
     // here would make a perfectly valid connection look like a broken one.
     let check = { error: "no_attempt" };
     for (let attempt = 1; attempt <= 4; attempt += 1) {
-      check = await getBrokerAccountInformation({ token, accountId, region }).catch((error) => ({ error: error.message }));
+      check = await getBrokerAccountInformation({ token, accountId, region }).catch((error) => ({ error: publicBrokerError(error.message) }));
       if (!check.error) break;
       if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 6000));
     }
@@ -2920,21 +3350,21 @@ async function handleApi(req, res, url) {
         `INSERT INTO auto_trading_accounts (user_id, ${c.token}, ${c.accountId}, ${c.region}, ${c.lastCheckStatus}, ${c.lastCheckAt}, approval_status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'none', ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET ${c.token} = excluded.${c.token}, ${c.accountId} = excluded.${c.accountId}, ${c.region} = excluded.${c.region}, ${c.connectedAt} = NULL, ${c.lastCheckStatus} = excluded.${c.lastCheckStatus}, ${c.lastCheckAt} = excluded.${c.lastCheckAt}, updated_at = excluded.updated_at`,
-        [session.user.id, token, accountId, region, `error: ${check.error}`, now, now, now],
+        [session.user.id, storedToken, accountId, region, `error: ${publicBrokerError(check.error)}`, now, now, now],
       );
       // Credentials are already saved above -- the user can just resubmit the
       // same form (or the server's own scheduler will pick it up once the
       // account responds) without retyping the token.
       const message = /504|timeout/i.test(check.error)
         ? "Le compte MetaApi met du temps à démarrer (compte inactif depuis un moment) -- réessaie dans 1 à 2 minutes, pas besoin de retaper le jeton."
-        : check.error;
+        : publicBrokerError(check.error);
       return sendJson(res, 502, { ok: false, error: "broker_check_failed", message });
     }
     await sqlRun(
       `INSERT INTO auto_trading_accounts (user_id, ${c.token}, ${c.accountId}, ${c.region}, ${c.connectedAt}, ${c.lastCheckStatus}, ${c.lastCheckAt}, approval_status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, 'ok', ?, 'none', ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET ${c.token} = excluded.${c.token}, ${c.accountId} = excluded.${c.accountId}, ${c.region} = excluded.${c.region}, ${c.connectedAt} = excluded.${c.connectedAt}, ${c.lastCheckStatus} = 'ok', ${c.lastCheckAt} = excluded.${c.lastCheckAt}, updated_at = excluded.updated_at`,
-      [session.user.id, token, accountId, region, now, now, now, now],
+      [session.user.id, storedToken, accountId, region, now, now, now, now],
     );
     sendJson(res, 200, { ok: true, balance: check.balance, currency: check.currency });
     return;
@@ -3067,7 +3497,7 @@ async function handleApi(req, res, url) {
         const slot = order.brokerSlot || "demo";
         const credentials = await getUserBrokerCredentials(session.user.id, slot).catch(() => null);
         if (!credentials) continue;
-        const result = await secureHalfForOrder(order, row, credentials).catch((error) => ({ status: 502, body: { ok: false, error: error.message } }));
+        const result = await secureHalfForOrder(order, row, credentials).catch((error) => ({ status: 502, body: { ok: false, error: "broker_operation_failed", message: publicBrokerError(error.message) } }));
         if (result.body?.ok) securedCount += 1;
       }
     }
@@ -3131,6 +3561,24 @@ async function handleApi(req, res, url) {
     const userTradingDaysInput = Array.isArray(body?.userTradingDays) ? [...new Set(body.userTradingDays.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))] : [];
     const userTradingDays = userTradingDaysInput.length && userTradingDaysInput.length < 7 ? userTradingDaysInput.join(",") : null;
     await ensureRelationalTables();
+    const preferenceDefinitions = [
+      ["user_min_confidence", "userMinConfidence", userMinConfidence],
+      ["user_risk_percent", "userRiskPercent", userRiskPercent],
+      ["user_capital_cap", "userCapitalCap", userCapitalCap],
+      ["user_max_concurrent_positions", "userMaxConcurrentPositions", userMaxConcurrentPositions],
+      ["user_max_trades_per_day", "userMaxTradesPerDay", userMaxTradesPerDay],
+      ["user_daily_loss_limit_percent", "userDailyLossLimitPercent", userDailyLossLimitPercent],
+      ["user_daily_loss_limit_amount", "userDailyLossLimitAmount", userDailyLossLimitAmount],
+      ["user_weekly_loss_limit_percent", "userWeeklyLossLimitPercent", userWeeklyLossLimitPercent],
+      ["user_weekly_loss_limit_amount", "userWeeklyLossLimitAmount", userWeeklyLossLimitAmount],
+      ["user_monthly_loss_limit_percent", "userMonthlyLossLimitPercent", userMonthlyLossLimitPercent],
+      ["user_monthly_loss_limit_amount", "userMonthlyLossLimitAmount", userMonthlyLossLimitAmount],
+      ["user_min_risk_reward", "userMinRiskReward", userMinRiskReward],
+      ["user_trading_hours_start", "userTradingHoursStart", userTradingHoursStart],
+      ["user_trading_hours_end", "userTradingHoursEnd", userTradingHoursEnd],
+      ["user_trading_days", "userTradingDays", userTradingDays],
+    ];
+    const providedPreferences = preferenceDefinitions.filter(([, key]) => Object.prototype.hasOwnProperty.call(body, key));
     // Found live while testing userCapitalCap: this was a plain UPDATE with no
     // row-existence guarantee -- the exact same silent-no-op bug class already
     // fixed elsewhere this session (broker connect, scalp settings,
@@ -3140,30 +3588,19 @@ async function handleApi(req, res, url) {
     // returned ok:true, and every preference silently vanished -- confirmed by
     // querying a fresh test account's row directly (empty) after a "successful"
     // save. INSERT ... ON CONFLICT DO UPDATE, same pattern as the other fixes.
-    await sqlRun(
-      `INSERT INTO auto_trading_accounts (
-         user_id, user_min_confidence, user_risk_percent, user_capital_cap, user_max_concurrent_positions, user_max_trades_per_day,
-         user_daily_loss_limit_percent, user_daily_loss_limit_amount,
-         user_weekly_loss_limit_percent, user_weekly_loss_limit_amount, user_monthly_loss_limit_percent, user_monthly_loss_limit_amount,
-         user_min_risk_reward, user_trading_hours_start, user_trading_hours_end, user_trading_days, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET
-         user_min_confidence = excluded.user_min_confidence, user_risk_percent = excluded.user_risk_percent,
-         user_capital_cap = excluded.user_capital_cap, user_max_concurrent_positions = excluded.user_max_concurrent_positions,
-         user_max_trades_per_day = excluded.user_max_trades_per_day, user_daily_loss_limit_percent = excluded.user_daily_loss_limit_percent,
-         user_daily_loss_limit_amount = excluded.user_daily_loss_limit_amount,
-         user_weekly_loss_limit_percent = excluded.user_weekly_loss_limit_percent, user_weekly_loss_limit_amount = excluded.user_weekly_loss_limit_amount,
-         user_monthly_loss_limit_percent = excluded.user_monthly_loss_limit_percent, user_monthly_loss_limit_amount = excluded.user_monthly_loss_limit_amount,
-         user_min_risk_reward = excluded.user_min_risk_reward,
-         user_trading_hours_start = excluded.user_trading_hours_start, user_trading_hours_end = excluded.user_trading_hours_end,
-         user_trading_days = excluded.user_trading_days, updated_at = excluded.updated_at`,
-      [
-        session.user.id, userMinConfidence, userRiskPercent, userCapitalCap, userMaxConcurrentPositions, userMaxTradesPerDay,
-        userDailyLossLimitPercent, userDailyLossLimitAmount,
-        userWeeklyLossLimitPercent, userWeeklyLossLimitAmount, userMonthlyLossLimitPercent, userMonthlyLossLimitAmount,
-        userMinRiskReward, userTradingHoursStart, userTradingHoursEnd, userTradingDays, new Date().toISOString(), new Date().toISOString(),
-      ],
-    );
+    if (providedPreferences.length) {
+      const columns = ["user_id", ...providedPreferences.map(([column]) => column), "created_at", "updated_at"];
+      const values = [session.user.id, ...providedPreferences.map(([, , value]) => value), new Date().toISOString(), new Date().toISOString()];
+      const placeholders = columns.map(() => "?").join(", ");
+      const updates = providedPreferences.map(([column]) => `${column} = excluded.${column}`);
+      updates.push("updated_at = excluded.updated_at");
+      await sqlRun(
+        `INSERT INTO auto_trading_accounts (${columns.join(", ")})
+         VALUES (${placeholders})
+         ON CONFLICT(user_id) DO UPDATE SET ${updates.join(", ")}`,
+        values,
+      );
+    }
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -3336,7 +3773,7 @@ async function handleApi(req, res, url) {
   if (url.pathname === "/api/push/subscription-topics") {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
-    const endpoint = url.searchParams.get("endpoint") || "";
+    const endpoint = normalizePushEndpoint(url.searchParams.get("endpoint"));
     if (!endpoint) return sendJson(res, 400, { ok: false, error: "invalid_request" });
     await ensureRelationalTables();
     const row = await sqlGet(`SELECT topics FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`, [endpoint, session.user.id]);
@@ -3350,9 +3787,9 @@ async function handleApi(req, res, url) {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     const body = await readBody(req);
-    const endpoint = String(body?.endpoint || "");
-    const p256dh = String(body?.keys?.p256dh || "");
-    const auth = String(body?.keys?.auth || "");
+    const endpoint = normalizePushEndpoint(body?.endpoint);
+    const p256dh = normalizePushKey(body?.keys?.p256dh);
+    const auth = normalizePushKey(body?.keys?.auth);
     const topic = ["tp_sl", "new_signal"].includes(body?.topic) ? body.topic : "tp_sl";
     if (topic === "new_signal" && !hasPremiumAccess(session.user)) return sendJson(res, 403, { ok: false, error: "premium_required" });
     if (!endpoint || !p256dh || !auth) return sendJson(res, 400, { ok: false, error: "invalid_subscription" });
@@ -3361,7 +3798,10 @@ async function handleApi(req, res, url) {
     // the same endpoint (e.g. toggling "new_signal" on after "tp_sl" was already on)
     // must add to the existing topic list, not replace it, or enabling one silently
     // disables the other.
-    const existing = await sqlGet(`SELECT topics FROM push_subscriptions WHERE endpoint = ?`, [endpoint]);
+    const existing = await sqlGet(`SELECT user_id, topics FROM push_subscriptions WHERE endpoint = ?`, [endpoint]);
+    if (existing && String(existing.user_id) !== String(session.user.id)) {
+      return sendJson(res, 403, { ok: false, error: "subscription_owned_by_another_user" });
+    }
     const topics = Array.from(new Set([...(existing?.topics ? existing.topics.split(",") : []), topic])).join(",");
     await sqlRun(
       `INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth, topics, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3377,7 +3817,7 @@ async function handleApi(req, res, url) {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     const body = await readBody(req);
-    const endpoint = String(body?.endpoint || "");
+    const endpoint = normalizePushEndpoint(body?.endpoint);
     if (endpoint) {
       await ensureRelationalTables();
       await sqlRun(`DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?`, [endpoint, session.user.id]);
@@ -3394,7 +3834,7 @@ async function handleApi(req, res, url) {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
     const body = await readBody(req);
-    const endpoint = String(body?.endpoint || "");
+    const endpoint = normalizePushEndpoint(body?.endpoint);
     const topic = String(body?.topic || "");
     if (!endpoint || !topic) return sendJson(res, 400, { ok: false, error: "invalid_request" });
     await ensureRelationalTables();
@@ -3507,7 +3947,8 @@ Format : PAIRE DIRECTION · résumé court`;
   }
 
   if (url.pathname === "/api/news") {
-    const symbol = url.searchParams.get("symbol") || "EURUSD";
+    const normalizedSymbol = normalizePair(url.searchParams.get("symbol"));
+    const symbol = normalizedSymbol ? toNewsSymbol(normalizedSymbol) : "EURUSD";
     sendJson(res, 200, { provider: "marketaux", news: await getMarketauxNews(symbol) });
     return;
   }
@@ -3565,7 +4006,7 @@ Réponds uniquement avec cet objet JSON, sans aucun texte avant ou après, sans 
     }
     const body = await readBody(req);
     const images = normalizeImages(body.images);
-    const question = cleanLine(body.message || body.messages?.at?.(-1)?.content || "");
+    const question = sanitizeUserText(cleanLine(body.message || body.messages?.at?.(-1)?.content || ""), 2000);
     const localAnswer = quickChatAnswer(question, images);
     if (localAnswer) {
       sendJson(res, 200, { ok: true, ...localAnswer });
@@ -3629,7 +4070,7 @@ Réponds uniquement avec cet objet JSON, sans aucun texte avant ou après, sans 
     const history = needsMarketContext ? await getHistoryForSymbol(chatPair, livePrice) : [];
     const technicalSnapshot = needsMarketContext ? buildTechnicalSnapshot(chatPair, history, livePrice) : { text: "Non requis pour cette question conversationnelle." };
     const context = Array.isArray(body.messages)
-      ? body.messages.slice(-6).map((m) => `${m.role || "user"}: ${m.content || ""}`).join("\n")
+      ? body.messages.slice(-6).map((m) => `${sanitizeUserText(m?.role || "user", 20)}: ${sanitizeUserText(m?.content || "", 500)}`).join("\n").slice(0, 4000)
       : "";
     const marketBlock = needsMarketContext
       ? `CONTEXTE MARCHÉ DISPONIBLE:
@@ -3987,6 +4428,9 @@ function signalCacheTtlMs(signals = [], newsRisk = null) {
 }
 
 async function fetchBestPrice(symbol, cached, ttlMs = cacheTtlMs(symbol)) {
+  if (MOCK_MARKET_DATA && Number.isFinite(Number(fallbackPrices[symbol]))) {
+    return pricePayload(symbol, { price: Number(fallbackPrices[symbol]), change: 0 }, "twelve_data", null, { stale: false, reliability: 100 });
+  }
   if (isRecentCache(cached, ttlMs)) {
     return pricePayload(symbol, cached, cached.source || "cache", "fresh_cache", {
       stale: false,
@@ -4305,7 +4749,7 @@ async function fetchYahooJson(yahooSymbol, range, interval) {
     signal: AbortSignal.timeout(4000),
   });
   if (!response.ok) throw new Error(`yahoo_http_${response.status}`);
-  const data = await response.json();
+  const data = await readResponseJsonLimited(response);
   const result = data?.chart?.result?.[0];
   if (!result) throw new Error(data?.chart?.error?.description || "yahoo_no_data");
   return result;
@@ -5319,7 +5763,7 @@ function withMarketMeta(prices, source, error) {
 }
 
 function pricePayload(symbol, value, source, error, options = {}) {
-  const open = isSymbolOpen(symbol);
+  const open = MOCK_MARKET_DATA ? true : isSymbolOpen(symbol);
   const live = isLivePriceSource(source);
   const stale = options.stale ?? (!live || !open);
   const reliability = options.reliability ?? (live ? 85 : 20);
@@ -5467,23 +5911,36 @@ async function getEconomicCalendar() {
 
 async function getMarketauxNews(symbol = "EURUSD") {
   if (!MARKETAUX_KEYS.length) return [];
-  try {
-    const data = await fetchWithRotation("marketaux", MARKETAUX_KEYS, async (key) => {
-      const api = new URL("https://api.marketaux.com/v1/news/all");
-      api.searchParams.set("symbols", symbol);
-      api.searchParams.set("filter_entities", "true");
-      api.searchParams.set("language", "en");
-      api.searchParams.set("api_token", key);
-      return fetchJson(api, 5000);
-    });
-    recordProviderHealth("marketaux_news", true);
-    return Array.isArray(data?.data) ? data.data.slice(0, 12) : [];
-  } catch (error) {
-    recordProviderHealth("marketaux_news", false, error.message);
-    return [];
-  }
+  const cacheKey = toNewsSymbol(symbol);
+  const cached = memoryCache.news.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) return cached.value;
+  const existing = newsInFlight.get(cacheKey);
+  if (existing) return existing;
+  const request = (async () => {
+    try {
+      const data = await fetchWithRotation("marketaux", MARKETAUX_KEYS, async (key) => {
+        const api = new URL("https://api.marketaux.com/v1/news/all");
+        api.searchParams.set("symbols", cacheKey);
+        api.searchParams.set("filter_entities", "true");
+        api.searchParams.set("language", "en");
+        api.searchParams.set("api_token", key);
+        return fetchJson(api, 5000);
+      });
+      const news = Array.isArray(data?.data) ? data.data.slice(0, 12) : [];
+      memoryCache.news.set(cacheKey, { value: news, expiresAt: Date.now() + 10 * 60 * 1000 });
+      while (memoryCache.news.size > 32) memoryCache.news.delete(memoryCache.news.keys().next().value);
+      recordProviderHealth("marketaux_news", true);
+      return news;
+    } catch (error) {
+      recordProviderHealth("marketaux_news", false, error.message);
+      return [];
+    } finally {
+      newsInFlight.delete(cacheKey);
+    }
+  })();
+  newsInFlight.set(cacheKey, request);
+  return request;
 }
-
 async function analysisNewsContext(pair = "EUR/USD") {
   const [risk, headlines] = await Promise.all([
     economicRiskWindow(),
@@ -5525,7 +5982,7 @@ async function analysisNewsContext(pair = "EUR/USD") {
 }
 
 function toNewsSymbol(pair = "") {
-  const clean = String(pair || "EUR/USD").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const clean = String(pair || "EUR/USD").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
   if (clean === "BTCUSD") return "BTCUSD";
   if (clean === "ETHUSD") return "ETHUSD";
   if (clean === "XAUUSD") return "XAUUSD";
@@ -5536,7 +5993,7 @@ function toNewsSymbol(pair = "") {
 }
 
 function newsKeywordsForPair(pair = "") {
-  const clean = String(pair || "EUR/USD").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const clean = String(pair || "EUR/USD").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
   const chunks = clean.match(/[A-Z]{3,4}/g) || [];
   const keywords = new Set([clean, ...chunks]);
   if (clean.includes("EUR")) keywords.add("EURO");
@@ -5660,7 +6117,7 @@ async function groqOnce(key, model, prompt, maxTokens, temperature) {
     }),
   });
   if (!response.ok) throw new Error(`groq_${response.status}`);
-  const data = await response.json();
+  const data = await readResponseJsonLimited(response);
   recordProviderHealth("groq", true);
   return data.choices?.[0]?.message?.content?.trim() || "";
 }
@@ -5680,10 +6137,10 @@ async function geminiText(prompt, maxTokens = 500, temperature = 0.3) {
           }),
         });
         if (!response.ok) {
-          const errText = await response.text();
+          const errText = await readResponseTextLimited(response);
           throw new Error(`gemini_text_${response.status}_${model}: ${errText.slice(0, 240)}`);
         }
-        const data = await response.json();
+        const data = await readResponseJsonLimited(response);
         return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "";
       });
       if (result) {
@@ -5726,10 +6183,10 @@ async function groqVision(prompt, images, maxTokens = 1000) {
           }),
         });
         if (!response.ok) {
-          const errText = await response.text();
+          const errText = await readResponseTextLimited(response);
           throw new Error(`groq_vision_${response.status}_${model}: ${errText.slice(0, 240)}`);
         }
-        const data = await response.json();
+        const data = await readResponseJsonLimited(response);
         return {
           text: data.choices?.[0]?.message?.content?.trim() || "",
           truncated: data.choices?.[0]?.finish_reason === "length",
@@ -5866,10 +6323,10 @@ async function geminiVision(prompt, images, maxTokens = 700) {
           }),
         });
         if (!response.ok) {
-          const errText = await response.text();
+          const errText = await readResponseTextLimited(response);
           throw new Error(`gemini_${response.status}_${model}: ${errText.slice(0, 240)}`);
         }
-        const data = await response.json();
+        const data = await readResponseJsonLimited(response);
         return {
           text: data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\n").trim() || "",
           truncated: data.candidates?.[0]?.finishReason === "MAX_TOKENS",
@@ -5887,16 +6344,54 @@ async function geminiVision(prompt, images, maxTokens = 700) {
   return { text: "", truncated: false };
 }
 
+async function readResponseTextLimited(response, maxBytes = 2 * 1024 * 1024) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new Error("response_too_large");
+  }
+  if (!response.body) {
+    const text = await readResponseTextLimited(response);
+    if (Buffer.byteLength(text, "utf8") > maxBytes) throw new Error("response_too_large");
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new Error("response_too_large");
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
+}
+
+async function readResponseJsonLimited(response, maxBytes = 2 * 1024 * 1024) {
+  const text = await readResponseTextLimited(response, maxBytes);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("invalid_json_response");
+  }
+}
 async function fetchJson(url, timeoutMs = 2200) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
-  return response.json();
+  return readResponseJsonLimited(response);
 }
 
 async function fetchText(url, timeoutMs = 2200) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) throw new Error(`http_${response.status}`);
-  return response.text();
+  return readResponseTextLimited(response);
 }
 
 function promiseWithTimeout(promise, timeoutMs, fallbackValue = null) {
@@ -5940,11 +6435,25 @@ function splitCsvLine(line) {
 // actually threatens the whole process (and therefore every other connected user),
 // not just the requester. 25MB is generous for two base64 chart screenshots (real
 // uploads assessed by assessImageQuality() run well under 1MB each in practice).
-const MAX_BODY_BYTES = Number(env.MAX_BODY_BYTES || 25 * 1024 * 1024);
+const MAX_BODY_BYTES = Math.trunc(boundedEnvNumber(env.MAX_BODY_BYTES, 25 * 1024 * 1024, 64 * 1024, 50 * 1024 * 1024));
+const BODY_READ_TIMEOUT_MS = Math.trunc(boundedEnvNumber(env.BODY_READ_TIMEOUT_MS, 30_000, 1_000, 120_000));
 
 function bodyTooLargeError() {
   const error = new Error("payload_too_large");
   error.statusCode = 413;
+  return error;
+}
+
+function bodyReadTimeoutError() {
+  const error = new Error("request_body_timeout");
+  error.statusCode = 408;
+  return error;
+}
+
+function invalidJsonError() {
+  const error = new Error("invalid_json");
+  error.statusCode = 400;
+  error.publicCode = "invalid_json";
   return error;
 }
 
@@ -5953,24 +6462,37 @@ async function readBody(req) {
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) throw bodyTooLargeError();
   const chunks = [];
   let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    // Don't req.destroy() here: on a connection using "Expect: 100-continue" that
-    // aborts the socket before our own 413 response goes out, leaving the client
-    // with a bare connection reset instead of a readable error. Just stop
-    // buffering and let the caller's error response close the connection cleanly
-    // (see the top-level catch: 413 responses set Connection: close).
-    if (total > MAX_BODY_BYTES) throw bodyTooLargeError();
-    chunks.push(chunk);
+  const timeout = setTimeout(() => req.destroy(bodyReadTimeoutError()), BODY_READ_TIMEOUT_MS);
+  timeout.unref?.();
+  try {
+    for await (const chunk of req) {
+      total += chunk.length;
+      // Don't req.destroy() here: on a connection using "Expect: 100-continue" that
+      // aborts the socket before our own 413 response goes out, leaving the client
+      // with a bare connection reset instead of a readable error. Just stop
+      // buffering and let the caller's error response close the connection cleanly
+      // (see the top-level catch: 413 responses set Connection: close).
+      if (total > MAX_BODY_BYTES) throw bodyTooLargeError();
+      chunks.push(chunk);
+    }
+  } finally {
+    clearTimeout(timeout);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw invalidJsonError();
+  }
 }
+
+const MAX_IMAGE_DATA_URL_CHARS = 8 * 1024 * 1024;
 
 function normalizeImages(images) {
   if (!Array.isArray(images)) return [];
   return images.slice(0, 2).map((image) => {
-    if (typeof image !== "string") return null;
+    if (typeof image !== "string" || image.length > MAX_IMAGE_DATA_URL_CHARS) return null;
     const match = image.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
     return match ? { mimeType: match[1].toLowerCase(), data: match[2] } : null;
   }).filter(Boolean);
@@ -6583,7 +7105,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, 35),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) — signal bloqué par prudence plutôt que d'inventer un score.`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) — signal bloqué par prudence plutôt que d'inventer un score.`,
       validation: { ...validation, valid: false, reason: "Score de confiance non détecté dans la réponse IA." },
       meta,
     });
@@ -6593,7 +7117,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 45),
       technique: normalized.technique === "Mixte" ? "Aucun style validé" : normalized.technique || validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: signal bloqué volontairement, car l'analyse IA n'a pas confirmé un setup exploitable.`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: signal bloqué volontairement, car l'analyse IA n'a pas confirmé un setup exploitable.`,
       validation: { ...validation, valid: false, reason: "Aucun signal confirmé par Kronos." },
       meta,
     });
@@ -6602,7 +7128,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, imageQuality.score),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
       validation: { ...validation, valid: false, reason: `Qualité image insuffisante: ${imageQuality.reason}` },
       meta,
     });
@@ -6611,7 +7139,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 42),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: signal bloqué car aucun screenshot n'a été fourni et l'historique API n'est pas assez aligné avec la stratégie/timeframe demandé.`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: signal bloqué car aucun screenshot n'a été fourni et l'historique API n'est pas assez aligné avec la stratégie/timeframe demandé.`,
       validation: { ...validation, valid: false, reason: "Historique API insuffisant ou non aligné sans screenshot." },
       meta,
     });
@@ -6621,7 +7151,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 35),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: direction achat/vente non détectée dans la réponse IA — signal bloqué par prudence plutôt que de supposer un achat par défaut.`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: direction achat/vente non détectée dans la réponse IA — signal bloqué par prudence plutôt que de supposer un achat par défaut.`,
       validation: { ...validation, valid: false, reason: "Direction non détectée dans la réponse IA." },
       meta,
     });
@@ -6646,7 +7178,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, 35),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: niveaux entrée/SL/TP incomplets et aucun prix live disponible pour générer un plan prudent.`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: niveaux entrée/SL/TP incomplets et aucun prix live disponible pour générer un plan prudent.`,
       validation: { ...validation, valid: false, reason: "Niveaux entrée/SL/TP incomplets." },
       meta,
     });
@@ -6673,7 +7207,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, levelCheck.score),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: ${levelCheck.reason}`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: ${levelCheck.reason}`,
       validation: { ...validation, valid: false, reason: levelCheck.reason },
       meta: { ...meta, levelCheck },
     });
@@ -6684,7 +7220,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, normalized.score, 45),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: Trade risqué — ${suspicious.reason}. Les niveaux sont indicatifs uniquement et ne doivent pas être copiés directement.`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: Trade risqué — ${suspicious.reason}. Les niveaux sont indicatifs uniquement et ne doivent pas être copiés directement.`,
       validation: { ...validation, valid: false, reason: `Trade risqué: ${suspicious.reason}` },
       meta: { ...meta, levelCheck, rr, suspiciousLevels: suspicious },
     });
@@ -6727,7 +7265,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: Math.min(validation.score, normalized.score, 58),
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: contrôle qualité non validé — ${qualityGate.reason}`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: contrôle qualité non validé — ${qualityGate.reason}`,
       validation: { ...validation, valid: false, reason: qualityGate.reason },
       meta: { ...meta, levelCheck, rr, dangerScore: danger.score, danger, qualityGate },
     });
@@ -6742,7 +7282,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     return blockAnalysis(normalized, {
       score: calibratedScore,
       technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: score d'efficacité insuffisant (${calibratedScore}%).`,
+      explanation: `${displayText}
+
+VALIDATION KRONOS: score d'efficacité insuffisant (${calibratedScore}%).`,
       validation: { ...validation, valid: false, reason: "Score d'efficacité insuffisant." },
       meta: { ...meta, levelCheck, rr },
     });
@@ -6760,7 +7302,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     scoreRange: scoreConfidenceBand(calibratedScore, dataReliability, calibration),
     dangerScore: danger.score,
     beginnerPlan,
-    explanation: `${displayText}\n\nVALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. Gestion du risque: ${profile.label}, perte maximale visée ${profile.percent}% si la taille de lot est correctement ajustée. ${calibration.message}`,
+    explanation: `${displayText}
+
+VALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.toFixed(1)}. Gestion du risque: ${profile.label}, perte maximale visée ${profile.percent}% si la taille de lot est correctement ajustée. ${calibration.message}`,
     validation,
     meta: {
       ...meta,
@@ -7474,6 +8018,57 @@ function scoreStyleRule(text, selected) {
   };
 }
 
+function safeImageDimensions(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 16) return null;
+  const valid = (width, height) => width > 0 && height > 0 && width <= 100000 && height <= 100000 ? { width, height } : null;
+
+  if (buffer.length >= 24 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47
+    && buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a
+    && buffer.toString("ascii", 12, 16) === "IHDR") {
+    return valid(buffer.readUInt32BE(16), buffer.readUInt32BE(20));
+  }
+
+  if (buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+    let offset = 12;
+    for (let chunks = 0; chunks < 1000 && offset + 8 <= buffer.length; chunks += 1) {
+      const type = buffer.toString("ascii", offset, offset + 4);
+      const size = buffer.readUInt32LE(offset + 4);
+      const data = offset + 8;
+      if (size > buffer.length - data) return null;
+      if (type === "VP8X" && size >= 10) {
+        return valid(1 + buffer.readUIntLE(data + 4, 3), 1 + buffer.readUIntLE(data + 7, 3));
+      }
+      if (type === "VP8L" && size >= 5 && buffer[data] === 0x2f) {
+        const width = 1 + ((buffer[data + 1] | (buffer[data + 2] << 8)) & 0x3fff);
+        const height = 1 + (((buffer[data + 2] >> 6) | (buffer[data + 3] << 2) | (buffer[data + 4] << 10)) & 0x3fff);
+        return valid(width, height);
+      }
+      if (type === "VP8 " && size >= 10 && buffer[data + 3] === 0x9d && buffer[data + 4] === 0x01 && buffer[data + 5] === 0x2a) {
+        return valid(buffer.readUInt16LE(data + 6) & 0x3fff, buffer.readUInt16LE(data + 8) & 0x3fff);
+      }
+      offset = data + size + (size & 1);
+    }
+    return null;
+  }
+
+  if (buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+  const sofMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  let offset = 2;
+  for (let markers = 0; markers < 10000 && offset + 3 < buffer.length; markers += 1) {
+    if (buffer[offset] !== 0xff) return null;
+    while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+    if (offset >= buffer.length) return null;
+    const marker = buffer[offset++];
+    if (marker === 0xd9 || marker === 0xda) return null;
+    if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > buffer.length) return null;
+    const length = buffer.readUInt16BE(offset);
+    if (length < 2 || offset + length > buffer.length) return null;
+    if (sofMarkers.has(marker) && length >= 7) return valid(buffer.readUInt16BE(offset + 3), buffer.readUInt16BE(offset + 5));
+    offset += length;
+  }
+  return null;
+}
 function assessImageQuality(images) {
   if (!images.length) return { score: 0, reason: "aucune image" };
   const details = [];
@@ -7482,7 +8077,7 @@ function assessImageQuality(images) {
     const bytes = Math.round((image.data.length * 3) / 4);
     let dimensions = null;
     try {
-      dimensions = imageSize(Buffer.from(image.data, "base64"));
+      dimensions = safeImageDimensions(Buffer.from(image.data, "base64"));
     } catch {
       dimensions = null;
     }
@@ -7764,7 +8359,9 @@ const fileLocks = new Map();
 function withFileLock(key, fn) {
   const tail = fileLocks.get(key) || Promise.resolve();
   const run = tail.then(fn, fn);
-  fileLocks.set(key, run.then(() => {}, () => {}));
+  const settled = run.then(() => {}, () => {});
+  fileLocks.set(key, settled);
+  settled.then(() => { if (fileLocks.get(key) === settled) fileLocks.delete(key); }, () => { if (fileLocks.get(key) === settled) fileLocks.delete(key); });
   return run;
 }
 
@@ -7814,7 +8411,8 @@ async function saveMarketCache(cache) {
     updatedAt: new Date().toISOString(),
   };
   if (await saveStateDocument("market-cache", trimmed)) return trimmed;
-  await atomicWriteFile(marketCachePath, `${JSON.stringify(trimmed, null, 2)}\n`);
+  await atomicWriteFile(marketCachePath, `${JSON.stringify(trimmed, null, 2)}
+`);
   return trimmed;
 }
 
@@ -7906,9 +8504,22 @@ function runtimeCacheSummary() {
 // a single missing/expired API key spams the console with the same warning on every
 // single analysis request.
 const recentLogs = new Map();
+const RECENT_LOG_TTL_MS = 60 * 60 * 1000;
+const MAX_RECENT_LOG_ENTRIES = 2000;
+function pruneRecentLogs(now = Date.now()) {
+  for (const [key, at] of recentLogs) {
+    if (now - at > RECENT_LOG_TTL_MS) recentLogs.delete(key);
+  }
+  if (recentLogs.size <= MAX_RECENT_LOG_ENTRIES) return;
+  const oldest = [...recentLogs.entries()]
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, recentLogs.size - MAX_RECENT_LOG_ENTRIES);
+  for (const [key] of oldest) recentLogs.delete(key);
+}
 function logOnce(scope, message, throttleMs = 5 * 60 * 1000) {
   const key = `${scope}:${message}`;
   const now = Date.now();
+  if (recentLogs.size >= MAX_RECENT_LOG_ENTRIES) pruneRecentLogs(now);
   const last = recentLogs.get(key);
   if (last && now - last < throttleMs) return;
   recentLogs.set(key, now);
@@ -7917,12 +8528,13 @@ function logOnce(scope, message, throttleMs = 5 * 60 * 1000) {
 
 function recordProviderHealth(provider, ok, error = null) {
   const previous = providerHealth.get(provider) || { ok: 0, fail: 0 };
+  const safeError = error == null ? null : String(error).slice(0, 240);
   providerHealth.set(provider, {
     ok: previous.ok + (ok ? 1 : 0),
     fail: previous.fail + (ok ? 0 : 1),
     lastOk: ok ? new Date().toISOString() : previous.lastOk || null,
     lastFail: ok ? previous.lastFail || null : new Date().toISOString(),
-    lastError: ok ? null : error,
+    lastError: ok ? null : safeError,
   });
 }
 
@@ -8230,20 +8842,41 @@ async function loadAuthStore() {
   };
 }
 
-async function saveAuthStore(store) {
+async function persistAuthUser(user, session = null) {
   await ensureRelationalTables();
-  const activeSessions = store.sessions.filter((session) => new Date(session.expiresAt).getTime() > Date.now());
-  for (const user of store.users) await upsertUserRow(user);
-  const keepIds = activeSessions.map((session) => session.id);
-  if (keepIds.length) {
-    const placeholders = keepIds.map(() => "?").join(",");
-    await sqlRun(`DELETE FROM sessions WHERE id NOT IN (${placeholders})`, keepIds);
-  } else {
-    await sqlRun(`DELETE FROM sessions`);
+  await upsertUserRow(user);
+  if (session) {
+    await sqlRun("DELETE FROM sessions WHERE user_id = ? AND expires_at <= ?", [user.id, new Date().toISOString()]);
+    await upsertSessionRow(session);
   }
-  for (const session of activeSessions) await upsertSessionRow(session);
-  return { version: 1, users: store.users, sessions: activeSessions, updatedAt: new Date().toISOString(), persisted: pgPool ? "supabase" : "sqlite" };
+  return { persisted: pgPool ? "supabase" : "sqlite" };
 }
+
+async function deleteSessionsForUser(userId) {
+  await ensureRelationalTables();
+  await sqlRun("DELETE FROM sessions WHERE user_id = ?", [userId]);
+}
+
+async function deleteSessionByToken(token) {
+  await ensureRelationalTables();
+  await sqlRun("DELETE FROM sessions WHERE token_hash = ?", [sessionHash(token)]);
+}
+
+async function persistLoginSession(user, session) {
+  await ensureRelationalTables();
+  const now = new Date().toISOString();
+  await sqlRun("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", [now, now, user.id]);
+  await sqlRun("DELETE FROM sessions WHERE user_id = ? AND expires_at <= ?", [user.id, now]);
+  await upsertSessionRow(session);
+  return { persisted: pgPool ? "supabase" : "sqlite" };
+}
+
+async function persistUserPassword(user) {
+  await ensureRelationalTables();
+  await sqlRun("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?", [user.passwordHash, user.updatedAt, user.id]);
+  return { persisted: pgPool ? "supabase" : "sqlite" };
+}
+
 
 async function signupUser(body = {}, req = null) {
   const name = cleanLine(body.name || body.fullName || "");
@@ -8283,7 +8916,7 @@ async function signupUser(body = {}, req = null) {
       store.sessions.push(session);
       existing.lastLoginAt = new Date().toISOString();
       existing.updatedAt = new Date().toISOString();
-      const saved = await saveAuthStore(store);
+      const saved = await persistLoginSession(existing, session);
       if (authPersistenceRequired() && saved.persisted !== "supabase") {
         return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
       }
@@ -8307,7 +8940,7 @@ async function signupUser(body = {}, req = null) {
     const session = createSession(user.id);
     store.users.push(user);
     store.sessions.push(session);
-    const saved = await saveAuthStore(store);
+    const saved = await persistAuthUser(user, session);
     if (authPersistenceRequired() && saved.persisted !== "supabase") {
       return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
     }
@@ -8330,15 +8963,43 @@ async function deleteRateLimitEntry(kind, key) {
   await sqlRun(`DELETE FROM rate_limit_attempts WHERE kind = ? AND rate_key = ?`, [kind, key]);
 }
 
-async function upsertRateLimitEntry(kind, key, count, firstAttemptAt) {
+async function incrementRateLimitEntry(kind, key, windowMs) {
   await ensureRelationalTables();
-  await sqlRun(
-    `INSERT INTO rate_limit_attempts (kind, rate_key, count, first_attempt_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT (kind, rate_key) DO UPDATE SET count = excluded.count, first_attempt_at = excluded.first_attempt_at`,
-    [kind, key, count, new Date(firstAttemptAt).toISOString()],
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const cutoffIso = new Date(now - windowMs).toISOString();
+  // Update an existing row atomically. If the window expired, this same
+  // statement resets it instead of deleting then reinserting it.
+  const updated = await sqlRun(
+    "UPDATE rate_limit_attempts SET count = CASE WHEN first_attempt_at < ? THEN 1 ELSE count + 1 END, first_attempt_at = CASE WHEN first_attempt_at < ? THEN ? ELSE first_attempt_at END WHERE kind = ? AND rate_key = ?",
+    [cutoffIso, cutoffIso, nowIso, kind, key],
   );
+  if (Number(pgPool ? updated.rowCount : updated.changes) === 1) {
+    return getRateLimitEntry(kind, key);
+  }
+  // Two replicas can both observe "no row". One wins the insert; the other
+  // retries the atomic UPDATE and therefore never loses an increment.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await sqlRun(
+        "INSERT INTO rate_limit_attempts (kind, rate_key, count, first_attempt_at) VALUES (?, ?, 1, ?)",
+        [kind, key, nowIso],
+      );
+      return getRateLimitEntry(kind, key);
+    } catch (error) {
+      if (attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)));
+      const retry = await sqlRun(
+        "UPDATE rate_limit_attempts SET count = CASE WHEN first_attempt_at < ? THEN 1 ELSE count + 1 END, first_attempt_at = CASE WHEN first_attempt_at < ? THEN ? ELSE first_attempt_at END WHERE kind = ? AND rate_key = ?",
+        [cutoffIso, cutoffIso, nowIso, kind, key],
+      );
+      if (Number(pgPool ? retry.rowCount : retry.changes) === 1) {
+        return getRateLimitEntry(kind, key);
+      }
+    }
+  }
+  return getRateLimitEntry(kind, key);
 }
-
 async function checkLoginRateLimit(req, email) {
   const key = loginRateLimitKey(req, email);
   const entry = await getRateLimitEntry("login", key);
@@ -8356,19 +9017,7 @@ async function checkLoginRateLimit(req, email) {
 
 async function registerLoginFailure(req, email) {
   const key = loginRateLimitKey(req, email);
-  // Read-then-write: two failed attempts arriving concurrently for the same key
-  // could both read count=1 and both write count=2 (a lost update that
-  // under-counts real attempts) without this -- one shared lock, not per-key, for
-  // the same reason consumeAnonymousQuota uses one ("anon-quota" -- avoids
-  // recreating the unbounded dynamic-lock-Map problem this migration fixes).
-  return withFileLock("rate-limit-attempts", async () => {
-    const entry = await getRateLimitEntry("login", key);
-    if (!entry || Date.now() - entry.firstAttemptAt > LOGIN_WINDOW_MS) {
-      await upsertRateLimitEntry("login", key, 1, Date.now());
-      return;
-    }
-    await upsertRateLimitEntry("login", key, entry.count + 1, entry.firstAttemptAt);
-  });
+  return incrementRateLimitEntry("login", key, LOGIN_WINDOW_MS);
 }
 
 async function clearLoginAttempts(req, email) {
@@ -8392,22 +9041,15 @@ async function checkSignupRateLimit(req) {
 
 async function registerSignupAttempt(req) {
   const key = clientFingerprint(req);
-  return withFileLock("rate-limit-attempts", async () => {
-    const entry = await getRateLimitEntry("signup", key);
-    if (!entry || Date.now() - entry.firstAttemptAt > SIGNUP_WINDOW_MS) {
-      await upsertRateLimitEntry("signup", key, 1, Date.now());
-      return;
-    }
-    await upsertRateLimitEntry("signup", key, entry.count + 1, entry.firstAttemptAt);
-  });
+  return incrementRateLimitEntry("signup", key, SIGNUP_WINDOW_MS);
 }
 
 // Without this, /api/forgot-password could be hammered to repeatedly email a target
 // address (annoying at best, a spam vector at worst) -- same fingerprint-keyed
 // mechanism as signup, one shared lock, its own "kind" so it doesn't share a counter
 // with login/signup attempts.
-const PASSWORD_RESET_MAX_ATTEMPTS = Number(env.PASSWORD_RESET_MAX_ATTEMPTS || 3);
-const PASSWORD_RESET_WINDOW_MS = Number(env.PASSWORD_RESET_WINDOW_MINUTES || 60) * 60 * 1000;
+const PASSWORD_RESET_MAX_ATTEMPTS = Math.trunc(boundedEnvNumber(env.PASSWORD_RESET_MAX_ATTEMPTS, 3, 1, 50));
+const PASSWORD_RESET_WINDOW_MS = boundedEnvNumber(env.PASSWORD_RESET_WINDOW_MINUTES, 60, 1, 1440) * 60 * 1000;
 const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
 
 async function checkPasswordResetRateLimit(req) {
@@ -8427,14 +9069,7 @@ async function checkPasswordResetRateLimit(req) {
 
 async function registerPasswordResetAttempt(req) {
   const key = clientFingerprint(req);
-  return withFileLock("rate-limit-attempts", async () => {
-    const entry = await getRateLimitEntry("password-reset", key);
-    if (!entry || Date.now() - entry.firstAttemptAt > PASSWORD_RESET_WINDOW_MS) {
-      await upsertRateLimitEntry("password-reset", key, 1, Date.now());
-      return;
-    }
-    await upsertRateLimitEntry("password-reset", key, entry.count + 1, entry.firstAttemptAt);
-  });
+  return incrementRateLimitEntry("password-reset", key, PASSWORD_RESET_WINDOW_MS);
 }
 
 async function loginUser(body = {}, req = null) {
@@ -8461,7 +9096,7 @@ async function loginUser(body = {}, req = null) {
     store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
     store.sessions.push(session);
     user.lastLoginAt = new Date().toISOString();
-    const saved = await saveAuthStore(store);
+    const saved = await persistLoginSession(user, session);
     if (authPersistenceRequired() && saved.persisted !== "supabase") {
       return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
     }
@@ -8522,7 +9157,17 @@ async function resetPassword(body = {}) {
   return withFileLock("auth-store", async () => {
     const row = await sqlGet(`SELECT * FROM password_reset_tokens WHERE token_hash = ?`, [resetTokenHash(token)]);
     if (!row || row.used_at) return { ok: false, error: "Lien de réinitialisation invalide ou déjà utilisé." };
+    const claimedAt = new Date().toISOString();
     if (new Date(row.expires_at).getTime() < Date.now()) return { ok: false, error: "Lien de réinitialisation expiré. Demande-en un nouveau." };
+    // The process-local lock is not enough with multiple replicas. Claim the
+    // token first in SQL; exactly one concurrent request can change NULL -> used.
+    const claim = await sqlRun(
+      `UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at >= ?`,
+      [claimedAt, row.id, claimedAt],
+    );
+    if (Number(pgPool ? claim.rowCount : claim.changes) !== 1) {
+      return { ok: false, error: "Lien de réinitialisation invalide ou déjà utilisé." };
+    }
     const store = await loadAuthStore();
     const user = store.users.find((item) => item.id === row.user_id);
     if (!user) return { ok: false, error: "Compte introuvable." };
@@ -8531,12 +9176,11 @@ async function resetPassword(body = {}) {
     // Force re-login everywhere: if the reset was triggered because the account was
     // compromised, an attacker's existing session should not survive the password
     // change.
-    store.sessions = store.sessions.filter((item) => item.userId !== user.id);
-    const saved = await saveAuthStore(store);
+    await deleteSessionsForUser(user.id);
+    const saved = await persistUserPassword(user);
     if (authPersistenceRequired() && saved.persisted !== "supabase") {
       return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
     }
-    await sqlRun(`UPDATE password_reset_tokens SET used_at = ? WHERE id = ?`, [new Date().toISOString(), row.id]);
     return { ok: true };
   });
 }
@@ -8559,12 +9203,7 @@ async function currentSession(req) {
 }
 
 async function destroySession(token) {
-  const tokenHash = sessionHash(token);
-  return withFileLock("auth-store", async () => {
-    const store = await loadAuthStore();
-    store.sessions = store.sessions.filter((item) => item.tokenHash !== tokenHash);
-    await saveAuthStore(store);
-  });
+  await deleteSessionByToken(token);
 }
 
 function createSession(userId) {
@@ -8594,91 +9233,100 @@ function publicUser(user) {
   };
 }
 
+const FREE_DAILY_ANALYSES_LIMIT = Math.trunc(boundedEnvNumber(env.FREE_DAILY_ANALYSES, 3, 0, 10_000));
+const FREE_DAILY_CHAT_LIMIT = Math.trunc(boundedEnvNumber(env.FREE_DAILY_CHAT, 25, 0, 10_000));
+const FREE_DAILY_DETECTIONS_LIMIT = Math.trunc(boundedEnvNumber(env.FREE_DAILY_DETECTIONS, 8, 0, 10_000));
+const VISITOR_DAILY_ANALYSES_LIMIT = Math.trunc(boundedEnvNumber(env.VISITOR_DAILY_ANALYSES, 1, 0, 10_000));
+const VISITOR_DAILY_CHAT_LIMIT = Math.trunc(boundedEnvNumber(env.VISITOR_DAILY_CHAT, 5, 0, 10_000));
+const VISITOR_DAILY_DETECTIONS_LIMIT = Math.trunc(boundedEnvNumber(env.VISITOR_DAILY_DETECTIONS, 2, 0, 10_000));
+
 async function consumeQuota(user, feature, req = null) {
   if (!user) return consumeAnonymousQuota(req, feature);
-  // Was loadAuthStore() + saveAuthStore() -- the entire users table read AND
-  // re-written (every row upserted, not just this one) on every single
-  // analysis/chat/detection call from every logged-in user, all serialized behind
-  // one global "auth-store" lock shared with signup/login/premium-grant. A single
-  // indexed row read/write, locked per-user (correctness only requires
-  // serializing the same user's own concurrent requests against each other, not
-  // against every other user's), fixes both.
-  return withFileLock(`quota:${user.id}`, async () => {
-    await ensureRelationalTables();
-    const stored = rowToUser(await sqlGet(`SELECT * FROM users WHERE id = ?`, [user.id])) || user;
-    if (hasPremiumAccess(stored)) {
-      return { ok: true, unlimited: true, feature };
-    }
-    const limits = {
-      analysis: Number(env.FREE_DAILY_ANALYSES || 3),
-      chat: Number(env.FREE_DAILY_CHAT || 25),
-      detection: Number(env.FREE_DAILY_DETECTIONS || 8),
-    };
-    const limit = limits[feature] ?? 10;
-    const today = new Date().toISOString().slice(0, 10);
-    if (!stored) return { ok: false, error: "session_invalid" };
-    stored.usage = normalizeUsage(stored.usage, today);
-    const used = Number(stored.usage[feature] || 0);
-    if (used >= limit) {
-      return quotaExceededPayload({
-        error: "quota_exceeded",
-        feature,
-        plan: effectivePlan(stored),
-        limit,
-        used,
-        message: "Quota gratuit atteint pour aujourd'hui.",
-        upgradeHint: "Passe en premium pour débloquer les analyses illimitées.",
-      });
-    }
-    stored.usage[feature] = used + 1;
-    stored.updatedAt = new Date().toISOString();
-    await upsertUserRow(stored);
-    return { ok: true, feature, plan: effectivePlan(stored), limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
-  });
+  await ensureRelationalTables();
+  const stored = rowToUser(await sqlGet("SELECT * FROM users WHERE id = ?", [user.id]));
+  if (!stored) return { ok: false, error: "session_invalid" };
+  if (hasPremiumAccess(stored)) {
+    return { ok: true, unlimited: true, feature };
+  }
+  const limits = {
+    analysis: FREE_DAILY_ANALYSES_LIMIT,
+    chat: FREE_DAILY_CHAT_LIMIT,
+    detection: FREE_DAILY_DETECTIONS_LIMIT,
+  };
+  if (!Object.prototype.hasOwnProperty.call(limits, feature)) {
+    return { ok: false, error: "invalid_feature" };
+  }
+  const limit = limits[feature];
+  const today = new Date().toISOString().slice(0, 10);
+  const initial = normalizeUsage(stored.usage, today);
+  const now = new Date().toISOString();
+  // The legacy users.usage JSON is used only to seed a brand-new daily row.
+  // Enforcement itself is an atomic database increment, so replicas cannot
+  // overwrite one another's counters or restore an old user profile snapshot.
+  await sqlRun(
+    "INSERT INTO user_usage (user_id, date, analysis, chat, detection, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, date) DO NOTHING",
+    [stored.id, today, initial.analysis, initial.chat, initial.detection, now],
+  );
+  const increment = await sqlRun(
+    "UPDATE user_usage SET " + feature + " = " + feature + " + 1, updated_at = ? WHERE user_id = ? AND date = ? AND " + feature + " < ?",
+    [now, stored.id, today, limit],
+  );
+  const changed = Number(pgPool ? increment.rowCount : increment.changes);
+  const row = await sqlGet("SELECT " + feature + " FROM user_usage WHERE user_id = ? AND date = ?", [stored.id, today]);
+  const used = Number(row?.[feature] || 0);
+  if (changed !== 1) {
+    return quotaExceededPayload({
+      error: "quota_exceeded",
+      feature,
+      plan: effectivePlan(stored),
+      limit,
+      used,
+      message: "Quota gratuit atteint pour aujourd'hui.",
+      upgradeHint: "Passe en premium pour débloquer les analyses illimitées.",
+    });
+  }
+  return { ok: true, feature, plan: effectivePlan(stored), limit, used, remaining: Math.max(0, limit - used) };
 }
-
 async function consumeAnonymousQuota(req, feature) {
   const limits = {
-    analysis: Number(env.VISITOR_DAILY_ANALYSES || 1),
-    chat: Number(env.VISITOR_DAILY_CHAT || 5),
-    detection: Number(env.VISITOR_DAILY_DETECTIONS || 2),
+    analysis: VISITOR_DAILY_ANALYSES_LIMIT,
+    chat: VISITOR_DAILY_CHAT_LIMIT,
+    detection: VISITOR_DAILY_DETECTIONS_LIMIT,
   };
-  const limit = limits[feature] ?? 3;
+  if (!Object.prototype.hasOwnProperty.call(limits, feature)) {
+    return { ok: false, error: "invalid_feature" };
+  }
+  const limit = limits[feature];
   const today = new Date().toISOString().slice(0, 10);
   const fingerprint = clientFingerprint(req);
   await ensureRelationalTables();
-  // One shared lock instead of a lock per fingerprint: a per-fingerprint dynamic key
-  // would just recreate the exact unbounded-Map-growth problem this migration exists
-  // to fix (fileLocks never sweeps its keys either). Anonymous quota checks are cheap
-  // and infrequent enough per request that serializing them site-wide is not a real
-  // bottleneck at this project's scale.
-  return withFileLock("anon-quota", async () => {
-    const row = await sqlGet(`SELECT * FROM anonymous_usage WHERE fingerprint = ? AND date = ?`, [fingerprint, today]);
-    const used = Number(row?.[feature] || 0);
-    if (used >= limit) {
-      return quotaExceededPayload({
-        error: "visitor_quota_exceeded",
-        feature,
-        plan: "visitor",
-        limit,
-        used,
-        message: "Limite visiteur atteinte.",
-        upgradeHint: "Crée un compte gratuit ou demande un accès premium test.",
-      });
-    }
-    const now = new Date().toISOString();
-    if (row) {
-      await sqlRun(`UPDATE anonymous_usage SET ${feature} = ?, updated_at = ? WHERE fingerprint = ? AND date = ?`, [used + 1, now, fingerprint, today]);
-    } else {
-      await sqlRun(
-        `INSERT INTO anonymous_usage (fingerprint, date, analysis, chat, detection, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-        [fingerprint, today, feature === "analysis" ? 1 : 0, feature === "chat" ? 1 : 0, feature === "detection" ? 1 : 0, now],
-      );
-    }
-    return { ok: true, anonymous: true, feature, plan: "visitor", limit, used: used + 1, remaining: Math.max(0, limit - used - 1) };
-  });
+  const now = new Date().toISOString();
+  // Seed the row without overwriting a concurrent request. The conditional
+  // increment below is the real guard and works across processes/replicas.
+  await sqlRun(
+    "INSERT INTO anonymous_usage (fingerprint, date, analysis, chat, detection, updated_at) VALUES (?, ?, 0, 0, 0, ?) ON CONFLICT (fingerprint, date) DO NOTHING",
+    [fingerprint, today, now],
+  );
+  const increment = await sqlRun(
+    "UPDATE anonymous_usage SET " + feature + " = " + feature + " + 1, updated_at = ? WHERE fingerprint = ? AND date = ? AND " + feature + " < ?",
+    [now, fingerprint, today, limit],
+  );
+  const changed = Number(pgPool ? increment.rowCount : increment.changes);
+  const row = await sqlGet("SELECT " + feature + " FROM anonymous_usage WHERE fingerprint = ? AND date = ?", [fingerprint, today]);
+  const used = Number(row?.[feature] || 0);
+  if (changed !== 1) {
+    return quotaExceededPayload({
+      error: "visitor_quota_exceeded",
+      feature,
+      plan: "visitor",
+      limit,
+      used,
+      message: "Limite visiteur atteinte.",
+      upgradeHint: "Crée un compte gratuit ou demande un accès premium test.",
+    });
+  }
+  return { ok: true, anonymous: true, feature, plan: "visitor", limit, used, remaining: Math.max(0, limit - used) };
 }
-
 function quotaSnapshot(user = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const usage = normalizeUsage(user.usage, today);
@@ -8686,9 +9334,9 @@ function quotaSnapshot(user = {}) {
   return {
     date: today,
     plan: effectivePlan(user),
-    analysis: { used: usage.analysis || 0, limit: premium ? "illimité" : Number(env.FREE_DAILY_ANALYSES || 3) },
-    chat: { used: usage.chat || 0, limit: premium ? "illimité" : Number(env.FREE_DAILY_CHAT || 25) },
-    detection: { used: usage.detection || 0, limit: premium ? "illimité" : Number(env.FREE_DAILY_DETECTIONS || 8) },
+    analysis: { used: usage.analysis || 0, limit: premium ? "illimité" : FREE_DAILY_ANALYSES_LIMIT },
+    chat: { used: usage.chat || 0, limit: premium ? "illimité" : FREE_DAILY_CHAT_LIMIT },
+    detection: { used: usage.detection || 0, limit: premium ? "illimité" : FREE_DAILY_DETECTIONS_LIMIT },
     resetsAt: nextQuotaReset().toISOString(),
   };
 }
@@ -8831,7 +9479,8 @@ async function grantPremiumAccess(body = {}) {
     user.premiumSource = "manual_admin";
     user.updatedAt = new Date().toISOString();
     user.usage = { date: new Date().toISOString().slice(0, 10), analysis: 0, chat: 0, detection: 0 };
-    await saveAuthStore(store);
+    await sqlRun("UPDATE users SET plan = ?, premium_until = ?, manual_premium = ?, premium_source = ?, usage = ?, updated_at = ? WHERE id = ?", [user.plan, user.premiumUntil, user.manualPremium ? 1 : 0, user.premiumSource, JSON.stringify(user.usage), user.updatedAt, user.id]);
+    await sqlRun("DELETE FROM user_usage WHERE user_id = ?", [user.id]);
     return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
   });
 }
@@ -8848,7 +9497,7 @@ async function revokePremiumAccess(body = {}) {
     user.manualPremium = false;
     user.premiumSource = null;
     user.updatedAt = new Date().toISOString();
-    await saveAuthStore(store);
+    await sqlRun("UPDATE users SET plan = ?, premium_until = NULL, manual_premium = 0, premium_source = NULL, updated_at = ? WHERE id = ?", [user.plan, user.updatedAt, user.id]);
     return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
   });
 }
@@ -8906,10 +9555,50 @@ function resetTokenHash(token) {
 }
 
 function requestOrigin(req) {
+  const configuredOrigin = String(env.PUBLIC_ORIGIN || env.APP_URL || "").trim().replace(/\/+$/, "");
+  if (configuredOrigin) {
+    try {
+      const parsed = new URL(configuredOrigin);
+      if ((parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password) {
+        return parsed.origin;
+      }
+    } catch {
+      logOnce("public-origin", "PUBLIC_ORIGIN invalide -- fallback sécurisé utilisé");
+    }
+  }
+  if (env.NODE_ENV === "production") return "https://forex-by-kronos-oracle.onrender.com";
   const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
   const protocol = forwardedProto === "https" || env.NODE_ENV === "production" ? "https" : "http";
-  const host = req?.headers?.host || `127.0.0.1:${port}`;
-  return `${protocol}://${host}`;
+  const candidateHost = String(req?.headers?.host || `127.0.0.1:${port}`);
+  const host = /^[a-z0-9.-]+(?::\d{1,5})?$/i.test(candidateHost) ? candidateHost : `127.0.0.1:${port}`;
+  return protocol + "://" + host;
+}
+
+function normalizePushEndpoint(value) {
+  const endpoint = String(value ?? "").trim();
+  if (!endpoint || endpoint.length > 2048) return null;
+  try {
+    const parsed = new URL(endpoint);
+    return parsed.protocol === "https:" && parsed.hostname ? endpoint : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizePushKey(value) {
+  const key = String(value ?? "").trim();
+  return key && key.length <= 512 && !/[\\s<>]/.test(key) ? key : null;
+}
+
+function isSameOriginRequest(req) {
+  const origin = String(req?.headers?.origin || "").trim();
+  if (!origin) return true;
+  if (origin === "null") return false;
+  try {
+    return new URL(origin).origin === requestOrigin(req);
+  } catch {
+    return false;
+  }
 }
 
 // Resend (https://resend.com): the only transactional-email provider configured for
@@ -8923,9 +9612,10 @@ async function sendResendEmail(to, subject, html) {
       method: "POST",
       headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({ from: env.RESEND_FROM || "Oracle Forex <onboarding@resend.dev>", to: [to], subject, html }),
+      signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
+      const detail = await readResponseTextLimited(response).catch(() => "");
       return { ok: false, error: `resend_${response.status}`, detail };
     }
     return { ok: true };
@@ -8946,7 +9636,12 @@ function cookieValue(req, name) {
   const cookies = String(req.headers.cookie || "").split(";").map((part) => part.trim());
   const prefix = `${name}=`;
   const found = cookies.find((part) => part.startsWith(prefix));
-  return found ? decodeURIComponent(found.slice(prefix.length)) : "";
+  if (!found) return "";
+  try {
+    return decodeURIComponent(found.slice(prefix.length));
+  } catch {
+    return "";
+  }
 }
 
 function setSessionCookie(res, token, req = null) {
@@ -8955,8 +9650,10 @@ function setSessionCookie(res, token, req = null) {
   res.setHeader("Set-Cookie", `oracle_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${14 * 24 * 60 * 60}${secure}`);
 }
 
-function clearSessionCookie(res) {
-  res.setHeader("Set-Cookie", "oracle_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+function clearSessionCookie(res, req = null) {
+  const forwardedProto = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  const secure = env.COOKIE_SECURE === "true" || forwardedProto === "https" || env.NODE_ENV === "production" ? "; Secure" : "";
+  res.setHeader("Set-Cookie", "oracle_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + secure);
 }
 
 function rowToAnalysis(row) {
@@ -9147,14 +9844,33 @@ async function setAppSetting(key, value) {
   );
 }
 
-const TRADE_DAILY_ORDER_CAP = Number(env.TRADE_DAILY_ORDER_CAP || 10);
+const TRADE_DAILY_ORDER_CAP = Math.trunc(boundedEnvNumber(env.TRADE_DAILY_ORDER_CAP, 10, 1, 10_000));
 
 // Admin-editable from premium-admin.html without a redeploy -- falls back to the
 // env-configured default (or 10) until an admin sets an override.
 async function getTradeDailyOrderCap() {
   const stored = await getAppSetting("trade_daily_order_cap", null);
   const cap = Number(stored);
-  return Number.isFinite(cap) && cap >= 1 ? cap : TRADE_DAILY_ORDER_CAP;
+  return Number.isFinite(cap) ? Math.min(10_000, Math.max(1, Math.trunc(cap))) : TRADE_DAILY_ORDER_CAP;
+}
+
+async function consumeTradeDailySlot(userId, cap) {
+  await ensureRelationalTables();
+  const date = new Date().toISOString().slice(0, 10);
+  const now = new Date().toISOString();
+  // Seed from historical orders so a deploy cannot reset today's cap to zero.
+  await sqlRun(
+    `INSERT INTO trade_daily_usage (user_id, date, confirmed_count, updated_at)
+     VALUES (?, ?, (SELECT COUNT(*) FROM trade_orders WHERE user_id = ? AND confirmed_at >= ? AND status IN ('SENT', 'FAILED', 'DELIVERY_UNKNOWN')), ?)
+     ON CONFLICT (user_id, date) DO NOTHING`,
+    [userId, date, userId, date + "T00:00:00.000Z", now],
+  );
+  const result = await sqlRun(
+    `UPDATE trade_daily_usage SET confirmed_count = confirmed_count + 1, updated_at = ?
+     WHERE user_id = ? AND date = ? AND confirmed_count < ?`,
+    [now, userId, date, cap],
+  );
+  return Number(pgPool ? result.rowCount : result.changes) === 1;
 }
 
 // MetaApi's REST trade endpoint -- verified live this session against a real
@@ -9166,6 +9882,10 @@ async function getTradeDailyOrderCap() {
 // credentials, see getUserBrokerCredentials / auto_trading_accounts) -- it's kept
 // only for the admin panel's own env-config visibility.
 const BROKER_CONFIGURED = Boolean(env.METAAPI_TOKEN && env.METAAPI_ACCOUNT_ID);
+// Simulation flags are deliberately ignored in production: a deployment typo
+// must never turn real trading or market display into a fake-data environment.
+const MOCK_BROKER_ENABLED = env.NODE_ENV !== "production" && env.MOCK_BROKER_ENABLED === "true";
+const MOCK_MARKET_DATA = env.NODE_ENV !== "production" && env.MOCK_MARKET_DATA === "true";
 
 // Both the semi-automatic flow and the autonomous bot now always pass their own
 // connected user's credentials explicitly (see getUserBrokerCredentials /
@@ -9201,7 +9921,12 @@ function brokerSlotColumns(slot) {
 function resolveBrokerCredentialsFromAccount(account, slot) {
   const c = brokerSlotColumns(slot);
   if (!account[c.token] || !account[c.accountId] || !account[c.connectedAt]) return null;
-  return { token: account[c.token], accountId: account[c.accountId], region: account[c.region] || "new-york" };
+  try {
+    return { token: decryptBrokerCredential(account[c.token]), accountId: account[c.accountId], region: account[c.region] || "new-york" };
+  } catch (error) {
+    logOnce("broker-credential-read-" + slot, "identifiant broker illisible (" + error.message + ")");
+    return null;
+  }
 }
 
 // Which slots the autonomous bot should actually process this tick for a given
@@ -9225,10 +9950,36 @@ async function getUserBrokerCredentials(userId, slot) {
     [userId],
   );
   if (!row) return null;
-  return { token: row.token, accountId: row.account_id, region: row.region || "new-york" };
+  let token;
+  try {
+    token = decryptBrokerCredential(row.token);
+  } catch (error) {
+    logOnce("broker-credential-read-" + slot, "identifiant broker illisible (" + error.message + ")");
+    return null;
+  }
+  if (!token) return null;
+  if (BROKER_CREDENTIALS_ENCRYPTION_KEY && (!isEncryptedBrokerCredential(row.token) || brokerCredentialUsesPreviousKey(row.token))) {
+    try {
+      await sqlRun("UPDATE auto_trading_accounts SET " + c.token + " = ? WHERE user_id = ?", [encryptBrokerCredential(token), userId]);
+    } catch (error) {
+      logOnce("broker-credential-migrate-" + slot, "migration d un identifiant broker echouee (" + error.message + ")");
+    }
+  }
+  return { token, accountId: row.account_id, region: row.region || "new-york" };
+}
+
+function publicBrokerError(value) {
+  const raw = String(value || "");
+  if (/504|timeout|timed out/i.test(raw)) return "Le broker met trop de temps a repondre. Reessaie dans quelques instants.";
+  if (/401|403|unauthor|forbidden|auth/i.test(raw)) return "Le broker a refuse l authentification. Verifie le jeton et l identifiant du compte.";
+  if (/10016|invalid.?stops/i.test(raw)) return "Le broker a refuse les niveaux de protection. Reanalyse le marche puis reessaie.";
+  return "Le broker a refuse l operation. Verifie la connexion et les niveaux de l ordre.";
 }
 
 async function sendOrderToBroker(order, credentials = null) {
+  if (MOCK_BROKER_ENABLED) {
+    return { ok: true, brokerOrderId: `mock_${Date.now()}_${randomBytes(4).toString("hex")}` };
+  }
   const creds = resolveBrokerCredentials(credentials);
   if (!creds) return { ok: false, error: "broker_not_configured" };
   const region = creds.region || "new-york";
@@ -9247,7 +9998,7 @@ async function sendOrderToBroker(order, credentials = null) {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15000),
     });
-    const data = await response.json().catch(() => ({}));
+    const data = await readResponseJsonLimited(response).catch(() => ({}));
     if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
     // MetaApi's trade endpoint returns HTTP 200 even when the broker rejects the
     // trade (e.g. numericCode 10016 TRADE_RETCODE_INVALID_STOPS) -- confirmed live
@@ -9257,9 +10008,15 @@ async function sendOrderToBroker(order, credentials = null) {
     if (data?.numericCode !== 10009) {
       return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
     }
-    return { ok: true, brokerOrderId: String(data?.orderId ?? data?.positionId ?? "") };
+    const brokerOrderId = String(data?.orderId ?? data?.positionId ?? "");
+    // A successful numeric code without an identifier is still ambiguous: the
+    // broker may have opened the position, but we cannot reconcile it afterward.
+    if (!brokerOrderId) return { ok: false, uncertain: true, error: "broker_ack_missing_order_id" };
+    return { ok: true, brokerOrderId };
   } catch (error) {
-    return { ok: false, error: `broker_request_failed: ${error.message}` };
+    // The request may have reached the broker before the connection failed. Never
+    // turn this into a retryable FAILED order: that can duplicate a real position.
+    return { ok: false, uncertain: true, error: `broker_request_uncertain: ${error.message}` };
   }
 }
 
@@ -9280,12 +10037,12 @@ async function closeBrokerPosition(credentials, positionId) {
       body: JSON.stringify({ actionType: "POSITION_CLOSE_ID", positionId: String(positionId) }),
       signal: AbortSignal.timeout(15000),
     });
-    const data = await response.json().catch(() => ({}));
+    const data = await readResponseJsonLimited(response).catch(() => ({}));
     if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
     if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
     return { ok: true };
   } catch (error) {
-    return { ok: false, error: `broker_request_failed: ${error.message}` };
+    return { ok: false, uncertain: true, error: `broker_request_uncertain: ${error.message}` };
   }
 }
 
@@ -9305,7 +10062,7 @@ async function modifyBrokerPositionStopLoss(credentials, positionId, newStopLoss
       body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: String(positionId), stopLoss: newStopLoss }),
       signal: AbortSignal.timeout(15000),
     });
-    const data = await response.json().catch(() => ({}));
+    const data = await readResponseJsonLimited(response).catch(() => ({}));
     if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
     if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
     return { ok: true };
@@ -9333,7 +10090,7 @@ async function modifyBrokerPositionTakeProfit(credentials, positionId, newTakePr
       body: JSON.stringify({ actionType: "POSITION_MODIFY", positionId: String(positionId), takeProfit: newTakeProfit }),
       signal: AbortSignal.timeout(15000),
     });
-    const data = await response.json().catch(() => ({}));
+    const data = await readResponseJsonLimited(response).catch(() => ({}));
     if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
     if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
     return { ok: true };
@@ -9350,7 +10107,7 @@ async function modifyBrokerPositionTakeProfit(credentials, positionId, newTakePr
 // button. Case B (no broker TP) has no open-time equivalent -- it can only
 // ever be triggered live, once price actually reaches the halfway point, see
 // checkTrailingStops.
-async function secureHalfForOrder(order, orderRow, credentials) {
+async function secureHalfForOrderUnlocked(order, orderRow, credentials) {
   const buy = order.direction === "ACHAT";
   const brokerPrice = await getBrokerCurrentPrice(credentials, order.pair).catch(() => null);
   if (!brokerPrice) return { status: 502, body: { ok: false, error: "broker_price_unavailable" } };
@@ -9370,7 +10127,7 @@ async function secureHalfForOrder(order, orderRow, credentials) {
       };
     }
     const result = await modifyBrokerPositionTakeProfit(credentials, order.brokerOrderId, halfTp);
-    if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: result.error } };
+    if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: publicBrokerError(result.error) } };
     await sqlRun(`UPDATE trade_orders SET tp1 = ?, half_target_secured = 1 WHERE id = ?`, [halfTp, order.id]);
     return { status: 200, body: { ok: true, mode: "tp_halved", newTakeProfit: halfTp } };
   }
@@ -9396,9 +10153,33 @@ async function secureHalfForOrder(order, orderRow, credentials) {
     return { status: 409, body: { ok: false, error: "already_secured_more", message: "Le stop suiveur protège déjà plus que la moitié du profit actuel -- rien à faire." } };
   }
   const result = await modifyBrokerPositionStopLoss(credentials, order.brokerOrderId, halfLockStop);
-  if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: result.error } };
+  if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: publicBrokerError(result.error) } };
   await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ?, half_target_secured = 1 WHERE id = ?`, [halfLockStop, currentPrice, order.id]);
   return { status: 200, body: { ok: true, mode: "stop_locked_half_profit", newStopLoss: halfLockStop } };
+}
+
+async function secureHalfForOrder(order, orderRow, credentials) {
+  const leaseToken = await tryAcquireTradeOperationLease(order.id, "position-modify");
+  if (!leaseToken) {
+    return { status: 409, body: { ok: false, error: "position_operation_in_progress" } };
+  }
+  try {
+    const latestRow = await sqlGet(
+      `SELECT o.*, a.source as source FROM trade_orders o LEFT JOIN analyses a ON a.id = o.analysis_id WHERE o.id = ? AND o.user_id = ?`,
+      [order.id, order.userId],
+    );
+    const latestOrder = rowToTradeOrder(latestRow);
+    if (!latestOrder || latestOrder.status !== "SENT" || !latestOrder.brokerOrderId) {
+      return { status: 409, body: { ok: false, error: "order_not_open" } };
+    }
+    if (Number(latestRow.half_target_secured) === 1) {
+      return { status: 409, body: { ok: false, error: "already_secured_more" } };
+    }
+    return await secureHalfForOrderUnlocked(latestOrder, latestRow, credentials);
+  } finally {
+    await releaseTradeOperationLease(order.id, "position-modify", leaseToken).catch((error) =>
+      logOnce(`position-lease-release-${order.id}`, "libération du verrou de modification échouée (" + error.message + ")"));
+  }
 }
 
 // The one function in this feature that can actually move money -- shared by
@@ -9407,7 +10188,7 @@ async function secureHalfForOrder(order, orderRow, credentials) {
 // credentials = the user's own connected broker). Every guard below applies
 // identically to both paths; extracted here specifically so the autonomous path
 // can never accidentally skip one by duplicating this logic instead of calling it.
-async function confirmAndSendOrder({ orderId, userId, volume, credentials = null }) {
+async function confirmAndSendOrder({ orderId, userId, volume, credentials = null, brokerSlot = null }) {
   await ensureRelationalTables();
   // A double-click or a client retry firing two confirms for the same order used to
   // both read PENDING_CONFIRMATION (the status only flips after sendOrderToBroker
@@ -9434,6 +10215,7 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     const ageMinutes = (Date.now() - new Date(order.createdAt).getTime()) / 60000;
     if (ageMinutes > ORDER_EXPIRY_MINUTES) {
       await sqlRun(`UPDATE trade_orders SET status = 'CANCELLED' WHERE id = ?`, [order.id]);
+      await sqlRun("DELETE FROM trade_prepare_claims WHERE order_id = ?", [order.id]);
       return { status: 409, body: { ok: false, error: "order_expired", expiryMinutes: ORDER_EXPIRY_MINUTES } };
     }
     // An order is a market order (executes at whatever the price is right now, not
@@ -9496,26 +10278,43 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     // send to a broker in a single day, so a UI bug or a confused user (or a runaway
     // autonomous cycle) can't fire off far more real trades than anyone intended
     // before anyone notices.
-    const todayStart = new Date(); todayStart.setUTCHours(0, 0, 0, 0);
-    const sentToday = await sqlGet(
-      `SELECT COUNT(*) as n FROM trade_orders WHERE user_id = ? AND confirmed_at >= ? AND status IN ('SENT', 'FAILED')`,
-      [userId, todayStart.toISOString()],
-    );
     const dailyOrderCap = await getTradeDailyOrderCap();
-    if (Number(sentToday?.n || 0) >= dailyOrderCap) {
-      return { status: 429, body: { ok: false, error: "daily_order_cap_reached", cap: dailyOrderCap } };
-    }
     order.volume = volume;
     order.confirmedAt = new Date().toISOString();
+    // The per-user file lock protects requests inside one process only. This
+    // conditional update is the cross-process/replica guard: exactly one
+    // confirmer can claim PENDING_CONFIRMATION before the broker call.
+    const claim = await sqlRun(
+      `UPDATE trade_orders SET volume = ?, broker_slot = ?, status = 'SENDING', confirmed_at = ?
+       WHERE id = ? AND user_id = ? AND status = 'PENDING_CONFIRMATION'`,
+      [order.volume, brokerSlot, order.confirmedAt, order.id, userId],
+    );
+    const claimedRows = Number(pgPool ? claim.rowCount : claim.changes);
+    if (claimedRows !== 1) return { status: 400, body: { ok: false, error: 'order_not_pending' } };
+    if (!(await consumeTradeDailySlot(userId, dailyOrderCap))) {
+      await sqlRun(`UPDATE trade_orders SET status = 'FAILED', error_message = ? WHERE id = ? AND status = 'SENDING'`, ["daily_order_cap_reached", order.id]);
+      await sqlRun("DELETE FROM trade_prepare_claims WHERE order_id = ?", [order.id]);
+      return { status: 429, body: { ok: false, error: "daily_order_cap_reached", cap: dailyOrderCap } };
+    }
+    order.brokerSlot = brokerSlot || order.brokerSlot;
     const broker = await sendOrderToBroker(order, credentials);
-    order.status = broker.ok ? "SENT" : "FAILED";
+    order.status = broker.ok ? "SENT" : broker.uncertain ? "DELIVERY_UNKNOWN" : "FAILED";
     order.brokerOrderId = broker.ok ? broker.brokerOrderId : null;
-    order.errorMessage = broker.ok ? null : broker.error;
+    order.errorMessage = broker.ok ? null : broker.uncertain ? "broker_delivery_uncertain" : publicBrokerError(broker.error);
     order.sentAt = broker.ok ? new Date().toISOString() : null;
-    await sqlRun(
-      `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ?`,
+    const finalUpdate = await sqlRun(
+      `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ? AND status = 'SENDING'`,
       [order.volume, order.status, order.brokerOrderId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
     );
+    if (Number(pgPool ? finalUpdate.rowCount : finalUpdate.changes) !== 1) {
+      // Another instance may have moved SENDING to DELIVERY_UNKNOWN while this
+      // broker call was still in flight. Never overwrite that safer state with a
+      // late SENT/FAILED response from this instance.
+      const persistedOrder = rowToTradeOrder(await sqlGet("SELECT * FROM trade_orders WHERE id = ?", [order.id]));
+      return { status: 502, body: { ok: false, error: "broker_delivery_uncertain", order: persistedOrder || order } };
+    }
+    if (!broker.ok && !broker.uncertain) await sqlRun("DELETE FROM trade_prepare_claims WHERE order_id = ?", [order.id]);
+
     // Fire-and-forget, same reasoning as notifyAnalysisClosed: a push send is a
     // network call to an external provider, no reason to hold the per-user
     // trade-confirm lock open for it. Covers both paths that reach this function
@@ -9543,18 +10342,21 @@ async function getBrokerCurrentPrice(credentials, pair) {
   const symbol = String(pair).replace("/", "");
   const response = await fetch(`https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/symbols/${symbol}/current-price`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(15000) });
   if (!response.ok) throw new Error(`broker_http_${response.status}`);
-  const data = await response.json();
+  const data = await readResponseJsonLimited(response);
   const bid = Number(data?.bid), ask = Number(data?.ask);
   if (!Number.isFinite(bid) || !Number.isFinite(ask)) throw new Error("invalid_price");
   return { bid, ask };
 }
 
 async function getBrokerAccountInformation(credentials) {
+  if (MOCK_BROKER_ENABLED) {
+    return { balance: 10000, equity: 10000, currency: "USD" };
+  }
   const region = credentials.region || "new-york";
   const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/account-information`;
   const response = await fetch(url, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(15000) });
   if (!response.ok) throw new Error(`broker_http_${response.status}`);
-  const data = await response.json();
+  const data = await readResponseJsonLimited(response);
   const balance = Number(data?.balance);
   if (!Number.isFinite(balance)) throw new Error("invalid_account_information");
   return { balance, equity: Number(data?.equity), currency: data?.currency || null };
@@ -9576,8 +10378,8 @@ async function getBrokerSymbolSpecification(credentials, pair) {
   ]);
   if (!specResponse.ok) throw new Error(`broker_http_${specResponse.status}`);
   if (!priceResponse.ok) throw new Error(`broker_http_${priceResponse.status}`);
-  const spec = await specResponse.json();
-  const price = await priceResponse.json();
+  const spec = await readResponseJsonLimited(specResponse);
+  const price = await readResponseJsonLimited(priceResponse);
   const tickSize = Number(spec?.tickSize);
   const lossTickValue = Number(price?.lossTickValue);
   if (!Number.isFinite(tickSize) || tickSize <= 0 || !Number.isFinite(lossTickValue) || lossTickValue <= 0) {
@@ -9647,7 +10449,7 @@ function brokerApiBase(credentials) {
 async function getBrokerOpenPositions(credentials) {
   const res = await fetch(`${brokerApiBase(credentials)}/positions`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(10000) });
   if (!res.ok) return null;
-  const positions = await res.json();
+  const positions = await readResponseJsonLimited(res);
   return Array.isArray(positions) ? positions : null;
 }
 
@@ -9659,7 +10461,7 @@ async function getBrokerPositionOutcome(credentials, positionId) {
   }
   const dealsRes = await fetch(`${brokerApiBase(credentials)}/history-deals/position/${positionId}`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(10000) });
   if (!dealsRes.ok) return null;
-  const deals = await dealsRes.json();
+  const deals = await readResponseJsonLimited(dealsRes);
   if (!Array.isArray(deals)) return null;
   const closingDeal = deals.find((deal) => deal.entryType === "DEAL_ENTRY_OUT");
   if (!closingDeal) return null; // position not open, but no closing deal found yet -- treat as unresolved, try again next tick
@@ -9850,8 +10652,9 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
     credentialsCache.set(cacheKey, await getUserBrokerCredentials(brokerOrder.user_id, slot).catch(() => null));
   }
   const credentials = credentialsCache.get(cacheKey);
-  if (!credentials) return null;
+  if (!credentials) return { brokerUnavailable: true };
   const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
+  if (!brokerOutcome) return { brokerUnavailable: true };
   if (brokerOutcome?.status === "still_open") return { stillOpen: true }; // confirmed still live at the broker -- no 24h EXPIRED fallback needed, this is authoritative
   if (brokerOutcome?.status === "closed") {
     const brokerStatus = brokerOutcome.reason === "DEAL_REASON_SL" ? "SL_HIT"
@@ -9890,7 +10693,7 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
     await sqlRun(`UPDATE trade_orders SET status = 'CLOSED' WHERE analysis_id = ? AND status = 'SENT'`, [analysis.id]);
     return { closed: true };
   }
-  return null; // broker query failed (e.g. temporarily unreachable) -- caller falls through rather than leaving the row stuck unevaluated
+  return { brokerUnavailable: true }; // never simulate a broker-backed position while its real broker state is unknown
 }
 
 // Broker-backed positions used to only ever get reconciled on the same 90s tick as
@@ -9907,8 +10710,11 @@ let brokerReconcileInFlight = false;
 async function reconcileBrokerBackedOutcomes() {
   if (brokerReconcileInFlight) return; // previous run still mid-flight (slow broker response) -- skip this tick rather than pile up overlapping calls to the same positions
   brokerReconcileInFlight = true;
+  let schedulerLeaseToken = null;
   const justClosed = [];
   try {
+    schedulerLeaseToken = await tryAcquireSchedulerLease("broker-reconcile");
+    if (!schedulerLeaseToken) return;
     await withFileLock("learning-log", async () => {
       await ensureRelationalTables();
       const brokerOrderRows = await sqlAll(
@@ -9924,16 +10730,19 @@ async function reconcileBrokerBackedOutcomes() {
         if (!brokerOrderByAnalysisId.has(row.id)) continue; // not broker-backed -- the slower full tick still owns these
         const analysis = rowToAnalysis(row);
         const result = await tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, credentialsCache);
+        if (result?.brokerUnavailable) continue;
         if (result?.closed && analysis.userId && !analysis.isTest) justClosed.push(analysis);
       }
     });
   } finally {
+    await releaseSchedulerLease("broker-reconcile", schedulerLeaseToken).catch((error) =>
+      logOnce("broker-reconcile-lease-release", "libération du verrou réconciliation échouée (" + error.message + ")"));
     brokerReconcileInFlight = false;
   }
   for (const analysis of justClosed) notifyAnalysisClosed(analysis).catch(() => {});
 }
 
-const BROKER_RECONCILE_INTERVAL_MS = Number(env.BROKER_RECONCILE_INTERVAL_SECONDS || 15) * 1000;
+const BROKER_RECONCILE_INTERVAL_MS = boundedEnvNumber(env.BROKER_RECONCILE_INTERVAL_SECONDS, 15, 5, 3600) * 1000;
 
 function startBrokerReconcileScheduler() {
   setInterval(() => {
@@ -9950,16 +10759,55 @@ function startBrokerReconcileScheduler() {
 // for a close that already happened. Narrow and cheap on purpose (only
 // source='auto_scalp' rows, one broker call per timed-out position) so it's
 // safe to run often.
-const SCALP_TIMEOUT_INTERVAL_MS = Number(env.SCALP_TIMEOUT_INTERVAL_SECONDS || 10) * 1000;
+// A process crash after the broker request starts can leave an order in SENDING
+// with no broker id. Never resend it: the broker may already own the position.
+// After the broker timeout window, make the ambiguity explicit and keep the order
+// non-clearable/non-preparable until an operator reconciles it externally.
+const SENDING_RECOVERY_INTERVAL_MS = boundedEnvNumber(env.SENDING_RECOVERY_INTERVAL_SECONDS, 60, 30, 3600) * 1000;
+const SENDING_RECOVERY_AFTER_MS = boundedEnvNumber(env.SENDING_RECOVERY_AFTER_SECONDS, 120, 60, 86400) * 1000;
+let sendingRecoveryInFlight = false;
+
+async function recoverStaleSendingOrders() {
+  if (sendingRecoveryInFlight) return;
+  sendingRecoveryInFlight = true;
+  let schedulerLeaseToken = null;
+  try {
+    schedulerLeaseToken = await tryAcquireSchedulerLease("sending-recovery");
+    if (!schedulerLeaseToken) return;
+    await ensureRelationalTables();
+    const cutoff = new Date(Date.now() - SENDING_RECOVERY_AFTER_MS).toISOString();
+    const rows = await sqlAll("SELECT id FROM trade_orders WHERE status = 'SENDING' AND confirmed_at IS NOT NULL AND confirmed_at < ?", [cutoff]);
+    for (const row of rows) {
+      const result = await sqlRun("UPDATE trade_orders SET status = 'DELIVERY_UNKNOWN', error_message = ? WHERE id = ? AND status = 'SENDING'", ["broker_delivery_uncertain", row.id]);
+      if (Number(pgPool ? result.rowCount : result.changes) === 1) {
+        logOnce("sending-recovery-" + row.id, "ordre " + row.id + " marque DELIVERY_UNKNOWN: livraison broker incertaine");
+      }
+    }
+  } finally {
+    await releaseSchedulerLease("sending-recovery", schedulerLeaseToken).catch((error) => logOnce("sending-recovery-release", "liberation du verrou de recuperation echouee (" + error.message + ")"));
+    sendingRecoveryInFlight = false;
+  }
+}
+
+function startSendingRecoveryScheduler() {
+  const tick = () => recoverStaleSendingOrders().catch((error) => logOnce("sending-recovery", "recuperation des ordres SENDING echouee (" + error.message + ")"));
+  tick();
+  setInterval(tick, SENDING_RECOVERY_INTERVAL_MS);
+}
+
+const SCALP_TIMEOUT_INTERVAL_MS = boundedEnvNumber(env.SCALP_TIMEOUT_INTERVAL_SECONDS, 10, 5, 3600) * 1000;
 let scalpTimeoutInFlight = false;
 
 async function checkScalpTimeouts() {
   if (scalpTimeoutInFlight) return;
   scalpTimeoutInFlight = true;
+  let schedulerLeaseToken = null;
   try {
+    schedulerLeaseToken = await tryAcquireSchedulerLease("scalp-timeouts");
+    if (!schedulerLeaseToken) return;
     await ensureRelationalTables();
     const rows = await sqlAll(
-      `SELECT a.id as analysis_id, a.user_id as user_id, a.broker_slot as broker_slot, o.broker_order_id as broker_order_id, o.sent_at as sent_at, o.scalp_max_hold_seconds as scalp_max_hold_seconds
+      `SELECT a.id as analysis_id, a.user_id as user_id, a.broker_slot as broker_slot, o.id as order_id, o.broker_order_id as broker_order_id, o.sent_at as sent_at, o.scalp_max_hold_seconds as scalp_max_hold_seconds
        FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
        WHERE a.status = 'OPEN' AND a.source = 'auto_scalp' AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL AND o.sent_at IS NOT NULL`,
       [],
@@ -9977,14 +10825,30 @@ async function checkScalpTimeouts() {
       }
       const credentials = credentialsCache.get(cacheKey);
       if (!credentials) continue;
-      // Not resolved here -- just asks the broker to close it; the existing fast
-      // reconcile scheduler picks up the resulting close (real price, real
-      // profit) on its own very next tick, same as any other close.
-      await closeBrokerPosition(credentials, row.broker_order_id).catch((error) => {
-        logOnce(`scalp-timeout-${row.analysis_id}`, `fermeture scalp échouée (${error.message})`);
-      });
+      const positionLeaseToken = await tryAcquireTradeOperationLease(row.order_id, "position-modify").catch(() => null);
+      if (!positionLeaseToken) continue;
+      try {
+        const latestRow = await sqlGet(
+          `SELECT o.status, o.broker_order_id, o.sent_at, o.scalp_max_hold_seconds, a.status as analysis_status
+           FROM trade_orders o JOIN analyses a ON a.id = o.analysis_id
+           WHERE o.id = ?`,
+          [row.order_id],
+        ).catch(() => null);
+        if (!latestRow || latestRow.status !== "SENT" || latestRow.analysis_status !== "OPEN" || String(latestRow.broker_order_id) !== String(row.broker_order_id)) continue;
+        const latestHeldSeconds = (Date.now() - new Date(latestRow.sent_at).getTime()) / 1000;
+        if (latestHeldSeconds < (Number(latestRow.scalp_max_hold_seconds) || 0)) continue;
+        const result = await closeBrokerPosition(credentials, latestRow.broker_order_id);
+        if (!result.ok) {
+          logOnce(`scalp-timeout-${row.analysis_id}`, `fermeture scalp échouée (${result.error})`);
+        }
+      } finally {
+        await releaseTradeOperationLease(row.order_id, "position-modify", positionLeaseToken).catch((error) =>
+          logOnce(`position-lease-release-${row.order_id}`, "libération du verrou de modification échouée (" + error.message + ")"));
+      }
     }
   } finally {
+    await releaseSchedulerLease("scalp-timeouts", schedulerLeaseToken).catch((error) =>
+      logOnce("scalp-timeout-lease-release", "libération du verrou timeout scalp échouée (" + error.message + ")"));
     scalpTimeoutInFlight = false;
   }
 }
@@ -10016,7 +10880,7 @@ function computeTrailingStopPrice(entry, direction, risk, bestFavorablePrice, pa
   return buy ? Math.max(breakevenStop, trailedStop) : Math.min(breakevenStop, trailedStop);
 }
 
-const TRAILING_STOP_INTERVAL_MS = Number(env.TRAILING_STOP_INTERVAL_SECONDS || 15) * 1000;
+const TRAILING_STOP_INTERVAL_MS = boundedEnvNumber(env.TRAILING_STOP_INTERVAL_SECONDS, 15, 5, 3600) * 1000;
 let trailingStopInFlight = false;
 
 // Which staged-trailing-stop params (if any) apply to an open position, keyed
@@ -10033,7 +10897,10 @@ function trailingStopParamsFor(source, pair) {
 async function checkTrailingStops() {
   if (trailingStopInFlight) return;
   trailingStopInFlight = true;
+  let schedulerLeaseToken = null;
   try {
+    schedulerLeaseToken = await tryAcquireSchedulerLease("trailing-stops");
+    if (!schedulerLeaseToken) return;
     await ensureRelationalTables();
     const rows = await sqlAll(
       `SELECT a.id as analysis_id, a.user_id as user_id, a.pair as pair, a.direction as direction, a.entry as entry, a.sl as sl, a.broker_slot as broker_slot, a.source as source,
@@ -10063,6 +10930,20 @@ async function checkTrailingStops() {
       }
       const credentials = credentialsCache.get(cacheKey);
       if (!credentials) continue;
+      const positionLeaseToken = await tryAcquireTradeOperationLease(row.order_id, "position-modify").catch(() => null);
+      if (!positionLeaseToken) continue;
+      try {
+      const latestOrderRow = await sqlGet(
+        `SELECT status, broker_order_id, trailing_stop_price, best_favorable_price, tp1, tp2, half_target_secured FROM trade_orders WHERE id = ?`,
+        [row.order_id],
+      ).catch(() => null);
+      if (!latestOrderRow || latestOrderRow.status !== "SENT" || String(latestOrderRow.broker_order_id) !== String(row.broker_order_id)) continue;
+      Object.assign(row, latestOrderRow);
+      const latestAccountRow = await sqlGet(
+        `SELECT secure_half_priority_enabled FROM auto_trading_accounts WHERE user_id = ?`,
+        [row.user_id],
+      ).catch(() => null);
+      if (latestAccountRow) row.secure_half_priority_enabled = latestAccountRow.secure_half_priority_enabled;
       // Broker-direct price, not getAnalysisPrice -- see getBrokerCurrentPrice's
       // own comment for why: this needs the exact price the broker will itself
       // validate the modify request against, not the (potentially minutes-stale)
@@ -10126,7 +11007,7 @@ async function checkTrailingStops() {
         }
         continue;
       }
-      const result = await modifyBrokerPositionStopLoss(credentials, row.broker_order_id, candidateStop).catch((error) => ({ ok: false, error: error.message }));
+      const result = await modifyBrokerPositionStopLoss(credentials, row.broker_order_id, candidateStop).catch((error) => ({ ok: false, error: "broker_operation_failed", message: publicBrokerError(error.message) }));
       if (result.ok) {
         await sqlRun(
           `UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ?${justSecuredHalf ? ", half_target_secured = 1" : ""} WHERE id = ?`,
@@ -10135,8 +11016,14 @@ async function checkTrailingStops() {
       } else {
         logOnce(`trailing-${row.analysis_id}`, `déplacement du stop suiveur échoué (${result.error})`);
       }
+      } finally {
+        await releaseTradeOperationLease(row.order_id, "position-modify", positionLeaseToken).catch((error) =>
+          logOnce(`position-lease-release-${row.order_id}`, "libération du verrou de modification échouée (" + error.message + ")"));
+      }
     }
   } finally {
+    await releaseSchedulerLease("trailing-stops", schedulerLeaseToken).catch((error) =>
+      logOnce("trailing-lease-release", "libération du verrou trailing échouée (" + error.message + ")"));
     trailingStopInFlight = false;
   }
 }
@@ -10148,6 +11035,9 @@ function startTrailingStopScheduler() {
 }
 
 async function updateLearningOutcomes(prices = null, histories = null) {
+  const schedulerLeaseToken = await tryAcquireSchedulerLease("learning-outcomes");
+  if (!schedulerLeaseToken) return loadLearningLog();
+  try {
   // Only OPEN+active rows are pulled here (an indexed WHERE, not a full-table load
   // like the old load-mutate-save-whole-blob version), and only the rows that
   // actually resolve this tick get written. Still wrapped in the lock: two overlapping
@@ -10170,7 +11060,7 @@ async function updateLearningOutcomes(prices = null, histories = null) {
         const analysis = rowToAnalysis(row);
 
         const brokerResult = await tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, credentialsCache);
-        if (brokerResult?.stillOpen) continue;
+        if (brokerResult?.stillOpen || brokerResult?.brokerUnavailable) continue;
         if (brokerResult?.closed) {
           if (analysis.userId && !analysis.isTest) justClosed.push(analysis);
           continue;
@@ -10220,6 +11110,10 @@ async function updateLearningOutcomes(prices = null, histories = null) {
   // shouldn't delay other callers waiting on the same lock.
   for (const analysis of justClosed) notifyAnalysisClosed(analysis).catch(() => {});
   return result;
+  } finally {
+    await releaseSchedulerLease("learning-outcomes", schedulerLeaseToken).catch((error) =>
+      logOnce("learning-lease-release", "libération du verrou apprentissage échouée (" + error.message + ")"));
+  }
 }
 
 // Real push notification (Web Push API), not a stub -- see pushConfigured near the
@@ -10887,8 +11781,26 @@ async function serveStatic(res, pathname, req = null) {
     if (pathname === "/dashboard.html" && !session) return sendRedirect(res, "/login");
     if ((pathname === "/login.html" || pathname === "/signup.html") && session) return sendRedirect(res, "/dashboard");
   }
-  const safe = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, "");
-  let file = join(root, pathname === "/" ? "index.html" : safe);
+  let decodedPathname;
+  try {
+    decodedPathname = decodeURIComponent(pathname);
+  } catch {
+    await send404Page(res);
+    return;
+  }
+  const relativePath = normalize(decodedPathname).replace(/^[/\\]+/, "");
+  const rootPath = resolve(root);
+  let file = resolve(rootPath, pathname === "/" ? "index.html" : relativePath);
+  const normalizedRoot = rootPath.toLowerCase();
+  const normalizedFile = file.toLowerCase();
+  const publicDeniedPath = /^(?:server\.mjs|secret(?:\.[^/\\]*)?|\.env(?:\.[^/\\]*)?|package(?:-lock)?\.json|data[/\\]|scripts[/\\]|server[/\\]|\.git[/\\]|\.github[/\\]|\.codex[/\\]|\.agents[/\\]|node_modules[/\\])/i;
+  if (
+    (normalizedFile !== normalizedRoot && !normalizedFile.startsWith(normalizedRoot + "\\")) ||
+    publicDeniedPath.test(relativePath)
+  ) {
+    await send404Page(res);
+    return;
+  }
   if (existsSync(file) && statSync(file).isDirectory()) file = join(root, "index.html");
   if (!existsSync(file) && !extname(file)) file = join(root, "index.html");
   if (!existsSync(file) || statSync(file).isDirectory()) {

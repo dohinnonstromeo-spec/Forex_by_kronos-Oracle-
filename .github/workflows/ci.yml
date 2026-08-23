@@ -18,6 +18,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Syntax check server and scripts
         run: |
           node --check server.mjs
@@ -69,7 +72,7 @@ jobs:
             echo "$name OK"
           }
           check "Homepage" "http://127.0.0.1:4174/"
-          check "/api/health" "http://127.0.0.1:4174/api/health"
+          check "/api/ready" "http://127.0.0.1:4174/api/ready"
           check "/api/signals" "http://127.0.0.1:4174/api/signals"
           check "/api/analyze-chart" "http://127.0.0.1:4174/api/analyze-chart" \
             -X POST -H "Content-Type: application/json" \
@@ -88,4 +91,7 @@ jobs:
       # have them; the rest (signup validation, login rejection, password-reset
       # enumeration safety) still run for real.
       - name: Auth/quota/admin integration tests
-        run: node --test scripts/api-tests.mjs
+        run: node --test --test-concurrency=1 scripts/api-tests.mjs
+
+      - name: Trading safety regression checks
+        run: node scripts/safety-checks.mjs

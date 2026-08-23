@@ -3,7 +3,7 @@
   // default HTML -- the default is always the fallback, this only ever overwrites
   // elements that carry a matching data-cms="key" attribute. No overrides = no
   // change, byte-for-byte identical to what's already on the page.
-  fetch("/api/site-content")
+  fetch("/api/site-content", { signal: AbortSignal.timeout(5000) })
     .then((res) => res.json())
     .then((data) => {
       if (!data?.ok) return;

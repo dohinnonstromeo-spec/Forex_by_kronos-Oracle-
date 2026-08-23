@@ -25,7 +25,10 @@
     setInterval(updateSignalScores, 5 * 60 * 1000);
   }
 
+  let pricesRefreshInFlight = false;
   async function updatePrices() {
+    if (pricesRefreshInFlight) return;
+    pricesRefreshInFlight = true;
     const data = await getJson("/api/prices", 9000);
     if (!data?.prices) {
       const market = await getJson("/api/market-status", 5000);
@@ -45,14 +48,19 @@
         renderLiveComment(symbol, previous, next.price);
       }
     }
+    pricesRefreshInFlight = false;
   }
 
+  let signalsRefreshInFlight = false;
   async function updateSignals() {
+    if (signalsRefreshInFlight) return;
+    signalsRefreshInFlight = true;
     const data = await getJson("/api/signals", 18000);
     const signals = Array.isArray(data?.signals) ? data.signals : [];
     if (!signals.length) {
       const market = data?.market || await getJson("/api/market-status", 5000);
       updateMarketBanner(market, state.prices, "Signaux en synchronisation");
+      signalsRefreshInFlight = false;
       return;
     }
     state.signals = signals;
@@ -61,9 +69,13 @@
     updateMarketBanner(data.market, state.prices);
     renderSignals(signals);
     updateCountdowns();
+    signalsRefreshInFlight = false;
   }
 
+  let signalScoresRefreshInFlight = false;
   async function updateSignalScores() {
+    if (signalScoresRefreshInFlight) return;
+    signalScoresRefreshInFlight = true;
     // Concurrent, not one-at-a-time -- a sequential loop meant later cards visibly
     // updated their score noticeably after earlier ones on every refresh, an
     // avoidable staggered pop-in with no ordering requirement between signals.
@@ -90,6 +102,7 @@
         badgeEl.className = `kronos-status ${Number(score.score) < 40 ? "danger" : ""}`;
       }
     }));
+    signalScoresRefreshInFlight = false;
   }
 
   // Anchored on data-market-row/-price/-change instead of the row's visual Tailwind
@@ -314,7 +327,7 @@
         .filter((price) => price?.source && price.source !== "static_fallback")
         .map((price) => sourceLabel(price.source)))].slice(0, 3);
       const sourceText = sources.length ? sources.join(" · ") : "sources indisponibles";
-      marketHeader.innerHTML = `<span class="h-2 w-2 rounded-full ${anyLive ? "bg-neon-green" : "bg-neon-red"} pulse-dot"></span>${text} · ${sourceText}`;
+      marketHeader.innerHTML = `<span class="h-2 w-2 rounded-full ${anyLive ? "bg-neon-green" : "bg-neon-red"} pulse-dot"></span>${text} · ${escapeHtml(sourceText)}`;
     }
   }
 

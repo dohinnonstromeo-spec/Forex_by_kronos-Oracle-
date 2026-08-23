@@ -35,6 +35,9 @@ window.OracleIcons = {
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("[data-icon]").forEach((el) => {
     const markup = window.OracleIcons[el.dataset.icon];
-    if (markup) el.insertAdjacentHTML("afterbegin", markup);
+    if (markup) {
+      if (!el.textContent.trim()) el.setAttribute("aria-hidden", "true");
+      el.insertAdjacentHTML("afterbegin", markup);
+    }
   });
 });

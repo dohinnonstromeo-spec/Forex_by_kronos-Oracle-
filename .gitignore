@@ -10,3 +10,4 @@ data/*.db-shm
 backups/
 .venv-backtest/
 data-backtest/
+data/*.tmp

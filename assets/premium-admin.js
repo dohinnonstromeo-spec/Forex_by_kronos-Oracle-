@@ -3,6 +3,14 @@
   const message = document.querySelector("[data-premium-admin-message]");
   const members = document.querySelector("[data-premium-members]");
   const loadButton = document.querySelector("[data-load-members]");
+  const memberDrawer = document.querySelector("[data-member-drawer]");
+  const memberDetail = document.querySelector("[data-member-detail]");
+  const memberClose = document.querySelector("[data-member-close]");
+  const memberDrawerTitle = document.querySelector("[data-member-drawer-title]");
+  let lastMemberTrigger = null;
+  const memberSearch = document.querySelector("[data-member-search]");
+  const memberPlanFilter = document.querySelector("[data-member-plan-filter]");
+  let memberItems = [];
 
   // The token used to have to be retyped on every page load/navigation -- painful
   // now that the admin token is shared across two pages (this one and
@@ -21,27 +29,38 @@
 
   form?.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const submitButton = form.querySelector("button[type=\"submit\"]");
+    if (submitButton?.disabled) return;
+    submitButton.disabled = true;
     const body = Object.fromEntries(new FormData(form).entries());
     setMessage("Activation en cours...", false);
     const data = await adminFetch("/api/admin/grant-premium", body);
     if (!data?.ok) {
       setMessage(data?.message || data?.error || "Activation impossible.", true);
+      submitButton.disabled = false;
       return;
     }
     setMessage(data.message || "Premium activé.", false);
-    renderMembers([data.user]);
+    memberItems = [data.user, ...memberItems.filter((item) => item.email !== data.user.email)];
+    renderMemberDirectory();
+    submitButton.disabled = false;
   });
 
   loadButton?.addEventListener("click", async () => {
+    if (loadButton.disabled) return;
+    loadButton.disabled = true;
     const token = form?.elements?.token?.value || "";
     setMessage("Chargement des comptes...", false);
     const data = await adminFetch("/api/admin/members", null, token);
     if (!data?.ok) {
       setMessage(data?.message || data?.error || "Chargement impossible.", true);
+      loadButton.disabled = false;
       return;
     }
     setMessage(`${data.users.length} compte(s) chargé(s).`, false);
-    renderMembers(data.users);
+    memberItems = Array.isArray(data.users) ? data.users : [];
+    renderMemberDirectory();
+    loadButton.disabled = false;
   });
 
   async function adminFetch(url, body = null, explicitToken = "") {
@@ -56,7 +75,7 @@
       options.body = JSON.stringify(payload);
     }
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
       try {
         return await response.json();
       } catch {
@@ -72,10 +91,21 @@
     }
   }
 
+  function currentMemberItems() {
+    const query = String(memberSearch?.value || "").trim().toLocaleLowerCase();
+    const plan = memberPlanFilter?.value || "all";
+    return memberItems.filter((user) => {
+      const haystack = [user.name, user.email, user.role].map((value) => String(value || "").toLocaleLowerCase()).join(" ");
+      return (!query || haystack.includes(query)) && (plan === "all" || user.plan === plan);
+    });
+  }
+  function renderMemberDirectory() { renderMembers(currentMemberItems()); }
+  memberSearch?.addEventListener("input", renderMemberDirectory);
+  memberPlanFilter?.addEventListener("change", renderMemberDirectory);
   function renderMembers(items = []) {
     if (!members) return;
     if (!items.length) {
-      members.innerHTML = `<div class="dashboard-empty">Aucun compte à afficher.</div>`;
+      members.innerHTML = memberItems.length ? `<div class="dashboard-empty">Aucun compte ne correspond aux filtres.</div>` : `<div class="dashboard-empty">Aucun compte à afficher.</div>`;
       return;
     }
     const MEMBERS_VISIBLE = 5;
@@ -85,7 +115,7 @@
           <strong>${escapeHtml(user.name || "Compte")} · ${escapeHtml(user.email)}</strong>
           <span>${escapeHtml(user.role || "user")} · ${user.premiumUntil ? `Premium jusqu'au ${formatDate(user.premiumUntil)}` : "Free"} · ${user.manualPremium ? "Manuel" : "Standard"}</span>
         </div>
-        <div class="dashboard-history-levels">
+        <div class="dashboard-history-levels"><button type="button" data-member-details="${escapeHtml(user.id)}">Voir le dossier</button>
           <button type="button" data-revoke-premium="${escapeHtml(user.email)}" ${user.plan === "premium" ? "" : "disabled"}>Révoquer</button>
         </div>
         <span class="${user.plan === "premium" ? "history-open" : "history-blocked"}">${escapeHtml(user.plan || "free")}</span>
@@ -99,6 +129,7 @@
       members.querySelectorAll("[data-member-extra]").forEach((card) => card.removeAttribute("hidden"));
       this.remove();
     });
+    members.querySelectorAll("[data-member-details]").forEach((button) => { const userId = button.dataset.memberDetails; button.addEventListener("click", () => { lastMemberTrigger = button; loadMemberDetails(userId); }); });
     members.querySelectorAll("[data-revoke-premium]").forEach((button) => {
       button.addEventListener("click", async () => {
         const email = button.dataset.revokePremium;
@@ -117,17 +148,54 @@
           return;
         }
         setMessage(data.message || "Premium retiré.", false);
-        renderMembers(items.map((item) => (item.email === email ? { ...item, ...data.user } : item)));
+        memberItems = memberItems.map((item) => (item.email === email ? { ...item, ...data.user } : item));
+        renderMemberDirectory();
       });
     });
   }
 
+  memberClose?.addEventListener("click", closeMemberDetails);
+  memberDrawer?.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); closeMemberDetails(); } });
+  memberDrawer?.addEventListener("click", (event) => { if (event.target === memberDrawer) closeMemberDetails(); });
+  function closeMemberDetails() { if (memberDrawer) memberDrawer.hidden = true; if (lastMemberTrigger) lastMemberTrigger.focus(); }
+  async function loadMemberDetails(userId) {
+    const token = form?.elements?.token?.value || "";
+    if (!token || !userId || !memberDrawer || !memberDetail) { setMessage("Renseigne le token admin avant d ouvrir un dossier.", true); return; }
+    memberDrawer.hidden = false;
+    memberDrawer.focus();
+    if (memberDrawerTitle) memberDrawerTitle.textContent = "Chargement du dossier";
+    memberDetail.innerHTML = "<p class=\"health-empty\">Chargement du dossier client...</p>";
+    const data = await adminFetch("/api/admin/members/" + encodeURIComponent(userId), null, token);
+    if (!data?.ok) { memberDetail.innerHTML = "<p class=\"health-empty\">" + escapeHtml(data?.message || data?.error || "Dossier indisponible.") + "</p>"; return; }
+    renderMemberDetail(data);
+  }
+  function renderMemberDetail(data) {
+    const user = data.user || {}, account = data.account || {}, performance = data.performance || {}, trading = data.trading || {}, bot = data.autoTrade;
+    const analyses = Array.isArray(data.analyses) ? data.analyses : [], orders = Array.isArray(data.orders) ? data.orders : [];
+    if (memberDrawerTitle) memberDrawerTitle.textContent = "Dossier de " + (user.name || user.email || "ce compte");
+    const byPair = Array.isArray(data.byPair) ? data.byPair : [];
+    const pairRows = byPair.length ? byPair.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + Number(item.total || 0) + "</td><td>" + Number(item.wins || 0) + "</td><td>" + Number(item.losses || 0) + "</td><td>" + escapeHtml(formatNumber(item.net_r, "R")) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucune donnee par paire.</td></tr>";
+    const winRate = performance.wins + performance.losses ? Math.round((performance.wins / (performance.wins + performance.losses)) * 100) : 0;
+    const analysisRows = analyses.length ? analyses.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + escapeHtml(item.direction || "--") + "</td><td>" + escapeHtml(item.outcome || item.status || "--") + "</td><td>" + escapeHtml(formatNumber(item.r_multiple, "R")) + "</td><td>" + escapeHtml(formatDateTime(item.created_at)) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucune analyse enregistree.</td></tr>";
+    const orderRows = orders.length ? orders.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + escapeHtml(item.direction || "--") + "</td><td>" + escapeHtml(item.status || "--") + "</td><td>" + escapeHtml(item.broker_slot || "--") + "</td><td>" + escapeHtml(formatDateTime(item.created_at)) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucun ordre enregistre.</td></tr>";
+    const activity = [...analyses.map((item) => ({ kind: "Analyse", title: (item.pair || "--") + " � " + (item.direction || "--"), status: item.outcome || item.status || "--", at: item.created_at })), ...orders.map((item) => ({ kind: "Ordre", title: (item.pair || "--") + " � " + (item.direction || "--"), status: item.status || "--", at: item.created_at }))].sort((left, right) => new Date(right.at || 0) - new Date(left.at || 0)).slice(0, 12);
+    const activityRows = activity.length ? activity.map((item) => "<div class=\"member-timeline-item\"><span class=\"member-timeline-dot\" aria-hidden=\"true\"></span><div><strong>" + escapeHtml(item.kind + " � " + item.title) + "</strong><span>" + escapeHtml(item.status) + " � " + escapeHtml(formatDateTime(item.at)) + "</span></div></div>").join("") : "<p class=\"health-empty\">Aucune activite recente.</p>";
+    memberDetail.innerHTML = "<section class=\"member-profile-grid\"><div><span class=\"admin-stat-label\">Identite</span><strong>" + escapeHtml(user.name || "Compte") + "</strong><span>" + escapeHtml(user.email || "--") + "</span></div><div><span class=\"admin-stat-label\">Plan</span><strong>" + escapeHtml(user.plan || "free") + "</strong><span>Depuis " + escapeHtml(formatDateTime(account.createdAt)) + "</span></div><div><span class=\"admin-stat-label\">Derniere connexion</span><strong>" + escapeHtml(formatDateTime(account.lastLoginAt)) + "</strong><span>" + account.activeSessions + " session(s) active(s)</span></div></section>"
+      + "<section class=\"member-metric-grid\"><div><span>Winrate</span><strong>" + winRate + "%</strong></div><div><span>Gains cumules</span><strong>" + escapeHtml(formatNumber(performance.grossWinR, "R")) + "</strong></div><div><span>Pertes cumulees</span><strong>" + escapeHtml(formatNumber(performance.grossLossR, "R")) + "</strong></div><div><span>Net performance</span><strong>" + escapeHtml(formatNumber(performance.netR, "R")) + "</strong></div><div><span>Profit broker</span><strong>" + escapeHtml(formatNumber(performance.brokerProfit, "$")) + "</strong></div><div><span>Analyses ouvertes</span><strong>" + performance.open + "</strong></div><div><span>Ordres envoyes</span><strong>" + trading.sent + "</strong></div><div><span>Livraisons incertaines</span><strong class=\"" + (trading.uncertain ? "member-danger" : "") + "\">" + trading.uncertain + "</strong></div></section>"
+      + "<section class=\"member-detail-section\"><div class=\"admin-section-heading\"><h4>Robot Kronos</h4><span class=\"health-state\" data-state=\"" + (bot?.approvalStatus === "approved" ? "ok" : "warning") + "\">" + escapeHtml(bot?.approvalStatus || "Non configure") + "</span></div><p class=\"health-empty\">" + (bot ? "Paires : " + escapeHtml(bot.approvedPairs || "non precisees") + " � Risque : " + escapeHtml(formatNumber(bot.riskPercent, "%")) + " � Broker : " + escapeHtml(bot.brokerLastCheckStatus || "non verifie") : "Aucun compte robot configure.") + "</p></section>"
+      + "<section class=\"member-detail-section\"><h4>Dernieres analyses</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Direction</th><th>Resultat</th><th>R</th><th>Date</th></tr></thead><tbody>" + analysisRows + "</tbody></table></div></section>"
+      + "<section class=\"member-detail-section\"><h4>Performance par paire</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Analyses</th><th>Gains</th><th>Pertes</th><th>Net R</th></tr></thead><tbody>" + pairRows + "</tbody></table></div></section>"
+      + "<section class=\"member-detail-section\"><h4>Derniers ordres</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Direction</th><th>Statut</th><th>Broker</th><th>Date</th></tr></thead><tbody>" + orderRows + "</tbody></table></div></section>" + "<section class=\"member-detail-section\"><h4>Fil d activite recent</h4><div class=\"member-timeline\">" + activityRows + "</div></section>";
+  }
+  function formatDateTime(value) { if (!value) return "Jamais"; try { return new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); } catch { return "Date inconnue"; } }
+  function formatNumber(value, suffix = "") { const number = Number(value); return Number.isFinite(number) ? number.toFixed(2) + suffix : "--"; }
   const tradingStatus = document.querySelector("[data-trading-status]");
   const tradingRefresh = document.querySelector("[data-trading-refresh]");
   const tradingPause = document.querySelector("[data-trading-pause]");
   const tradingResume = document.querySelector("[data-trading-resume]");
   const tradingCapInput = document.querySelector("[data-trading-cap-input]");
   const tradingCapSave = document.querySelector("[data-trading-cap-save]");
+  const tradingUncertain = document.querySelector("[data-trading-uncertain]");
 
   function requireToken() {
     const token = form?.elements?.token?.value || "";
@@ -144,12 +212,26 @@
       return;
     }
     if (tradingStatus) {
-      tradingStatus.textContent = `${data.paused ? "⏸ EN PAUSE" : "▶ Actif"} · ${data.ordersConfirmedToday} ordre(s) envoyé(s) aujourd'hui (plafond ${data.dailyCapPerUser}/compte/jour) · Broker ${data.brokerConfigured ? "connecté" : "non connecté"}.`;
+      tradingStatus.textContent = `${data.paused ? "⏸ EN PAUSE" : "▶ Actif"} · ${data.ordersConfirmedToday} ordre(s) confirmé(s) aujourd'hui (plafond ${data.dailyCapPerUser}/compte/jour) · Broker ${data.brokerConfigured ? "connecté" : "non connecté"}.`;
     }
     if (tradingCapInput && document.activeElement !== tradingCapInput) tradingCapInput.value = data.dailyCapPerUser;
+    if (tradingUncertain) {
+      const orders = Array.isArray(data.deliveryUnknownOrders) ? data.deliveryUnknownOrders : [];
+      tradingUncertain.hidden = orders.length === 0;
+      tradingUncertain.innerHTML = orders.length
+        ? "<strong>Attention : " + orders.length + " ordre(s) à vérifier manuellement.</strong><br>Ne jamais renvoyer ces ordres avant vérification côté broker.<ul>"
+          + orders.map((order) => "<li>" + escapeHtml(order.userEmail || "Compte inconnu") + " · " + escapeHtml(order.pair) + " · " + escapeHtml(order.direction) + " · volume " + escapeHtml(order.volume ?? "—") + " · " + escapeHtml(order.brokerSlot || "slot inconnu") + " · confirmé le " + escapeHtml(formatDate(order.confirmedAt)) + "</li>").join("")
+          + "</ul>"
+        : "";
+    }
   }
 
-  tradingRefresh?.addEventListener("click", refreshTradingStatus);
+  tradingRefresh?.addEventListener("click", async () => {
+    if (tradingRefresh.disabled) return;
+    tradingRefresh.disabled = true;
+    await refreshTradingStatus();
+    tradingRefresh.disabled = false;
+  });
 
   tradingCapSave?.addEventListener("click", async () => {
     const token = requireToken();
@@ -159,6 +241,7 @@
       setMessage("Plafond invalide (1 à 200).", true);
       return;
     }
+    tradingCapSave.disabled = true;
     setMessage("Enregistrement du plafond...", false);
     const data = await adminFetch("/api/admin/trading-pause", { token, dailyOrderCap: cap });
     if (!data?.ok) {
@@ -182,9 +265,54 @@
     refreshTradingStatus();
   }
 
-  tradingPause?.addEventListener("click", () => setTradingPause(true));
-  tradingResume?.addEventListener("click", () => setTradingPause(false));
+  async function runTradingToggle(button, paused) {
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    await setTradingPause(paused);
+    button.disabled = false;
+  }
 
+  tradingPause?.addEventListener("click", () => runTradingToggle(tradingPause, true));
+  tradingResume?.addEventListener("click", () => runTradingToggle(tradingResume, false));
+
+  const adminOverviewRefresh = document.querySelector('[data-admin-overview-refresh]');
+  async function refreshAdminOverview() {
+    const token = form?.elements?.token?.value || '';
+    if (!token) { setMessage('Renseigne le token admin avant de charger la synthese.', true); return; }
+    if (adminOverviewRefresh) adminOverviewRefresh.disabled = true;
+    try {
+      const results = await Promise.all([
+        adminFetch('/api/admin/members', null, token),
+        adminFetch('/api/admin/trading-status', null, token),
+        adminFetch('/api/admin/auto-trade/requests', null, token),
+      ]);
+      const membersData = results[0], tradingData = results[1], requestsData = results[2];
+      if (!membersData?.ok || !tradingData?.ok || !requestsData?.ok) {
+        setAdminOverviewState('critical', 'Acces admin incomplet', 'Une ou plusieurs sources n ont pas repondu.');
+        setMessage('Synthese indisponible : verifie le token et les droits.', true);
+        return;
+      }
+      const users = Array.isArray(membersData.users) ? membersData.users : [];
+      const requests = Array.isArray(requestsData.requests) ? requestsData.requests : [];
+      const premium = users.filter((user) => user.plan === 'premium').length;
+      const pending = requests.filter((request) => request.approvalStatus === 'requested').length;
+      setAdminStat('members', users.length, 'Comptes charges');
+      setAdminStat('premium', premium, 'Acces Premium actifs');
+      setAdminStat('trading', tradingData.paused ? 'Pause' : 'Actif', tradingData.brokerConfigured ? 'Broker connecte' : 'Broker non connecte');
+      setAdminStat('requests', pending, pending ? 'A traiter en priorite' : 'Aucune demande en attente');
+      const uncertain = Array.isArray(tradingData.deliveryUnknownOrders) ? tradingData.deliveryUnknownOrders.length : 0;
+      const state = uncertain ? 'critical' : tradingData.paused || !tradingData.brokerConfigured ? 'warning' : 'ok';
+      const title = uncertain ? uncertain + ' ordre(s) a verifier' : tradingData.paused ? 'Trading en pause' : tradingData.brokerConfigured ? 'Systeme operationnel' : 'Broker non connecte';
+      const detail = uncertain ? 'Ne jamais renvoyer un ordre ambigu avant verification broker.' : pending ? pending + ' demande(s) robot attendent une revue.' : 'Les controles principaux sont a jour.';
+      setAdminOverviewState(state, title, detail);
+      setMessage('Synthese admin actualisee.', false);
+    } finally {
+      if (adminOverviewRefresh) adminOverviewRefresh.disabled = false;
+    }
+  }
+  function setAdminStat(key, value, meta) { const valueNode = document.querySelector('[data-admin-stat="' + key + '"]'); const metaNode = document.querySelector('[data-admin-stat-meta="' + key + '"]'); if (valueNode) valueNode.textContent = String(value); if (metaNode) metaNode.textContent = meta; }
+  function setAdminOverviewState(state, title, detail) { const chip = document.querySelector('[data-admin-overall-status]'); const alert = document.querySelector('[data-admin-alerts]'); if (chip) { chip.dataset.state = state; chip.textContent = title; } if (alert) { alert.dataset.state = state; const strong = alert.querySelector('strong'); const text = alert.querySelector('div span'); if (strong) strong.textContent = title; if (text) text.textContent = detail; } const sync = document.querySelector('[data-admin-last-sync]'); if (sync) sync.textContent = 'Derniere mise a jour : ' + new Date().toLocaleTimeString('fr-FR'); }
+  adminOverviewRefresh?.addEventListener('click', refreshAdminOverview);
   function setMessage(text, error) {
     if (!message) return;
     message.textContent = text;
@@ -300,15 +428,19 @@
   const autotradeRequests = document.querySelector("[data-autotrade-requests]");
 
   autotradeLoad?.addEventListener("click", async () => {
+    if (autotradeLoad.disabled) return;
+    autotradeLoad.disabled = true;
     const token = form?.elements?.token?.value || "";
     setMessage("Chargement des demandes...", false);
     const data = await adminFetch("/api/admin/auto-trade/requests", null, token);
     if (!data?.ok) {
       setMessage(data?.message || data?.error || "Chargement impossible.", true);
+      autotradeLoad.disabled = false;
       return;
     }
     setMessage(`${data.requests.length} demande(s) chargée(s).`, false);
     renderAutoTradeRequests(data.requests);
+    autotradeLoad.disabled = false;
   });
 
   function renderAutoTradeRequests(requests = []) {

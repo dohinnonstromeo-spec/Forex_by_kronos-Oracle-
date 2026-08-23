@@ -1,10 +1,11 @@
 User-agent: *
-Disallow: /premium-admin
-Disallow: /premium-admin.html
-Disallow: /admin-premium
-Disallow: /admin
+Allow: /
+Disallow: /dashboard
+Disallow: /admin-contenu
 Disallow: /admin-health
-Disallow: /admin-health.html
-Disallow: /api/
-
+Disallow: /premium-admin
+Disallow: /login.html
+Disallow: /signup.html
+Disallow: /forgot-password.html
+Disallow: /reset-password.html
 Sitemap: https://forex-by-kronos-oracle.onrender.com/sitemap.xml

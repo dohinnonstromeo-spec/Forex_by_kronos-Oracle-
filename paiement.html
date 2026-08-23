@@ -42,7 +42,8 @@
     </div>
   </nav>
 
-  <main class="oracle-main payment-main">
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main payment-main">
     <section class="payment-hero">
       <p class="analysis-kicker" data-cms="payment.hero.kicker">Activation premium</p>
       <h1 class="analysis-title" data-cms="payment.hero.title">S'abonner maintenant</h1>
@@ -63,7 +64,7 @@
           </ul>
         </div>
       </div>
-      <p class="payment-already-active" data-payment-status hidden data-cms="payment.already_active">Ton compte est déjà Premium — accès illimité actif, aucun paiement à refaire.</p>
+      <p class="payment-already-active" data-payment-status role="status" aria-live="polite" hidden data-cms="payment.already_active">Ton compte est déjà Premium — accès illimité actif, aucun paiement à refaire.</p>
     </section>
 
     <section class="payment-methods" aria-label="Modes de paiement" data-payment-form>

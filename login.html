@@ -12,6 +12,7 @@
   <meta name="description" content="Connectez-vous à votre espace Oracle Forex pour retrouver vos analyses Kronos." data-cms="login.seo.description">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
+  <meta name="robots" content="noindex, nofollow">
 </head>
 <body class="oracle-page auth-page">
   <nav class="oracle-nav">
@@ -28,12 +29,13 @@
     </div>
   </nav>
 
-  <main class="oracle-main auth-main">
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main auth-main">
     <section class="auth-card">
       <p class="analysis-kicker" data-cms="login.hero.kicker">Espace membre</p>
       <h1 class="analysis-title" data-cms="login.hero.title">Connexion</h1>
       <p class="analysis-subtitle" data-cms="login.hero.subtitle">Retrouvez votre dashboard, vos analyses et les prochains outils premium.</p>
-      <form class="auth-form" data-auth-form="login">
+      <form class="auth-form" data-auth-form="login" method="post">
         <label>Email<input name="email" type="email" autocomplete="email" required></label>
         <label>Mot de passe<input name="password" type="password" autocomplete="current-password" required></label>
         <button class="analysis-submit" type="submit" data-cms="login.submit_button">Se connecter</button>

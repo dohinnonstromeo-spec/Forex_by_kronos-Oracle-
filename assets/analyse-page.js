@@ -352,7 +352,10 @@
     document.querySelector(".refresh-signals")?.addEventListener("click", refreshSignals);
   }
 
+  let signalsRefreshInFlight = false;
   async function refreshSignals() {
+    if (signalsRefreshInFlight) return;
+    signalsRefreshInFlight = true;
     const data = await getJson("/api/signals", 18000);
     if (!data) {
       const market = await getJson("/api/market-status", 5000);
@@ -368,6 +371,7 @@
       return;
     }
     applySignalsPayload(data);
+    signalsRefreshInFlight = false;
   }
 
   // Shared by the initial fetch, the manual refresh button and every SSE
@@ -786,7 +790,7 @@
   function renderPreviews(container) {
     container.innerHTML = images.map((src, index) => `
       <div class="preview-item">
-        <img src="${src}" alt="Graphique uploadé ${index + 1}">
+        <img src="${src}" alt="Graphique uploadé ${index + 1}" loading="lazy" decoding="async">
         <button type="button" class="preview-remove" data-remove-image="${index}" aria-label="Supprimer le graphique ${index + 1}">×</button>
       </div>
     `).join("");

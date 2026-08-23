@@ -1,4 +1,10 @@
 (() => {
+  const CLIENT_REQUEST_TIMEOUT_MS = 30_000;
+
+  function fetchWithTimeout(url, options = {}) {
+    if (options.signal) return fetch(url, options);
+    return fetch(url, { ...options, signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS) });
+  }
   document.querySelectorAll("[data-password-strength]").forEach((meter) => {
     const input = meter.closest("form")?.querySelector('input[type="password"][autocomplete="new-password"]');
     const fill = meter.querySelector("[data-password-strength-fill]");
@@ -49,7 +55,7 @@
       setMessage("Connexion au serveur...", false);
       try {
         const body = Object.fromEntries(new FormData(form).entries());
-        const response = await fetch(`/api/${mode}`, {
+        const response = await fetchWithTimeout(`/api/${mode}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -82,7 +88,7 @@
       setMessage("Envoi en cours...", false);
       try {
         const body = Object.fromEntries(new FormData(forgotForm).entries());
-        const response = await fetch("/api/forgot-password", {
+        const response = await fetchWithTimeout("/api/forgot-password", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -101,10 +107,12 @@
 
   const resetForm = document.querySelector("[data-reset-password-form]");
   if (resetForm) {
+    const resetToken = new URLSearchParams(window.location.search).get("token") || "";
+    if (resetToken) window.history.replaceState({}, document.title, window.location.pathname);
     resetForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const button = resetForm.querySelector("button[type='submit']");
-      const token = new URLSearchParams(window.location.search).get("token") || "";
+      const token = resetToken;
       if (!token) {
         setMessage("Lien invalide : ouvre le lien reçu par email.", true);
         return;
@@ -113,7 +121,7 @@
       setMessage("Mise à jour...", false);
       try {
         const body = { ...Object.fromEntries(new FormData(resetForm).entries()), token };
-        const response = await fetch("/api/reset-password", {
+        const response = await fetchWithTimeout("/api/reset-password", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -168,7 +176,7 @@
   }
 
   document.querySelector("[data-logout]")?.addEventListener("click", async () => {
-    await fetch("/api/logout", { method: "POST" });
+    await fetchWithTimeout("/api/logout", { method: "POST" });
     window.location.href = "/login";
   });
 
@@ -225,9 +233,15 @@
     setInterval(refreshLivePositions, 10000);
   }
 
+  let livePositionsRefreshInFlight = false;
   async function refreshLivePositions() {
+    if (livePositionsRefreshInFlight) return;
+    livePositionsRefreshInFlight = true;
     const slots = document.querySelectorAll("[data-broker-order-id]:not([data-broker-order-id=''])");
-    if (!slots.length) return;
+    if (!slots.length) {
+      livePositionsRefreshInFlight = false;
+      return;
+    }
     const data = await fetchJson("/api/trade/live-positions");
     const positions = new Map((data?.positions || []).map((p) => [p.id, p]));
     slots.forEach((card) => {
@@ -242,6 +256,7 @@
       pnlEl.textContent = `${position.profit >= 0 ? "+" : ""}${position.profit.toFixed(2)}`;
       pnlEl.classList.toggle("is-negative", position.profit < 0);
     });
+    livePositionsRefreshInFlight = false;
   }
 
   // Fallback for a user who never granted push permission (dismissed the prompt,
@@ -270,11 +285,20 @@
     setInterval(refreshNotifications, 20000);
   }
 
+  let notificationsRefreshInFlight = false;
   async function refreshNotifications() {
+    if (notificationsRefreshInFlight) return;
+    notificationsRefreshInFlight = true;
     const wrap = document.querySelector("[data-notif-wrap]");
-    if (!wrap) return;
+    if (!wrap) {
+      notificationsRefreshInFlight = false;
+      return;
+    }
     const data = await fetchJson("/api/notifications/summary");
-    if (!data?.ok) return;
+    if (!data?.ok) {
+      notificationsRefreshInFlight = false;
+      return;
+    }
     const badge = wrap.querySelector("[data-notif-badge]");
     badge.hidden = !data.count;
     badge.textContent = data.count > 9 ? "9+" : String(data.count);
@@ -295,10 +319,11 @@
       this.insertAdjacentHTML("beforebegin", rest.join(""));
       this.remove();
     });
+    notificationsRefreshInFlight = false;
   }
 
   async function markNotificationsSeen() {
-    await fetch("/api/notifications/mark-seen", { method: "POST" }).catch(() => {});
+    await fetchWithTimeout("/api/notifications/mark-seen", { method: "POST" }).catch(() => {});
     const badge = document.querySelector("[data-notif-badge]");
     if (badge) badge.hidden = true;
   }
@@ -360,13 +385,13 @@
           if (activeTopics.has(topic)) {
             if (current) {
               if (activeTopics.size > 1) {
-                await fetch("/api/push/unsubscribe-topic", {
+                await fetchWithTimeout("/api/push/unsubscribe-topic", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ endpoint: current.endpoint, topic }),
                 });
               } else {
-                await fetch("/api/push/unsubscribe", {
+                await fetchWithTimeout("/api/push/unsubscribe", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ endpoint: current.endpoint }),
@@ -390,7 +415,7 @@
               applicationServerKey: urlBase64ToUint8Array(vapid.publicKey),
             });
           }
-          await fetch("/api/push/subscribe", {
+          await fetchWithTimeout("/api/push/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ ...subscription.toJSON(), topic }),
@@ -507,7 +532,7 @@
         button.disabled = true;
         if (errorEl) errorEl.hidden = true;
         try {
-          const response = await fetch("/api/trade/prepare", {
+          const response = await fetchWithTimeout("/api/trade/prepare", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ analysisId: button.dataset.prepareOrder }),
@@ -543,20 +568,26 @@
     SENT: "Envoyé au broker",
     CLOSED: "Clôturé",
     FAILED: "Échec d'envoi",
+    DELIVERY_UNKNOWN: "Livraison à vérifier",
     CANCELLED: "Annulé",
   };
 
+  let tradeOrdersRefreshInFlight = false;
   async function loadTradeOrders(isPremium) {
+    if (tradeOrdersRefreshInFlight) return;
     const panel = document.querySelector("[data-trade-panel]");
     const upsell = document.querySelector("[data-trade-upsell]");
     if (!panel) return;
+    tradeOrdersRefreshInFlight = true;
     if (!isPremium) {
       if (upsell) upsell.hidden = false;
+      tradeOrdersRefreshInFlight = false;
       return;
     }
     panel.hidden = false;
     const data = await fetchJson("/api/trade/orders");
     renderTradeOrders(data?.orders || [], Boolean(data?.brokerConfigured));
+    tradeOrdersRefreshInFlight = false;
   }
 
   function renderTradeOrders(orders, brokerConfigured) {
@@ -612,6 +643,7 @@
           <p class="dashboard-history-note" data-secure-half-message hidden></p>
         ` : ""}
         ${order.status === "FAILED" && order.errorMessage ? `<p class="dashboard-history-note">${escapeHtml(order.errorMessage)}</p>` : ""}
+        ${order.status === "DELIVERY_UNKNOWN" ? `<p class="dashboard-history-note">Livraison incertaine : le broker a peut-être accepté cet ordre. Ne le renvoie pas. Vérifie ton compte broker avant toute nouvelle action.</p>` : ""}
         ${order.status === "CANCELLED" || order.status === "FAILED" ? `
           <button type="button" class="dashboard-trade-cancel" data-order-clear>Retirer de la liste</button>
         ` : ""}
@@ -633,7 +665,7 @@
     host.querySelector("[data-orders-clear-all]")?.addEventListener("click", async function () {
       this.disabled = true;
       try {
-        await fetch("/api/trade/clear-all", { method: "POST" });
+        await fetchWithTimeout("/api/trade/clear-all", { method: "POST" });
       } finally {
         await loadTradeOrders(true);
       }
@@ -643,7 +675,7 @@
         const orderId = button.closest("[data-order-id]").dataset.orderId;
         button.disabled = true;
         try {
-          await fetch("/api/trade/clear", {
+          await fetchWithTimeout("/api/trade/clear", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ orderId }),
@@ -675,7 +707,7 @@
         if (messageEl) messageEl.hidden = true;
         button.disabled = true;
         try {
-          const response = await fetch("/api/trade/secure-half", {
+          const response = await fetchWithTimeout("/api/trade/secure-half", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ orderId }),
@@ -747,7 +779,7 @@
         // real status did (sent/failed/expired).
         const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached", "broker_not_connected", "live_trading_not_authorized", "invalid_broker_slot"]);
         try {
-          const response = await fetch("/api/trade/confirm", {
+          const response = await fetchWithTimeout("/api/trade/confirm", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ orderId, volume, brokerSlot }),
@@ -783,7 +815,7 @@
         const orderId = button.closest("[data-order-id]").dataset.orderId;
         button.disabled = true;
         try {
-          await fetch("/api/trade/cancel", {
+          await fetchWithTimeout("/api/trade/cancel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ orderId }),
@@ -840,7 +872,7 @@
         submitButton.disabled = true;
         if (message) message.hidden = true;
         try {
-          const response = await fetch("/api/auto-trade/broker/connect", {
+          const response = await fetchWithTimeout("/api/auto-trade/broker/connect", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ token, accountId, region, slot }),
@@ -870,7 +902,7 @@
       button.addEventListener("click", async () => {
         button.disabled = true;
         try {
-          await fetch("/api/auto-trade/broker/disconnect", {
+          await fetchWithTimeout("/api/auto-trade/broker/disconnect", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ slot: button.dataset.autotradeBrokerDisconnect }),
@@ -897,7 +929,7 @@
         }
         checkbox.disabled = true;
         try {
-          const response = await fetch("/api/auto-trade/toggle-slot", {
+          const response = await fetchWithTimeout("/api/auto-trade/toggle-slot", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ slot, enabled }),
@@ -918,7 +950,7 @@
       const enabled = checkbox.checked;
       checkbox.disabled = true;
       try {
-        const response = await fetch("/api/auto-trade/toggle-scalp", {
+        const response = await fetchWithTimeout("/api/auto-trade/toggle-scalp", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ enabled }),
@@ -940,7 +972,7 @@
       if (messageEl) messageEl.hidden = true;
       checkbox.disabled = true;
       try {
-        const response = await fetch("/api/auto-trade/toggle-secure-half", {
+        const response = await fetchWithTimeout("/api/auto-trade/toggle-secure-half", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ enabled }),
@@ -967,8 +999,9 @@
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        await fetch("/api/auto-trade/request", { method: "POST" });
+        await fetchWithTimeout("/api/auto-trade/request", { method: "POST" });
       } finally {
+        button.disabled = false;
         await refreshAutoTradeStatus();
       }
     });
@@ -977,8 +1010,9 @@
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        await fetch("/api/auto-trade/pause", { method: "POST" });
+        await fetchWithTimeout("/api/auto-trade/pause", { method: "POST" });
       } finally {
+        button.disabled = false;
         await refreshAutoTradeStatus();
       }
     });
@@ -987,8 +1021,9 @@
       const button = event.currentTarget;
       button.disabled = true;
       try {
-        await fetch("/api/auto-trade/resume", { method: "POST" });
+        await fetchWithTimeout("/api/auto-trade/resume", { method: "POST" });
       } finally {
+        button.disabled = false;
         await refreshAutoTradeStatus();
       }
     });
@@ -1274,7 +1309,7 @@
       button.disabled = true;
       if (message) message.hidden = true;
       try {
-        const response = await fetch("/api/auto-trade/preferences", {
+        const response = await fetchWithTimeout("/api/auto-trade/preferences", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1424,7 +1459,7 @@
 
   async function fetchJson(url) {
     try {
-      const response = await fetch(url);
+      const response = await fetchWithTimeout(url);
       return response.json();
     } catch {
       return null;

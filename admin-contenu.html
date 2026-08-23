@@ -24,15 +24,27 @@
     </div>
   </nav>
 
-  <main class="oracle-main auth-main">
-    <section class="auth-card premium-admin-card">
-      <p class="analysis-kicker">Administration</p>
-      <h1 class="analysis-title">Espace admin complet</h1>
-      <p class="analysis-subtitle">Tout ce qu'il y a sur la page d'administration existante, plus la gestion du contenu de tout le site. Un seul token admin pour tout.</p>
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main auth-main admin-main">
+    <section class="admin-hero" aria-labelledby="admin-page-title">
+      <div class="admin-hero-copy">
+        <p class="admin-eyebrow">Oracle command center / administration</p>
+        <h1 id="admin-page-title">Piloter la plateforme avec precision.</h1>
+        <p class="admin-hero-subtitle">Un espace unique pour superviser les comptes, proteger le trading automatique et faire evoluer le contenu public sans perdre le contexte.</p>
+        <div class="admin-hero-meta"><span class="admin-status-chip" data-admin-overall-status data-state="neutral">Session admin requise</span><span class="admin-last-sync" data-admin-last-sync>Donnees a charger</span></div>
+      </div>
+      <div class="admin-hero-actions"><a class="admin-quick-link" href="/admin-health"><span class="admin-quick-link-kicker">Monitoring restreint</span><strong>Sante API</strong><span>Providers, cache et alertes</span></a><button type="button" class="admin-primary-action" data-admin-overview-refresh>Charger la vue d ensemble</button></div>
     </section>
+    <section class="admin-summary-grid" aria-label="Synthese de la plateforme">
+      <article class="admin-stat-card"><span class="admin-stat-label">Comptes connus</span><strong class="admin-stat-value" data-admin-stat="members">--</strong><span class="admin-stat-meta" data-admin-stat-meta="members">Token requis</span></article>
+      <article class="admin-stat-card"><span class="admin-stat-label">Premium actifs</span><strong class="admin-stat-value" data-admin-stat="premium">--</strong><span class="admin-stat-meta" data-admin-stat-meta="premium">Comptes avec acces</span></article>
+      <article class="admin-stat-card"><span class="admin-stat-label">Trading automatique</span><strong class="admin-stat-value" data-admin-stat="trading">--</strong><span class="admin-stat-meta" data-admin-stat-meta="trading">Etat global</span></article>
+      <article class="admin-stat-card"><span class="admin-stat-label">Demandes robot</span><strong class="admin-stat-value" data-admin-stat="requests">--</strong><span class="admin-stat-meta" data-admin-stat-meta="requests">En attente de revue</span></article>
+    </section>
+    <section class="admin-alert-strip" data-admin-alerts data-state="neutral" role="status" aria-live="polite"><span class="admin-alert-icon" aria-hidden="true">!</span><div><strong>Vue d ensemble non chargee</strong><span>Renseigne le token admin puis lance le chargement securise.</span></div></section>
 
-    <div class="oracle-tabs" data-tabs>
-      <nav class="oracle-tabs-nav" role="tablist">
+    <div class="oracle-tabs admin-tabs-workspace" data-tabs>
+      <nav class="oracle-tabs-nav" role="tablist" aria-label="Sections d administration" aria-orientation="horizontal">
         <button type="button" class="oracle-tabs-btn" data-tab-btn="accounts" role="tab"><span data-icon="user"></span>Comptes &amp; accès</button>
         <button type="button" class="oracle-tabs-btn" data-tab-btn="circuit" role="tab"><span data-icon="alertTriangle"></span>Coupe-circuit</button>
         <button type="button" class="oracle-tabs-btn" data-tab-btn="robot" role="tab"><span data-icon="zap"></span>Robot Kronos</button>
@@ -45,7 +57,7 @@
           <h2 class="analysis-title">Accès Premium manuel</h2>
           <p class="analysis-subtitle">Donne Premium à un testeur sans passer par le paiement. La personne doit d'abord créer un compte.</p>
 
-          <form class="auth-form" data-premium-admin-form>
+          <form class="auth-form" data-premium-admin-form method="post">
             <label>
               Token admin
               <input name="token" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" required>
@@ -56,16 +68,18 @@
             </label>
             <label>
               Durée Premium
-              <input name="days" type="number" min="1" max="730" value="30" required>
+              <input name="days" type="number" min="1" max="730" value="30" required autocomplete="off">
             </label>
             <button class="analysis-submit" type="submit">Activer Premium</button>
           </form>
 
-          <div class="auth-message" data-premium-admin-message></div>
+          <div class="auth-message" data-premium-admin-message role="status" aria-live="polite"></div>
           <div class="premium-admin-actions">
             <button type="button" data-load-members>Voir les derniers comptes</button>
           </div>
+          <div class="admin-member-toolbar" aria-label="Filtres des comptes"><label><span>Rechercher un compte</span><input type="search" data-member-search placeholder="Nom, email ou role..." autocomplete="off"></label><label><span>Plan</span><select data-member-plan-filter><option value="all">Tous les plans</option><option value="premium">Premium</option><option value="free">Free</option></select></label></div>
           <div class="dashboard-history" data-premium-members></div>
+          <aside class="admin-member-drawer" data-member-drawer hidden role="region" tabindex="-1" aria-labelledby="member-drawer-title"><div class="admin-member-drawer-head"><div><p class="admin-eyebrow">Dossier client</p><h3 id="member-drawer-title" data-member-drawer-title>Details du compte</h3></div><button type="button" class="admin-icon-button" data-member-close aria-label="Fermer les details du compte">Fermer</button></div><div class="admin-member-detail" data-member-detail role="status" aria-live="polite"></div></aside>
         </section>
       </div>
 
@@ -74,7 +88,7 @@
           <p class="analysis-kicker">Exécution semi-automatique</p>
           <h2 class="analysis-title">Coupe-circuit trading</h2>
           <p class="analysis-subtitle">Coupe instantanément l'envoi d'ordres au broker pour tous les comptes, sans redéploiement. Utilise le même token admin que ci-dessus.</p>
-          <p data-trading-status>Statut inconnu — clique sur "Actualiser".</p>
+          <p data-trading-status role="status" aria-live="polite">Statut inconnu — clique sur "Actualiser".</p>
           <div class="premium-admin-actions">
             <button type="button" data-trading-refresh>Actualiser</button>
             <button type="button" data-trading-pause>Mettre en pause</button>
@@ -82,7 +96,7 @@
           </div>
           <label class="premium-admin-cap-field">Plafond d'ordres réels par compte / jour
             <div class="premium-admin-cap-row">
-              <input type="number" min="1" max="200" step="1" data-trading-cap-input placeholder="10">
+              <input type="number" min="1" max="200" step="1" data-trading-cap-input placeholder="10" autocomplete="off">
               <button type="button" data-trading-cap-save>Enregistrer</button>
             </div>
           </label>
@@ -106,10 +120,8 @@
           <p class="analysis-kicker">Contenu du site</p>
           <h2 class="analysis-title">Textes de toutes les pages</h2>
           <p class="analysis-subtitle">Modifie n'importe quel texte visible du site. Chaque champ s'enregistre automatiquement quand tu cliques ailleurs. "Réinitialiser" revient au texte d'origine du site -- rien n'est jamais perdu définitivement.</p>
-          <div class="premium-admin-actions">
-            <button type="button" data-site-content-load>Charger le contenu du site</button>
-          </div>
-          <p class="dashboard-history-note" data-site-content-summary></p>
+          <div class="admin-content-toolbar"><div class="premium-admin-actions"><button type="button" data-site-content-load>Charger le contenu du site</button></div><label class="admin-content-search"><span>Rechercher dans le contenu</span><input type="search" data-site-content-search placeholder="Page, titre ou cle..." autocomplete="off" disabled></label></div>
+          <p class="dashboard-history-note" data-site-content-summary role="status" aria-live="polite"></p>
           <div data-site-content-sections></div>
         </section>
       </div>

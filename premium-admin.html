@@ -23,14 +23,15 @@
     </div>
   </nav>
 
-  <main class="oracle-main auth-main">
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main auth-main">
     <section class="auth-card premium-admin-card">
       <p class="analysis-kicker">Administration</p>
       <h1 class="analysis-title">Accès Premium manuel</h1>
       <p class="analysis-subtitle"><a href="/admin-contenu" class="payment-method-button is-inline">→ Gestion complète du site (comptes, trading et contenu)</a></p>
       <p class="analysis-subtitle">Donne Premium à un testeur sans passer par le paiement. La personne doit d'abord créer un compte.</p>
 
-      <form class="auth-form" data-premium-admin-form>
+      <form class="auth-form" data-premium-admin-form method="post">
         <label>
           Token admin
           <input name="token" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" required>
@@ -41,15 +42,16 @@
         </label>
         <label>
           Durée Premium
-          <input name="days" type="number" min="1" max="730" value="30" required>
+          <input name="days" type="number" min="1" max="730" value="30" required autocomplete="off">
         </label>
         <button class="analysis-submit" type="submit">Activer Premium</button>
       </form>
 
-      <div class="auth-message" data-premium-admin-message></div>
+      <div class="auth-message" data-premium-admin-message role="status" aria-live="polite"></div>
       <div class="premium-admin-actions">
         <button type="button" data-load-members>Voir les derniers comptes</button>
       </div>
+      <div class="admin-member-toolbar" aria-label="Filtres des comptes"><label><span>Rechercher un compte</span><input type="search" data-member-search placeholder="Nom, email ou role..." autocomplete="off"></label><label><span>Plan</span><select data-member-plan-filter><option value="all">Tous les plans</option><option value="premium">Premium</option><option value="free">Free</option></select></label></div>
       <div class="dashboard-history" data-premium-members></div>
     </section>
 
@@ -57,7 +59,8 @@
       <p class="analysis-kicker">Exécution semi-automatique</p>
       <h2 class="analysis-title">Coupe-circuit trading</h2>
       <p class="analysis-subtitle">Coupe instantanément l'envoi d'ordres au broker pour tous les comptes, sans redéploiement. Utilise le même token admin que ci-dessus.</p>
-      <p data-trading-status>Statut inconnu — clique sur "Actualiser".</p>
+      <p data-trading-status role="status" aria-live="polite">Statut inconnu — clique sur "Actualiser".</p>
+      <div class="dashboard-history-note" data-trading-uncertain hidden></div>
       <div class="premium-admin-actions">
         <button type="button" data-trading-refresh>Actualiser</button>
         <button type="button" data-trading-pause>Mettre en pause</button>
@@ -65,7 +68,7 @@
       </div>
       <label class="premium-admin-cap-field">Plafond d'ordres réels par compte / jour
         <div class="premium-admin-cap-row">
-          <input type="number" min="1" max="200" step="1" data-trading-cap-input placeholder="10">
+          <input type="number" min="1" max="200" step="1" data-trading-cap-input placeholder="10" autocomplete="off">
           <button type="button" data-trading-cap-save>Enregistrer</button>
         </div>
       </label>

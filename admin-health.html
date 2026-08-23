@@ -21,17 +21,20 @@
     </div>
   </nav>
 
-  <main class="oracle-main">
-    <section class="analysis-card">
-      <div class="signal-top">
-        <div>
-          <p class="analysis-kicker">Monitoring local</p>
-          <h1 class="analysis-title">Santé APIs & Kronos</h1>
-        </div>
-        <button id="refreshHealth" class="refresh-signals" type="button">Actualiser</button>
-      </div>
-      <div id="healthOutput" class="analysis-signals mt-6"></div>
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main admin-main health-main">
+    <section class="admin-hero admin-hero--health" aria-labelledby="health-page-title">
+      <div class="admin-hero-copy"><p class="admin-eyebrow">Oracle command center / observability</p><h1 id="health-page-title">Sante des APIs &amp; de Kronos.</h1><p class="admin-hero-subtitle">Une lecture rapide de la disponibilite, de la fraicheur des donnees et des signaux qui meritent une intervention.</p><div class="admin-hero-meta"><span class="admin-status-chip" data-health-state data-state="neutral">Controle en attente</span><span class="admin-last-sync" data-health-updated>Derniere verification : --</span></div></div>
+      <div class="admin-hero-actions"><div class="health-score-orb"><strong data-health-score>--</strong><span>score</span></div><button id="refreshHealth" class="admin-primary-action" type="button">Actualiser les controles</button></div>
     </section>
+    <section class="health-summary-grid" aria-label="Resume de sante">
+      <article class="health-summary-card health-summary-card--accent"><span class="admin-stat-label">Statut global</span><strong class="admin-stat-value" data-health-summary-status>En attente</strong><span class="admin-stat-meta" data-health-summary-meta>Les controles demarrent automatiquement</span></article>
+      <article class="health-summary-card"><span class="admin-stat-label">Providers</span><strong class="admin-stat-value" data-health-provider-count>--</strong><span class="admin-stat-meta" data-health-provider-meta>Disponibilite inconnue</span></article>
+      <article class="health-summary-card"><span class="admin-stat-label">Prix en cache</span><strong class="admin-stat-value" data-health-price-count>--</strong><span class="admin-stat-meta">Sources disponibles</span></article>
+      <article class="health-summary-card"><span class="admin-stat-label">Analyses</span><strong class="admin-stat-value" data-health-analysis-count>--</strong><span class="admin-stat-meta">Historique d apprentissage</span></article>
+    </section>
+    <section class="admin-alert-strip" data-health-alerts data-state="neutral" role="status" aria-live="polite"><span class="admin-alert-icon" aria-hidden="true">!</span><div><strong>Verification en cours</strong><span>Les fournisseurs et caches vont etre controles.</span></div></section>
+    <section class="admin-health-output" aria-labelledby="health-details-title"><div class="admin-section-heading"><div><p class="admin-eyebrow">Diagnostic detaille</p><h2 id="health-details-title">Flux, caches et apprentissage</h2></div><span class="admin-section-note">Actualisation automatique toutes les 60 secondes</span></div><div id="healthOutput" class="health-detail-grid" role="status" aria-live="polite" aria-busy="false"></div></section>
   </main>
 
   <footer class="oracle-footer-lite">

@@ -43,7 +43,8 @@
     </div>
   </nav>
 
-  <main class="oracle-main">
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main">
     <section class="analysis-hero">
       <p class="analysis-kicker" data-cms="analyse.hero.kicker">Terminal Kronos</p>
       <h1 class="analysis-title" data-cms="analyse.hero.title">Analyse Forex Intelligente</h1>
@@ -66,8 +67,8 @@
         <h2 class="analysis-title icon-prefix"><span data-icon="zap"></span><span data-cms="analyse.console.title">Analyse de Chart IA</span></h2>
         <p class="analysis-subtitle" data-cms="analyse.console.subtitle">Déposez votre screenshot · Analyse généralement en quelques secondes</p>
 
-        <form id="analysisForm">
-          <input id="chartUpload" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+        <form id="analysisForm" method="post">
+          <input id="chartUpload" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden aria-label="Ajouter des captures de graphe">
           <div class="drop-zone" role="button" tabindex="0" aria-label="Ajouter des captures de graphe">
             <div>
               <div class="font-display text-3xl text-amber-neon icon-prefix"><span data-icon="paperclip"></span><span data-cms="analyse.dropzone.title">Glissez vos graphiques</span></div>

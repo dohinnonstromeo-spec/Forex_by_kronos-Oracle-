@@ -12,6 +12,7 @@
   <meta name="description" content="Dashboard membre Oracle Forex pour suivre Kronos, les signaux et l'abonnement." data-cms="dashboard.seo.description">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
+  <meta name="robots" content="noindex, nofollow">
 </head>
 <body class="oracle-page auth-page">
   <nav class="oracle-nav">
@@ -28,10 +29,10 @@
           <button class="auth-notif-bell" type="button" data-notif-bell aria-label="Notifications">
             🔔<span class="auth-notif-badge" data-notif-badge hidden>0</span>
           </button>
-          <div class="auth-notif-panel" data-notif-panel hidden>
+          <div class="auth-notif-panel" data-notif-panel role="region" aria-label="Notifications" hidden>
             <p class="auth-notif-title">Activité récente</p>
             <p class="auth-notif-empty" data-notif-empty hidden>Aucun événement pour l'instant.</p>
-            <div data-notif-list></div>
+            <div data-notif-list aria-live="polite"></div>
           </div>
         </div>
         <button class="auth-logout" type="button" data-logout>Déconnexion</button>
@@ -39,7 +40,8 @@
     </div>
   </nav>
 
-  <main class="oracle-main dashboard-main">
+    <a class="oracle-skip-link" href="#main-content">Aller au contenu principal</a>
+  <main id="main-content" class="oracle-main dashboard-main">
     <section class="dashboard-hero">
       <p class="analysis-kicker" data-cms="dashboard.hero.kicker">Espace membre</p>
       <h1 class="analysis-title" data-cms="dashboard.hero.title">Tableau de bord Kronos</h1>
@@ -47,7 +49,7 @@
     </section>
 
     <div class="oracle-tabs" data-tabs>
-      <nav class="oracle-tabs-nav" role="tablist">
+      <nav class="oracle-tabs-nav" role="tablist" aria-label="Sections du tableau de bord" aria-orientation="horizontal">
         <button type="button" class="oracle-tabs-btn" data-tab-btn="overview" role="tab"><span data-icon="layers"></span>Vue d'ensemble</button>
         <button type="button" class="oracle-tabs-btn" data-tab-btn="analyses" role="tab"><span data-icon="history"></span>Mes analyses</button>
         <button type="button" class="oracle-tabs-btn" data-tab-btn="trading" role="tab"><span data-icon="creditCard"></span>Trading</button>
@@ -84,7 +86,7 @@
               <p class="analysis-kicker" data-cms="dashboard.performance.kicker">Performance Kronos</p>
               <h2 class="analysis-title" data-cms="dashboard.performance.title">Résumé actuel</h2>
             </div>
-            <span class="oracle-tech" data-dashboard-status>Synchronisation</span>
+            <span class="oracle-tech" data-dashboard-status role="status" aria-live="polite">Synchronisation</span>
           </div>
           <div class="dashboard-metrics" data-dashboard-metrics><div class="oracle-skeleton"><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div><div class="oracle-skeleton-line"></div></div></div>
         </section>
@@ -97,7 +99,7 @@
               <p class="analysis-kicker" data-cms="dashboard.history.kicker">Historique personnel</p>
               <h2 class="analysis-title" data-cms="dashboard.history.title">Mes analyses Kronos</h2>
             </div>
-            <span class="oracle-tech" data-personal-status>Compte connecté</span>
+            <span class="oracle-tech" data-personal-status role="status" aria-live="polite">Compte connecté</span>
           </div>
           <div class="dashboard-push-controls">
             <div>
@@ -123,14 +125,14 @@
             </div>
           </div>
           <p class="dashboard-trade-note" data-cms="dashboard.broker.intro">Connecte jusqu'à deux comptes broker : un <strong>démo</strong> pour tester librement, et un <strong>réel</strong> une fois prêt (nécessite une autorisation admin -- section Robot Kronos plus bas). Les deux servent à l'exécution semi-automatique et au robot. Aucun ordre n'utilise jamais un autre compte que le tien.</p>
-          <p class="dashboard-history-note" data-cms="dashboard.broker.instructions" data-cms-html>Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
+          <p class="dashboard-history-note" data-cms="dashboard.broker.instructions" data-cms-html>Crée un compte sur <a href="https://metaapi.cloud" target="_blank" rel="noopener noreferrer">metaapi.cloud</a>, déploie ton compte MT5 (mot de passe <strong>Trading / Maître</strong>, jamais l'Investisseur), attends que le statut affiche "Connected", puis récupère le jeton d'accès au compte (menu ⋮ → "jeton d'accès au compte") et l'identifiant du compte (visible dans l'URL de la page du compte).</p>
           <div class="dashboard-broker-slots">
             <div class="dashboard-autotrade-section" data-broker-slot-panel="demo">
               <h3>Compte démo</h3>
-              <form class="dashboard-autotrade-form" data-autotrade-broker-form="demo">
-                <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
-                <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
-                <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
+              <form class="dashboard-autotrade-form" data-autotrade-broker-form="demo" method="post">
+                <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" aria-label="Jeton API MetaApi" required>
+                <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" aria-label="Identifiant du compte MetaApi" required>
+                <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london" autocomplete="off" aria-label="Region MetaApi">
                 <button type="submit" class="payment-method-button">Connecter le démo</button>
               </form>
               <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message="demo" hidden></p>
@@ -142,10 +144,10 @@
             <div class="dashboard-autotrade-section" data-broker-slot-panel="live">
               <h3>Compte réel</h3>
               <p class="dashboard-history-note dashboard-live-locked" data-live-locked-note hidden>🔒 Réservé : demande à l'administrateur d'autoriser ce compte pour le réel (section Robot Kronos) avant de pouvoir connecter un vrai compte broker ici.</p>
-              <form class="dashboard-autotrade-form" data-autotrade-broker-form="live" hidden>
-                <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" required>
-                <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" required>
-                <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london">
+              <form class="dashboard-autotrade-form" data-autotrade-broker-form="live" hidden method="post">
+                <input type="password" placeholder="Jeton API MetaApi" data-autotrade-token autocomplete="off" aria-label="Jeton API MetaApi" required>
+                <input type="text" placeholder="ID du compte (UUID)" data-autotrade-account-id autocomplete="off" aria-label="Identifiant du compte MetaApi" required>
+                <input type="text" placeholder="Région (ex: london)" data-autotrade-region value="london" autocomplete="off" aria-label="Region MetaApi">
                 <button type="submit" class="payment-method-button">Connecter le réel</button>
               </form>
               <p class="dashboard-history-note dashboard-prepare-error" data-autotrade-broker-message="live" hidden></p>
@@ -163,7 +165,7 @@
               <p class="analysis-kicker" data-cms="dashboard.trade.kicker">Exécution semi-automatique</p>
               <h2 class="analysis-title" data-cms="dashboard.trade.title">Ordres</h2>
             </div>
-            <span class="oracle-tech" data-trade-broker-status>Broker non connecté</span>
+            <span class="oracle-tech" data-trade-broker-status role="status" aria-live="polite">Broker non connecté</span>
           </div>
           <p class="dashboard-trade-note" data-cms="dashboard.trade.intro">Kronos prépare l'ordre à partir d'une analyse ouverte, tu choisis la taille et confirmes — rien n'est envoyé au broker sans ta validation explicite.</p>
           <p class="dashboard-history-note dashboard-prepare-error" data-trade-broker-prompt hidden data-cms="dashboard.trade.broker_prompt">Connecte ton broker ci-dessus pour pouvoir envoyer un ordre réel.</p>
@@ -179,7 +181,7 @@
               <p class="analysis-kicker" data-cms="dashboard.autotrade.kicker">Exécution 100% automatique</p>
               <h2 class="analysis-title" data-cms="dashboard.autotrade.title">Robot Kronos</h2>
             </div>
-            <span class="oracle-tech" data-autotrade-status-badge>Statut...</span>
+            <span class="oracle-tech" data-autotrade-status-badge role="status" aria-live="polite">Statut...</span>
           </div>
           <p class="dashboard-trade-note" data-cms="dashboard.autotrade.intro" data-cms-html>Le robot surveille le marché seul et exécute sans confirmation, uniquement sur les paires et le risque approuvés. Nécessite ton propre compte broker connecté (ci-dessus) <strong>et</strong> une approbation manuelle de l'équipe — ce n'est pas activable en un clic.</p>
 
@@ -195,14 +197,14 @@
             <div data-autotrade-slot-block="demo">
               <div class="dashboard-slot-head">
                 <h3>Démo</h3>
-                <label class="dashboard-slot-switch"><input type="checkbox" data-slot-toggle="demo"> Actif</label>
+                <label class="dashboard-slot-switch"><input type="checkbox" data-slot-toggle="demo" autocomplete="off"> Actif</label autocomplete="off">
               </div>
               <div class="dashboard-autotrade-metrics" data-slot-metrics="demo"></div>
             </div>
             <div data-autotrade-slot-block="live">
               <div class="dashboard-slot-head">
                 <h3>Réel</h3>
-                <label class="dashboard-slot-switch"><input type="checkbox" data-slot-toggle="live"> Actif</label>
+                <label class="dashboard-slot-switch"><input type="checkbox" data-slot-toggle="live" autocomplete="off"> Actif</label autocomplete="off">
               </div>
               <p class="dashboard-history-note dashboard-live-locked" data-live-slot-locked-note hidden>🔒 Pas encore autorisé par l'administrateur -- demande l'autorisation avant de pouvoir activer le réel ici.</p>
               <div class="dashboard-autotrade-metrics" data-slot-metrics="live"></div>
@@ -212,7 +214,7 @@
           <div class="dashboard-autotrade-section" data-scalp-section hidden>
             <div class="dashboard-slot-head">
               <h3>Mode scalping</h3>
-              <label class="dashboard-slot-switch"><input type="checkbox" data-scalp-toggle> Actif</label>
+              <label class="dashboard-slot-switch"><input type="checkbox" data-scalp-toggle autocomplete="off"> Actif</label autocomplete="off">
             </div>
             <p class="dashboard-history-note" data-cms="dashboard.autotrade.scalp_intro">Mean-reversion à edge validé par backtest, paires et paramètres définis par l'administrateur -- tu actives/désactives librement une fois autorisé.</p>
             <p class="dashboard-history-note dashboard-live-locked" data-scalp-locked-note hidden>🔒 Pas encore autorisé par l'administrateur pour ce compte.</p>
@@ -222,7 +224,7 @@
           <div class="dashboard-autotrade-section" data-autotrade-preferences-section-secure-half hidden>
             <div class="dashboard-slot-head">
               <h3>Sécuriser à mi-TP (priorité du robot)</h3>
-              <label class="dashboard-slot-switch"><input type="checkbox" data-secure-half-priority-toggle> Actif</label>
+              <label class="dashboard-slot-switch"><input type="checkbox" data-secure-half-priority-toggle autocomplete="off"> Actif</label autocomplete="off">
             </div>
             <p class="dashboard-history-note">Une fois activé : toute nouvelle position sur une paire à TP fixe (US500, BTC/USD, USD/JPY) part directement avec son objectif réduit de moitié. Pour XAU/USD, USD/CHF, EUR/USD et le scalp (pas de TP fixe), le stop se resserre automatiquement dès que le prix atteint la moitié de l'objectif de référence. Les positions déjà ouvertes à TP fixe sont sécurisées immédiatement à l'activation.</p>
             <p class="dashboard-history-note dashboard-prepare-error" data-secure-half-priority-message hidden></p>
@@ -233,56 +235,56 @@
             <p class="dashboard-history-note">Resserre le robot pour ton propre compte, dans la limite fixée par l'administrateur pour chaque paramètre. Un champ laissé vide utilise directement le réglage admin.</p>
             <div class="dashboard-autotrade-form">
               <label class="dashboard-autotrade-field">Risque % / trade <span class="dashboard-autotrade-hint" data-pref-hint="riskPercent"></span>
-                <input type="number" min="0.1" max="3" step="0.1" data-pref="userRiskPercent" placeholder="réglage admin">
+                <input type="number" min="0.1" max="3" step="0.1" data-pref="userRiskPercent" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Capital alloué ($) <span class="dashboard-autotrade-hint">laisse vide pour utiliser tout le solde réel</span>
-                <input type="number" min="1" step="1" data-pref="userCapitalCap" placeholder="solde réel du compte">
+                <input type="number" min="1" step="1" data-pref="userCapitalCap" placeholder="solde réel du compte" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Confiance min (%) <span class="dashboard-autotrade-hint" data-pref-hint="minConfidenceFloor"></span>
-                <input type="number" min="60" max="99" step="1" data-pref="userMinConfidence" placeholder="réglage admin">
+                <input type="number" min="60" max="99" step="1" data-pref="userMinConfidence" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">R:R minimum <span class="dashboard-autotrade-hint" data-pref-hint="minRiskReward"></span>
-                <input type="number" min="0.1" max="10" step="0.1" data-pref="userMinRiskReward" placeholder="réglage admin">
+                <input type="number" min="0.1" max="10" step="0.1" data-pref="userMinRiskReward" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Positions ouvertes max <span class="dashboard-autotrade-hint" data-pref-hint="maxConcurrentPositions"></span>
-                <input type="number" min="1" max="20" step="1" data-pref="userMaxConcurrentPositions" placeholder="réglage admin">
+                <input type="number" min="1" max="20" step="1" data-pref="userMaxConcurrentPositions" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Trades max / jour <span class="dashboard-autotrade-hint" data-pref-hint="maxTradesPerDay"></span>
-                <input type="number" min="1" max="100" step="1" data-pref="userMaxTradesPerDay" placeholder="réglage admin">
+                <input type="number" min="1" max="100" step="1" data-pref="userMaxTradesPerDay" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Perte max / jour (%) <span class="dashboard-autotrade-hint" data-pref-hint="dailyLossLimitPercent"></span>
-                <input type="number" min="1" max="10" step="0.5" data-pref="userDailyLossLimitPercent" placeholder="réglage admin">
+                <input type="number" min="1" max="10" step="0.5" data-pref="userDailyLossLimitPercent" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Perte max / jour (montant) <span class="dashboard-autotrade-hint" data-pref-hint="dailyLossLimitAmount"></span>
-                <input type="number" min="0" step="1" data-pref="userDailyLossLimitAmount" placeholder="réglage admin">
+                <input type="number" min="0" step="1" data-pref="userDailyLossLimitAmount" placeholder="réglage admin" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Perte max / semaine (%) <span class="dashboard-autotrade-hint" data-pref-hint="weeklyLossLimitPercent"></span>
-                <input type="number" min="1" max="50" step="0.5" data-pref="userWeeklyLossLimitPercent" placeholder="aucune limite">
+                <input type="number" min="1" max="50" step="0.5" data-pref="userWeeklyLossLimitPercent" placeholder="aucune limite" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Perte max / semaine (montant) <span class="dashboard-autotrade-hint" data-pref-hint="weeklyLossLimitAmount"></span>
-                <input type="number" min="0" step="1" data-pref="userWeeklyLossLimitAmount" placeholder="aucune limite">
+                <input type="number" min="0" step="1" data-pref="userWeeklyLossLimitAmount" placeholder="aucune limite" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Perte max / mois (%) <span class="dashboard-autotrade-hint" data-pref-hint="monthlyLossLimitPercent"></span>
-                <input type="number" min="1" max="90" step="0.5" data-pref="userMonthlyLossLimitPercent" placeholder="aucune limite">
+                <input type="number" min="1" max="90" step="0.5" data-pref="userMonthlyLossLimitPercent" placeholder="aucune limite" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Perte max / mois (montant) <span class="dashboard-autotrade-hint" data-pref-hint="monthlyLossLimitAmount"></span>
-                <input type="number" min="0" step="1" data-pref="userMonthlyLossLimitAmount" placeholder="aucune limite">
+                <input type="number" min="0" step="1" data-pref="userMonthlyLossLimitAmount" placeholder="aucune limite" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Heure de début <span class="dashboard-autotrade-hint">(UTC)</span>
-                <input type="time" data-pref="userTradingHoursStart">
+                <input type="time" data-pref="userTradingHoursStart" autocomplete="off">
               </label>
               <label class="dashboard-autotrade-field">Heure de fin <span class="dashboard-autotrade-hint">(UTC)</span>
-                <input type="time" data-pref="userTradingHoursEnd">
+                <input type="time" data-pref="userTradingHoursEnd" autocomplete="off">
               </label>
             </div>
             <div class="dashboard-autotrade-pairs" data-pref-trading-days>
-              <label><input type="checkbox" value="1" checked>Lun</label>
-              <label><input type="checkbox" value="2" checked>Mar</label>
-              <label><input type="checkbox" value="3" checked>Mer</label>
-              <label><input type="checkbox" value="4" checked>Jeu</label>
-              <label><input type="checkbox" value="5" checked>Ven</label>
-              <label><input type="checkbox" value="6" checked>Sam</label>
-              <label><input type="checkbox" value="0" checked>Dim</label>
+              <label><input type="checkbox" value="1" checked autocomplete="off">Lun</label autocomplete="off">
+              <label><input type="checkbox" value="2" checked autocomplete="off">Mar</label autocomplete="off">
+              <label><input type="checkbox" value="3" checked autocomplete="off">Mer</label autocomplete="off">
+              <label><input type="checkbox" value="4" checked autocomplete="off">Jeu</label autocomplete="off">
+              <label><input type="checkbox" value="5" checked autocomplete="off">Ven</label autocomplete="off">
+              <label><input type="checkbox" value="6" checked autocomplete="off">Sam</label autocomplete="off">
+              <label><input type="checkbox" value="0" checked autocomplete="off">Dim</label autocomplete="off">
             </div>
             <div class="premium-admin-actions">
               <button type="button" class="payment-method-button" data-autotrade-preferences-save>Enregistrer mes préférences</button>

@@ -2,6 +2,7 @@
   const host = document.querySelector("[data-site-content-sections]");
   const loadButton = document.querySelector("[data-site-content-load]");
   const summary = document.querySelector("[data-site-content-summary]");
+  const searchInput = document.querySelector("[data-site-content-search]");
   if (!host) return;
 
   function getToken() {
@@ -17,7 +18,7 @@
       options.body = JSON.stringify(body);
     }
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, { ...options, signal: AbortSignal.timeout(10000) });
       return await response.json();
     } catch {
       return { ok: false, error: "network_error" };
@@ -31,24 +32,33 @@
   }
 
   loadButton?.addEventListener("click", load);
+  searchInput?.addEventListener("input", filterContent);
 
   async function load() {
+    if (loadButton?.disabled) return;
     if (!getToken()) {
-      if (summary) summary.textContent = "Renseigne le token admin dans la section \"Accès Premium manuel\" ci-dessus avant de charger le contenu.";
+      if (summary) summary.textContent = 'Renseigne le token admin avant de charger le contenu.';
       return;
     }
-    if (summary) summary.textContent = "Chargement du registre de contenu...";
-    const [registryData, contentData] = await Promise.all([
-      adminFetch("/api/admin/site-content/registry"),
-      fetch("/api/site-content").then((r) => r.json()).catch(() => ({ ok: false })),
-    ]);
-    if (!registryData?.ok) {
-      if (summary) summary.textContent = registryData?.message || registryData?.error || "Chargement impossible -- vérifie le token.";
-      return;
+    if (loadButton) loadButton.disabled = true;
+    if (summary) summary.textContent = 'Chargement du registre de contenu...';
+    try {
+      const [registryData, contentData] = await Promise.all([
+        adminFetch('/api/admin/site-content/registry'),
+        fetch('/api/site-content', { signal: AbortSignal.timeout(5000) }).then((r) => r.json()).catch(() => ({ ok: false })),
+      ]);
+      if (!registryData?.ok) {
+        if (summary) summary.textContent = registryData?.message || registryData?.error || 'Chargement impossible -- verifie le token.';
+        return;
+      }
+      const registry = Array.isArray(registryData.registry) ? registryData.registry : [];
+      const overrides = contentData?.ok ? contentData.overrides : {};
+      render(registry, overrides);
+      if (searchInput) searchInput.disabled = false;
+      if (summary) summary.textContent = registry.length + ' champ(s) de contenu, groupes par page.';
+    } finally {
+      if (loadButton) loadButton.disabled = false;
     }
-    const overrides = contentData?.ok ? contentData.overrides : {};
-    render(registryData.registry, overrides);
-    if (summary) summary.textContent = `${registryData.registry.length} champ(s) de contenu, groupés par page.`;
   }
 
   function render(registry, overrides) {
@@ -75,14 +85,18 @@
       </details>
     `).join("");
 
+    filterContent();
     host.querySelectorAll("[data-field-key]").forEach((field) => {
       const key = field.dataset.fieldKey;
       const textarea = field.querySelector("[data-field-input]");
       const status = field.querySelector("[data-field-status]");
       const resetButton = field.querySelector("[data-field-reset]");
 
-      textarea.addEventListener("blur", async () => {
-        const value = textarea.value;
+      let saveQueue = Promise.resolve();
+      textarea.addEventListener("input", () => { status.textContent = "Modification en attente..."; });
+      textarea.addEventListener("blur", () => {
+        saveQueue = saveQueue.then(async () => {
+          const value = textarea.value;
         status.textContent = "Enregistrement...";
         const data = await adminFetch("/api/admin/site-content/set", { key, value });
         if (!data?.ok) {
@@ -92,6 +106,7 @@
         status.textContent = "✓ Enregistré";
         resetButton.disabled = !value;
         setTimeout(() => { if (status.textContent === "✓ Enregistré") status.textContent = ""; }, 3000);
+        });
       });
 
       resetButton.addEventListener("click", async () => {
@@ -107,5 +122,24 @@
         setTimeout(() => { if (status.textContent.startsWith("✓")) status.textContent = ""; }, 3000);
       });
     });
+  function filterContent() {
+    if (!host) return;
+    const query = String(searchInput?.value || '').trim().toLowerCase();
+    let visibleFields = 0;
+    host.querySelectorAll('.site-content-page-group').forEach((group) => {
+      let groupVisible = false;
+      group.querySelectorAll('[data-field-key]').forEach((field) => {
+        const matches = !query || field.textContent.toLowerCase().includes(query) || String(field.dataset.fieldKey || '').toLowerCase().includes(query);
+        field.hidden = !matches;
+        if (matches) { groupVisible = true; visibleFields += 1; }
+      });
+      group.hidden = !groupVisible;
+    });
+    let empty = host.querySelector('[data-content-search-empty]');
+    if (query && !visibleFields) {
+      if (!empty) { empty = document.createElement('p'); empty.className = 'site-content-search-empty'; empty.dataset.contentSearchEmpty = 'true'; host.append(empty); }
+      empty.textContent = 'Aucun champ ne correspond a cette recherche.';
+    } else if (empty) empty.remove();
+  }
   }
 })();
