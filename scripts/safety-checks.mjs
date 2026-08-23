@@ -487,7 +487,8 @@ const serverSource = await readFile(new URL("../server.mjs", import.meta.url), "
 const ciSource = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const apiTestSource = await readFile(new URL("../scripts/api-tests.mjs", import.meta.url), "utf8");
 check("durable auto-trade lease table exists", /CREATE TABLE IF NOT EXISTS auto_trade_leases/.test(serverSource));
-check("lease acquisition uses an expiry condition", /auto_trade_leases SET[\s\S]{0,300}lease_until < \?/.test(serverSource));
+check("lease acquisition uses an expiry condition", /async function tryAcquireLease[\s\S]{0,600}\$\{table\} SET[\s\S]{0,300}lease_until < \?/.test(serverSource));
+check("auto-trade lease goes through the shared CAS lease helper", /tryAcquireAutoTradeLease[\s\S]{0,200}return tryAcquireLease\("auto_trade_leases"/.test(serverSource));
 check("swing scheduler acquires a lease before processing a user", /tryAcquireAutoTradeLease\(account\.user_id, slot\)[\s\S]{0,300}processAutoTradeForUser/.test(serverSource));
 check("scalp scheduler acquires a lease before processing a user", /tryAcquireAutoTradeLease\(account\.user_id, slot\)[\s\S]{0,300}processScalpForUser/.test(serverSource));
 check("password reset claims the token atomically", /UPDATE password_reset_tokens SET used_at = \? WHERE id = \? AND used_at IS NULL/.test(serverSource));

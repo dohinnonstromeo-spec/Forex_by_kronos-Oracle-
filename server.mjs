@@ -1615,23 +1615,31 @@ function startNewSignalAlertScheduler() {
 const AUTO_TRADE_INTERVAL_MS = boundedEnvNumber(env.AUTO_TRADE_INTERVAL_SECONDS, 60, 10, 3600) * 1000;
 const AUTO_TRADE_LEASE_MS = boundedEnvNumber(env.AUTO_TRADE_LEASE_SECONDS, 300, 120, 86400) * 1000;
 
-async function tryAcquireAutoTradeLease(userId, brokerSlot) {
+// Shared by all three lease flavors below (auto-trade, scheduler,
+// trade-operation) -- they were three structurally identical
+// UPDATE-then-INSERT-on-conflict CAS implementations differing only in table
+// name and key columns, which meant any future fix to the locking logic
+// itself (e.g. the WHERE clause, the token generation) had to be applied
+// three times and could drift. Table/column names here are always fixed
+// string literals from the call sites below, never user input.
+async function tryAcquireLease(table, keyColumns, keyValues, leaseMs) {
   await ensureRelationalTables();
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
-  const leaseUntil = new Date(now + AUTO_TRADE_LEASE_MS).toISOString();
+  const leaseUntil = new Date(now + leaseMs).toISOString();
   const leaseToken = randomBytes(18).toString("hex");
+  const whereKeys = keyColumns.map((column) => `${column} = ?`).join(" AND ");
   const updated = await sqlRun(
-    `UPDATE auto_trade_leases SET lease_token = ?, lease_until = ?, updated_at = ?
-     WHERE user_id = ? AND broker_slot = ? AND lease_until < ?`,
-    [leaseToken, leaseUntil, nowIso, userId, brokerSlot, nowIso],
+    `UPDATE ${table} SET lease_token = ?, lease_until = ?, updated_at = ?
+     WHERE ${whereKeys} AND lease_until < ?`,
+    [leaseToken, leaseUntil, nowIso, ...keyValues, nowIso],
   );
   if (Number(pgPool ? updated.rowCount : updated.changes) === 1) return leaseToken;
   try {
+    const insertColumns = [...keyColumns, "lease_token", "lease_until", "updated_at"];
     await sqlRun(
-      `INSERT INTO auto_trade_leases (user_id, broker_slot, lease_token, lease_until, updated_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [userId, brokerSlot, leaseToken, leaseUntil, nowIso],
+      `INSERT INTO ${table} (${insertColumns.join(", ")}) VALUES (${insertColumns.map(() => "?").join(", ")})`,
+      [...keyValues, leaseToken, leaseUntil, nowIso],
     );
     return leaseToken;
   } catch {
@@ -1639,80 +1647,38 @@ async function tryAcquireAutoTradeLease(userId, brokerSlot) {
   }
 }
 
-async function releaseAutoTradeLease(userId, brokerSlot, leaseToken) {
+async function releaseLease(table, keyColumns, keyValues, leaseToken) {
   if (!leaseToken) return;
-  await sqlRun(
-    `DELETE FROM auto_trade_leases WHERE user_id = ? AND broker_slot = ? AND lease_token = ?`,
-    [userId, brokerSlot, leaseToken],
-  );
+  const whereKeys = keyColumns.map((column) => `${column} = ?`).join(" AND ");
+  await sqlRun(`DELETE FROM ${table} WHERE ${whereKeys} AND lease_token = ?`, [...keyValues, leaseToken]);
+}
+
+async function tryAcquireAutoTradeLease(userId, brokerSlot) {
+  return tryAcquireLease("auto_trade_leases", ["user_id", "broker_slot"], [userId, brokerSlot], AUTO_TRADE_LEASE_MS);
+}
+
+async function releaseAutoTradeLease(userId, brokerSlot, leaseToken) {
+  return releaseLease("auto_trade_leases", ["user_id", "broker_slot"], [userId, brokerSlot], leaseToken);
 }
 
 const SCHEDULER_LEASE_MS = boundedEnvNumber(env.SCHEDULER_LEASE_SECONDS, 120, 120, 86400) * 1000;
 
 async function tryAcquireSchedulerLease(leaseKey) {
-  await ensureRelationalTables();
-  const now = Date.now();
-  const nowIso = new Date(now).toISOString();
-  const leaseUntil = new Date(now + SCHEDULER_LEASE_MS).toISOString();
-  const leaseToken = randomBytes(18).toString("hex");
-  const updated = await sqlRun(
-    `UPDATE scheduler_leases SET lease_token = ?, lease_until = ?, updated_at = ?
-     WHERE lease_key = ? AND lease_until < ?`,
-    [leaseToken, leaseUntil, nowIso, leaseKey, nowIso],
-  );
-  if (Number(pgPool ? updated.rowCount : updated.changes) === 1) return leaseToken;
-  try {
-    await sqlRun(
-      `INSERT INTO scheduler_leases (lease_key, lease_token, lease_until, updated_at)
-       VALUES (?, ?, ?, ?)`,
-      [leaseKey, leaseToken, leaseUntil, nowIso],
-    );
-    return leaseToken;
-  } catch {
-    return null;
-  }
+  return tryAcquireLease("scheduler_leases", ["lease_key"], [leaseKey], SCHEDULER_LEASE_MS);
 }
 
 async function releaseSchedulerLease(leaseKey, leaseToken) {
-  if (!leaseToken) return;
-  await sqlRun(
-    `DELETE FROM scheduler_leases WHERE lease_key = ? AND lease_token = ?`,
-    [leaseKey, leaseToken],
-  );
+  return releaseLease("scheduler_leases", ["lease_key"], [leaseKey], leaseToken);
 }
 
 const TRADE_OPERATION_LEASE_MS = boundedEnvNumber(env.TRADE_OPERATION_LEASE_SECONDS, 180, 60, 86400) * 1000;
 
 async function tryAcquireTradeOperationLease(orderId, operation) {
-  await ensureRelationalTables();
-  const now = Date.now();
-  const nowIso = new Date(now).toISOString();
-  const leaseUntil = new Date(now + TRADE_OPERATION_LEASE_MS).toISOString();
-  const leaseToken = randomBytes(18).toString("hex");
-  const updated = await sqlRun(
-    `UPDATE trade_operation_leases SET lease_token = ?, lease_until = ?, updated_at = ?
-     WHERE order_id = ? AND operation = ? AND lease_until < ?`,
-    [leaseToken, leaseUntil, nowIso, orderId, operation, nowIso],
-  );
-  if (Number(pgPool ? updated.rowCount : updated.changes) === 1) return leaseToken;
-  try {
-    await sqlRun(
-      `INSERT INTO trade_operation_leases (order_id, operation, lease_token, lease_until, updated_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [orderId, operation, leaseToken, leaseUntil, nowIso],
-    );
-    return leaseToken;
-  } catch {
-    return null;
-  }
+  return tryAcquireLease("trade_operation_leases", ["order_id", "operation"], [orderId, operation], TRADE_OPERATION_LEASE_MS);
 }
 
 async function releaseTradeOperationLease(orderId, operation, leaseToken) {
-  if (!leaseToken) return;
-  await sqlRun(
-    `DELETE FROM trade_operation_leases WHERE order_id = ? AND operation = ? AND lease_token = ?`,
-    [orderId, operation, leaseToken],
-  );
+  return releaseLease("trade_operation_leases", ["order_id", "operation"], [orderId, operation], leaseToken);
 }
 
 // Heartbeat for checkSchedulerHeartbeat below -- set at the START of every tick
@@ -10969,7 +10935,12 @@ async function checkTrailingStops() {
         `SELECT secure_half_priority_enabled FROM auto_trading_accounts WHERE user_id = ?`,
         [row.user_id],
       ).catch(() => null);
-      if (latestAccountRow) row.secure_half_priority_enabled = latestAccountRow.secure_half_priority_enabled;
+      // Fail safe, not stale: if the account row is gone by the time the lease
+      // is held (broker disconnected/account deleted mid-tick), treat the
+      // priority as off rather than keep whatever value the pre-lock read
+      // happened to have -- same "always trust the freshest read" invariant
+      // latestOrderRow enforces two lines above, just extended to this field.
+      row.secure_half_priority_enabled = latestAccountRow ? latestAccountRow.secure_half_priority_enabled : 0;
       // Broker-direct price, not getAnalysisPrice -- see getBrokerCurrentPrice's
       // own comment for why: this needs the exact price the broker will itself
       // validate the modify request against, not the (potentially minutes-stale)

@@ -112,34 +112,44 @@
       const status = field.querySelector("[data-field-status]");
       const resetButton = field.querySelector("[data-field-reset]");
 
+      // Save and reset both go through this one queue -- confirmed live that
+      // without it, clicking "Reinitialiser" while a blur-triggered save was
+      // still in flight raced the two requests against each other: whichever
+      // response landed last on the server won, so a reset could be silently
+      // undone moments later by a save that was already in flight when the
+      // reset was clicked. Serializing both through saveQueue makes the last
+      // action the user actually took win, deterministically, instead of
+      // whichever network round-trip happened to finish last.
       let saveQueue = Promise.resolve();
       textarea.addEventListener("input", () => { status.textContent = "Modification en attente..."; });
       textarea.addEventListener("blur", () => {
         saveQueue = saveQueue.then(async () => {
           const value = textarea.value;
-        status.textContent = "Enregistrement...";
-        const data = await adminFetch("/api/admin/site-content/set", { key, value });
-        if (!data?.ok) {
-          status.textContent = data?.message || data?.error || "Échec.";
-          return;
-        }
-        status.textContent = "✓ Enregistré";
-        resetButton.disabled = !value;
-        setTimeout(() => { if (status.textContent === "✓ Enregistré") status.textContent = ""; }, 3000);
+          status.textContent = "Enregistrement...";
+          const data = await adminFetch("/api/admin/site-content/set", { key, value });
+          if (!data?.ok) {
+            status.textContent = data?.message || data?.error || "Échec.";
+            return;
+          }
+          status.textContent = "✓ Enregistré";
+          resetButton.disabled = !value;
+          setTimeout(() => { if (status.textContent === "✓ Enregistré") status.textContent = ""; }, 3000);
         });
       });
 
-      resetButton.addEventListener("click", async () => {
+      resetButton.addEventListener("click", () => {
         resetButton.disabled = true;
-        const data = await adminFetch("/api/admin/site-content/reset", { key });
-        if (!data?.ok) {
-          status.textContent = data?.message || data?.error || "Échec.";
-          resetButton.disabled = false;
-          return;
-        }
-        textarea.value = "";
-        status.textContent = "✓ Réinitialisé (texte par défaut restauré)";
-        setTimeout(() => { if (status.textContent.startsWith("✓")) status.textContent = ""; }, 3000);
+        saveQueue = saveQueue.then(async () => {
+          const data = await adminFetch("/api/admin/site-content/reset", { key });
+          if (!data?.ok) {
+            status.textContent = data?.message || data?.error || "Échec.";
+            resetButton.disabled = false;
+            return;
+          }
+          textarea.value = "";
+          status.textContent = "✓ Réinitialisé (texte par défaut restauré)";
+          setTimeout(() => { if (status.textContent.startsWith("✓")) status.textContent = ""; }, 3000);
+        });
       });
     });
   }
