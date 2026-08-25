@@ -927,6 +927,8 @@ const requestedSupabaseStateTable = String(env.SUPABASE_STATE_TABLE || "oracle_a
 const supabaseStateTable = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(requestedSupabaseStateTable) ? requestedSupabaseStateTable : "oracle_app_state";
 let supabaseUnavailable = false;
 let supabaseLastError = null;
+let lastAuthLoginError = null;
+let lastAdminMembersError = null;
 const providerHealth = new Map();
 // anonymousUsage/loginAttempts/signupAttempts (visitor quota + brute-force counters)
 // used to live here as plain in-memory Maps -- real enforcement state that silently
@@ -2483,6 +2485,13 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/admin/debug-auth") {
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    sendJson(res, 200, { ok: true, lastAuthLoginError, lastAdminMembersError });
+    return;
+  }
+
   if (url.pathname === "/api/admin/members") {
     try {
       const admin = await requireAdmin(req);
@@ -2497,6 +2506,7 @@ async function handleApi(req, res, url) {
           .map(adminUserPayload),
       });
     } catch (error) {
+      lastAdminMembersError = { at: new Date().toISOString(), message: String(error?.message || error), stack: String(error?.stack || "") };
       logOnce("admin-members", "lecture membres echouee (" + error.message + ")");
       sendJson(res, 500, {
         ok: false,
@@ -9106,6 +9116,7 @@ async function loginUser(body = {}, req = null) {
       return { ok: true, user, session };
     });
   } catch (error) {
+    lastAuthLoginError = { at: new Date().toISOString(), message: String(error?.message || error), stack: String(error?.stack || "") };
     logOnce("auth-login", "connexion echouee (" + error.message + ")");
     return {
       ok: false,
@@ -11916,4 +11927,6 @@ async function send404Page(res) {
     sendJson(res, 404, { error: "not_found" });
   }
 }
+
+
 
