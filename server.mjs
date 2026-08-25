@@ -200,6 +200,19 @@ let relationalTablesReady = false;
 let relationalTablesPromise = null;
 async function ensureRelationalTables() {
   if (relationalTablesReady) return;
+  let schemaVersion = null;
+  try {
+    schemaVersion = await sqlGet(`SELECT 1 as ready FROM schema_migrations WHERE name = ?`, ["relational-schema-v2"]);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (!/schema_migrations|no such table|does not exist/i.test(message)) {
+      throw error;
+    }
+  }
+  if (schemaVersion?.ready) {
+    relationalTablesReady = true;
+    return;
+  }
   if (relationalTablesPromise) return relationalTablesPromise;
   relationalTablesPromise = ensureRelationalTablesImpl();
   try {
@@ -423,6 +436,10 @@ async function ensureRelationalTablesImpl() {
       updated_at text NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS idx_auto_trading_status ON auto_trading_accounts(approval_status)`,
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+      name text PRIMARY KEY,
+      applied_at text NOT NULL
+    )`,
   ];
   // Confirmed live in production: one statement in this list failing for any
   // reason (a transient pooler/connection hiccup, or a genuine error in a single
@@ -683,6 +700,7 @@ async function ensureRelationalTablesImpl() {
   }
   await migratePlaintextBrokerCredentials()
   await migrateLegacyJsonIntoRelationalTables();
+  await sqlRun(`INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET applied_at = excluded.applied_at`, ["relational-schema-v2", new Date().toISOString()]);
   // Publish readiness only after legacy data is fully imported so concurrent requests
   // cannot write rate limits or users while the initial migration is still running.
   relationalTablesReady = true;
@@ -2521,7 +2539,7 @@ async function handleApi(req, res, url) {
       sendJson(res, 500, {
         ok: false,
         error: "server_error",
-        message: "Impossible de charger la liste des comptes pour le moment. Vérifie les logs Render.",
+        message: "Impossible de charger la liste des comptes pour le moment. Vï¿½rifie les logs Render.",
       });
     }
     return;
@@ -9103,7 +9121,7 @@ async function loginUser(body = {}, req = null) {
       return {
         ok: false,
         error: "too_many_attempts",
-        message: `Trop de tentatives. Réessaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
+        message: `Trop de tentatives. Rï¿½essaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
         retryAfterSeconds: rateLimit.retryAfterSeconds,
       };
     }
@@ -9121,7 +9139,7 @@ async function loginUser(body = {}, req = null) {
       user.lastLoginAt = new Date().toISOString();
       const saved = await persistLoginSession(user, session);
       if (authPersistenceRequired() && saved.persisted !== "supabase") {
-        return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+        return { ok: false, error: "Persistance Supabase indisponible. Rï¿½essaie dans quelques secondes." };
       }
       return { ok: true, user, session };
     });
@@ -9131,7 +9149,7 @@ async function loginUser(body = {}, req = null) {
     return {
       ok: false,
       error: "server_error",
-      message: "Connexion impossible pour le moment. Vérifie les logs Render.",
+      message: "Connexion impossible pour le moment. Vï¿½rifie les logs Render.",
     };
   }
 }
