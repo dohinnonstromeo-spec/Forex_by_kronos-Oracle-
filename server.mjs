@@ -2484,17 +2484,26 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/admin/members") {
-    const admin = await requireAdmin(req);
-    if (!admin.ok) return sendJson(res, admin.status, admin);
-    const store = await loadAuthStore();
-    sendJson(res, 200, {
-      ok: true,
-      users: store.users
-        .slice()
-        .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
-        .slice(0, 200)
-        .map(adminUserPayload),
-    });
+    try {
+      const admin = await requireAdmin(req);
+      if (!admin.ok) return sendJson(res, admin.status, admin);
+      const store = await loadAuthStore();
+      sendJson(res, 200, {
+        ok: true,
+        users: store.users
+          .slice()
+          .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+          .slice(0, 200)
+          .map(adminUserPayload),
+      });
+    } catch (error) {
+      logOnce("admin-members", "lecture membres echouee (" + error.message + ")");
+      sendJson(res, 500, {
+        ok: false,
+        error: "server_error",
+        message: "Impossible de charger la liste des comptes pour le moment. Vérifie les logs Render.",
+      });
+    }
     return;
   }
 
@@ -9066,35 +9075,44 @@ async function registerPasswordResetAttempt(req) {
 }
 
 async function loginUser(body = {}, req = null) {
-  const email = normalizeEmail(body.email);
-  const password = String(body.password || "");
-  const rateLimit = req ? await checkLoginRateLimit(req, email) : { ok: true };
-  if (!rateLimit.ok) {
+  try {
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || "");
+    const rateLimit = req ? await checkLoginRateLimit(req, email) : { ok: true };
+    if (!rateLimit.ok) {
+      return {
+        ok: false,
+        error: "too_many_attempts",
+        message: `Trop de tentatives. Réessaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      };
+    }
+    return await withFileLock("auth-store", async () => {
+      const store = await loadAuthStore();
+      const user = store.users.find((item) => item.email === email);
+      if (!user || !verifyPassword(password, user.passwordHash)) {
+        if (req) await registerLoginFailure(req, email);
+        return { ok: false, error: "Email ou mot de passe incorrect." };
+      }
+      if (req) await clearLoginAttempts(req, email);
+      const session = createSession(user.id);
+      store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
+      store.sessions.push(session);
+      user.lastLoginAt = new Date().toISOString();
+      const saved = await persistLoginSession(user, session);
+      if (authPersistenceRequired() && saved.persisted !== "supabase") {
+        return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
+      }
+      return { ok: true, user, session };
+    });
+  } catch (error) {
+    logOnce("auth-login", "connexion echouee (" + error.message + ")");
     return {
       ok: false,
-      error: "too_many_attempts",
-      message: `Trop de tentatives. RÃ©essaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
-      retryAfterSeconds: rateLimit.retryAfterSeconds,
+      error: "server_error",
+      message: "Connexion impossible pour le moment. Vérifie les logs Render.",
     };
   }
-  return withFileLock("auth-store", async () => {
-    const store = await loadAuthStore();
-    const user = store.users.find((item) => item.email === email);
-    if (!user || !verifyPassword(password, user.passwordHash)) {
-      if (req) await registerLoginFailure(req, email);
-      return { ok: false, error: "Email ou mot de passe incorrect." };
-    }
-    if (req) await clearLoginAttempts(req, email);
-    const session = createSession(user.id);
-    store.sessions = store.sessions.filter((item) => item.userId !== user.id || new Date(item.expiresAt).getTime() > Date.now());
-    store.sessions.push(session);
-    user.lastLoginAt = new Date().toISOString();
-    const saved = await persistLoginSession(user, session);
-    if (authPersistenceRequired() && saved.persisted !== "supabase") {
-      return { ok: false, error: "Persistance Supabase indisponible. RÃ©essaie dans quelques secondes." };
-    }
-    return { ok: true, user, session };
-  });
 }
 
 // Standard enumeration-safe design: always returns { ok: true } regardless of
@@ -11898,3 +11916,4 @@ async function send404Page(res) {
     sendJson(res, 404, { error: "not_found" });
   }
 }
+
