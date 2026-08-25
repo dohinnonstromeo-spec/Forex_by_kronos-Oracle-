@@ -123,8 +123,13 @@ if (pushConfigured) {
 
 const { Pool } = pg;
 const databaseUrl = env.DATABASE_URL || "";
-const allowInsecureDatabaseTls = env.NODE_ENV !== "production" && env.DATABASE_SSL_REJECT_UNAUTHORIZED === "false";
-const pgPool = databaseUrl ? new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: !allowInsecureDatabaseTls } }) : null;
+const databaseSslMode = String(env.DATABASE_SSL_MODE || "require").toLowerCase();
+const allowInsecureDatabaseTls = databaseSslMode === "disable" || env.DATABASE_SSL_REJECT_UNAUTHORIZED === "false";
+const pgPool = databaseUrl ? new Pool({
+  connectionString: databaseUrl,
+  family: Number(env.DATABASE_FAMILY || 4) === 6 ? 6 : 4,
+  ssl: databaseSslMode === "disable" ? false : { rejectUnauthorized: !allowInsecureDatabaseTls },
+}) : null;
 if (IS_PRODUCTION && !databaseUrl) throw new Error("DATABASE_URL is required in production; refusing ephemeral local storage.");
 let pgTableReady = false;
 
