@@ -125,6 +125,11 @@ const { Pool } = pg;
 const databaseUrl = env.DATABASE_URL || "";
 const databaseSslMode = String(env.DATABASE_SSL_MODE || "require").toLowerCase();
 const allowInsecureDatabaseTls = databaseSslMode === "disable" || env.DATABASE_SSL_REJECT_UNAUTHORIZED === "false";
+const debugDb = env.DEBUG_DB === "1" || env.DEBUG_DB === "true";
+if (debugDb && databaseUrl) {
+  const dbHint = /supabase\.co/i.test(databaseUrl) ? "supabase" : /neon\.tech/i.test(databaseUrl) ? "neon" : "other";
+  console.log(`[boot] database_url_hint=${dbHint} family=${Number(env.DATABASE_FAMILY || 4) === 6 ? 6 : 4} ssl_mode=${String(env.DATABASE_SSL_MODE || (env.DATABASE_SSL_REJECT_UNAUTHORIZED === "false" ? "disable" : "require")).toLowerCase()}`);
+}
 const pgPool = databaseUrl ? new Pool({
   connectionString: databaseUrl,
   family: Number(env.DATABASE_FAMILY || 4) === 6 ? 6 : 4,
