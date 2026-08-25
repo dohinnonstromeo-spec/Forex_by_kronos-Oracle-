@@ -9459,43 +9459,52 @@ function isTestRequest(req) {
 }
 
 async function grantPremiumAccess(body = {}) {
-  const email = normalizeEmail(body.email);
-  const days = Math.max(1, Math.min(730, Number(body.days || body.durationDays || 30)));
-  if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
-  return withFileLock("auth-store", async () => {
-    const store = await loadAuthStore();
-    const user = store.users.find((item) => item.email === email);
-    if (!user) return { ok: false, error: "Utilisateur introuvable. La personne doit d'abord créer un compte." };
-    const premiumUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-    user.plan = "premium";
-    user.premiumUntil = premiumUntil;
-    user.manualPremium = true;
-    user.premiumSource = "manual_admin";
-    user.updatedAt = new Date().toISOString();
-    user.usage = { date: new Date().toISOString().slice(0, 10), analysis: 0, chat: 0, detection: 0 };
-    await sqlRun("UPDATE users SET plan = ?, premium_until = ?, manual_premium = ?, premium_source = ?, usage = ?, updated_at = ? WHERE id = ?", [user.plan, user.premiumUntil, user.manualPremium ? 1 : 0, user.premiumSource, JSON.stringify(user.usage), user.updatedAt, user.id]);
-    await sqlRun("DELETE FROM user_usage WHERE user_id = ?", [user.id]);
-    return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
-  });
+  try {
+    const email = normalizeEmail(body.email);
+    const days = Math.max(1, Math.min(730, Number(body.days || body.durationDays || 30)));
+    if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
+    return await withFileLock("auth-store", async () => {
+      const store = await loadAuthStore();
+      const user = store.users.find((item) => item.email === email);
+      if (!user) return { ok: false, error: "Utilisateur introuvable. La personne doit d'abord créer un compte." };
+      const premiumUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+      user.plan = "premium";
+      user.premiumUntil = premiumUntil;
+      user.manualPremium = true;
+      user.premiumSource = "manual_admin";
+      user.updatedAt = new Date().toISOString();
+      user.usage = { date: new Date().toISOString().slice(0, 10), analysis: 0, chat: 0, detection: 0 };
+      await sqlRun("UPDATE users SET plan = ?, premium_until = ?, manual_premium = ?, premium_source = ?, usage = ?, updated_at = ? WHERE id = ?", [user.plan, user.premiumUntil, user.manualPremium ? 1 : 0, user.premiumSource, JSON.stringify(user.usage), user.updatedAt, user.id]);
+      await sqlRun("DELETE FROM user_usage WHERE user_id = ?", [user.id]);
+      return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
+    });
+  } catch (error) {
+    logOnce("admin-premium", `activation premium echouee (${error.message})`);
+    return { ok: false, error: "server_error", message: "Activation impossible pour le moment. Vérifie les logs Render." };
+  }
 }
 
 async function revokePremiumAccess(body = {}) {
-  const email = normalizeEmail(body.email);
-  if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
-  return withFileLock("auth-store", async () => {
-    const store = await loadAuthStore();
-    const user = store.users.find((item) => item.email === email);
-    if (!user) return { ok: false, error: "Utilisateur introuvable." };
-    user.plan = "free";
-    user.premiumUntil = null;
-    user.manualPremium = false;
-    user.premiumSource = null;
-    user.updatedAt = new Date().toISOString();
-    await sqlRun("UPDATE users SET plan = ?, premium_until = NULL, manual_premium = 0, premium_source = NULL, updated_at = ? WHERE id = ?", [user.plan, user.updatedAt, user.id]);
-    return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
-  });
+  try {
+    const email = normalizeEmail(body.email);
+    if (!isValidEmail(email)) return { ok: false, error: "Email invalide." };
+    return await withFileLock("auth-store", async () => {
+      const store = await loadAuthStore();
+      const user = store.users.find((item) => item.email === email);
+      if (!user) return { ok: false, error: "Utilisateur introuvable." };
+      user.plan = "free";
+      user.premiumUntil = null;
+      user.manualPremium = false;
+      user.premiumSource = null;
+      user.updatedAt = new Date().toISOString();
+      await sqlRun("UPDATE users SET plan = ?, premium_until = NULL, manual_premium = 0, premium_source = NULL, updated_at = ? WHERE id = ?", [user.plan, user.updatedAt, user.id]);
+      return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
+    });
+  } catch (error) {
+    logOnce("admin-premium", `revocation premium echouee (${error.message})`);
+    return { ok: false, error: "server_error", message: "Révocation impossible pour le moment. Vérifie les logs Render." };
+  }
 }
-
 function adminUserPayload(user = {}) {
   return {
     id: user.id,
