@@ -22,10 +22,24 @@
     // call the paid /api/news-summary endpoint for every visible row: it added
     // decorative Groq requests and six avoidable quota/database writes per page.
     await Promise.all([updatePrices(), updateSignals()]);
-    setInterval(updateCountdowns, 1000);
-    setInterval(updatePrices, 60000);
-    setInterval(updateSignals, 15 * 60 * 1000);
-    setInterval(updateSignalScores, 5 * 60 * 1000);
+    scheduleVisiblePoll(updateCountdowns, 1000);
+    scheduleVisiblePoll(updatePrices, 60000);
+    scheduleVisiblePoll(updateSignals, 15 * 60 * 1000);
+    scheduleVisiblePoll(updateSignalScores, 5 * 60 * 1000);
+  }
+
+  // A hidden public tab should not keep waking the server and external market
+  // providers. Refresh immediately when the visitor returns so the interface
+  // never feels stale after switching back.
+  function scheduleVisiblePoll(callback, intervalMs) {
+    const tick = () => {
+      if (document.visibilityState !== "hidden") callback();
+    };
+    tick();
+    setInterval(tick, intervalMs);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "hidden") callback();
+    });
   }
 
   let pricesRefreshInFlight = false;

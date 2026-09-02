@@ -27,12 +27,25 @@
         <a href="/paiement" data-payment-form>S'abonner</a>
         <div class="auth-notif" data-notif-wrap hidden>
           <button class="auth-notif-bell" type="button" data-notif-bell aria-label="Notifications">
-            🔔<span class="auth-notif-badge" data-notif-badge hidden>0</span>
+            <span data-icon="bell" aria-hidden="true"></span><span class="auth-notif-badge" data-notif-badge hidden>0</span>
           </button>
-          <div class="auth-notif-panel" data-notif-panel role="region" aria-label="Notifications" hidden>
-            <p class="auth-notif-title">Activité récente</p>
+          <div class="auth-notif-panel" data-notif-panel role="dialog" aria-label="Centre de notifications" aria-modal="false" hidden>
+            <div class="auth-notif-heading">
+              <div>
+                <p class="auth-notif-eyebrow">Centre de contrôle</p>
+                <p class="auth-notif-title">Activité récente</p>
+              </div>
+              <button class="auth-notif-close" type="button" data-notif-close aria-label="Fermer les notifications">×</button>
+            </div>
+            <p class="auth-notif-device-status" data-push-device-status>Alertes sur cet appareil : vérification...</p>
+            <p class="auth-notif-robot-status" data-notif-robot-status>Diagnostic robot : vérification...</p>
             <p class="auth-notif-empty" data-notif-empty hidden>Aucun événement pour l'instant.</p>
             <div data-notif-list aria-live="polite"></div>
+            <div class="auth-notif-actions">
+              <button class="payment-method-button" type="button" data-push-test>Tester sur cet appareil</button>
+              <button class="auth-notif-link" type="button" data-notif-go-trading>Voir le suivi des trades</button>
+            </div>
+            <p class="auth-notif-test-status" data-push-test-status role="status" aria-live="polite"></p>
           </div>
         </div>
         <button class="auth-logout" type="button" data-logout>Déconnexion</button>
@@ -76,6 +89,57 @@
           <small>Filtres de risque en place</small>
         </div>
       </div>
+    </section>
+
+    <section class="dashboard-status-center" data-dashboard-status-center aria-labelledby="dashboard-status-title">
+      <div class="dashboard-status-heading">
+        <div>
+          <p class="analysis-kicker">Centre de contrôle</p>
+          <h2 id="dashboard-status-title" class="analysis-title">État réel de ton espace</h2>
+          <p class="dashboard-status-intro">Une lecture courte de la base, du broker, du robot, des prix et du calendrier économique.</p>
+        </div>
+        <div class="dashboard-status-actions">
+          <span class="dashboard-status-overall" data-global-status-overall data-state="pending">Initialisation...</span>
+          <button class="dashboard-history-more" type="button" data-dashboard-status-refresh>Actualiser</button>
+          <button class="auth-notif-link" type="button" data-onboarding-open>Guide de démarrage</button>
+        </div>
+      </div>
+      <div class="dashboard-status-grid">
+        <article class="dashboard-status-card" data-runtime-card="database">
+          <span class="dashboard-status-card-icon" data-icon="database" aria-hidden="true"></span>
+          <div><span>Neon</span><strong data-runtime-value>Vérification...</strong><small data-runtime-meta>Connexion sécurisée</small></div>
+        </article>
+        <article class="dashboard-status-card" data-runtime-card="broker">
+          <span class="dashboard-status-card-icon" data-icon="creditCard" aria-hidden="true"></span>
+          <div><span>Broker</span><strong data-runtime-value>Vérification...</strong><small data-runtime-meta>Démo et réel</small></div>
+        </article>
+        <article class="dashboard-status-card" data-runtime-card="robot">
+          <span class="dashboard-status-card-icon" data-icon="zap" aria-hidden="true"></span>
+          <div><span>Robot Kronos</span><strong data-runtime-value>Vérification...</strong><small data-runtime-meta>Swing et scalp</small></div>
+        </article>
+        <article class="dashboard-status-card" data-runtime-card="market">
+          <span class="dashboard-status-card-icon" data-icon="activity" aria-hidden="true"></span>
+          <div><span>Prix &amp; marché</span><strong data-runtime-value>Vérification...</strong><small data-runtime-meta>Dernière synchronisation</small></div>
+        </article>
+        <article class="dashboard-status-card" data-runtime-card="calendar">
+          <span class="dashboard-status-card-icon" data-icon="calendar" aria-hidden="true"></span>
+          <div><span>Calendrier économique</span><strong data-runtime-value>Vérification...</strong><small data-runtime-meta>Filtre de sécurité</small></div>
+        </article>
+      </div>
+      <div class="dashboard-status-feed">
+        <div><span>Dernière action du robot</span><strong data-runtime-last-action>Pas encore disponible</strong><small data-runtime-last-detail></small></div>
+        <div><span>Prochaine vérification estimée</span><strong data-runtime-next-check>En attente du scheduler</strong></div>
+      </div>
+    </section>
+
+    <section class="dashboard-onboarding" data-dashboard-onboarding hidden aria-labelledby="onboarding-title">
+      <div class="dashboard-onboarding-heading">
+        <div><p class="analysis-kicker">Mise en route guidée</p><h2 id="onboarding-title" class="analysis-title">Ton parcours Kronos</h2></div>
+        <button class="auth-notif-link" type="button" data-onboarding-dismiss>Masquer pour l’instant</button>
+      </div>
+      <p class="dashboard-status-intro">Quelques étapes simples avant d’utiliser le robot en conditions réelles. Le mode démo est recommandé pour commencer.</p>
+      <div class="dashboard-onboarding-progress"><span data-onboarding-progress>0 / 4 étapes vérifiées</span><i><b data-onboarding-progress-bar></b></i></div>
+      <div class="dashboard-onboarding-steps" data-onboarding-steps></div>
     </section>
 
     <div class="oracle-tabs" data-tabs>

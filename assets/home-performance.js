@@ -1,11 +1,20 @@
 (() => {
-  document.addEventListener("DOMContentLoaded", refreshHomeMetrics);
+  document.addEventListener("DOMContentLoaded", () => scheduleVisiblePoll(refreshHomeMetrics, 5 * 60 * 1000));
   // Sole owner of /api/performance rendering on the home page -- kronos-live.js
   // used to also fetch and render this same panel (via fragile h3-text matching)
   // every 5 minutes, racing this file to overwrite the same DOM node with a
   // different, less complete template. Removed there; the periodic refresh moved
   // here instead so the panel still stays fresh on a long-open tab.
-  setInterval(refreshHomeMetrics, 5 * 60 * 1000);
+  function scheduleVisiblePoll(callback, intervalMs) {
+    const tick = () => {
+      if (document.visibilityState !== "hidden") callback();
+    };
+    tick();
+    setInterval(tick, intervalMs);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "hidden") callback();
+    });
+  }
 
   async function refreshHomeMetrics() {
     try {

@@ -20,10 +20,19 @@
     if (window.__oraclePricesPayload) {
       renderSparksFromPayload(window.__oraclePricesPayload);
     }
-    refreshNews();
-    tickClock();
-    setInterval(tickClock, 1000);
-    setInterval(refreshNews, 10 * 60 * 1000);
+    scheduleVisiblePoll(refreshNews, 10 * 60 * 1000);
+    scheduleVisiblePoll(tickClock, 1000);
+  }
+
+  function scheduleVisiblePoll(callback, intervalMs) {
+    const tick = () => {
+      if (document.visibilityState !== "hidden") callback();
+    };
+    tick();
+    setInterval(tick, intervalMs);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "hidden") callback();
+    });
   }
 
   function renderSparksFromPayload(data) {

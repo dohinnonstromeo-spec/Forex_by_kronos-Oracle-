@@ -117,6 +117,8 @@ const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_ANON_KEY || ""
 // generateVAPIDKeys()), and delivery goes straight to the browser vendor's push
 // service (Chrome->FCM, Firefox->Mozilla's autopush), which is testable for real.
 const pushConfigured = Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY);
+const pushTestLastSentAt = new Map();
+const PUSH_TEST_COOLDOWN_MS = 60 * 1000;
 if (pushConfigured) {
   webpush.setVapidDetails(env.VAPID_SUBJECT || "mailto:contact@example.com", env.VAPID_PUBLIC_KEY, env.VAPID_PRIVATE_KEY);
 }
@@ -198,6 +200,7 @@ async function sqlAll(sql, params = []) {
 
 let relationalTablesReady = false;
 let relationalTablesPromise = null;
+let schemaMigrationFailures = [];
 async function ensureRelationalTables() {
   if (relationalTablesReady) return;
   if (relationalTablesPromise) return relationalTablesPromise;
@@ -211,6 +214,7 @@ async function ensureRelationalTables() {
 
 async function ensureRelationalTablesImpl() {
   if (relationalTablesReady) return;
+  schemaMigrationFailures = [];
   const statements = [
     `CREATE TABLE IF NOT EXISTS users (
       id text PRIMARY KEY,
@@ -446,7 +450,9 @@ async function ensureRelationalTablesImpl() {
     try {
       await runStatement(statement);
     } catch (error) {
-      logOnce("schema", `instruction de schéma échouée (${error.message}) -- ${statement.slice(0, 60).replace(/\s+/g, " ")}...`);
+      const failure = `instruction de schéma échouée (${error.message}) -- ${statement.slice(0, 60).replace(/\s+/g, " ")}...`;
+      schemaMigrationFailures.push(failure);
+      logOnce("schema", failure);
     }
   }
   // Tables created before this column existed need it added on top -- ALTER TABLE
@@ -707,9 +713,15 @@ async function ensureRelationalTablesImpl() {
   try {
     await runStatement(`CREATE INDEX IF NOT EXISTS idx_analyses_user_source_status ON analyses(user_id, source, status)`);
   } catch (error) {
-    logOnce("schema", `index idx_analyses_user_source_status échoué (${error.message})`);
+    const failure = `index idx_analyses_user_source_status échoué (${error.message})`;
+    schemaMigrationFailures.push(failure);
+    logOnce("schema", failure);
   }
-  await migratePlaintextBrokerCredentials()
+  if (schemaMigrationFailures.length) {
+    const detail = [...new Set(schemaMigrationFailures)].join(" | ").slice(0, 1200);
+    throw new Error(`schema_migration_incomplete: ${detail}`);
+  }
+  await migratePlaintextBrokerCredentials();
   await migrateLegacyJsonIntoRelationalTables();
   await sqlRun(`INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET applied_at = excluded.applied_at`, ["relational-schema-v2", new Date().toISOString()]);
   // Publish readiness only after legacy data is fully imported so concurrent requests
@@ -724,15 +736,13 @@ async function ensureColumn(table, columnDef) {
     else getSqliteDb().exec(alterSql);
   } catch (error) {
     if (!/already exists|duplicate column/i.test(error.message)) {
-      // Confirmed live in production: this used to rethrow on any error that
-      // wasn't recognizably "already exists" (e.g. a transient connection/pooler
-      // hiccup), which -- since every ensureColumn call happens before
-      // relationalTablesReady is set -- took down every single API route on the
-      // site at once, none of which had anything to do with this one column.
-      // Logged instead of thrown: a genuinely missing column then surfaces as a
-      // real, specific "column does not exist" error only on the one query that
-      // actually needed it, not as a site-wide outage.
+      // Keep trying the remaining additive migrations so one transient ALTER does
+      // not hide other missing columns. The failure is collected and checked by
+      // ensureRelationalTablesImpl before readiness is published; the server may
+      // keep serving static pages, but it will not run schedulers or claim storage
+      // readiness until the relational schema is complete.
       logOnce("schema", `ajout de colonne échoué (${table}.${columnDef.split(" ")[0]}: ${error.message})`);
+      schemaMigrationFailures.push(`${table}.${columnDef.split(" ")[0]}: ${error.message}`);
     }
   }
 }
@@ -984,6 +994,8 @@ const LOGIN_WINDOW_MS = boundedEnvNumber(env.LOGIN_WINDOW_MINUTES, 15, 1, 1440) 
 const SIGNUP_MAX_ATTEMPTS = Math.trunc(boundedEnvNumber(env.SIGNUP_MAX_ATTEMPTS, 5, 1, 100));
 const SIGNUP_WINDOW_MS = boundedEnvNumber(env.SIGNUP_WINDOW_MINUTES, 60, 1, 1440) * 60 * 1000;
 const memoryCache = {
+  marketDocument: null,
+  marketCachePersistedAt: 0,
   prices: { value: null, expiresAt: 0 },
   histories: { key: "", value: null, expiresAt: 0 },
   calendar: { value: null, expiresAt: 0 },
@@ -1055,7 +1067,10 @@ const autoTradeTickStatus = new Map();
 function recordAutoTradeStatus(userId, slot, reason, detail = null) {
   autoTradeTickStatus.set(`${userId}:${slot}`, { at: new Date().toISOString(), reason, detail });
 }
-const AUTO_TRADE_STATUS_TTL_MS = 2 * 60 * 60 * 1000;
+// Keep the most recent gate reason long enough to diagnose a quiet trading
+// window after a user returns to the dashboard. This is memory-only and bounded;
+// it does not add a Neon write on every scheduler tick.
+const AUTO_TRADE_STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_AUTO_TRADE_STATUS_ENTRIES = 10000;
 function pruneAutoTradeTickStatus(now = Date.now()) {
   for (const [key, value] of autoTradeTickStatus) {
@@ -1406,8 +1421,18 @@ httpServer.headersTimeout = 15_000;
 httpServer.requestTimeout = 120_000;
 httpServer.keepAliveTimeout = 65_000;
 
-httpServer.listen(port, () => {
-  console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
+let schedulersStarted = false;
+async function startSchedulersAfterReady() {
+  if (schedulersStarted) return;
+  try {
+    await ensureRelationalTables();
+  } catch (error) {
+    logOnce("schema-bootstrap", `démarrage suspendu: schéma relationnel non prêt (${error.message})`);
+    const retry = setTimeout(() => startSchedulersAfterReady(), 15_000);
+    retry.unref?.();
+    return;
+  }
+  schedulersStarted = true;
   startLearningOutcomesScheduler();
   startBrokerReconcileScheduler();
   startSendingRecoveryScheduler();
@@ -1419,6 +1444,11 @@ httpServer.listen(port, () => {
   startScalpTradingScheduler();
   startHeartbeatScheduler();
   startRateLimitMapSweeper();
+}
+
+httpServer.listen(port, () => {
+  console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
+  startSchedulersAfterReady();
 });
 
 let shutdownPromise = null;
@@ -1891,6 +1921,41 @@ async function checkSchedulerHeartbeat() {
 }
 
 const HEARTBEAT_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
+function schedulerRuntimeStatus(lastAttemptAt, intervalMs) {
+  const timestamp = Number(lastAttemptAt);
+  if (!Number.isFinite(timestamp)) {
+    return {
+      started: Boolean(schedulersStarted),
+      lastAttemptAt: null,
+      nextExpectedAt: null,
+      stale: false,
+      intervalSeconds: Math.round(intervalMs / 1000),
+    };
+  }
+  const nextExpectedAt = timestamp + intervalMs;
+  return {
+    started: Boolean(schedulersStarted),
+    lastAttemptAt: new Date(timestamp).toISOString(),
+    nextExpectedAt: new Date(nextExpectedAt).toISOString(),
+    stale: Date.now() - timestamp > Math.max(HEARTBEAT_STALE_MS, intervalMs * 3),
+    intervalSeconds: Math.round(intervalMs / 1000),
+  };
+}
+
+function latestPriceRuntimeStatus() {
+  const values = Object.values(memoryCache.prices.value || {});
+  const timestamps = values
+    .map((value) => new Date(value?.asOf || 0).getTime())
+    .filter(Number.isFinite)
+    .filter((value) => value > 0);
+  const timestamp = timestamps.length ? Math.max(...timestamps) : null;
+  return {
+    lastSyncAt: timestamp ? new Date(timestamp).toISOString() : null,
+    stale: !timestamp || Date.now() - timestamp > 5 * 60 * 1000,
+    sourceCount: new Set(values.map((value) => value?.source).filter(Boolean)).size,
+  };
+}
 
 function startHeartbeatScheduler() {
   setInterval(() => {
@@ -3893,6 +3958,77 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/dashboard/status") {
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    try {
+      await ensureRelationalTables();
+      await sqlGet("SELECT 1 as ok");
+      const row = await sqlGet(`SELECT * FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
+      const now = new Date();
+      const approvedUntil = row?.approved_until ? new Date(row.approved_until) : null;
+      const approvalStatus = row?.approval_status === "approved" && approvedUntil && approvedUntil <= now
+        ? "expired"
+        : row?.approval_status || "none";
+      const demoConnected = Boolean(row?.broker_demo_token && row?.broker_demo_account_id && row?.broker_demo_connected_at);
+      const liveConnected = Boolean(row?.broker_live_token && row?.broker_live_account_id && row?.broker_live_connected_at);
+      const demoLastTick = autoTradeTickStatus.get(`${session.user.id}:demo`) || null;
+      const liveLastTick = autoTradeTickStatus.get(`${session.user.id}:live`) || null;
+      const lastAction = [
+        demoLastTick ? { ...demoLastTick, slot: "demo" } : null,
+        liveLastTick ? { ...liveLastTick, slot: "live" } : null,
+      ].filter(Boolean).sort((a, b) => new Date(b.at) - new Date(a.at))[0] || null;
+      const swingScheduler = schedulerRuntimeStatus(lastAutoTradeTickAttemptAt, AUTO_TRADE_INTERVAL_MS);
+      const scalpScheduler = schedulerRuntimeStatus(lastScalpTickAttemptAt, SCALP_TRADING_INTERVAL_MS);
+      const nextChecks = [swingScheduler.nextExpectedAt, scalpScheduler.nextExpectedAt]
+        .filter(Boolean)
+        .sort()
+        .map((value) => new Date(value).getTime());
+      const nextCheckAt = nextChecks.length ? new Date(nextChecks[0]).toISOString() : null;
+      sendJson(res, 200, {
+        ok: true,
+        database: { status: "operational", family: pgPool ? "postgres" : "sqlite" },
+        market: marketStatus(),
+        prices: latestPriceRuntimeStatus(),
+        calendar: {
+          status: memoryCache.calendarMeta.status,
+          checkedAt: memoryCache.calendarMeta.checkedAt,
+          reason: memoryCache.calendarMeta.reason || null,
+        },
+        broker: {
+          demo: {
+            connected: demoConnected,
+            enabled: Boolean(Number(row?.demo_trading_enabled ?? 1)),
+            lastCheckStatus: row?.broker_demo_last_check_status || null,
+            lastCheckAt: row?.broker_demo_last_check_at || null,
+          },
+          live: {
+            connected: liveConnected,
+            enabled: Boolean(Number(row?.live_trading_enabled)),
+            authorized: Boolean(Number(row?.live_trading_authorized)),
+            lastCheckStatus: row?.broker_live_last_check_status || null,
+            lastCheckAt: row?.broker_live_last_check_at || null,
+          },
+        },
+        robot: {
+          approvalStatus,
+          userPaused: Boolean(Number(row?.user_paused)),
+          scalpEnabled: Boolean(Number(row?.scalp_enabled)),
+          scalpUserEnabled: Boolean(Number(row?.user_scalp_enabled)),
+          swing: swingScheduler,
+          scalp: scalpScheduler,
+          activeSlots: activeBrokerSlots(row || {}),
+          lastAction,
+          nextCheckAt,
+        },
+      });
+    } catch (error) {
+      logOnce("dashboard-status", `état global indisponible (${error.message})`);
+      sendJson(res, 503, { ok: false, error: "storage_unavailable" });
+    }
+    return;
+  }
+
   if (url.pathname === "/api/auto-trade/status") {
     const session = await currentSession(req);
     if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
@@ -4106,6 +4242,36 @@ async function handleApi(req, res, url) {
       [`push_${Date.now()}_${randomBytes(4).toString("hex")}`, session.user.id, endpoint, p256dh, auth, topics, new Date().toISOString()],
     );
     sendJson(res, 200, { ok: true, topics: topics.split(",") });
+    return;
+  }
+
+  if (url.pathname === "/api/push/test") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    if (!pushConfigured) return sendJson(res, 503, { ok: false, error: "push_not_configured" });
+    const now = Date.now();
+    for (const [userId, sentAt] of pushTestLastSentAt) {
+      if (now - sentAt > PUSH_TEST_COOLDOWN_MS) pushTestLastSentAt.delete(userId);
+    }
+    const lastSentAt = pushTestLastSentAt.get(session.user.id) || 0;
+    const remainingMs = PUSH_TEST_COOLDOWN_MS - (now - lastSentAt);
+    if (remainingMs > 0) {
+      return sendJson(res, 429, { ok: false, error: "push_test_cooldown", retryAfterSeconds: Math.ceil(remainingMs / 1000) });
+    }
+    await ensureRelationalTables();
+    const subscriptions = await sqlAll(`SELECT * FROM push_subscriptions WHERE user_id = ?`, [session.user.id]);
+    if (!subscriptions.length) return sendJson(res, 404, { ok: false, error: "push_subscription_missing" });
+    pushTestLastSentAt.set(session.user.id, Date.now());
+    const delivered = await sendPushToSubscriptions(
+      subscriptions,
+      JSON.stringify({
+        title: "Oracle Forex · Notification test",
+        body: "Si tu vois ce message, les alertes mobiles sont correctement configurées.",
+        url: "/dashboard.html#trading",
+      }),
+    );
+    sendJson(res, delivered ? 200 : 502, { ok: Boolean(delivered), error: delivered ? null : "push_delivery_failed", delivered });
     return;
   }
 
@@ -5268,7 +5434,7 @@ async function loadHistories(prices, usableKey) {
   await saveMarketCache({
     ...cache,
     histories: mergeCachedHistories(cache.histories || {}, histories),
-  });
+  }, { force: true });
   memoryCache.histories = { key: usableKey, value: histories, expiresAt: Date.now() + 10 * 60 * 1000 };
   return histories;
 }
@@ -5304,7 +5470,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
             await saveMarketCache({
               ...cache,
               histories: mergeCachedHistories(cache.histories || {}, { [symbol]: bars }),
-            });
+            }, { force: true });
             recordProviderHealth(`${source}_history_single`, true);
             return bars;
           }
@@ -5438,7 +5604,7 @@ async function fetchFreeHistories(cache, prices) {
   await saveMarketCache({
     ...cache,
     histories: mergeCachedHistories(cache.histories || {}, histories),
-  });
+  }, { force: true });
   return histories;
 }
 
@@ -8967,43 +9133,57 @@ async function atomicWriteFile(filePath, content) {
 }
 
 async function loadMarketCache() {
+  if (memoryCache.marketDocument) return memoryCache.marketDocument;
   const fromState = await loadStateDocument("market-cache");
   if (fromState) {
-    return {
+    memoryCache.marketDocument = {
       version: 1,
       prices: fromState.prices && typeof fromState.prices === "object" ? fromState.prices : {},
       histories: fromState.histories && typeof fromState.histories === "object" ? fromState.histories : {},
       updatedAt: fromState.updatedAt || null,
     };
+    return memoryCache.marketDocument;
   }
   try {
     const raw = await readFile(marketCachePath, "utf8");
     const parsed = JSON.parse(raw);
-    return {
+    memoryCache.marketDocument = {
       version: 1,
       prices: parsed.prices && typeof parsed.prices === "object" ? parsed.prices : {},
       histories: parsed.histories && typeof parsed.histories === "object" ? parsed.histories : {},
       updatedAt: parsed.updatedAt || null,
     };
+    return memoryCache.marketDocument;
   } catch {
-    return { version: 1, prices: {}, histories: {}, updatedAt: null };
+    memoryCache.marketDocument = { version: 1, prices: {}, histories: {}, updatedAt: null };
+    return memoryCache.marketDocument;
   }
 }
 
-async function saveMarketCache(cache) {
+const MARKET_CACHE_PERSIST_INTERVAL_MS = boundedEnvNumber(env.MARKET_CACHE_PERSIST_INTERVAL_SECONDS, 600, 60, 86400) * 1000;
+async function saveMarketCache(cache, { force = false } = {}) {
+  const current = memoryCache.marketDocument || { prices: {}, histories: {} };
   const trimmed = {
     version: 1,
-    prices: cache.prices || {},
-    histories: Object.fromEntries(Object.entries(cache.histories || {}).map(([symbol, history]) => [symbol, {
+    // Price and history refreshes can overlap. Merge symbol maps so an older
+    // caller snapshot cannot erase a newer update from the other path.
+    prices: { ...(current.prices || {}), ...(cache.prices || {}) },
+    histories: Object.fromEntries(Object.entries({ ...(current.histories || {}), ...(cache.histories || {}) }).map(([symbol, history]) => [symbol, {
       source: history.source,
       asOf: history.asOf,
       bars: Array.isArray(history.bars) ? history.bars.slice(-80) : [],
     }])),
     updatedAt: new Date().toISOString(),
   };
-  if (await saveStateDocument("market-cache", trimmed)) return trimmed;
+  memoryCache.marketDocument = trimmed;
+  if (!force && Date.now() - memoryCache.marketCachePersistedAt < MARKET_CACHE_PERSIST_INTERVAL_MS) return trimmed;
+  if (await saveStateDocument("market-cache", trimmed)) {
+    memoryCache.marketCachePersistedAt = Date.now();
+    return trimmed;
+  }
   await atomicWriteFile(marketCachePath, `${JSON.stringify(trimmed, null, 2)}
 `);
+  memoryCache.marketCachePersistedAt = Date.now();
   return trimmed;
 }
 
@@ -11507,7 +11687,7 @@ async function reconcileBrokerBackedOutcomes() {
       );
       if (!brokerOrderRows.length) return;
       const brokerOrderByAnalysisId = new Map(brokerOrderRows.map((row) => [row.analysis_id, row]));
-      const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ?`, [1]);
+      const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ? AND is_test = ?`, [1, 0]);
       const credentialsCache = new Map();
       for (const row of openRows) {
         if (!brokerOrderByAnalysisId.has(row.id)) continue; // not broker-backed -- the slower full tick still owns these
@@ -11838,7 +12018,7 @@ async function updateLearningOutcomes(prices = null, histories = null) {
   const justClosed = [];
   const result = await withFileLock("learning-log", async () => {
     await ensureRelationalTables();
-    const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ?`, [1]);
+    const openRows = await sqlAll(`SELECT * FROM analyses WHERE status = 'OPEN' AND active = ? AND is_test = ?`, [1, 0]);
     if (openRows.length) {
       const livePrices = prices || await getPrices();
       const brokerOrderRows = await sqlAll(
@@ -11976,9 +12156,11 @@ async function notifyOrderOpened(order) {
 }
 
 async function sendPushToSubscriptions(subs, payload) {
+  let delivered = 0;
   for (const sub of subs) {
     try {
       await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, payload);
+      delivered += 1;
     } catch (error) {
       // 404/410: the browser/user revoked or the subscription expired -- push
       // services return these permanently, retrying is pointless, so clean it up.
@@ -11989,6 +12171,7 @@ async function sendPushToSubscriptions(subs, payload) {
       }
     }
   }
+  return delivered;
 }
 
 // Alerts premium users (topic "new_signal") the moment the deterministic engine's

@@ -174,7 +174,9 @@
   }
 
   if (document.querySelector(".dashboard-main")) {
-    loadDashboard();
+    // Let the rest of this deferred script initialize its state variables before
+    // the dashboard starts. This keeps the early notification/status boot safe.
+    setTimeout(() => loadDashboard(), 0);
   }
 
   syncAuthNav();
@@ -222,9 +224,18 @@
       window.location.href = "/login";
       return;
     }
+    dashboardUser = me.user;
     document.querySelector("[data-user-greeting]").textContent = `Bienvenue ${me.user.name}. Ton espace Kronos est prêt.`;
     const planLabel = String(me.user.plan || "free").toLowerCase() === "premium" ? "PREMIUM" : "GRATUIT";
     document.querySelector("[data-user-plan]").textContent = planLabel;
+    const isPremium = String(me.user.plan || "").toLowerCase() === "premium";
+
+    // Start the local notification center before the slower performance/history
+    // requests. A failed provider response must never prevent the bell from
+    // opening or hide the in-app fallback.
+    startNotificationsFallback();
+    void initPush(isPremium);
+    void refreshDashboardRuntimeStatus();
 
     const performance = await fetchJson("/api/performance");
     const performanceReady = Boolean(performance?.precisionLabel);
@@ -256,16 +267,238 @@
       ].map(([name, value]) => `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
     }
 
-    const isPremium = String(me.user.plan || "").toLowerCase() === "premium";
     const personal = await fetchJson("/api/my-analyses");
     renderPersonalHistory(personal, isPremium);
-    initPush(isPremium);
     loadBrokerPanel(isPremium);
     loadTradeOrders(isPremium);
     loadAutoTrade(isPremium);
     startLivePositionsPolling();
-    startNotificationsFallback();
+    // Performance/news loading can populate the in-memory calendar and price
+    // snapshots after the first lightweight status request. Refresh once more so
+    // the first screen reflects that completed work without starting another
+    // provider request.
+    void refreshDashboardRuntimeStatus();
   }
+
+  let dashboardRuntimeStatus = null;
+  let dashboardRuntimeRefreshInFlight = false;
+  let dashboardRuntimePollStarted = false;
+  let dashboardUser = null;
+  let pushDeviceReady = false;
+  const ONBOARDING_DISMISSED_KEY = "oracle-kronos-onboarding-dismissed-v1";
+
+  function relativeTime(value) {
+    const timestamp = new Date(value || 0).getTime();
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "jamais";
+    const minutes = Math.max(0, Math.round((Date.now() - timestamp) / 60000));
+    if (minutes < 1) return "à l'instant";
+    if (minutes < 60) return `il y a ${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `il y a ${hours} h`;
+    return `il y a ${Math.floor(hours / 24)} j`;
+  }
+
+  function runtimeReasonLabel(reason) {
+    return AUTOTRADE_TICK_REASON_LABELS[reason] || {
+      account_not_configured: "Compte broker non configuré",
+      broker_not_connected: "Broker non connecté",
+      robot_disabled: "Robot désactivé sur ce compte",
+      scheduler_not_started: "Scheduler en attente de démarrage",
+      scheduler_stale: "Scheduler silencieux, vérification nécessaire",
+    }[reason] || reason || "Aucune action enregistrée";
+  }
+
+  function setRuntimeCard(key, state, value, meta) {
+    const card = document.querySelector(`[data-runtime-card="${key}"]`);
+    if (!card) return;
+    card.dataset.state = state;
+    const valueEl = card.querySelector("[data-runtime-value]");
+    const metaEl = card.querySelector("[data-runtime-meta]");
+    if (valueEl) valueEl.textContent = value;
+    if (metaEl) metaEl.textContent = meta;
+  }
+
+  function renderDashboardRuntimeStatus(data) {
+    dashboardRuntimeStatus = data;
+    const databaseOk = data?.database?.status === "operational";
+    const demo = data?.broker?.demo;
+    const live = data?.broker?.live;
+    const connectedSlots = [demo?.connected, live?.connected].filter(Boolean).length;
+    const brokerState = connectedSlots ? "ready" : "pending";
+    const brokerValue = connectedSlots === 2 ? "Démo + réel" : connectedSlots === 1 ? (demo?.connected ? "Démo connectée" : "Réel connecté") : "Non connecté";
+    const brokerChecks = [demo?.lastCheckAt, live?.lastCheckAt].filter(Boolean).sort().reverse();
+    setRuntimeCard("database", databaseOk ? "ready" : "danger", databaseOk ? "Opérationnelle" : "Indisponible", data?.database?.family === "postgres" ? "Neon / PostgreSQL" : "Stockage relationnel");
+    setRuntimeCard("broker", brokerState, brokerValue, brokerChecks[0] ? `Dernier contrôle ${relativeTime(brokerChecks[0])}` : "Connecte un compte démo pour commencer");
+
+    const robot = data?.robot || {};
+    const activeRobotSlots = Array.isArray(robot.activeSlots) ? robot.activeSlots : [];
+    const connectedBrokerSlots = [demo?.connected, live?.connected].filter(Boolean).length;
+    const approvalStatus = String(robot.approvalStatus || "none").toLowerCase();
+    const swingReady = approvalStatus === "approved" && !robot.userPaused && activeRobotSlots.length > 0;
+    const scalpReady = Boolean(robot.scalpEnabled && robot.scalpUserEnabled && !robot.userPaused && activeRobotSlots.length > 0);
+    const schedulerStarted = Boolean(robot.swing?.started || robot.scalp?.started);
+    const schedulerStale = Boolean((swingReady && robot.swing?.stale) || (scalpReady && robot.scalp?.stale));
+    const robotConfigured = swingReady || scalpReady;
+    const approvalMessage = {
+      requested: "Approbation du robot en attente",
+      rejected: "Approbation du robot refusée",
+      revoked: "Approbation du robot révoquée",
+      expired: "Approbation du robot expirée",
+    }[approvalStatus];
+    const robotState = robot.userPaused ? "warning" : schedulerStale ? "danger" : robotConfigured && schedulerStarted ? "ready" : "pending";
+    const robotValue = robot.userPaused
+      ? "En pause"
+      : schedulerStale
+          ? "À vérifier"
+          : robotConfigured && schedulerStarted
+            ? "Sous surveillance"
+            : !activeRobotSlots.length
+            ? connectedBrokerSlots ? "Robot désactivé" : "Compte requis"
+            : approvalMessage
+              ? approvalMessage.replace(" du robot", "")
+              : approvalStatus !== "approved" && !scalpReady
+                ? "Approbation requise"
+                : !schedulerStarted
+                  ? "Démarrage en attente"
+                  : !robot.scalpUserEnabled && robot.scalpEnabled
+                    ? "Scalp désactivé par toi"
+                    : "Configuration incomplète";
+    const robotMeta = robot.lastAction?.at
+      ? `${robot.lastAction.slot === "live" ? "Réel" : "Démo"} : ${relativeTime(robot.lastAction.at)}`
+      : !activeRobotSlots.length
+        ? connectedBrokerSlots
+          ? "Compte connecté, mais aucun créneau activé"
+          : "Aucun compte actif pour le robot"
+        : approvalMessage && !scalpReady
+          ? approvalMessage
+          : !robotConfigured
+            ? "Active le mode scalp ou attends l'approbation swing"
+            : schedulerStarted
+              ? "Cycles serveur actifs"
+              : "Scheduler en attente";
+    setRuntimeCard("robot", robotState, robotValue, robotMeta);
+
+    const forexOpen = Boolean(data?.market?.forex?.open);
+    const priceState = data?.prices?.lastSyncAt && !data?.prices?.stale ? "ready" : "warning";
+    setRuntimeCard("market", priceState, forexOpen ? "Forex ouvert" : "Forex fermé", data?.prices?.lastSyncAt ? `Prix synchronisés ${relativeTime(data.prices.lastSyncAt)}` : "Prix pas encore synchronisés");
+
+    const calendarStatus = data?.calendar?.status;
+    const calendarState = calendarStatus === "ok" ? "ready" : calendarStatus === "error" || calendarStatus === "unavailable" ? "danger" : "warning";
+    const calendarValue = calendarStatus === "ok" ? "Disponible" : calendarStatus === "error" || calendarStatus === "unavailable" ? "Indisponible" : "Pas encore vérifié";
+    setRuntimeCard("calendar", calendarState, calendarValue, data?.calendar?.checkedAt ? `Vérifié ${relativeTime(data.calendar.checkedAt)}` : "Le robot bloque par sécurité si la vérification échoue");
+
+    const overall = document.querySelector("[data-global-status-overall]");
+    if (overall) {
+      const overallState = !databaseOk || schedulerStale ? "danger" : robotConfigured && schedulerStarted ? "ready" : "pending";
+      overall.dataset.state = overallState;
+      overall.textContent = overallState === "ready" ? "Opérationnel" : overallState === "danger" ? "À vérifier" : "Configuration requise";
+    }
+    const action = document.querySelector("[data-runtime-last-action]");
+    if (action) {
+      action.textContent = robot.lastAction
+        ? `${robot.lastAction.slot === "live" ? "Réel" : "Démo"} · ${runtimeReasonLabel(robot.lastAction.reason)} · ${relativeTime(robot.lastAction.at)}`
+        : "Aucun cycle personnel enregistré depuis le démarrage";
+      action.title = robot.lastAction?.at ? formatDate(robot.lastAction.at) : "";
+    }
+    const actionDetail = document.querySelector("[data-runtime-last-detail]");
+    if (actionDetail) actionDetail.textContent = robot.lastAction
+      ? formatTickDetail(robot.lastAction.reason, robot.lastAction.detail) || "Aucun détail supplémentaire communiqué par le serveur."
+      : "Le prochain cycle indiquera automatiquement la raison si aucune position n’est retenue.";
+    const notificationRobot = document.querySelector("[data-notif-robot-status]");
+    if (notificationRobot) notificationRobot.textContent = robot.lastAction
+      ? `Robot : ${runtimeReasonLabel(robot.lastAction.reason)} (${relativeTime(robot.lastAction.at)}).`
+      : !activeRobotSlots.length ? "Robot : aucun compte actif pour l’instant." : "Robot : aucun cycle personnel enregistré depuis le démarrage.";
+    const next = document.querySelector("[data-runtime-next-check]");
+    if (next) next.textContent = robot.nextCheckAt ? formatDate(robot.nextCheckAt) : "En attente du scheduler";
+    renderDashboardOnboarding(data);
+  }
+
+  function renderDashboardRuntimeError() {
+    ["database", "broker", "robot", "market", "calendar"].forEach((key) => setRuntimeCard(key, "danger", "Indisponible", "Réessaie dans un instant"));
+    const overall = document.querySelector("[data-global-status-overall]");
+    if (overall) { overall.dataset.state = "danger"; overall.textContent = "État indisponible"; }
+    const action = document.querySelector("[data-runtime-last-action]");
+    if (action) action.textContent = "Le centre d’état n’a pas pu être chargé";
+    const actionDetail = document.querySelector("[data-runtime-last-detail]");
+    if (actionDetail) actionDetail.textContent = "Réessaie avec le bouton Actualiser.";
+    const notificationRobot = document.querySelector("[data-notif-robot-status]");
+    if (notificationRobot) notificationRobot.textContent = "Diagnostic robot indisponible pour le moment.";
+    renderDashboardOnboarding(null);
+  }
+
+  async function refreshDashboardRuntimeStatus() {
+    if (dashboardRuntimeRefreshInFlight) return;
+    dashboardRuntimeRefreshInFlight = true;
+    try {
+      const data = await fetchJson("/api/dashboard/status");
+      if (!data?.ok) throw new Error("dashboard_status_unavailable");
+      renderDashboardRuntimeStatus(data);
+    } catch {
+      renderDashboardRuntimeError();
+    } finally {
+      dashboardRuntimeRefreshInFlight = false;
+      if (!dashboardRuntimePollStarted) {
+        dashboardRuntimePollStarted = true;
+        scheduleVisiblePoll(refreshDashboardRuntimeStatus, 5 * 60 * 1000);
+      }
+    }
+  }
+
+  function onboardingDismissed() {
+    try { return localStorage.getItem(ONBOARDING_DISMISSED_KEY) === "1"; } catch { return false; }
+  }
+
+  function renderDashboardOnboarding(runtime) {
+    const section = document.querySelector("[data-dashboard-onboarding]");
+    const host = document.querySelector("[data-onboarding-steps]");
+    if (!section || !host || !dashboardUser) return;
+    section.hidden = onboardingDismissed();
+    const brokerDone = Boolean(runtime?.broker?.demo?.connected || runtime?.broker?.live?.connected);
+    const robotDone = runtime?.robot?.approvalStatus === "approved";
+    const steps = [
+      { done: true, title: "Compte sécurisé", text: "Ta session membre est active et protégée.", action: null },
+      { done: brokerDone, title: "Connecter le compte démo", text: brokerDone ? "Le broker est vérifié." : "Commence par un compte démo, sans risque réel.", action: "trading", label: "Ouvrir Trading" },
+      { done: robotDone, title: "Faire approuver le robot", text: robotDone ? "L’autorisation robot est active." : "Configure tes limites puis envoie la demande d’activation.", action: "robot", label: "Ouvrir Robot Kronos" },
+      { done: pushDeviceReady, title: "Recevoir les alertes", text: pushDeviceReady ? "Les alertes mobiles sont actives sur cet appareil." : "Active les alertes et lance un test depuis la cloche.", action: "notifications", label: "Voir les notifications" },
+    ];
+    const completed = steps.filter((step) => step.done).length;
+    const progress = document.querySelector("[data-onboarding-progress]");
+    const progressBar = document.querySelector("[data-onboarding-progress-bar]");
+    if (progress) progress.textContent = `${completed} / ${steps.length} étapes vérifiées`;
+    if (progressBar) progressBar.style.width = `${(completed / steps.length) * 100}%`;
+    host.innerHTML = steps.map((step, index) => `
+      <article class="dashboard-onboarding-step${step.done ? " is-complete" : ""}">
+        <span class="dashboard-onboarding-index">${step.done ? "✓" : String(index + 1).padStart(2, "0")}</span>
+        <div><strong>${escapeHtml(step.title)}</strong><p>${escapeHtml(step.text)}</p>${step.action && !step.done ? `<button type="button" class="auth-notif-link" data-onboarding-action="${step.action}">${escapeHtml(step.label)}</button>` : ""}</div>
+      </article>
+    `).join("");
+    host.querySelectorAll("[data-onboarding-action]").forEach((button) => button.addEventListener("click", () => {
+      const target = button.dataset.onboardingAction;
+      if (target === "notifications") document.querySelector("[data-notif-bell]")?.click();
+      else document.querySelector(`[data-tab-btn="${target}"]`)?.click();
+    }));
+  }
+
+  document.querySelector("[data-onboarding-open]")?.addEventListener("click", () => {
+    try { localStorage.removeItem(ONBOARDING_DISMISSED_KEY); } catch {}
+    const section = document.querySelector("[data-dashboard-onboarding]");
+    if (section) { section.hidden = false; section.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    renderDashboardOnboarding(dashboardRuntimeStatus);
+  });
+  document.querySelector("[data-onboarding-dismiss]")?.addEventListener("click", () => {
+    try { localStorage.setItem(ONBOARDING_DISMISSED_KEY, "1"); } catch {}
+    const section = document.querySelector("[data-dashboard-onboarding]");
+    if (section) section.hidden = true;
+  });
+  document.querySelector("[data-dashboard-status-refresh]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      await refreshDashboardRuntimeStatus();
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   // Real floating P&L for whichever open positions are currently rendered on the
   // page, refreshed every 10s -- not a websocket/true push, but close enough that
@@ -280,34 +513,61 @@
     if (livePositionsPollStarted) return;
     if (!document.querySelector("[data-trade-panel], [data-autotrade-panel]")) return;
     livePositionsPollStarted = true;
-    refreshLivePositions();
-    setInterval(refreshLivePositions, 30000);
+    scheduleVisiblePoll(refreshLivePositions, 30000);
+  }
+
+  // Hidden dashboard tabs do not need broker/notification refreshes. Browsers
+  // throttle hidden timers inconsistently, so gate the callback ourselves and
+  // refresh once when the user returns to the tab.
+  function scheduleVisiblePoll(callback, intervalMs) {
+    const tick = () => {
+      if (document.visibilityState !== "hidden") callback();
+    };
+    tick();
+    setInterval(tick, intervalMs);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "hidden") callback();
+    });
   }
 
   let livePositionsRefreshInFlight = false;
   async function refreshLivePositions() {
     if (livePositionsRefreshInFlight) return;
     livePositionsRefreshInFlight = true;
-    const slots = document.querySelectorAll("[data-broker-order-id]:not([data-broker-order-id=''])");
-    if (!slots.length) {
+    try {
+      const slots = document.querySelectorAll("[data-broker-order-id]:not([data-broker-order-id=''])");
+      if (!slots.length) return;
+      const data = await fetchJson("/api/trade/live-positions");
+      const positions = new Map((data?.positions || []).map((p) => [`${p.brokerSlot || ""}:${p.id}`, p]));
+      slots.forEach((card) => {
+        const pnlEl = card.querySelector("[data-live-pnl]");
+        if (!pnlEl) return;
+        const position = positions.get(`${card.dataset.brokerSlot || ""}:${card.dataset.brokerOrderId}`);
+        const profit = Number(position?.profit);
+        if (!Number.isFinite(profit)) {
+          pnlEl.hidden = true; // no longer open, or broker returned an incomplete quote
+          const protectionEl = card.querySelector("[data-live-protection]");
+          if (protectionEl) protectionEl.hidden = true;
+          return;
+        }
+        pnlEl.hidden = false;
+        pnlEl.textContent = `${profit >= 0 ? "+" : ""}${profit.toFixed(2)}`;
+        pnlEl.classList.toggle("is-negative", profit < 0);
+        const protectionEl = card.querySelector("[data-live-protection]");
+        if (protectionEl) {
+          const stopLoss = Number(position.stopLoss);
+          const takeProfit = Number(position.takeProfit);
+          const levels = [
+            Number.isFinite(stopLoss) ? `SL broker ${stopLoss}` : null,
+            Number.isFinite(takeProfit) ? `TP broker ${takeProfit}` : null,
+          ].filter(Boolean);
+          protectionEl.textContent = levels.join(" · ");
+          protectionEl.hidden = !levels.length;
+        }
+      });
+    } finally {
       livePositionsRefreshInFlight = false;
-      return;
     }
-    const data = await fetchJson("/api/trade/live-positions");
-    const positions = new Map((data?.positions || []).map((p) => [p.id, p]));
-    slots.forEach((card) => {
-      const pnlEl = card.querySelector("[data-live-pnl]");
-      if (!pnlEl) return;
-      const position = positions.get(card.dataset.brokerOrderId);
-      if (!position) {
-        pnlEl.hidden = true; // no longer an open position at the broker -- next full refresh will show its real outcome
-        return;
-      }
-      pnlEl.hidden = false;
-      pnlEl.textContent = `${position.profit >= 0 ? "+" : ""}${position.profit.toFixed(2)}`;
-      pnlEl.classList.toggle("is-negative", position.profit < 0);
-    });
-    livePositionsRefreshInFlight = false;
   }
 
   // Fallback for a user who never granted push permission (dismissed the prompt,
@@ -316,6 +576,7 @@
   // event set the push notifications cover (see /api/notifications/summary), so
   // it can never show something push wouldn't have also said.
   let notificationsFallbackStarted = false;
+  let pushTestBound = false;
   function startNotificationsFallback() {
     if (notificationsFallbackStarted) return;
     const wrap = document.querySelector("[data-notif-wrap]");
@@ -324,53 +585,74 @@
     wrap.hidden = false;
     const bell = wrap.querySelector("[data-notif-bell]");
     const panel = wrap.querySelector("[data-notif-panel]");
-    bell.addEventListener("click", () => {
+    const close = wrap.querySelector("[data-notif-close]");
+    const openPanel = () => {
       const opening = panel.hidden;
       panel.hidden = !panel.hidden;
+      bell.setAttribute("aria-expanded", String(!panel.hidden));
       if (opening) markNotificationsSeen();
+    };
+    bell.setAttribute("aria-expanded", "false");
+    bell.addEventListener("click", openPanel);
+    close?.addEventListener("click", () => {
+      panel.hidden = true;
+      bell.setAttribute("aria-expanded", "false");
+      bell.focus();
+    });
+    wrap.querySelector("[data-notif-go-trading]")?.addEventListener("click", () => {
+      panel.hidden = true;
+      bell.setAttribute("aria-expanded", "false");
+      document.querySelector('[data-tab-btn="trading"]')?.click();
     });
     document.addEventListener("click", (event) => {
-      if (!panel.hidden && !wrap.contains(event.target)) panel.hidden = true;
+      if (!panel.hidden && !wrap.contains(event.target)) {
+        panel.hidden = true;
+        bell.setAttribute("aria-expanded", "false");
+      }
     });
-    refreshNotifications();
-    setInterval(refreshNotifications, 60000);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !panel.hidden) {
+        panel.hidden = true;
+        bell.setAttribute("aria-expanded", "false");
+        bell.focus();
+      }
+    });
+    bindPushTest();
+    scheduleVisiblePoll(refreshNotifications, 60000);
   }
 
   let notificationsRefreshInFlight = false;
   async function refreshNotifications() {
     if (notificationsRefreshInFlight) return;
     notificationsRefreshInFlight = true;
-    const wrap = document.querySelector("[data-notif-wrap]");
-    if (!wrap) {
+    try {
+      const wrap = document.querySelector("[data-notif-wrap]");
+      if (!wrap) return;
+      const data = await fetchJson("/api/notifications/summary");
+      if (!data?.ok) return;
+      const badge = wrap.querySelector("[data-notif-badge]");
+      badge.hidden = !data.count;
+      badge.textContent = data.count > 9 ? "9+" : String(data.count);
+      const list = wrap.querySelector("[data-notif-list]");
+      const empty = wrap.querySelector("[data-notif-empty]");
+      const items = data.items || [];
+      empty.hidden = items.length > 0;
+      const NOTIF_VISIBLE = 5;
+      const cards = items.map((item) => {
+        const label = item.type === "opened" ? "Position ouverte" : `${historyStatusIcon(item)}${historyStatusLabel(item)}`;
+        const slotTag = item.brokerSlot ? ` <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : "";
+        return `<div class="auth-notif-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${slotTag}</strong><small>${formatDate(item.at)}</small></div>`;
+      });
+      const rest = cards.slice(NOTIF_VISIBLE);
+      list.innerHTML = cards.slice(0, NOTIF_VISIBLE).join("")
+        + (rest.length ? `<button type="button" class="dashboard-history-more" data-notif-more>Voir ${rest.length} de plus</button>` : "");
+      list.querySelector("[data-notif-more]")?.addEventListener("click", function () {
+        this.insertAdjacentHTML("beforebegin", rest.join(""));
+        this.remove();
+      });
+    } finally {
       notificationsRefreshInFlight = false;
-      return;
     }
-    const data = await fetchJson("/api/notifications/summary");
-    if (!data?.ok) {
-      notificationsRefreshInFlight = false;
-      return;
-    }
-    const badge = wrap.querySelector("[data-notif-badge]");
-    badge.hidden = !data.count;
-    badge.textContent = data.count > 9 ? "9+" : String(data.count);
-    const list = wrap.querySelector("[data-notif-list]");
-    const empty = wrap.querySelector("[data-notif-empty]");
-    const items = data.items || [];
-    empty.hidden = items.length > 0;
-    const NOTIF_VISIBLE = 5;
-    const cards = items.map((item) => {
-      const label = item.type === "opened" ? "Position ouverte" : `${historyStatusIcon(item)}${historyStatusLabel(item)}`;
-      const slotTag = item.brokerSlot ? ` <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : "";
-      return `<div class="auth-notif-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${slotTag}</strong><small>${formatDate(item.at)}</small></div>`;
-    });
-    const rest = cards.slice(NOTIF_VISIBLE);
-    list.innerHTML = cards.slice(0, NOTIF_VISIBLE).join("")
-      + (rest.length ? `<button type="button" class="dashboard-history-more" data-notif-more>Voir ${rest.length} de plus</button>` : "");
-    list.querySelector("[data-notif-more]")?.addEventListener("click", function () {
-      this.insertAdjacentHTML("beforebegin", rest.join(""));
-      this.remove();
-    });
-    notificationsRefreshInFlight = false;
   }
 
   async function markNotificationsSeen() {
@@ -402,6 +684,48 @@
     new_signal: { on: "Désactiver les alertes nouveaux signaux", off: "Activer les alertes nouveaux signaux", active: "Alertes nouveaux signaux actives sur cet appareil." },
   };
 
+  function setPushDeviceStatus(text, state = "pending") {
+    const status = document.querySelector("[data-push-device-status]");
+    if (status) {
+      status.textContent = text;
+      status.dataset.state = state;
+    }
+  }
+
+  function bindPushTest() {
+    if (pushTestBound) return;
+    const button = document.querySelector("[data-push-test]");
+    if (!button) return;
+    pushTestBound = true;
+    button.addEventListener("click", async () => {
+      const status = document.querySelector("[data-push-test-status]");
+      button.disabled = true;
+      if (status) status.textContent = "Envoi du test...";
+      try {
+        const response = await fetchWithTimeout("/api/push/test", { method: "POST" });
+        const result = await response.json().catch(() => ({}));
+        if (result.ok) {
+          if (status) status.textContent = "Test envoyé. Vérifie les notifications de ton appareil.";
+          setPushDeviceStatus("Alertes mobiles actives sur cet appareil.", "ready");
+          pushDeviceReady = true;
+          renderDashboardOnboarding(dashboardRuntimeStatus);
+        } else if (result.error === "push_not_configured") {
+          if (status) status.textContent = "Notifications serveur non configurées sur Render.";
+        } else if (result.error === "push_subscription_missing") {
+          if (status) status.textContent = "Active d’abord les notifications TP/SL dans l’onglet Mes analyses.";
+        } else if (result.error === "push_test_cooldown") {
+          if (status) status.textContent = `Patiente encore ${result.retryAfterSeconds || 60} s avant un nouveau test.`;
+        } else {
+          if (status) status.textContent = "Le test n’a pas été livré. Vérifie la permission du navigateur.";
+        }
+      } catch {
+        if (status) status.textContent = "Impossible de contacter le serveur pour le test.";
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+
   // One browser only ever exposes one PushManager subscription per device, but it
   // carries several independently-toggled topics server-side (see
   // /api/push/subscribe's topic param) -- "new_signal" (alerts the moment Kronos
@@ -412,19 +736,32 @@
       return button.dataset.pushToggle !== "new_signal" || isPremium;
     });
     const upsell = document.querySelector("[data-push-upsell]");
+    bindPushTest();
     if (!buttons.length) return;
-    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
-    const vapid = await fetchJson("/api/push/vapid-public-key");
-    if (!vapid?.configured) return;
-    if (upsell && !isPremium) upsell.hidden = false;
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      setPushDeviceStatus("Les notifications mobiles ne sont pas prises en charge par ce navigateur.", "danger");
+      return;
+    }
+    try {
+      const vapid = await fetchJson("/api/push/vapid-public-key");
+      if (!vapid?.configured) {
+        setPushDeviceStatus("Notifications serveur non configurées sur Render.", "danger");
+        return;
+      }
+      if (upsell && !isPremium) upsell.hidden = false;
 
-    const registration = await navigator.serviceWorker.register("/sw.js");
-    const existing = await registration.pushManager.getSubscription();
-    const activeTopics = new Set(
-      existing ? (await fetchJson(`/api/push/subscription-topics?endpoint=${encodeURIComponent(existing.endpoint)}`))?.topics || [] : [],
-    );
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      const existing = await registration.pushManager.getSubscription();
+      const activeTopics = new Set(
+        existing ? (await fetchJson(`/api/push/subscription-topics?endpoint=${encodeURIComponent(existing.endpoint)}`))?.topics || [] : [],
+      );
+      pushDeviceReady = activeTopics.size > 0;
+      setPushDeviceStatus(
+        pushDeviceReady ? "Alertes mobiles actives sur cet appareil." : Notification.permission === "denied" ? "Notifications refusées dans les réglages du navigateur." : "Appareil compatible. Active une alerte ci-dessous.",
+        pushDeviceReady ? "ready" : Notification.permission === "denied" ? "danger" : "pending",
+      );
 
-    buttons.forEach((button) => {
+      buttons.forEach((button) => {
       const topic = button.dataset.pushToggle;
       const status = document.querySelector(`[data-push-status="${topic}"]`);
       setPushButtonState(button, status, topic, activeTopics.has(topic));
@@ -436,22 +773,27 @@
           if (activeTopics.has(topic)) {
             if (current) {
               if (activeTopics.size > 1) {
-                await fetchWithTimeout("/api/push/unsubscribe-topic", {
+                const response = await fetchWithTimeout("/api/push/unsubscribe-topic", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ endpoint: current.endpoint, topic }),
                 });
+                if (!response.ok) throw new Error("push_unsubscribe_rejected");
               } else {
-                await fetchWithTimeout("/api/push/unsubscribe", {
+                const response = await fetchWithTimeout("/api/push/unsubscribe", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ endpoint: current.endpoint }),
                 });
+                if (!response.ok) throw new Error("push_unsubscribe_rejected");
                 await current.unsubscribe();
               }
             }
             activeTopics.delete(topic);
+            pushDeviceReady = activeTopics.size > 0;
             setPushButtonState(button, status, topic, false);
+            setPushDeviceStatus(pushDeviceReady ? "Alertes mobiles actives sur cet appareil." : "Alertes mobiles désactivées sur cet appareil.", pushDeviceReady ? "ready" : "pending");
+            renderDashboardOnboarding(dashboardRuntimeStatus);
             return;
           }
           let subscription = current;
@@ -459,6 +801,7 @@
             const permission = await Notification.requestPermission();
             if (permission !== "granted") {
               if (status) status.textContent = "Notifications refusées dans le navigateur.";
+              setPushDeviceStatus("Notifications refusées dans les réglages du navigateur.", "danger");
               return;
             }
             subscription = await registration.pushManager.subscribe({
@@ -466,13 +809,17 @@
               applicationServerKey: urlBase64ToUint8Array(vapid.publicKey),
             });
           }
-          await fetchWithTimeout("/api/push/subscribe", {
+          const response = await fetchWithTimeout("/api/push/subscribe", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ ...subscription.toJSON(), topic }),
           });
+          if (!response.ok) throw new Error("push_subscribe_rejected");
           activeTopics.add(topic);
+          pushDeviceReady = true;
           setPushButtonState(button, status, topic, true);
+          setPushDeviceStatus("Alertes mobiles actives sur cet appareil.", "ready");
+          renderDashboardOnboarding(dashboardRuntimeStatus);
         } catch (error) {
           if (status) status.textContent = "Notifications indisponibles sur cet appareil.";
         } finally {
@@ -484,7 +831,10 @@
       // showing it earlier (right after the VAPID check) meant a fast click during
       // service-worker registration silently did nothing, no listener attached yet.
       button.hidden = false;
-    });
+      });
+    } catch {
+      setPushDeviceStatus("Impossible d’initialiser les notifications sur cet appareil.", "danger");
+    }
   }
 
   function setPushButtonState(button, status, topic, active) {
@@ -630,18 +980,24 @@
     const upsell = document.querySelector("[data-trade-upsell]");
     if (!panel) return;
     tradeOrdersRefreshInFlight = true;
-    if (!isPremium) {
-      if (upsell) upsell.hidden = false;
+    try {
+      if (!isPremium) {
+        if (upsell) upsell.hidden = false;
+        return;
+      }
+      panel.hidden = false;
+      const data = await fetchJson("/api/trade/orders");
+      const brokerConfigured = {
+        demo: Boolean(data?.brokerConfigured?.demo),
+        live: Boolean(data?.brokerConfigured?.live),
+      };
+      renderTradeOrders(data?.orders || [], brokerConfigured);
+    } finally {
       tradeOrdersRefreshInFlight = false;
-      return;
     }
-    panel.hidden = false;
-    const data = await fetchJson("/api/trade/orders");
-    renderTradeOrders(data?.orders || [], Boolean(data?.brokerConfigured));
-    tradeOrdersRefreshInFlight = false;
   }
 
-  function renderTradeOrders(orders, brokerConfigured) {
+  function renderTradeOrders(orders, brokerConfigured = { demo: false, live: false }) {
     const statusEl = document.querySelector("[data-trade-broker-status]");
     if (statusEl) {
       const parts = [];
@@ -662,7 +1018,7 @@
     // normally) but start hidden -- "voir plus" just removes the attribute, no re-render.
     const VISIBLE_COUNT = 5;
     const orderCards = orders.map((order, index) => `
-      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}" ${index >= VISIBLE_COUNT ? "hidden data-order-extra" : ""}>
+      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}" data-broker-slot="${escapeHtml(order.brokerSlot || "")}" ${index >= VISIBLE_COUNT ? "hidden data-order-extra" : ""}>
 
         <div>
           <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}${order.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(order.brokerSlot)}">${order.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
@@ -1481,21 +1837,46 @@
     const data = await fetchJson("/api/auto-trade/history");
     const trades = data?.trades || [];
     if (!trades.length) {
-      host.innerHTML = `<div class="dashboard-empty">Le robot n'a encore ouvert aucune position.</div>`;
+      const lastAction = dashboardRuntimeStatus?.robot?.lastAction;
+      const diagnostic = lastAction
+        ? `Dernière vérification ${relativeTime(lastAction.at)} : ${runtimeReasonLabel(lastAction.reason)}.`
+        : "Le centre d’état attend encore le premier cycle personnel du serveur.";
+      host.innerHTML = `<div class="dashboard-empty dashboard-empty-diagnostic"><strong>Aucune position ouverte par le robot pour l’instant.</strong><span>${escapeHtml(diagnostic)}</span><button type="button" class="dashboard-history-more" data-dashboard-empty-refresh>Actualiser le diagnostic</button></div>`;
+      host.querySelector("[data-dashboard-empty-refresh]")?.addEventListener("click", async (event) => {
+        event.currentTarget.disabled = true;
+        await refreshDashboardRuntimeStatus();
+        await loadAutoTradeHistory();
+      });
       return;
     }
     const HISTORY_VISIBLE = 5;
     const cards = trades.slice(0, 20).map((item) => `
-      <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}">
+      <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}" data-broker-slot="${escapeHtml(item.brokerSlot || "")}">
         <div>
           <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${item.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
           <span class="${historyStatusClass(item)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}${item.status === "OPEN" && item.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
         </div>
         <div class="dashboard-history-levels">
           <span>Entrée ${escapeHtml(item.entry)}</span>
-          <span>SL ${escapeHtml(item.sl)}</span>
+          <span>SL ${escapeHtml(item.sl)}${item.trailingStopPrice != null && item.trailingStopPrice !== item.sl ? " (suiveur)" : ""}</span>
           <span>TP1 ${escapeHtml(item.tp1 ?? "—")}</span>
         </div>
+        <div class="dashboard-live-protection" data-live-protection hidden></div>
+        <details class="dashboard-trade-details">
+          <summary>Voir le suivi détaillé</summary>
+          <dl class="dashboard-trade-detail-grid">
+            <div><dt>Entrée demandée</dt><dd>${escapeHtml(item.entry ?? "—")}</dd></div>
+            <div><dt>Entrée exécutée</dt><dd>${escapeHtml(item.executedEntry ?? "En attente")}</dd></div>
+            <div><dt>Stop actuel</dt><dd>${escapeHtml(item.trailingStopPrice ?? item.sl ?? "—")}${item.trailingStopPrice != null && item.trailingStopPrice !== item.sl ? " · suiveur" : ""}</dd></div>
+            <div><dt>Objectifs</dt><dd>TP1 ${escapeHtml(item.tp1 ?? "—")} · TP2 ${escapeHtml(item.tp2 ?? "—")}</dd></div>
+            <div><dt>État</dt><dd>${escapeHtml(historyStatusLabel(item))}</dd></div>
+            <div><dt>Prix de clôture</dt><dd>${escapeHtml(item.closePrice ?? "En cours")}</dd></div>
+            <div><dt>Durée</dt><dd>${escapeHtml(historyDuration(item) || (item.status === "OPEN" ? "En cours" : "Non disponible"))}</dd></div>
+            <div><dt>Résultat broker</dt><dd>${escapeHtml(historyResultLabel(item) || "Non disponible")}</dd></div>
+          </dl>
+          ${item.outcomeReason ? `<p class="dashboard-history-note">Motif : ${escapeHtml(item.outcomeReason)}</p>` : ""}
+          ${item.marketRegime ? `<p class="dashboard-history-note">Régime détecté : ${escapeHtml(item.marketRegime)}</p>` : ""}
+        </details>
       </article>
     `);
     const rest = cards.slice(HISTORY_VISIBLE);

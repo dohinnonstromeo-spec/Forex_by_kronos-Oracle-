@@ -27,6 +27,9 @@ window.OracleIcons = {
   radio: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10" cy="15.2" r="1.1" fill="currentColor" stroke="none"/><path d="M6.7 12a4.7 4.7 0 0 1 6.6 0"/><path d="M4 9a8.7 8.7 0 0 1 12 0"/></svg>',
   refresh: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 10.5a6 6 0 1 1-1.8-4.3"/><path d="M16 3v4.2h-4.2"/></svg>',
   close: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5l10 10"/><path d="M15 5 5 15"/></svg>',
+  bell: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14.5h12l-1.4-1.8V9a4.6 4.6 0 0 0-9.2 0v3.7L4 14.5Z"/><path d="M8.2 17h3.6"/></svg>',
+  database: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="10" cy="4.5" rx="6.5" ry="2.5"/><path d="M3.5 4.5v5.5c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5V4.5"/><path d="M3.5 10v5.5c0 1.4 2.9 2.5 6.5 2.5s6.5-1.1 6.5-2.5V10"/></svg>',
+  calendar: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="14" height="12" rx="1.8"/><path d="M6.5 2.5v4M13.5 2.5v4M3 8h14"/><path d="M6.5 11h.1M10 11h.1M13.5 11h.1M6.5 14h.1M10 14h.1"/></svg>',
 };
 
 // Static markup can reference an icon declaratively (<span data-icon="user">Label</span>)

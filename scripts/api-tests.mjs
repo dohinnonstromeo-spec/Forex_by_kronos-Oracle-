@@ -81,7 +81,7 @@ before(async () => {
     (async () => {
       for (let i = 0; i < 360; i++) {
         try {
-          const res = await fetch(`${BASE}/api/health`);
+          const res = await fetch(`${BASE}/api/ready`);
           if (!res.ok) continue;
           const readyRes = await fetch(`${BASE}/api/me`, { headers: { Cookie: "oracle_session=readiness_probe" } });
           if (readyRes.ok) return true;
@@ -429,6 +429,34 @@ test("public health and config expose safe shapes only", async () => {
   assert.doesNotMatch(JSON.stringify(configData), /BEGIN PRIVATE KEY|postgresql:|sk-[A-Za-z0-9]/i);
   assert.equal(typeof configData.groq, "boolean");
   assert.equal(typeof configData.gemini, "boolean");
+});
+test("dashboard runtime status and push test require authentication", async () => {
+  const dashboardStatus = await fetch(`${BASE}/api/dashboard/status`);
+  const dashboardStatusData = await dashboardStatus.json();
+  assert.equal(dashboardStatus.status, 401);
+  assert.equal(dashboardStatusData.error, "auth_required");
+  const pushTest = await postJson("/api/push/test", {});
+  assert.equal(pushTest.status, 401);
+  assert.equal(pushTest.data.error, "auth_required");
+});
+test("authenticated dashboard runtime status exposes safe state fields", async () => {
+  resetRateLimits();
+  const email = uniqueEmail("apitest_dashboard_status");
+  const signup = await fetch(`${BASE}/api/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "ApiTest", email, password: "CorrectPass123!" }),
+  });
+  const cookie = signup.headers.get("set-cookie");
+  const response = await fetch(`${BASE}/api/dashboard/status`, { headers: { Cookie: cookie } });
+  const data = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(data.ok, true);
+  assert.equal(data.database.status, "operational");
+  assert.equal(typeof data.robot.swing.started, "boolean");
+  assert.equal(typeof data.prices.stale, "boolean");
+  assert.equal(JSON.stringify(data).includes("broker_demo_token"), false);
+  assert.equal(JSON.stringify(data).includes("broker_live_token"), false);
 });
 test("public surface: security headers are present on the home page", async () => {
   const res = await fetch(`${BASE}/`);

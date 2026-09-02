@@ -38,11 +38,31 @@ RESEND_FROM=Oracle Forex <noreply@domaine-verifie.example>
 BROKER_CREDENTIALS_ENCRYPTION_KEY=genere_un_secret_aleatoire_d_au_moins_32_caracteres
 BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS=ancienne_cle_pendant_une_rotation
 BROKER_CREDENTIALS_ENCRYPTION_REQUIRED=true
+VAPID_PUBLIC_KEY=cle_publique_web_push
+VAPID_PRIVATE_KEY=cle_privee_web_push
+VAPID_SUBJECT=mailto:adresse-de-contact@domaine.example
 ```
 
 Le navigateur appelle seulement `/api/...`; les clés restent côté serveur local.
 
 Les jetons MetaApi des utilisateurs sont chiffrés au repos avec AES-256-GCM lorsque BROKER_CREDENTIALS_ENCRYPTION_KEY est configurée. En production, le mode obligatoire est actif par défaut : sans cette clé, une nouvelle connexion broker est refusée plutôt que d'enregistrer un secret en clair. Les anciennes valeurs sont relues pour assurer la migration puis rechiffrées automatiquement. Conserver cette clé dans le gestionnaire de secrets de l'hébergeur et hors du dépôt. Pendant une rotation, renseigner la nouvelle clé dans BROKER_CREDENTIALS_ENCRYPTION_KEY et l'ancienne dans BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS. Le serveur relit puis rechiffre automatiquement les valeurs encore protégées par l'ancienne clé. Après vérification, retirer la variable PREVIOUS. Conserver ces clés dans le gestionnaire de secrets de l'hébergeur et hors du dépôt.
+
+## Configuration Render et vérification
+
+Dans Render, renseigner ces variables dans l'environnement du service web, sans les committer dans Git :
+
+- `DATABASE_URL` : URL de la base Neon active.
+- `BROKER_CREDENTIALS_ENCRYPTION_KEY` : secret aléatoire d'au moins 32 caractères. Sans lui, les nouvelles connexions broker sont bloquées en production.
+- `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` et `VAPID_SUBJECT` : nécessaires pour activer les notifications push mobiles. La clé privée reste uniquement côté serveur.
+
+Après chaque remplacement de base ou modification d'environnement :
+
+1. Attendre que `/api/ready` réponde avec `ok: true`.
+2. Ouvrir le centre d'état du tableau de bord et vérifier Neon, le broker et le robot.
+3. Autoriser les notifications dans le navigateur, puis utiliser `Tester sur cet appareil`.
+4. Vérifier le compte broker en mode démo avant toute activation réelle.
+
+Le centre d'état affiche le dernier motif connu du robot et la prochaine vérification. Ce diagnostic en mémoire est volontairement sans écriture à chaque cycle afin de ne pas consommer inutilement le quota Neon ; il repart de zéro après un redémarrage et indique alors clairement qu'aucun cycle n'a encore été observé.
 
 Table Supabase attendue pour la persistance serveur:
 

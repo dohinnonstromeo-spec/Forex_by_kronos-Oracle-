@@ -501,6 +501,8 @@ console.log("=== distributed scheduler lease: autonomous execution stays single-
 const serverSource = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
 const ciSource = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const apiTestSource = await readFile(new URL("../scripts/api-tests.mjs", import.meta.url), "utf8");
+const readmeSource = await readFile(new URL("../README.md", import.meta.url), "utf8");
+check("Render runbook documents broker encryption, push keys and readiness", readmeSource.includes("BROKER_CREDENTIALS_ENCRYPTION_KEY") && readmeSource.includes("VAPID_PUBLIC_KEY") && readmeSource.includes("VAPID_PRIVATE_KEY") && readmeSource.includes("/api/ready"));
 check("durable auto-trade lease table exists", /CREATE TABLE IF NOT EXISTS auto_trade_leases/.test(serverSource));
 check("lease acquisition uses an expiry condition", /async function tryAcquireLease[\s\S]{0,600}\$\{table\} SET[\s\S]{0,300}lease_until < \?/.test(serverSource));
 check("auto-trade lease goes through the shared CAS lease helper", /tryAcquireAutoTradeLease[\s\S]{0,200}return tryAcquireLease\("auto_trade_leases"/.test(serverSource));
@@ -544,6 +546,18 @@ check(
     serverSource.includes("if (relationalTablesPromise) return relationalTablesPromise;") &&
     !serverSource.includes("if (schemaVersion?.ready) {\n    relationalTablesReady = true;\n    return;\n  }"),
 );
+check(
+  "incomplete schema blocks schedulers and readiness",
+  serverSource.includes("let schemaMigrationFailures = [];") &&
+    serverSource.includes("schema_migration_incomplete:") &&
+    serverSource.includes("async function startSchedulersAfterReady()") &&
+    serverSource.includes("démarrage suspendu: schéma relationnel non prêt"),
+);
+check(
+  "test analyses stay outside live learning and reconciliation",
+  (serverSource.match(/WHERE status = 'OPEN' AND active = \? AND is_test = \?/g) || []).length >= 2 &&
+    serverSource.includes(", [1, 0]);"),
+);
 check("chat prompts are bounded", serverSource.includes("sanitizeUserText(cleanLine") && serverSource.includes(".slice(0, 4000)"));
 check("image payloads are bounded before decoding", serverSource.includes("MAX_IMAGE_DATA_URL_CHARS = 8 * 1024 * 1024") && serverSource.includes("image.length > MAX_IMAGE_DATA_URL_CHARS"));
 check("SSE clients cannot create an unbounded backlog", serverSource.includes("if (!client.write(message)) client.destroy()") && serverSource.includes("client.writableEnded"));
@@ -554,6 +568,7 @@ check("readiness verifies relational storage", serverSource.includes('url.pathna
 check("HTTP server has explicit resource timeouts", serverSource.includes("httpServer.headersTimeout = 15_000") && serverSource.includes("httpServer.requestTimeout = 120_000") && serverSource.includes("httpServer.keepAliveTimeout = 65_000"));
 check("shutdown closes SSE and database resources", serverSource.includes("async function gracefulShutdown") && serverSource.includes("client.destroy()") && serverSource.includes("pgPool.end()"));
 check("CI probes readiness instead of liveness only", ciSource.includes("/api/ready"));
+check("integration tests wait for relational readiness", apiTestSource.includes("/api/ready"));
 check("integration tests force a non-production environment", apiTestSource.includes('NODE_ENV: "test"'));
 const robotsSource = await readFile(new URL("../robots.txt", import.meta.url), "utf8");
 const sitemapSource = await readFile(new URL("../sitemap.xml", import.meta.url), "utf8");
@@ -604,6 +619,7 @@ const frontendTabsSource = frontendAuditSources[2];
 const frontendChatSource = frontendAuditSources[3];
 const homeEffectsSource = await readFile(new URL("../assets/home-market-effects.js", import.meta.url), "utf8");
 const migrationSource = await readFile(new URL("../scripts/migrate-postgres.mjs", import.meta.url), "utf8");
+const serviceWorkerSource = await readFile(new URL("../sw.js", import.meta.url), "utf8");
 const frontendHtmlSources = await Promise.all(
   ["index.html", "analyse.html", "dashboard.html", "legal.html", "404.html", "paiement.html", "admin-contenu.html", "admin-health.html", "premium-admin.html"].map((file) => readFile(new URL("../" + file, import.meta.url), "utf8")),
 );
@@ -633,6 +649,13 @@ check(
     serverSource.includes("if (historiesInFlight?.key === usableKey) return historiesInFlight.promise;"),
 );
 check(
+  "market cache avoids repeated Neon reads and price writes",
+  serverSource.includes("if (memoryCache.marketDocument) return memoryCache.marketDocument;") &&
+    serverSource.includes("MARKET_CACHE_PERSIST_INTERVAL_MS = boundedEnvNumber(env.MARKET_CACHE_PERSIST_INTERVAL_SECONDS, 600, 60, 86400) * 1000") &&
+    serverSource.includes("if (!force && Date.now() - memoryCache.marketCachePersistedAt < MARKET_CACHE_PERSIST_INTERVAL_MS) return trimmed") &&
+    serverSource.includes("}, { force: true });"),
+);
+check(
   "frontend score refresh lock also recovers after rendering errors",
   frontendHomeSource.includes("async function updateSignalScores()") &&
     frontendHomeSource.includes("signalScoresRefreshInFlight = false;") &&
@@ -646,7 +669,7 @@ check("chat and analysis previews stay lazy", frontendChatSource.includes('loadi
 check("public and internal pages expose skip links", frontendHtmlSources.every((source) => source.includes('class="oracle-skip-link"') && source.includes('id="main-content"')));
 check(
   "user-facing sources contain no replacement or common mojibake characters",
-  [...frontendHtmlSources, authClientSource, ...boundedFrontendSources].every((source) => !/[\uFFFD\u00C3\u00C2\u00E2\u00F0]/.test(source)),
+  [...frontendHtmlSources, authClientSource, ...boundedFrontendSources, serviceWorkerSource].every((source) => !/[\uFFFD\u00C3\u00C2\u00E2\u00F0]/.test(source)),
 );
 check("forms declare an HTTP method", frontendHtmlSources.concat(privateHtmlSources).every((source) => !/<form\\b(?![^>]*\\bmethod=)[^>]*>/i.test(source)));
 check("private pages keep noindex", privateHtmlSources.every((source) => source.includes('name="robots" content="noindex, nofollow"')));
@@ -957,11 +980,81 @@ check(
     && adminStylesSource.includes('@media (prefers-reduced-motion: reduce)'),
 );
 check(
-  'non-trading dashboard polls are spaced out to reduce database pressure',
-  authClientSource.includes('setInterval(refreshLivePositions, 30000)')
-    && authClientSource.includes('setInterval(refreshNotifications, 60000)')
+  'background tab polling is paused and resumes visibly',
+  authClientSource.includes('scheduleVisiblePoll(refreshLivePositions, 30000)')
+    && authClientSource.includes('scheduleVisiblePoll(refreshNotifications, 60000)')
+    && authClientSource.includes('document.visibilityState')
+    && frontendHomeSource.includes('scheduleVisiblePoll(updatePrices, 60000)')
+    && homeEffectsSource.includes('scheduleVisiblePoll(refreshNews, 10 * 60 * 1000)')
     && serverSource.includes('LEARNING_OUTCOMES_INTERVAL_MS = boundedEnvNumber(env.LEARNING_OUTCOMES_INTERVAL_SECONDS, 600')
     && serverSource.includes('SIGNALS_BROADCAST_INTERVAL_MS = boundedEnvNumber(env.SIGNALS_BROADCAST_INTERVAL_SECONDS, 300'),
+);
+check(
+  'dashboard control center exposes real runtime state without secrets',
+  (() => {
+    const start = serverSource.indexOf('url.pathname === "/api/dashboard/status"');
+    const responseStart = serverSource.indexOf('sendJson(res, 200, {', start);
+    const responseEnd = serverSource.indexOf('});\n    } catch', responseStart);
+    const response = start >= 0 && responseStart > start && responseEnd > responseStart
+      ? serverSource.slice(responseStart, responseEnd)
+      : "";
+    return response.includes('database: { status: "operational"')
+      && serverSource.includes('latestPriceRuntimeStatus()')
+      && serverSource.includes('schedulerRuntimeStatus')
+      && !response.includes('broker_demo_token')
+      && !response.includes('broker_live_token');
+  })(),
+);
+check(
+  'dashboard runtime diagnostics stay authenticated and quota-light',
+  apiTestSource.includes('dashboard runtime status and push test require authentication')
+    && authClientSource.includes('/api/dashboard/status')
+    && authClientSource.includes('scheduleVisiblePoll(refreshDashboardRuntimeStatus, 5 * 60 * 1000)')
+    && authClientSource.includes('startNotificationsFallback();')
+    && authClientSource.indexOf('startNotificationsFallback();') < authClientSource.indexOf('const performance = await fetchJson'),
+);
+check(
+  'dashboard runtime distinguishes approval blockers from an active scheduler',
+  authClientSource.includes('Approbation du robot en attente')
+    && authClientSource.includes('Compte requis')
+    && authClientSource.includes('Robot désactivé')
+    && authClientSource.includes("Active le mode scalp ou attends l'approbation swing"),
+);
+check(
+  'trade order loading preserves demo/live broker configuration and releases its lock',
+  authClientSource.includes('Boolean(data?.brokerConfigured?.demo)')
+    && authClientSource.includes('Boolean(data?.brokerConfigured?.live)')
+    && authClientSource.includes('finally {\n      tradeOrdersRefreshInFlight = false;')
+    && !authClientSource.includes('renderTradeOrders(data?.orders || [], Boolean(data?.brokerConfigured))'),
+);
+check(
+  'live positions are matched by broker slot and order id',
+  authClientSource.includes('data-broker-slot')
+    && authClientSource.includes('data-broker-slot="${escapeHtml(order.brokerSlot || "")}"')
+    && authClientSource.includes('data-broker-slot="${escapeHtml(item.brokerSlot || "")}"')
+    && authClientSource.includes('`${p.brokerSlot || ""}:${p.id}`')
+    && authClientSource.includes('`${card.dataset.brokerSlot || ""}:${card.dataset.brokerOrderId}`'),
+);
+check(
+  'push test is explicit, authenticated, and rate-limited',
+  serverSource.includes('url.pathname === "/api/push/test"')
+    && serverSource.includes('PUSH_TEST_COOLDOWN_MS')
+    && serverSource.includes('push_subscription_missing')
+    && serverSource.includes('sendPushToSubscriptions(')
+    && authClientSource.includes('data-push-test')
+    && authClientSource.includes('push_subscribe_rejected')
+    && authClientSource.includes('push_unsubscribe_rejected')
+    && dashboardHybridSource.includes('data-push-test'),
+);
+check(
+  'trade history exposes execution details and a quiet-bot diagnosis',
+  authClientSource.includes('data-dashboard-empty-refresh')
+    && authClientSource.includes('Entrée exécutée')
+    && authClientSource.includes('historyDuration(item)')
+    && authClientSource.includes('dashboard-trade-details')
+    && authClientSource.includes('data-live-protection')
+    && dashboardHybridSource.includes('data-runtime-last-detail')
+    && dashboardHybridSource.includes('data-autotrade-trades'),
 );
 
 console.log(`
