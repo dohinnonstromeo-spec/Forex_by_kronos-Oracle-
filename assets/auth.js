@@ -5,6 +5,42 @@
     if (options.signal) return fetch(url, options);
     return fetch(url, { ...options, signal: AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS) });
   }
+
+  document.querySelectorAll('input[type=password]').forEach((input, index) => {
+    if (input.closest('.password-field')) return;
+
+    const inputId = input.id || 'auth-password-' + (index + 1);
+    input.id = inputId;
+
+    const wrapper = document.createElement('span');
+    wrapper.className = 'password-field';
+    input.parentNode.insertBefore(wrapper, input);
+    wrapper.appendChild(input);
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'password-toggle';
+    toggle.dataset.passwordToggle = 'true';
+    toggle.setAttribute('aria-controls', inputId);
+    toggle.setAttribute('aria-label', 'Afficher le mot de passe');
+    toggle.setAttribute('aria-pressed', 'false');
+    toggle.textContent = 'Afficher';
+    wrapper.appendChild(toggle);
+
+    const syncToggle = (visible) => {
+      input.type = visible ? 'text' : 'password';
+      toggle.textContent = visible ? 'Masquer' : 'Afficher';
+      toggle.setAttribute('aria-label', visible ? 'Masquer le mot de passe' : 'Afficher le mot de passe');
+      toggle.setAttribute('aria-pressed', String(visible));
+    };
+
+    toggle.addEventListener('click', () => syncToggle(input.type === 'password'));
+   toggle.addEventListener('pointerdown', (event) => event.preventDefault());
+    input.addEventListener('blur', () => syncToggle(false));
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') syncToggle(false);
+    });
+  });
   document.querySelectorAll("[data-password-strength]").forEach((meter) => {
     const input = meter.closest("form")?.querySelector('input[type="password"][autocomplete="new-password"]');
     const fill = meter.querySelector("[data-password-strength-fill]");
@@ -191,17 +227,32 @@
     document.querySelector("[data-user-plan]").textContent = planLabel;
 
     const performance = await fetchJson("/api/performance");
+    const performanceReady = Boolean(performance?.precisionLabel);
     const status = document.querySelector("[data-dashboard-status]");
-    if (status) status.textContent = performance?.precisionLabel ? "Données chargées" : "En attente";
+    if (status) {
+      status.textContent = performanceReady ? "Données chargées" : "En attente";
+      status.dataset.state = performanceReady ? "ready" : "pending";
+    }
     const label = document.querySelector("[data-performance-label]");
     if (label) label.textContent = performance?.precisionLabel || "À auditer";
+    const heroStatus = document.querySelector("[data-dashboard-hero-status]");
+    if (heroStatus) {
+      heroStatus.textContent = performanceReady ? "Données synchronisées" : "En attente";
+      heroStatus.closest(".dashboard-hero-status")?.setAttribute("data-state", performanceReady ? "ready" : "pending");
+    }
+    const heroPrecision = document.querySelector("[data-dashboard-hero-precision]");
+    if (heroPrecision) heroPrecision.textContent = performance?.precisionLabel || "En attente";
+    const heroCoverage = document.querySelector("[data-dashboard-hero-coverage]");
+    if (heroCoverage) heroCoverage.textContent = performance?.decisionCoverageLabel || "En attente";
     const metrics = document.querySelector("[data-dashboard-metrics]");
     if (metrics) {
       metrics.innerHTML = [
-        ["Précision", performance?.precisionLabel || "À auditer"],
-        ["Analyses", performance?.totalAnalyses ?? 0],
-        ["Signaux ouverts", performance?.openAnalyses ?? 0],
-        ["Bloquées", performance?.blockedAnalyses ?? 0],
+        ["Précision clôturée", performance?.precisionLabel || "À auditer"],
+        ["Analyses totales", performance?.totalAnalyses ?? 0],
+        ["Résultats clôturés", performance?.closedAnalyses ?? 0],
+        ["En attente", performance?.openAnalyses ?? 0],
+        ["Bloquées", `${performance?.blockedAnalyses ?? 0} (${performance?.blockedRateLabel || "-"})`],
+        ["Couverture", performance?.decisionCoverageLabel || "-"],
       ].map(([name, value]) => `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
     }
 
@@ -230,7 +281,7 @@
     if (!document.querySelector("[data-trade-panel], [data-autotrade-panel]")) return;
     livePositionsPollStarted = true;
     refreshLivePositions();
-    setInterval(refreshLivePositions, 10000);
+    setInterval(refreshLivePositions, 30000);
   }
 
   let livePositionsRefreshInFlight = false;
@@ -282,7 +333,7 @@
       if (!panel.hidden && !wrap.contains(event.target)) panel.hidden = true;
     });
     refreshNotifications();
-    setInterval(refreshNotifications, 20000);
+    setInterval(refreshNotifications, 60000);
   }
 
   let notificationsRefreshInFlight = false;
@@ -537,7 +588,7 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ analysisId: button.dataset.prepareOrder }),
           });
-          const result = await response.json();
+         const result = await response.json();
           if (result.ok) {
             button.textContent = "Ordre préparé ✓";
             await loadTradeOrders(true);
@@ -742,6 +793,9 @@
 
     const CONFIRM_ERROR_LABELS = {
       price_unavailable: "Prix live indisponible -- impossible de vérifier que le setup tient toujours. Réessaie dans un instant.",
+      broker_protection_unavailable: "Impossible de vérifier les règles de protection du broker. Aucun ordre n'a été envoyé. Réessaie dans un instant.",
+      levels_crossed_by_broker_price: "Le prix broker a déjà dépassé le SL ou le TP depuis l'analyse. Aucun ordre n'a été envoyé : relance une analyse.",
+      broker_protection_too_close: "Le SL ou le TP est trop proche du bid/ask broker ou de la distance minimale du symbole. Relance une analyse.",
       order_expired: "Cet ordre a expiré (trop de temps écoulé depuis la préparation) et a été annulé automatiquement -- relance une analyse pour un ordre à jour.",
       levels_crossed_by_price: "Le prix a déjà dépassé le TP ou le SL depuis l'analyse -- ce setup n'a plus de sens au prix actuel. Relance une analyse.",
       levels_too_close_to_price: "Le SL ou le TP est trop proche du prix actuel pour être accepté par le broker maintenant. Relance une analyse.",
@@ -777,7 +831,7 @@
         // message off the screen the instant it appears, for no reason, since
         // nothing about the order actually changed. Only reload when the order's
         // real status did (sent/failed/expired).
-        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached", "broker_not_connected", "live_trading_not_authorized", "invalid_broker_slot"]);
+        const ORDER_UNCHANGED_ERRORS = new Set(["price_moved", "price_unavailable", "broker_protection_unavailable", "levels_crossed_by_broker_price", "broker_protection_too_close", "levels_crossed_by_price", "levels_too_close_to_price", "trading_paused", "daily_order_cap_reached", "broker_not_connected", "live_trading_not_authorized", "invalid_broker_slot"]);
         try {
           const response = await fetchWithTimeout("/api/trade/confirm", {
             method: "POST",
@@ -878,9 +932,19 @@
             body: JSON.stringify({ token, accountId, region, slot }),
           });
           const result = await response.json();
+          if (!result.ok && result.error === 'broker_credentials_security_not_configured') {
+            result.message = "La sécurité des identifiants broker n'est pas configurée sur le serveur. Ajoute BROKER_CREDENTIALS_ENCRYPTION_KEY dans Render.";
+          }
           if (result.ok) {
             form.reset();
             form.querySelector("[data-autotrade-region]").value = "london";
+            if (message) {
+              const money = (value) => Number.isFinite(Number(value)) ? Number(value).toFixed(2) : "indisponible";
+              const currency = result.currency ? ` ${result.currency}` : "";
+              message.textContent = `Broker connecté. Solde ${money(result.balance)}${currency} · equity ${money(result.equity)} · marge libre ${money(result.freeMargin)}${currency}.`;
+              message.classList.remove("error");
+              message.hidden = false;
+            }
           } else if (message) {
             message.textContent = result.message ? `Connexion refusée : ${result.message}` : `Échec (${result.error || "erreur inconnue"}).`;
             message.hidden = false;
@@ -995,6 +1059,48 @@
       }
     });
 
+    document.querySelector("[data-hybrid-trailing-toggle]")?.addEventListener("change", async (event) => {
+      const checkbox = event.currentTarget;
+      const enabled = checkbox.checked;
+      const messageEl = document.querySelector("[data-hybrid-trailing-message]");
+      if (messageEl) messageEl.hidden = true;
+      if (enabled && !window.confirm("Le mode hybride est expérimental : les prochaines positions utiliseront un TP fixe et un SL suiveur. Le mode démo est recommandé. Continuer ?")) {
+        checkbox.checked = false;
+        return;
+      }
+      checkbox.disabled = true;
+      try {
+        const response = await fetchWithTimeout("/api/auto-trade/toggle-hybrid-trailing", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await response.json();
+        if (!result.ok) {
+          checkbox.checked = !enabled;
+          if (messageEl) {
+            messageEl.textContent = result.message || `Échec (${result.error || "erreur inconnue"}).`;
+            messageEl.hidden = false;
+          }
+        } else if (messageEl) {
+          messageEl.textContent = enabled
+            ? "Mode hybride activé pour les prochaines positions validées. Les positions déjà ouvertes restent inchangées."
+            : "Mode hybride désactivé pour les prochaines positions. Les positions déjà ouvertes restent inchangées.";
+          messageEl.classList.remove("dashboard-prepare-error");
+          messageEl.hidden = false;
+        }
+      } catch {
+        checkbox.checked = !enabled;
+        if (messageEl) {
+          messageEl.textContent = "Impossible de contacter le serveur — le réglage n'a pas été modifié.";
+          messageEl.hidden = false;
+        }
+      } finally {
+        checkbox.disabled = false;
+        await refreshAutoTradeStatus();
+      }
+    });
+
     document.querySelector("[data-autotrade-request]")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -1064,10 +1170,13 @@
     max_concurrent_positions_reached: "Nombre maximum de positions ouvertes déjà atteint",
     max_trades_per_day_reached: "Nombre maximum de trades/jour déjà atteint",
     broker_unreachable: "Broker injoignable au dernier passage (solde non confirmé)",
+    broker_trading_not_allowed: "Trading refusé par le broker",
+    broker_funds_unavailable: "Solde, equity ou marge libre insuffisants ou indisponibles",
     opened_trade: "Position ouverte lors de la dernière évaluation",
     no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché à cet instant -- normal, pas une erreur",
+    another_execution_instance_running: "Passage ignoré : une autre exécution occupait le verrou, nouvel essai automatique",
   };
 
   const TICK_DAY_NAMES = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]; // matches JS getUTCDay()
@@ -1086,9 +1195,10 @@
       if (detail.correlation) parts.push(`${detail.correlation} bloqué(s) par corrélation`);
       if (detail.noSpec) parts.push(`${detail.noSpec} specs broker indisponibles`);
       if (detail.noVolume) parts.push(`${detail.noVolume} taille de position trop petite`);
+      if (detail.noFunds) parts.push(`${detail.noFunds} état des fonds broker indisponible`);
       if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
     } else if (reason === "no_signal_meets_confidence_or_rr") {
-      if (detail.minConfidence != null) parts.push(`seuil confiance ${detail.minConfidence}%`);
+      if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
       if (detail.approvedPairs?.length) parts.push(`paires : ${detail.approvedPairs.join(", ")}`);
     } else if (reason === "max_concurrent_positions_reached") {
@@ -1113,6 +1223,14 @@
       if (detail.tradingDays) parts.push(`jours autorisés : ${String(detail.tradingDays).split(",").map((d) => TICK_DAY_NAMES[Number(d)]).join(", ")}`);
     }
     return parts.length ? ` [${parts.join(", ")}]` : "";
+  }
+
+  function autoTradeLeaseSummary(lease) {
+    if (!lease || lease.active === null) return "État du verrou indisponible";
+    if (lease.active) {
+      return "Exécution en cours jusqu'au " + (lease.leaseUntil ? formatDate(lease.leaseUntil) : "date inconnue");
+    }
+    return "Aucune exécution en cours";
   }
 
   function autoTradeTickSummary(lastTick) {
@@ -1151,6 +1269,13 @@
       secureHalfSection.hidden = !anyBrokerConnected;
       const toggle = document.querySelector("[data-secure-half-priority-toggle]");
       if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.secureHalfPriorityEnabled);
+    }
+
+    const hybridTrailingSection = document.querySelector("[data-autotrade-preferences-section-hybrid-trailing]");
+    if (hybridTrailingSection) {
+      hybridTrailingSection.hidden = !anyBrokerConnected;
+      const toggle = document.querySelector("[data-hybrid-trailing-toggle]");
+      if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.hybridTrailingEnabled);
     }
 
     const statusText = document.querySelector("[data-autotrade-status-text]");
@@ -1215,7 +1340,8 @@
       return;
     }
     metrics.innerHTML = [
-      ["Positions ouvertes", `${slotStatus.openPositions} / ${status.maxConcurrentPositions ?? "—"}`],
+      ["Positions ouvertes", `${slotStatus.openPositions} / ${status.effectiveMaxConcurrentPositions ?? status.maxConcurrentPositions ?? "—"}`],
+      ["Maximum par paire", status.maxPositionsPerPair ?? "—"],
       // Real cumulative $ from actual broker-confirmed closes today, leading --
       // requested directly ("voilà les gains de la journée", "le cumul vrai vrai
       // des pertes et des profits"), not the R×risk% estimate alone anymore.
@@ -1223,6 +1349,7 @@
       ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
       ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
       ["Dernière évaluation", autoTradeTickSummary(slotStatus.lastTick)],
+      ["État actuel", autoTradeLeaseSummary(slotStatus.executionLease)],
     ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
   }
 
@@ -1294,6 +1421,16 @@
       daysWrap.querySelectorAll("input").forEach((box) => {
         box.checked = !status.userTradingDays || status.userTradingDays.includes(Number(box.value));
       });
+    }
+    const summary = section.querySelector("[data-autotrade-preferences-summary]");
+    if (summary) {
+      const risk = status.userRiskPercent ?? status.riskPercent;
+      const riskLabel = risk != null ? `Risque ${risk}%` : "Risque admin";
+      const capitalLabel = Number(status.userCapitalCap) > 0
+        ? `capital plafonné à ${status.userCapitalCap}`
+        : "fonds broker réels";
+      const positions = status.userMaxConcurrentPositions ?? status.maxConcurrentPositions;
+      summary.textContent = `${riskLabel} · ${capitalLabel} · ${positions ?? "—"} positions max`;
     }
   }
 
@@ -1440,12 +1577,20 @@
     return "En cours";
   }
 
+  const HISTORY_BLOCK_REASON_LABELS = {
+    broker_protection_unavailable: "Protection broker non vérifiable : aucune position n'a été ouverte.",
+    levels_crossed_by_broker_price: "Prix broker déjà passé par le SL ou le TP : aucune position n'a été ouverte.",
+    broker_protection_too_close: "SL/TP trop proche du bid/ask ou de la distance minimale du symbole : aucune position n'a été ouverte.",
+    levels_crossed_by_price: "Prix déjà passé par le SL ou le TP : aucune position n'a été ouverte.",
+    levels_too_close_to_price: "SL/TP trop proche du prix actuel : aucune position n'a été ouverte.",
+  };
+
   // The backend already computes and sends blockReason/outcomeReason/closePrice for
   // every analysis (server.mjs personalAnalysesPayload) but until now the dashboard
   // only ever showed the bare status word ("Bloquée") with zero explanation of why,
   // and never showed the actual exit price for a closed trade.
   function historyDetailNote(item) {
-    if (item.status === "BLOCKED" && item.blockReason) return item.blockReason;
+    if (item.status === "BLOCKED" && item.blockReason) return HISTORY_BLOCK_REASON_LABELS[item.blockReason] || item.blockReason;
     if (["TP1_HIT", "TP2_HIT", "SL_HIT", "CLOSED_MANUALLY", "EXPIRED"].includes(item.status)) {
       const price = Number.isFinite(item.closePrice) ? `clôturé à ${item.closePrice}` : "";
       // outcomeReason repeats the status label word-for-word for TP/SL hits ("TP1

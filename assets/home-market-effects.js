@@ -14,17 +14,20 @@
 
   function boot() {
     renderFallbackSparks();
-    refreshSparks();
+    window.addEventListener("oracle:prices", (event) => {
+      renderSparksFromPayload(event.detail);
+    });
+    if (window.__oraclePricesPayload) {
+      renderSparksFromPayload(window.__oraclePricesPayload);
+    }
     refreshNews();
     tickClock();
     setInterval(tickClock, 1000);
-    setInterval(refreshSparks, 60 * 1000);
     setInterval(refreshNews, 10 * 60 * 1000);
   }
 
-  async function refreshSparks() {
-    if (!sparkHost) return;
-    const data = await getJson("/api/prices", 9000);
+  function renderSparksFromPayload(data) {
+    if (!sparkHost || !data) return;
     const prices = data?.prices || {};
     const symbols = ["EUR/USD", "XAU/USD", "GBP/JPY", "BTC/USD"];
     renderSparks(symbols.map((pair, index) => {

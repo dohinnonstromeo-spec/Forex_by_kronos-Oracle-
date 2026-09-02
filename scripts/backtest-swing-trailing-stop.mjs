@@ -200,11 +200,119 @@ function simulateTrailingStop(bars, signalIndex, signal, activationR, trailR, bu
   return { result: "timeout", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
 }
 
+// Hybrid experiment: retain the production TP1 while the validated staged
+// trailing stop protects the position before that target is reached. The stop
+// is checked before the target on each OHLC bar, keeping the same conservative
+// path assumption as the two existing exit simulations above. Production stays
+// trailing-only until the user explicitly enables the dashboard option.
+function simulateHybridTpTrailingStop(bars, signalIndex, signal, activationR, trailR, bufferR) {
+  const buy = signal.direction === "ACHAT";
+  const tp1 = buy ? signal.entry + signal.risk * 1.6 : signal.entry - signal.risk * 1.6;
+  let stop = signal.sl;
+  let bestFavR = -Infinity;
+  for (let j = signalIndex + 1; j <= Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1); j++) {
+    const bar = bars[j];
+    const hitStop = buy ? bar.low <= stop : bar.high >= stop;
+    if (hitStop) {
+      const rAtStop = buy ? (stop - signal.entry) / signal.risk : (signal.entry - stop) / signal.risk;
+      return { result: rAtStop > 0 ? "win" : "loss", rMultiple: rAtStop - COST_DRAG_R, barsHeld: j - signalIndex };
+    }
+    const hitTp1 = buy ? bar.high >= tp1 : bar.low <= tp1;
+    if (hitTp1) return { result: "win", rMultiple: 1.6 - COST_DRAG_R, barsHeld: j - signalIndex };
+    const favExtreme = buy ? bar.high : bar.low;
+    const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
+    if (favR > bestFavR) bestFavR = favR;
+    if (bestFavR >= activationR) {
+      const breakevenStop = buy ? signal.entry + bufferR * signal.risk : signal.entry - bufferR * signal.risk;
+      const trailedStop = bestFavR >= activationR + trailR
+        ? (buy ? signal.entry + (bestFavR - trailR) * signal.risk : signal.entry - (bestFavR - trailR) * signal.risk)
+        : breakevenStop;
+      stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
+    }
+  }
+  const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
+  const expiryClose = bars[expiryIndex].close;
+  const markToMarketR = buy ? (expiryClose - signal.entry) / signal.risk : (signal.entry - expiryClose) / signal.risk;
+  return { result: "timeout", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
+}
+
 function summarize(trades) {
   if (!trades.length) return { count: 0, winRate: null, avgR: null };
   const wins = trades.filter((t) => t.result === "win").length;
   const totalR = trades.reduce((sum, t) => sum + t.rMultiple, 0);
   return { count: trades.length, winRate: Math.round((wins / trades.length) * 1000) / 10, avgR: Math.round((totalR / trades.length) * 1000) / 1000 };
+}
+
+function detailedSummary(trades) {
+  if (!trades.length) return { count: 0, winRate: null, avgR: null, totalR: 0, maxDrawdownR: 0 };
+  const wins = trades.filter((t) => t.result === "win").length;
+  const totalR = trades.reduce((sum, t) => sum + t.rMultiple, 0);
+  let equity = 0;
+  let peak = 0;
+  let maxDrawdownR = 0;
+  for (const trade of [...trades].sort((a, b) => a.signalIndex - b.signalIndex)) {
+    equity += trade.rMultiple;
+    peak = Math.max(peak, equity);
+    maxDrawdownR = Math.max(maxDrawdownR, peak - equity);
+  }
+  return {
+    count: trades.length,
+    winRate: Math.round((wins / trades.length) * 1000) / 10,
+    avgR: Math.round((totalR / trades.length) * 1000) / 1000,
+    totalR: Math.round(totalR * 1000) / 1000,
+    maxDrawdownR: Math.round(maxDrawdownR * 1000) / 1000,
+  };
+}
+
+function timeKey(dateValue, period) {
+  const date = new Date(dateValue || "");
+  if (!Number.isFinite(date.getTime())) return null;
+  const year = String(date.getUTCFullYear());
+  if (period === "year") return year;
+  if (period === "month") return `${year}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+  return `${year}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function bucketTrades(trades, period) {
+  const buckets = new Map();
+  for (const trade of trades) {
+    const key = timeKey(trade.signalTimestamp, period);
+    if (!key) continue;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(trade);
+  }
+  return buckets;
+}
+
+function shortStats(trades) {
+  const stats = detailedSummary(trades);
+  return `n=${stats.count} avgR=${stats.avgR >= 0 ? "+" : ""}${stats.avgR} totalR=${stats.totalR >= 0 ? "+" : ""}${stats.totalR} wr=${stats.winRate}%`;
+}
+
+function printTemporalBreakdown(pair, bars, methods) {
+  const first = bars[0]?.date || "inconnu";
+  const last = bars.at(-1)?.date || "inconnu";
+  console.log(`\nTEMPORAL ${pair}: ${first} -> ${last} (signal date, sorties simulees sur chaque bougie journaliere)`);
+  for (const method of methods) {
+    const stats = detailedSummary(method.trades);
+    const daily = [...bucketTrades(method.trades, "day").values()].map(detailedSummary);
+    const positiveDays = daily.filter((d) => d.totalR > 0).length;
+    const negativeDays = daily.filter((d) => d.totalR < 0).length;
+    const bestDay = daily.length ? Math.max(...daily.map((d) => d.totalR)) : 0;
+    const worstDay = daily.length ? Math.min(...daily.map((d) => d.totalR)) : 0;
+    console.log(`  ${method.name} GLOBAL ${shortStats(method.trades)} maxDD=${stats.maxDrawdownR}R`);
+    console.log(`  ${method.name} JOURS actifs=${daily.length} positifs=${positiveDays} negatifs=${negativeDays} meilleur=${bestDay >= 0 ? "+" : ""}${Math.round(bestDay * 1000) / 1000}R pire=${Math.round(worstDay * 1000) / 1000}R`);
+  }
+  for (const period of ["month", "year"]) {
+    const keys = new Set();
+    const maps = methods.map((method) => bucketTrades(method.trades, period));
+    for (const map of maps) for (const key of map.keys()) keys.add(key);
+    console.log(`  ${period.toUpperCase()}:`);
+    for (const key of [...keys].sort()) {
+      const values = methods.map((_, index) => shortStats(maps[index].get(key) || []));
+      console.log(`    ${key} | ${methods.map((method, index) => `${method.name} ${values[index]}`).join(" | ")}`);
+    }
+  }
 }
 
 function generateSignals(bars) {
@@ -222,6 +330,14 @@ const ACTIVATION_RS = [0.2, 0.4, 0.6, 0.8, 1.0];
 const TRAIL_RS = [0.3, 0.5, 0.75, 1.0];
 const BUFFER_R = 0.15;
 
+// These are the exact trailing settings currently shipped for the three swing
+// pairs. Other pairs are intentionally not assigned a hybrid result here.
+const CURRENT_TRAILING_PARAMS = {
+  "EUR/USD": { activationR: 0.2, trailR: 0.3, bufferR: 0.15 },
+  "XAU/USD": { activationR: 1, trailR: 0.5, bufferR: 0.15 },
+  "USD/CHF": { activationR: 0.2, trailR: 0.3, bufferR: 0.15 },
+};
+
 // One pair, one already-fetched slice of bars (a whole history, OR one half of
 // it for the two-independent-periods check) -- returns the baseline, the full
 // grid, and which combos beat baseline on both its own train and test splits.
@@ -231,6 +347,12 @@ function analyzePeriod(pair, bars) {
   const baselineTrades = signals.map((s) => ({ split: s.split, ...simulateFixedTp(bars, s.index, s.signal) }));
   const baselineTrain = summarize(baselineTrades.filter((t) => t.split === "train"));
   const baselineTest = summarize(baselineTrades.filter((t) => t.split === "test"));
+  const currentTrailing = CURRENT_TRAILING_PARAMS[pair];
+  const hybridTrades = currentTrailing
+    ? signals.map((s) => ({ split: s.split, ...simulateHybridTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }))
+    : [];
+  const hybridTrain = summarize(hybridTrades.filter((t) => t.split === "train"));
+  const hybridTest = summarize(hybridTrades.filter((t) => t.split === "test"));
   const results = [];
   for (const activationR of ACTIVATION_RS) {
     for (const trailR of TRAIL_RS) {
@@ -240,7 +362,7 @@ function analyzePeriod(pair, bars) {
       results.push({ activationR, trailR, train, test, beatsBaseline: train.avgR > baselineTrain.avgR && test.avgR > baselineTest.avgR });
     }
   }
-  return { barCount: bars.length, signalCount: signals.length, baselineTrain, baselineTest, results };
+  return { barCount: bars.length, signalCount: signals.length, baselineTrain, baselineTest, hybridTrain, hybridTest, results };
 }
 
 async function main() {
@@ -257,6 +379,19 @@ async function main() {
     }
     if (bars.length < 400) { console.log(`[${symbolDef.pair}] pas assez de bougies (${bars.length}) pour couper en deux periodes independantes, ignore.`); continue; }
     console.log(`\n=== ${symbolDef.pair} (${bars.length} bougies journalieres, ${bars[0].date} -> ${bars.at(-1).date}) ===`);
+
+    const currentTrailing = CURRENT_TRAILING_PARAMS[symbolDef.pair];
+    if (currentTrailing) {
+      const allSignals = generateSignals(bars);
+      const fullBaselineTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulateFixedTp(bars, s.index, s.signal) }));
+      const fullTrailingTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulateTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }));
+      const fullHybridTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulateHybridTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }));
+      printTemporalBreakdown(symbolDef.pair, bars, [
+        { name: "TP_FIXE", trades: fullBaselineTrades },
+        { name: "TRAILING", trades: fullTrailingTrades },
+        { name: "HYBRIDE", trades: fullHybridTrades },
+      ]);
+    }
 
     // Split into two genuinely separate, non-overlapping historical periods --
     // same "two real windows must independently agree" bar the scalp backtest
@@ -277,6 +412,11 @@ async function main() {
       const best = sorted[0];
       console.log(`    Meilleur stop suiveur: activation=${best.activationR}R trail=${best.trailR}R -- train avgR=${best.train.avgR} | test avgR=${best.test.avgR} ${best.beatsBaseline ? "(bat la baseline)" : "(NE bat PAS la baseline)"}`);
       console.log(`    Combinaisons qui battent la baseline: ${analysis.results.filter((r) => r.beatsBaseline).length} / ${analysis.results.length}`);
+      if (CURRENT_TRAILING_PARAMS[symbolDef.pair]) {
+        const hybridBeatsBaseline = analysis.hybridTrain.avgR > analysis.baselineTrain.avgR && analysis.hybridTest.avgR > analysis.baselineTest.avgR;
+        const p = CURRENT_TRAILING_PARAMS[symbolDef.pair];
+        console.log(`    HYBRIDE TP1 1.6R + trailing actuel (activation=${p.activationR}R trail=${p.trailR}R): train avgR=${analysis.hybridTrain.avgR} | test avgR=${analysis.hybridTest.avgR} ${hybridBeatsBaseline ? "(bat la baseline sur les deux splits)" : "(ne bat pas la baseline sur les deux splits)"}`);
+      }
     }
 
     // The real question this whole second period exists to answer: is there

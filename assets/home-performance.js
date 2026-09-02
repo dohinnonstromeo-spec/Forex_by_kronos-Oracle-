@@ -45,7 +45,7 @@
   function showPanelError() {
     const panel = document.querySelector(".home-performance-panel");
     if (!panel) return;
-    const message = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Performance indisponible pour l'instant -- nouvelle tentative dans quelques minutes.</div>`;
+    const message = `<div class="rounded border border-border bg-background/40 px-3 py-2 text-muted-foreground">Performance indisponible pour l'instant — nouvelle tentative dans quelques minutes.</div>`;
     const stats = panel.querySelector(".home-performance-stats");
     const chart = panel.querySelector(".home-performance-chart");
     if (stats && !stats.children.length) stats.innerHTML = message;

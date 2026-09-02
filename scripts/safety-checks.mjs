@@ -319,6 +319,21 @@ function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification
   return null;
 }
 
+function conservativeBrokerRiskBalanceForTest(accountInfo) {
+  const values = [accountInfo?.balance, accountInfo?.equity, accountInfo?.freeMargin].map(Number);
+  if (values.some((value) => !Number.isFinite(value) || value <= 0)) return null;
+  return Math.min(...values);
+}
+
+check(
+  "real free margin is the conservative sizing basis",
+  conservativeBrokerRiskBalanceForTest({ balance: 1000, equity: 900, freeMargin: 400 }) === 400,
+);
+check(
+  "missing free margin fails closed instead of sizing from balance alone",
+  conservativeBrokerRiskBalanceForTest({ balance: 1000, equity: 1000 }) === null,
+);
+
 // Real numbers confirmed live this session against the connected MetaApi demo
 // account: XAU/USD tickSize 0.01, lossTickValue ~1 (USD account), balance
 // $43,230.85, 0.1% risk, $15 SL distance -> volume 0.02 lots, confirmed against a
@@ -491,6 +506,9 @@ check("lease acquisition uses an expiry condition", /async function tryAcquireLe
 check("auto-trade lease goes through the shared CAS lease helper", /tryAcquireAutoTradeLease[\s\S]{0,200}return tryAcquireLease\("auto_trade_leases"/.test(serverSource));
 check("swing scheduler acquires a lease before processing a user", /tryAcquireAutoTradeLease\(account\.user_id, slot\)[\s\S]{0,300}processAutoTradeForUser/.test(serverSource));
 check("scalp scheduler acquires a lease before processing a user", /tryAcquireAutoTradeLease\(account\.user_id, slot\)[\s\S]{0,300}processScalpForUser/.test(serverSource));
+check("swing scheduler is single-flight inside one instance", serverSource.includes("let autoTradeTickInFlight = false") && serverSource.includes("if (autoTradeTickInFlight) return") && serverSource.includes("autoTradeTickInFlight = false"));
+check("scalp scheduler is single-flight inside one instance", serverSource.includes("let scalpTradeTickInFlight = false") && serverSource.includes("if (scalpTradeTickInFlight) return") && serverSource.includes("scalpTradeTickInFlight = false"));
+check("auto-trade status exposes the current durable lease", serverSource.includes("async function getAutoTradeLeaseState") && serverSource.includes("executionLease: demoExecutionLease") && serverSource.includes("executionLease: liveExecutionLease"));
 check("password reset claims the token atomically", /UPDATE password_reset_tokens SET used_at = \? WHERE id = \? AND used_at IS NULL/.test(serverSource));
 check("daily order usage is durable", /CREATE TABLE IF NOT EXISTS trade_daily_usage/.test(serverSource));
 check("daily order cap increments conditionally in SQL", /trade_daily_usage[\s\S]{0,1200}confirmed_count < \?/.test(serverSource));
@@ -519,7 +537,7 @@ check("request body reads have a bounded timeout", serverSource.includes("BODY_R
 check("free and trade quotas are bounded", serverSource.includes("FREE_DAILY_ANALYSES_LIMIT = Math.trunc(boundedEnvNumber") && serverSource.includes("VISITOR_DAILY_DETECTIONS_LIMIT = Math.trunc(boundedEnvNumber") && serverSource.includes("Math.min(10_000, Math.max(1, Math.trunc(cap)))"));
 check("browser isolation headers are present", serverSource.includes("X-DNS-Prefetch-Control") && serverSource.includes("Cross-Origin-Resource-Policy"));
 check("lease and recovery intervals are bounded", serverSource.includes("AUTO_TRADE_LEASE_MS = boundedEnvNumber") && serverSource.includes("SCHEDULER_LEASE_MS = boundedEnvNumber") && serverSource.includes("TRADE_OPERATION_LEASE_MS = boundedEnvNumber") && serverSource.includes("HEARTBEAT_STALE_MS = boundedEnvNumber") && serverSource.includes("SENDING_RECOVERY_INTERVAL_MS = boundedEnvNumber") && serverSource.includes("SENDING_RECOVERY_AFTER_MS = boundedEnvNumber"));
-check("relational readiness waits for legacy migration", serverSource.indexOf("await migrateLegacyJsonIntoRelationalTables();") < serverSource.indexOf("relationalTablesReady = true;"));
+check("relational readiness waits for legacy migration", serverSource.indexOf("await migrateLegacyJsonIntoRelationalTables();") < serverSource.lastIndexOf("relationalTablesReady = true;"));
 check("chat prompts are bounded", serverSource.includes("sanitizeUserText(cleanLine") && serverSource.includes(".slice(0, 4000)"));
 check("image payloads are bounded before decoding", serverSource.includes("MAX_IMAGE_DATA_URL_CHARS = 8 * 1024 * 1024") && serverSource.includes("image.length > MAX_IMAGE_DATA_URL_CHARS"));
 check("SSE clients cannot create an unbounded backlog", serverSource.includes("if (!client.write(message)) client.destroy()") && serverSource.includes("client.writableEnded"));
@@ -541,6 +559,8 @@ check("public legal page has canonical and social metadata", legalHtmlSource.inc
 check("private auth surfaces are noindex", privateHtmlSources.every((source) => source.includes('name="robots" content="noindex, nofollow"')));
 check("homepage has WebSite structured data", indexHtmlSource.includes('id="website-jsonld"') && indexHtmlSource.includes('"@type": "WebSite"'));
 check("successful broker acknowledgements require an order id", /broker_ack_missing_order_id/.test(serverSource));
+check("order protection is checked against the broker quote and symbol stopsLevel", serverSource.includes("getBrokerProtectionContext") && serverSource.includes("protection.stopsLevel * protection.point") && serverSource.includes("const stopReference = buyOrder ? protection.bid : protection.ask"));
+check("opening orders fail closed when broker protection context is unavailable", serverSource.includes('error: "broker_protection_unavailable"') && serverSource.includes('error: "broker_protection_too_close"'));
 check("ambiguous broker responses transition to DELIVERY_UNKNOWN", serverSource.includes('broker.uncertain ? "DELIVERY_UNKNOWN"'));
 check("stale SENDING orders have a recovery scheduler", /recoverStaleSendingOrders/.test(serverSource) && /status = 'DELIVERY_UNKNOWN'/.test(serverSource));
 const recoveryStart = serverSource.indexOf("async function recoverStaleSendingOrders");
@@ -555,6 +575,7 @@ check("session deletion preserves Secure", serverSource.includes("clearSessionCo
 check("news requests are normalized and bounded", serverSource.includes("normalizedSymbol = normalizePair") && serverSource.includes("const newsInFlight = new Map()") && serverSource.includes("memoryCache.news.size > 32"));
 const authClientSource = await readFile(new URL("../assets/auth.js", import.meta.url), "utf8");
 check("authenticated frontend requests have bounded timeouts", authClientSource.includes("function fetchWithTimeout(url, options = {})") && authClientSource.includes("AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS)") && !/await fetch\(/.test(authClientSource));
+check("user UI separates last evaluation from current lease", authClientSource.includes("another_execution_instance_running") && authClientSource.includes("function autoTradeLeaseSummary") && authClientSource.includes("slotStatus.executionLease"));
 check("external alert and email calls have bounded timeouts", serverSource.includes("signal: AbortSignal.timeout(3500)") && serverSource.includes("signal: AbortSignal.timeout(10000)"));
 check("production PostgreSQL TLS verifies certificates", serverSource.includes("allowInsecureDatabaseTls") && serverSource.includes("env.NODE_ENV !== \"production\"") && serverSource.includes("rejectUnauthorized: !allowInsecureDatabaseTls"));
 const boundedFrontendSources = await Promise.all(["admin-content.js", "premium-admin.js", "admin-health.js", "site-content.js"].map((file) => readFile(new URL("../assets/" + file, import.meta.url), "utf8")));
@@ -575,16 +596,52 @@ const frontendAnalyseSource = frontendAuditSources[0];
 const frontendHomeSource = frontendAuditSources[1];
 const frontendTabsSource = frontendAuditSources[2];
 const frontendChatSource = frontendAuditSources[3];
+const homeEffectsSource = await readFile(new URL("../assets/home-market-effects.js", import.meta.url), "utf8");
+const migrationSource = await readFile(new URL("../scripts/migrate-postgres.mjs", import.meta.url), "utf8");
 const frontendHtmlSources = await Promise.all(
   ["index.html", "analyse.html", "dashboard.html", "legal.html", "404.html", "paiement.html", "admin-contenu.html", "admin-health.html", "premium-admin.html"].map((file) => readFile(new URL("../" + file, import.meta.url), "utf8")),
 );
 check("frontend analysis refresh is single-flight", frontendAnalyseSource.includes("let signalsRefreshInFlight = false") && frontendAnalyseSource.includes("if (signalsRefreshInFlight) return"));
 check("homepage live refreshes are single-flight", frontendHomeSource.includes("let pricesRefreshInFlight = false") && frontendHomeSource.includes("let signalsRefreshInFlight = false") && frontendHomeSource.includes("let signalScoresRefreshInFlight = false"));
+check(
+  "frontend refresh locks recover after failed requests",
+  frontendHomeSource.includes("if (!data?.prices)") &&
+    frontendHomeSource.includes("pricesRefreshInFlight = false;") &&
+    frontendAnalyseSource.includes("if (!data)") &&
+    frontendAnalyseSource.includes("signalsRefreshInFlight = false;") &&
+    frontendHomeSource.includes("} finally {") &&
+    frontendAnalyseSource.includes("} finally {"),
+);
+check(
+  "homepage price visuals reuse one live payload",
+  frontendHomeSource.includes("window.__oraclePricesPayload") &&
+    frontendHomeSource.includes('dispatchEvent(new CustomEvent("oracle:prices"') &&
+    homeEffectsSource.includes('addEventListener("oracle:prices"') &&
+    !frontendHomeSource.includes("wireNewsSummaries()"),
+);
+check(
+  "server market cache prevents concurrent duplicate work",
+  serverSource.includes("let pricesInFlight = null;") &&
+    serverSource.includes("if (pricesInFlight) return pricesInFlight;") &&
+    serverSource.includes("let historiesInFlight = null;") &&
+    serverSource.includes("if (historiesInFlight?.key === usableKey) return historiesInFlight.promise;"),
+);
+check(
+  "frontend score refresh lock also recovers after rendering errors",
+  frontendHomeSource.includes("async function updateSignalScores()") &&
+    frontendHomeSource.includes("signalScoresRefreshInFlight = false;") &&
+    frontendHomeSource.includes("await Promise.all(state.signals.map") &&
+    frontendHomeSource.includes("} finally {"),
+);
 check("dashboard order refresh is single-flight", authClientSource.includes("let tradeOrdersRefreshInFlight = false") && authClientSource.includes("if (tradeOrdersRefreshInFlight) return"));
 check("robot action buttons are re-enabled", authClientSource.includes("/api/auto-trade/request") && authClientSource.includes("/api/auto-trade/pause") && authClientSource.includes("/api/auto-trade/resume") && (authClientSource.match(/button\.disabled = false/g) || []).length >= 3);
 check("tab keyboard and ARIA contract is present", frontendTabsSource.includes("aria-controls") && frontendTabsSource.includes("ArrowRight") && frontendTabsSource.includes("role"));
 check("chat and analysis previews stay lazy", frontendChatSource.includes('loading="lazy"') && frontendAnalyseSource.includes('loading="lazy"'));
 check("public and internal pages expose skip links", frontendHtmlSources.every((source) => source.includes('class="oracle-skip-link"') && source.includes('id="main-content"')));
+check(
+  "user-facing sources contain no replacement or common mojibake characters",
+  [...frontendHtmlSources, authClientSource, ...boundedFrontendSources].every((source) => !/[\uFFFD\u00C3\u00C2\u00E2\u00F0]/.test(source)),
+);
 check("forms declare an HTTP method", frontendHtmlSources.concat(privateHtmlSources).every((source) => !/<form\\b(?![^>]*\\bmethod=)[^>]*>/i.test(source)));
 check("private pages keep noindex", privateHtmlSources.every((source) => source.includes('name="robots" content="noindex, nofollow"')));
 const adminContentPageSource = await readFile(new URL('../admin-contenu.html', import.meta.url), 'utf8');
@@ -593,6 +650,7 @@ const adminPremiumSource = await readFile(new URL('../assets/premium-admin.js', 
 const adminHealthSource = await readFile(new URL('../assets/admin-health.js', import.meta.url), 'utf8');
 const adminContentSource = await readFile(new URL('../assets/admin-content.js', import.meta.url), 'utf8');
 const adminStylesSource = await readFile(new URL('../assets/oracle-extras.css', import.meta.url), 'utf8');
+check("admin UI keeps lease contention readable", adminPremiumSource.includes("another_execution_instance_running") && adminPremiumSource.includes("autoTradePassSummary") && adminPremiumSource.includes("executionLease"));
 check('admin member detail endpoint is protected', serverSource.includes('url.pathname.startsWith("/api/admin/members/")') && serverSource.includes('const admin = await requireAdmin(req)') && serverSource.includes('broker_last_check_status') && !serverSource.includes('broker_token:'));
 check('admin member detail exposes pair performance', serverSource.includes('GROUP BY pair') && serverSource.includes('LIMIT 20') && adminPremiumSource.includes('data.byPair') && adminPremiumSource.includes('Performance par paire'));
 check('admin member detail exposes a bounded activity timeline', adminPremiumSource.includes('const activity = [...analyses') && adminPremiumSource.includes('slice(0, 12)') && adminPremiumSource.includes('member-timeline'));
@@ -609,6 +667,163 @@ check('content CMS always restores its load button', adminContentSource.includes
 check('content CMS search remains client-side bounded', adminContentPageSource.includes('data-site-content-search') && adminContentSource.includes('filterContent()') && adminContentSource.includes('field.hidden = !matches') && adminStylesSource.includes('.admin-content-search'));
 check('admin member directory filters locally', adminContentPageSource.includes('data-member-search') && adminContentPageSource.includes('data-member-plan-filter') && adminPremiumSource.includes('currentMemberItems()') && adminPremiumSource.includes('renderMemberDirectory'));
 check('admin pages stay airy and responsive', adminContentPageSource.includes('admin-summary-grid') && adminHealthPageSource.includes('health-summary-grid') && adminStylesSource.includes('@media (max-width: 620px)') && adminStylesSource.includes('.health-detail-card--wide'));
+
+console.log("=== hybrid trailing: opt-in, bounded pairs, future orders only ===");
+const dashboardHybridSource = await readFile(new URL("../dashboard.html", import.meta.url), "utf8");
+const scalpBacktestSource = await readFile(new URL("../scripts/backtest-scalp-trailing-stop.mjs", import.meta.url), "utf8");
+const swingBacktestSource = await readFile(new URL("../scripts/backtest-swing-trailing-stop.mjs", import.meta.url), "utf8");
+check(
+  "hybrid preference is durable and OFF by default",
+  serverSource.includes('ensureColumn("auto_trading_accounts", "hybrid_trailing_enabled integer NOT NULL DEFAULT 0")')
+    && serverSource.includes("INSERT INTO auto_trading_accounts (user_id, hybrid_trailing_enabled, created_at, updated_at)")
+    && serverSource.includes("hybrid_trailing_enabled = excluded.hybrid_trailing_enabled"),
+);
+check(
+  "hybrid toggle accepts only real booleans",
+  serverSource.includes('url.pathname === "/api/auto-trade/toggle-hybrid-trailing"')
+    && serverSource.includes("body?.enabled !== true && body?.enabled !== false"),
+);
+check(
+  "hybrid status is returned without broker credentials",
+  serverSource.includes("hybridTrailingEnabled: Boolean(Number(row?.hybrid_trailing_enabled))")
+    && !/hybridTrailingEnabled[\s\S]{0,240}broker_(?:demo|live)_token/.test(serverSource),
+);
+check(
+  "hybrid is restricted to the backtested pair allowlist",
+  serverSource.includes('auto_scalp: new Set(["XAU/USD"])')
+    && serverSource.includes('auto_signal: new Set(["EUR/USD"])')
+    && serverSource.includes("HYBRID_TRAILING_PAIRS_BY_SOURCE[source]?.has(pair)"),
+);
+check(
+  "hybrid toggle does not rewrite existing trade orders",
+  (() => {
+    const start = serverSource.indexOf('url.pathname === "/api/auto-trade/toggle-hybrid-trailing"');
+    const end = serverSource.indexOf('url.pathname === "/api/auto-trade/toggle-secure-half"', start);
+    const block = start >= 0 && end > start ? serverSource.slice(start, end) : "";
+    return block.length > 0 && !block.includes("UPDATE trade_orders") && block.includes("future-only");
+  })(),
+);
+
+// Small pure copy of the server allowlist rule: disabled or non-validated pairs
+// must never receive a broker TP just because the account-level toggle is on.
+function hybridTargetForTest(source, pair, signal, enabled) {
+  const allowed = {
+    auto_scalp: new Set(["XAU/USD"]),
+    auto_signal: new Set(["EUR/USD"]),
+  };
+  if (!enabled || !allowed[source]?.has(pair)) return null;
+  const target = source === "auto_scalp" ? signal?.tp : signal?.tp1;
+  return target == null || !Number.isFinite(Number(target)) ? null : Number(target);
+}
+check("hybrid OFF leaves a trailing pair without a TP", hybridTargetForTest("auto_signal", "EUR/USD", { tp1: 1.2 }, false) === null);
+check("hybrid cannot extend to an unvalidated swing pair", hybridTargetForTest("auto_signal", "XAU/USD", { tp1: 1.2 }, true) === null);
+check("hybrid gives validated swing EUR/USD its fixed TP", hybridTargetForTest("auto_signal", "EUR/USD", { tp1: 1.2 }, true) === 1.2);
+check("hybrid gives validated scalp XAU/USD its fixed TP", hybridTargetForTest("auto_scalp", "XAU/USD", { tp: 1.3 }, true) === 1.3);
+check(
+  "backtests compare the hybrid exit instead of only printing a label",
+  scalpBacktestSource.includes("function simulateHybridTpTrailingStop")
+    && scalpBacktestSource.includes("HYBRIDE (TP fixe + trailing")
+    && scalpBacktestSource.includes("function printTemporalBreakdown")
+    && scalpBacktestSource.includes("JOURS actifs")
+    && scalpBacktestSource.includes('["month", "year"]')
+    && swingBacktestSource.includes("function simulateHybridTpTrailingStop")
+    && swingBacktestSource.includes("HYBRIDE TP1 1.6R + trailing actuel")
+    && swingBacktestSource.includes("function printTemporalBreakdown")
+    && swingBacktestSource.includes("JOURS actifs")
+    && swingBacktestSource.includes('["month", "year"]'),
+);
+check(
+  "dashboard labels the experiment and future-only behavior clearly",
+  dashboardHybridSource.includes('data-hybrid-trailing-toggle')
+    && dashboardHybridSource.includes("nouvelles positions")
+    && dashboardHybridSource.includes("positions déjà ouvertes")
+    && dashboardHybridSource.includes("mode démo"),
+);
+check(
+  "dashboard persists and refreshes the hybrid choice",
+  authClientSource.includes("/api/auto-trade/toggle-hybrid-trailing")
+    && authClientSource.includes("data-hybrid-trailing-toggle")
+    && authClientSource.includes("status.hybridTrailingEnabled"),
+);
+
+console.log("=== audit trail: snapshots, news fail-safe, and broker execution price ===");
+check(
+  "analysis audit columns exist in the initial schema and migration",
+  serverSource.includes("executed_entry real, data_snapshot text, news_snapshot text, decision_reasons text, market_regime text")
+    && serverSource.includes('ensureColumn("analyses", "data_snapshot text")')
+    && serverSource.includes('ensureColumn("analyses", "news_snapshot text")')
+    && serverSource.includes('ensureColumn("analyses", "decision_reasons text")')
+    && serverSource.includes('ensureColumn("analyses", "market_regime text")'),
+);
+check(
+  "blocked and accepted analyses build a durable data snapshot and reason codes",
+  serverSource.includes("function buildAnalysisSnapshot(")
+    && serverSource.includes("function buildDecisionReasonCodes(")
+    && serverSource.includes("decisionReasons: buildDecisionReasonCodes")
+    && serverSource.includes("if (!result.educationalOnly)"),
+);
+check(
+  "news provider failure is distinct from an empty event list",
+  serverSource.includes('calendarMeta = { status: "unavailable"')
+    && serverSource.includes('const calendarStatus = memoryCache.calendarMeta.status')
+    && serverSource.includes('calendarStatus !== "ok"')
+    && serverSource.includes('status: "unavailable"')
+    && serverSource.includes("aucune nouvelle position automatique"),
+);
+const scalpTickStart = serverSource.indexOf("async function runScalpTradingTick");
+const scalpTickEnd = serverSource.indexOf("async function processScalpForUser", scalpTickStart);
+const scalpTickBlock = scalpTickStart >= 0 && scalpTickEnd > scalpTickStart ? serverSource.slice(scalpTickStart, scalpTickEnd) : "";
+check(
+  "scalp is protected by the same calendar fail-safe as swing",
+  scalpTickBlock.includes("const newsRisk = await economicRiskWindow()")
+    && scalpTickBlock.includes('newsRisk.status !== "ok"')
+    && scalpTickBlock.includes("processScalpForUser(account, credentials, slot, newsRisk)"),
+);
+const scalpProcessStart = serverSource.indexOf("async function processScalpForUser");
+const scalpProcessEnd = serverSource.indexOf("async function handleApi", scalpProcessStart);
+const scalpProcessBlock = scalpProcessStart >= 0 && scalpProcessEnd > scalpProcessStart ? serverSource.slice(scalpProcessStart, scalpProcessEnd) : "";
+check(
+  "scalp records the checked news context and blocks affected pairs",
+  scalpProcessBlock.includes("economic_calendar_unavailable")
+    && scalpProcessBlock.includes("signalAffectedByNews(pair, event.currency)")
+    && scalpProcessBlock.includes("newsSnapshot: scalpNewsContext")
+    && scalpProcessBlock.includes("scalpDataSnapshot"),
+);
+check(
+  "execution columns are persisted and exposed without replacing analytical entry",
+  serverSource.includes('ensureColumn("trade_orders", "executed_entry real")')
+    && serverSource.includes("executionSlippage")
+    && serverSource.includes("persistBrokerExecution")
+    && serverSource.includes("executedEntry: row.executed_entry")
+    && serverSource.includes("COALESCE(executed_entry, excluded.executed_entry)"),
+);
+check(
+  "broker history can recover the opening fill even after a fast close",
+  serverSource.includes('const openingDeal = deals.find((deal) => deal.entryType === "DEAL_ENTRY_IN")')
+    && serverSource.includes("executedEntry: Number(openingDeal?.price)")
+    && serverSource.includes("brokerOutcome.position"),
+);
+check(
+  "trailing and half-profit protection use the effective executed entry",
+  serverSource.includes("let entry = Number.isFinite(Number(row.executed_entry))")
+    && serverSource.includes("const entry = Number.isFinite(Number(order.executedEntry))")
+    && serverSource.includes("const entry = Number.isFinite(Number(analysis.executedEntry))"),
+);
+
+function executionSlippageForTest(requestedEntry, executedEntry, direction) {
+  const requested = Number(requestedEntry);
+  const executed = Number(executedEntry);
+  if (!Number.isFinite(requested) || !Number.isFinite(executed)) return null;
+  const adverseMove = direction === "ACHAT" ? executed - requested : requested - executed;
+  return Math.round(adverseMove * 1e8) / 1e8;
+}
+check(
+  "execution slippage is adverse-direction aware",
+  executionSlippageForTest(1.1000, 1.1002, "ACHAT") > 0
+    && executionSlippageForTest(1.1000, 1.0998, "ACHAT") < 0
+    && executionSlippageForTest(1.1000, 1.0998, "VENTE") > 0,
+);
+
 console.log("=== requestOrigin: password-reset links never trust an attacker-controlled production Host ===");
 
 // Copy of requestOrigin() from server.mjs, with the logger omitted because this
@@ -649,6 +864,98 @@ check(
 check(
   "development keeps a valid local Host for reset-link testing",
   requestOriginForTest({ headers: { host: "127.0.0.1:4174" } }, { NODE_ENV: "development" }) === "http://127.0.0.1:4174",
+);
+
+check('mock market mode reads the fallback price payload', serverSource.includes('fallbackPrices[symbol]?.price'));
+check('integration tests override remote databases', apiTestSource.includes('process.env.DATABASE_URL ='));
+check(
+  'automatic positions count swing and scalp entries by pair with a hard maximum of three',
+  serverSource.includes('MAX_AUTO_POSITIONS_PER_PAIR')
+    && serverSource.includes("source IN ('auto_signal', 'auto_scalp')")
+    && serverSource.includes('countOpenAutoPositionsByPair')
+    && serverSource.includes('pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR'),
+);
+check(
+  'the total account cap remains explicit and tighter user limits still win',
+  serverSource.includes('account.max_concurrent_positions || 3')
+    && serverSource.includes('account.user_max_concurrent_positions')
+    && serverSource.includes('effectiveMaxConcurrentPositions: combineTightened')
+    && serverSource.includes('max_concurrent_positions_reached'),
+);
+check(
+  'new admin approvals default to three positions without changing existing explicit limits',
+  adminPremiumSource.includes('maxConcurrentPositions ?? 3')
+    && serverSource.includes('Number(body?.maxConcurrentPositions) || 3'),
+);
+check(
+  'autonomous sizing requires fresh broker balance, equity, free margin, and permission',
+  serverSource.includes('function conservativeBrokerRiskBalance')
+    && serverSource.includes('freeMargin')
+    && serverSource.includes('tradeAllowed')
+    && serverSource.includes('sizingBalanceForAccount(account, accountInfo)')
+    && serverSource.includes('getBrokerAccountInformation(credentials).catch(() => null)')
+    && authClientSource.includes('broker_funds_unavailable')
+    && adminPremiumSource.includes('broker_trading_not_allowed'),
+);
+check(
+  'dashboard metrics disclose closed results, open analyses, blocked rate, and coverage',
+  authClientSource.includes('performance?.closedAnalyses')
+    && authClientSource.includes('performance?.blockedRateLabel')
+    && authClientSource.includes('performance?.decisionCoverageLabel')
+    && serverSource.includes('decisionCoverageLabel')
+    && serverSource.includes('blockedRateLabel')
+    && dashboardHybridSource.includes('Pour 3 positions sur deux paires'),
+);
+check(
+  'long frontend settings stay compact and accessible through native disclosures',
+  dashboardHybridSource.includes('data-autotrade-preferences-section')
+    && dashboardHybridSource.includes('data-autotrade-preferences-summary')
+    && dashboardHybridSource.includes('Comment connecter ton broker ?')
+    && dashboardHybridSource.includes('Voir plus')
+    && dashboardHybridSource.includes('Voir moins')
+    && authClientSource.includes('data-autotrade-preferences-summary')
+    && adminPremiumSource.includes('admin-request-settings')
+    && adminStylesSource.includes('.dashboard-disclosure-summary:focus-visible')
+    && adminStylesSource.includes('prefers-reduced-motion'),
+);
+check(
+  'premium dashboard hero reuses existing performance data without new network paths',
+  dashboardHybridSource.includes('dashboard-hero-orbit')
+    && dashboardHybridSource.includes('data-dashboard-hero-precision')
+    && dashboardHybridSource.includes('data-dashboard-hero-coverage')
+    && authClientSource.includes('data-dashboard-hero-status')
+    && authClientSource.includes('data-dashboard-hero-precision')
+    && authClientSource.includes('data-dashboard-hero-coverage')
+    && adminStylesSource.includes('.dashboard-hero')
+    && adminStylesSource.includes('prefers-reduced-motion'),
+);
+check(
+  'dashboard switch labels remain valid HTML',
+  !dashboardHybridSource.includes("</label autocomplete=") &&
+    dashboardHybridSource.includes('data-slot-toggle="demo"') &&
+    dashboardHybridSource.includes('data-slot-toggle="live"'),
+);
+check(
+  'migration helper keeps readable UTF-8 output',
+  !/[\uFFFD\u00C3\u00C2\u00E2\u00F0]/.test(migrationSource) &&
+    migrationSource.includes("Migration terminée."),
+);
+check(
+  'public premium surfaces keep existing data contracts and responsive motion safety',
+  indexHtmlSource.includes('home-chart-panel')
+    && frontendHtmlSources[1].includes('analysis-hero-rail')
+    && frontendHtmlSources[5].includes('data-payment-form')
+    && adminStylesSource.includes('.analysis-layout')
+    && adminStylesSource.includes('.payment-methods')
+    && adminStylesSource.includes('.home-chart-panel::after')
+    && adminStylesSource.includes('@media (prefers-reduced-motion: reduce)'),
+);
+check(
+  'non-trading dashboard polls are spaced out to reduce database pressure',
+  authClientSource.includes('setInterval(refreshLivePositions, 30000)')
+    && authClientSource.includes('setInterval(refreshNotifications, 60000)')
+    && serverSource.includes('LEARNING_OUTCOMES_INTERVAL_MS = boundedEnvNumber(env.LEARNING_OUTCOMES_INTERVAL_SECONDS, 600')
+    && serverSource.includes('SIGNALS_BROADCAST_INTERVAL_MS = boundedEnvNumber(env.SIGNALS_BROADCAST_INTERVAL_SECONDS, 300'),
 );
 
 console.log(`

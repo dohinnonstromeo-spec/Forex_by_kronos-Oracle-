@@ -174,18 +174,18 @@
     const analyses = Array.isArray(data.analyses) ? data.analyses : [], orders = Array.isArray(data.orders) ? data.orders : [];
     if (memberDrawerTitle) memberDrawerTitle.textContent = "Dossier de " + (user.name || user.email || "ce compte");
     const byPair = Array.isArray(data.byPair) ? data.byPair : [];
-    const pairRows = byPair.length ? byPair.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + Number(item.total || 0) + "</td><td>" + Number(item.wins || 0) + "</td><td>" + Number(item.losses || 0) + "</td><td>" + escapeHtml(formatNumber(item.net_r, "R")) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucune donnee par paire.</td></tr>";
+    const pairRows = byPair.length ? byPair.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + Number(item.total || 0) + "</td><td>" + Number(item.wins || 0) + "</td><td>" + Number(item.losses || 0) + "</td><td>" + escapeHtml(formatNumber(item.net_r, "R")) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucune donnée par paire.</td></tr>";
     const winRate = performance.wins + performance.losses ? Math.round((performance.wins / (performance.wins + performance.losses)) * 100) : 0;
-    const analysisRows = analyses.length ? analyses.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + escapeHtml(item.direction || "--") + "</td><td>" + escapeHtml(item.outcome || item.status || "--") + "</td><td>" + escapeHtml(formatNumber(item.r_multiple, "R")) + "</td><td>" + escapeHtml(formatDateTime(item.created_at)) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucune analyse enregistree.</td></tr>";
-    const orderRows = orders.length ? orders.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + escapeHtml(item.direction || "--") + "</td><td>" + escapeHtml(item.status || "--") + "</td><td>" + escapeHtml(item.broker_slot || "--") + "</td><td>" + escapeHtml(formatDateTime(item.created_at)) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucun ordre enregistre.</td></tr>";
-    const activity = [...analyses.map((item) => ({ kind: "Analyse", title: (item.pair || "--") + " � " + (item.direction || "--"), status: item.outcome || item.status || "--", at: item.created_at })), ...orders.map((item) => ({ kind: "Ordre", title: (item.pair || "--") + " � " + (item.direction || "--"), status: item.status || "--", at: item.created_at }))].sort((left, right) => new Date(right.at || 0) - new Date(left.at || 0)).slice(0, 12);
-    const activityRows = activity.length ? activity.map((item) => "<div class=\"member-timeline-item\"><span class=\"member-timeline-dot\" aria-hidden=\"true\"></span><div><strong>" + escapeHtml(item.kind + " � " + item.title) + "</strong><span>" + escapeHtml(item.status) + " � " + escapeHtml(formatDateTime(item.at)) + "</span></div></div>").join("") : "<p class=\"health-empty\">Aucune activite recente.</p>";
-    memberDetail.innerHTML = "<section class=\"member-profile-grid\"><div><span class=\"admin-stat-label\">Identite</span><strong>" + escapeHtml(user.name || "Compte") + "</strong><span>" + escapeHtml(user.email || "--") + "</span></div><div><span class=\"admin-stat-label\">Plan</span><strong>" + escapeHtml(user.plan || "free") + "</strong><span>Depuis " + escapeHtml(formatDateTime(account.createdAt)) + "</span></div><div><span class=\"admin-stat-label\">Derniere connexion</span><strong>" + escapeHtml(formatDateTime(account.lastLoginAt)) + "</strong><span>" + account.activeSessions + " session(s) active(s)</span></div></section>"
-      + "<section class=\"member-metric-grid\"><div><span>Winrate</span><strong>" + winRate + "%</strong></div><div><span>Gains cumules</span><strong>" + escapeHtml(formatNumber(performance.grossWinR, "R")) + "</strong></div><div><span>Pertes cumulees</span><strong>" + escapeHtml(formatNumber(performance.grossLossR, "R")) + "</strong></div><div><span>Net performance</span><strong>" + escapeHtml(formatNumber(performance.netR, "R")) + "</strong></div><div><span>Profit broker</span><strong>" + escapeHtml(formatNumber(performance.brokerProfit, "$")) + "</strong></div><div><span>Analyses ouvertes</span><strong>" + performance.open + "</strong></div><div><span>Ordres envoyes</span><strong>" + trading.sent + "</strong></div><div><span>Livraisons incertaines</span><strong class=\"" + (trading.uncertain ? "member-danger" : "") + "\">" + trading.uncertain + "</strong></div></section>"
-      + "<section class=\"member-detail-section\"><div class=\"admin-section-heading\"><h4>Robot Kronos</h4><span class=\"health-state\" data-state=\"" + (bot?.approvalStatus === "approved" ? "ok" : "warning") + "\">" + escapeHtml(bot?.approvalStatus || "Non configure") + "</span></div><p class=\"health-empty\">" + (bot ? "Paires : " + escapeHtml(bot.approvedPairs || "non precisees") + " � Risque : " + escapeHtml(formatNumber(bot.riskPercent, "%")) + " � Broker : " + escapeHtml(bot.brokerLastCheckStatus || "non verifie") : "Aucun compte robot configure.") + "</p></section>"
-      + "<section class=\"member-detail-section\"><h4>Dernieres analyses</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Direction</th><th>Resultat</th><th>R</th><th>Date</th></tr></thead><tbody>" + analysisRows + "</tbody></table></div></section>"
+    const analysisRows = analyses.length ? analyses.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + escapeHtml(item.direction || "--") + "</td><td>" + escapeHtml(item.outcome || item.status || "--") + "</td><td>" + escapeHtml(formatNumber(item.r_multiple, "R")) + "</td><td>" + escapeHtml(formatDateTime(item.created_at)) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucune analyse enregistrée.</td></tr>";
+    const orderRows = orders.length ? orders.map((item) => "<tr><td>" + escapeHtml(item.pair || "--") + "</td><td>" + escapeHtml(item.direction || "--") + "</td><td>" + escapeHtml(item.status || "--") + "</td><td>" + escapeHtml(item.broker_slot || "--") + "</td><td>" + escapeHtml(formatDateTime(item.created_at)) + "</td></tr>").join("") : "<tr><td colspan=\"5\">Aucun ordre enregistré.</td></tr>";
+    const activity = [...analyses.map((item) => ({ kind: "Analyse", title: (item.pair || "--") + " · " + (item.direction || "--"), status: item.outcome || item.status || "--", at: item.created_at })), ...orders.map((item) => ({ kind: "Ordre", title: (item.pair || "--") + " · " + (item.direction || "--"), status: item.status || "--", at: item.created_at }))].sort((left, right) => new Date(right.at || 0) - new Date(left.at || 0)).slice(0, 12);
+    const activityRows = activity.length ? activity.map((item) => "<div class=\"member-timeline-item\"><span class=\"member-timeline-dot\" aria-hidden=\"true\"></span><div><strong>" + escapeHtml(item.kind + " · " + item.title) + "</strong><span>" + escapeHtml(item.status) + " · " + escapeHtml(formatDateTime(item.at)) + "</span></div></div>").join("") : "<p class=\"health-empty\">Aucune activité récente.</p>";
+    memberDetail.innerHTML = "<section class=\"member-profile-grid\"><div><span class=\"admin-stat-label\">Identité</span><strong>" + escapeHtml(user.name || "Compte") + "</strong><span>" + escapeHtml(user.email || "--") + "</span></div><div><span class=\"admin-stat-label\">Plan</span><strong>" + escapeHtml(user.plan || "free") + "</strong><span>Depuis " + escapeHtml(formatDateTime(account.createdAt)) + "</span></div><div><span class=\"admin-stat-label\">Dernière connexion</span><strong>" + escapeHtml(formatDateTime(account.lastLoginAt)) + "</strong><span>" + account.activeSessions + " session(s) active(s)</span></div></section>"
+      + "<section class=\"member-metric-grid\"><div><span>Winrate</span><strong>" + winRate + "%</strong></div><div><span>Gains cumulés</span><strong>" + escapeHtml(formatNumber(performance.grossWinR, "R")) + "</strong></div><div><span>Pertes cumulées</span><strong>" + escapeHtml(formatNumber(performance.grossLossR, "R")) + "</strong></div><div><span>Performance nette</span><strong>" + escapeHtml(formatNumber(performance.netR, "R")) + "</strong></div><div><span>Profit broker</span><strong>" + escapeHtml(formatNumber(performance.brokerProfit, "$")) + "</strong></div><div><span>Analyses ouvertes</span><strong>" + performance.open + "</strong></div><div><span>Ordres envoyés</span><strong>" + trading.sent + "</strong></div><div><span>Livraisons incertaines</span><strong class=\"" + (trading.uncertain ? "member-danger" : "") + "\">" + trading.uncertain + "</strong></div></section>"
+      + "<section class=\"member-detail-section\"><div class=\"admin-section-heading\"><h4>Robot Kronos</h4><span class=\"health-state\" data-state=\"" + (bot?.approvalStatus === "approved" ? "ok" : "warning") + "\">" + escapeHtml(bot?.approvalStatus || "Non configuré") + "</span></div><p class=\"health-empty\">" + (bot ? "Paires : " + escapeHtml(bot.approvedPairs || "non précisées") + " · Risque : " + escapeHtml(formatNumber(bot.riskPercent, "%")) + " · Broker : " + escapeHtml(bot.brokerLastCheckStatus || "non vérifié") : "Aucun compte robot configuré.") + "</p></section>"
+      + "<section class=\"member-detail-section\"><h4>Dernières analyses</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Direction</th><th>Résultat</th><th>R</th><th>Date</th></tr></thead><tbody>" + analysisRows + "</tbody></table></div></section>"
       + "<section class=\"member-detail-section\"><h4>Performance par paire</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Analyses</th><th>Gains</th><th>Pertes</th><th>Net R</th></tr></thead><tbody>" + pairRows + "</tbody></table></div></section>"
-      + "<section class=\"member-detail-section\"><h4>Derniers ordres</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Direction</th><th>Statut</th><th>Broker</th><th>Date</th></tr></thead><tbody>" + orderRows + "</tbody></table></div></section>" + "<section class=\"member-detail-section\"><h4>Fil d activite recent</h4><div class=\"member-timeline\">" + activityRows + "</div></section>";
+      + "<section class=\"member-detail-section\"><h4>Derniers ordres</h4><div class=\"member-table-wrap\"><table class=\"member-detail-table\"><thead><tr><th>Paire</th><th>Direction</th><th>Statut</th><th>Broker</th><th>Date</th></tr></thead><tbody>" + orderRows + "</tbody></table></div></section>" + "<section class=\"member-detail-section\"><h4>Fil d'activité récent</h4><div class=\"member-timeline\">" + activityRows + "</div></section>";
   }
   function formatDateTime(value) { if (!value) return "Jamais"; try { return new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); } catch { return "Date inconnue"; } }
   function formatNumber(value, suffix = "") { const number = Number(value); return Number.isFinite(number) ? number.toFixed(2) + suffix : "--"; }
@@ -282,7 +282,7 @@
   const adminOverviewRefresh = document.querySelector('[data-admin-overview-refresh]');
   async function refreshAdminOverview() {
     const token = form?.elements?.token?.value || '';
-    if (!token) { setMessage('Renseigne le token admin avant de charger la synthese.', true); return; }
+    if (!token) { setMessage('Renseigne le token admin avant de charger la synthèse.', true); return; }
     if (adminOverviewRefresh) adminOverviewRefresh.disabled = true;
     try {
       const results = await Promise.all([
@@ -292,30 +292,30 @@
       ]);
       const membersData = results[0], tradingData = results[1], requestsData = results[2];
       if (!membersData?.ok || !tradingData?.ok || !requestsData?.ok) {
-        setAdminOverviewState('critical', 'Acces admin incomplet', 'Une ou plusieurs sources n ont pas repondu.');
-        setMessage('Synthese indisponible : verifie le token et les droits.', true);
+        setAdminOverviewState('critical', 'Accès admin incomplet', "Une ou plusieurs sources n'ont pas répondu.");
+        setMessage('Synthèse indisponible : vérifie le token et les droits.', true);
         return;
       }
       const users = Array.isArray(membersData.users) ? membersData.users : [];
       const requests = Array.isArray(requestsData.requests) ? requestsData.requests : [];
       const premium = users.filter((user) => user.plan === 'premium').length;
       const pending = requests.filter((request) => request.approvalStatus === 'requested').length;
-      setAdminStat('members', users.length, 'Comptes charges');
-      setAdminStat('premium', premium, 'Acces Premium actifs');
-      setAdminStat('trading', tradingData.paused ? 'Pause' : 'Actif', tradingData.brokerConfigured ? 'Broker connecte' : 'Broker non connecte');
-      setAdminStat('requests', pending, pending ? 'A traiter en priorite' : 'Aucune demande en attente');
+      setAdminStat('members', users.length, 'Comptes chargés');
+      setAdminStat('premium', premium, 'Accès Premium actifs');
+      setAdminStat('trading', tradingData.paused ? 'Pause' : 'Actif', tradingData.brokerConfigured ? 'Broker connecté' : 'Broker non connecté');
+      setAdminStat('requests', pending, pending ? 'À traiter en priorité' : 'Aucune demande en attente');
       const uncertain = Array.isArray(tradingData.deliveryUnknownOrders) ? tradingData.deliveryUnknownOrders.length : 0;
       const state = uncertain ? 'critical' : tradingData.paused || !tradingData.brokerConfigured ? 'warning' : 'ok';
-      const title = uncertain ? uncertain + ' ordre(s) a verifier' : tradingData.paused ? 'Trading en pause' : tradingData.brokerConfigured ? 'Systeme operationnel' : 'Broker non connecte';
-      const detail = uncertain ? 'Ne jamais renvoyer un ordre ambigu avant verification broker.' : pending ? pending + ' demande(s) robot attendent une revue.' : 'Les controles principaux sont a jour.';
+      const title = uncertain ? uncertain + ' ordre(s) à vérifier' : tradingData.paused ? 'Trading en pause' : tradingData.brokerConfigured ? 'Système opérationnel' : 'Broker non connecté';
+      const detail = uncertain ? 'Ne jamais renvoyer un ordre ambigu avant vérification broker.' : pending ? pending + ' demande(s) robot attendent une revue.' : 'Les contrôles principaux sont à jour.';
       setAdminOverviewState(state, title, detail);
-      setMessage('Synthese admin actualisee.', false);
+      setMessage('Synthèse admin actualisée.', false);
     } finally {
       if (adminOverviewRefresh) adminOverviewRefresh.disabled = false;
     }
   }
   function setAdminStat(key, value, meta) { const valueNode = document.querySelector('[data-admin-stat="' + key + '"]'); const metaNode = document.querySelector('[data-admin-stat-meta="' + key + '"]'); if (valueNode) valueNode.textContent = String(value); if (metaNode) metaNode.textContent = meta; }
-  function setAdminOverviewState(state, title, detail) { const chip = document.querySelector('[data-admin-overall-status]'); const alert = document.querySelector('[data-admin-alerts]'); if (chip) { chip.dataset.state = state; chip.textContent = title; } if (alert) { alert.dataset.state = state; const strong = alert.querySelector('strong'); const text = alert.querySelector('div span'); if (strong) strong.textContent = title; if (text) text.textContent = detail; } const sync = document.querySelector('[data-admin-last-sync]'); if (sync) sync.textContent = 'Derniere mise a jour : ' + new Date().toLocaleTimeString('fr-FR'); }
+  function setAdminOverviewState(state, title, detail) { const chip = document.querySelector('[data-admin-overall-status]'); const alert = document.querySelector('[data-admin-alerts]'); if (chip) { chip.dataset.state = state; chip.textContent = title; } if (alert) { alert.dataset.state = state; const strong = alert.querySelector('strong'); const text = alert.querySelector('div span'); if (strong) strong.textContent = title; if (text) text.textContent = detail; } const sync = document.querySelector('[data-admin-last-sync]'); if (sync) sync.textContent = 'Dernière mise à jour : ' + new Date().toLocaleTimeString('fr-FR'); }
   adminOverviewRefresh?.addEventListener('click', refreshAdminOverview);
   function setMessage(text, error) {
     if (!message) return;
@@ -374,10 +374,13 @@
     max_concurrent_positions_reached: "Max positions ouvertes atteint",
     max_trades_per_day_reached: "Max trades/jour atteint",
     broker_unreachable: "Broker injoignable au dernier passage",
+    broker_trading_not_allowed: "Trading refusé par le broker",
+    broker_funds_unavailable: "Solde, equity ou marge libre insuffisants ou indisponibles",
     opened_trade: "Position ouverte au dernier passage",
     no_valid_setup_this_tick: "Signal(s) repéré(s), aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement",
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché (normal)",
+    another_execution_instance_running: "Passage ignoré : une autre exécution occupait le verrou, nouvel essai automatique",
   };
   const TICK_DAY_NAMES = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]; // matches JS getUTCDay()
 
@@ -393,9 +396,10 @@
       if (detail.correlation) parts.push(`${detail.correlation} bloqué(s) par corrélation`);
       if (detail.noSpec) parts.push(`${detail.noSpec} specs broker indisponibles`);
       if (detail.noVolume) parts.push(`${detail.noVolume} taille de position trop petite`);
+      if (detail.noFunds) parts.push(`${detail.noFunds} état des fonds broker indisponible`);
       if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
     } else if (reason === "no_signal_meets_confidence_or_rr") {
-      if (detail.minConfidence != null) parts.push(`seuil confiance ${detail.minConfidence}%`);
+      if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
       if (detail.approvedPairs?.length) parts.push(`paires : ${detail.approvedPairs.join(", ")}`);
     } else if (reason === "max_concurrent_positions_reached") {
@@ -420,6 +424,15 @@
       if (detail.tradingDays) parts.push(`jours autorisés : ${String(detail.tradingDays).split(",").map((d) => TICK_DAY_NAMES[Number(d)]).join(", ")}`);
     }
     return parts.length ? ` [${parts.join(", ")}]` : "";
+  }
+
+  function autoTradePassSummary(lastTick, lease) {
+    const summary = autoTradeTickSummary(lastTick);
+    if (!lease || lease.active === null) return summary;
+    if (lease.active) {
+      return summary + " · exécution en cours jusqu'au " + (lease.leaseUntil ? formatDate(lease.leaseUntil) : "date inconnue");
+    }
+    return summary + " · aucune exécution en cours";
   }
 
   function autoTradeTickSummary(lastTick) {
@@ -464,8 +477,8 @@
             · démo ${request.demo?.brokerConnected ? "connecté" : "non connecté"} · réel ${request.live?.brokerConnected ? "connecté" : "non connecté"}
           </span>
           ${request.approvalStatus === "approved" ? `
-            <span class="dashboard-autotrade-hint">Démo -- dernier passage : ${escapeHtml(autoTradeTickSummary(request.demo?.lastTick))}</span>
-            <span class="dashboard-autotrade-hint">Réel -- dernier passage : ${escapeHtml(autoTradeTickSummary(request.live?.lastTick))}</span>
+            <span class="dashboard-autotrade-hint">Démo -- dernier passage : ${escapeHtml(autoTradePassSummary(request.demo?.lastTick, request.demo?.executionLease))}</span>
+            <span class="dashboard-autotrade-hint">Réel -- dernier passage : ${escapeHtml(autoTradePassSummary(request.live?.lastTick, request.live?.executionLease))}</span>
           ` : ""}
           <div class="dashboard-live-authorize">
             <label class="dashboard-slot-switch">
@@ -474,6 +487,15 @@
             </label>
           </div>
         </div>
+        <details class="dashboard-disclosure admin-request-settings">
+          <summary class="dashboard-disclosure-summary">
+            <span class="dashboard-disclosure-summary-copy">
+              <span class="dashboard-disclosure-title">Paramètres d'approbation</span>
+              <span class="dashboard-disclosure-teaser">Paires, risque, limites, horaires et scalping</span>
+            </span>
+            <span class="dashboard-disclosure-action"><span class="dashboard-disclosure-closed">Voir plus</span><span class="dashboard-disclosure-open">Voir moins</span></span>
+          </summary>
+          <div class="dashboard-disclosure-content">
         <div class="dashboard-autotrade-pairs" data-trading-pairs>
           ${AUTOTRADE_PAIRS.map((pair) => `
             <label>
@@ -493,7 +515,7 @@
             <input type="number" min="1" max="10" step="0.5" value="${request.dailyLossLimitPercent ?? 3}" data-field="dailyLossLimitPercent">
           </label>
           <label class="dashboard-autotrade-field">Positions ouvertes max
-            <input type="number" min="1" max="20" step="1" value="${request.maxConcurrentPositions ?? 2}" data-field="maxConcurrentPositions">
+            <input type="number" min="1" max="20" step="1" value="${request.maxConcurrentPositions ?? 3}" data-field="maxConcurrentPositions">
           </label>
           <label class="dashboard-autotrade-field">Confiance min (%)
             <input type="number" min="60" max="95" step="1" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">
@@ -585,6 +607,8 @@
             <button type="button" data-autotrade-scalp-save="${escapeHtml(request.userId)}">Enregistrer le mode scalping</button>
           </div>
         </div>
+          </div>
+        </details>
       </article>
     `);
     const extraRequests = requests.length - REQUESTS_VISIBLE;

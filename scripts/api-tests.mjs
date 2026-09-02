@@ -63,6 +63,13 @@ let serverProcess = null;
 const createdEmails = [];
 
 before(async () => {
+  // server.mjs loads secret.dev before applying process.env. Empty overrides are
+  // therefore required here, otherwise local integration tests can hit Neon.
+  process.env.DATABASE_URL = '';
+  process.env.SUPABASE_URL = '';
+  process.env.SUPABASE_PROJECT_URL = '';
+  process.env.SUPABASE_SERVICE_ROLE_KEY = '';
+  process.env.SUPABASE_ANON_KEY = '';
   PORT = await findFreePort();
   BASE = `http://127.0.0.1:${PORT}`;
   serverProcess = spawn(process.execPath, ["server.mjs"], {
@@ -687,6 +694,7 @@ function seedOpenAnalysis(email) {
   const now = new Date().toISOString();
   db.prepare("INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth, direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal, image_quality, calibration, validation, technical_snapshot, multi_timeframe, closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount, is_test, source, broker_slot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     .run(id, user.id, now, "EUR/USD", "H1", "Mixte", "Swing Trading", "Protection maximale 0.5%", null, "Rapide", "ACHAT", 1.16818, 1.16608, 1.17039, 1.17165, "1:1.0", 80, 1, "OPEN", null, 1.16818, "{}", "{}", "{}", "{}", "[]", null, null, null, null, null, null, 1, "manual", null);
+  db.prepare('UPDATE analyses SET entry = ?, sl = ?, tp1 = ?, tp2 = ? WHERE id = ?').run(1.1531, 1.151, 1.15531, 1.15657, id);
   db.close();
   return id;
 }
@@ -782,7 +790,7 @@ test("premium user can confirm and send an order with the mock broker", { skip: 
     { orderId: prepareRes.data.order.id, volume: 0.01, brokerSlot: "demo" },
     { Cookie: cookie },
   );
-  assert.equal(confirmRes.status, 200);
+  assert.equal(confirmRes.status, 200, JSON.stringify(confirmRes.data));
   assert.equal(confirmRes.data.ok, true);
   assert.equal(confirmRes.data.order.status, "SENT");
   assert.match(confirmRes.data.order.brokerOrderId || "", /^mock_/);
@@ -817,7 +825,7 @@ test("trade confirm is single-flight under concurrent requests", { skip: !hasSec
     postJson("/api/trade/confirm", { orderId, volume: 0.01, brokerSlot: "demo" }, { Cookie: cookie }),
     postJson("/api/trade/confirm", { orderId, volume: 0.01, brokerSlot: "demo" }, { Cookie: cookie }),
   ]);
-  assert.equal(results.filter((result) => result.status === 200).length, 1);
+  assert.equal(results.filter((result) => result.status === 200).length, 1, JSON.stringify(results));
   assert.equal(results.filter((result) => result.status === 400).length, 1);
   assert.equal(results.find((result) => result.status === 400)?.data.error, "order_not_pending");
 

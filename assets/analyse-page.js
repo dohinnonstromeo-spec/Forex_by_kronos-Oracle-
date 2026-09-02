@@ -356,7 +356,8 @@
   async function refreshSignals() {
     if (signalsRefreshInFlight) return;
     signalsRefreshInFlight = true;
-    const data = await getJson("/api/signals", 18000);
+    try {
+      const data = await getJson("/api/signals", 18000);
     if (!data) {
       const market = await getJson("/api/market-status", 5000);
       renderSignals(staticSignals.map((signal) => ({
@@ -371,7 +372,9 @@
       return;
     }
     applySignalsPayload(data);
-    signalsRefreshInFlight = false;
+    } finally {
+      signalsRefreshInFlight = false;
+    }
   }
 
   // Shared by the initial fetch, the manual refresh button and every SSE

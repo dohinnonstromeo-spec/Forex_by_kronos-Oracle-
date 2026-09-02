@@ -47,7 +47,7 @@
     let empty = host.querySelector('[data-content-search-empty]');
     if (query && !visibleFields) {
       if (!empty) { empty = document.createElement('p'); empty.className = 'site-content-search-empty'; empty.dataset.contentSearchEmpty = 'true'; host.append(empty); }
-      empty.textContent = 'Aucun champ ne correspond a cette recherche.';
+      empty.textContent = 'Aucun champ ne correspond à cette recherche.';
     } else if (empty) empty.remove();
   }
 
@@ -68,7 +68,7 @@
         fetch('/api/site-content', { signal: AbortSignal.timeout(5000) }).then((r) => r.json()).catch(() => ({ ok: false })),
       ]);
       if (!registryData?.ok) {
-        if (summary) summary.textContent = registryData?.message || registryData?.error || 'Chargement impossible -- verifie le token.';
+        if (summary) summary.textContent = registryData?.message || registryData?.error || 'Chargement impossible — vérifie le token.';
         return;
       }
       const registry = Array.isArray(registryData.registry) ? registryData.registry : [];
@@ -113,7 +113,7 @@
       const resetButton = field.querySelector("[data-field-reset]");
 
       // Save and reset both go through this one queue -- confirmed live that
-      // without it, clicking "Reinitialiser" while a blur-triggered save was
+      // without it, clicking "Réinitialiser" while a blur-triggered save was
       // still in flight raced the two requests against each other: whichever
       // response landed last on the server won, so a reset could be silently
       // undone moments later by a save that was already in flight when the

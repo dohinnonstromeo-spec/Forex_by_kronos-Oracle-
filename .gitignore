@@ -9,5 +9,6 @@ data/*.db-wal
 data/*.db-shm
 backups/
 .venv-backtest/
+.vision-test/
 data-backtest/
 data/*.tmp

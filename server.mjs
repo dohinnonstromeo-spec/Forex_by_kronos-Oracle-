@@ -92,7 +92,7 @@ async function migratePlaintextBrokerCredentials() {
       await sqlRun("UPDATE auto_trading_accounts SET " + updates.join(", ") + " WHERE user_id = ?", params);
     }
   } catch (error) {
-    logOnce("broker-credential-migration", "chiffrement des identifiants broker echoue (" + error.message + ")");
+    logOnce("broker-credential-migration", "chiffrement des identifiants broker échoué (" + error.message + ")");
   }
 }
 function boundedEnvNumber(value, fallback, min, max) {
@@ -260,6 +260,7 @@ async function ensureRelationalTablesImpl() {
       live_price_at_signal real, image_quality text, calibration text, validation text,
       technical_snapshot text, multi_timeframe text,
       closed_at text, close_price real, outcome text, outcome_reason text, r_multiple real,
+      executed_entry real, data_snapshot text, news_snapshot text, decision_reasons text, market_regime text,
       is_test integer NOT NULL DEFAULT 0
     )`,
     `CREATE INDEX IF NOT EXISTS idx_analyses_status ON analyses(status)`,
@@ -339,6 +340,10 @@ async function ensureRelationalTablesImpl() {
       volume real,
       status text NOT NULL DEFAULT 'PENDING_CONFIRMATION',
       broker_order_id text,
+      executed_entry real,
+      executed_at text,
+      execution_slippage real,
+      execution_metadata text,
       error_message text,
       created_at text NOT NULL,
       confirmed_at text,
@@ -509,6 +514,21 @@ async function ensureRelationalTablesImpl() {
   // tryResolveBrokerBackedOutcome). Needed so a monetary daily-loss cap can sum
   // real closed P&L instead of the existing rMultiple*riskPercent approximation.
   await ensureColumn("analyses", "broker_profit_amount real");
+  // Audit trail for every persisted analysis. These fields are additive: the
+  // original analytical entry/levels remain untouched, while the snapshot tells
+  // us exactly which data and news state justified the decision.
+  await ensureColumn("analyses", "executed_entry real");
+  await ensureColumn("analyses", "data_snapshot text");
+  await ensureColumn("analyses", "news_snapshot text");
+  await ensureColumn("analyses", "decision_reasons text");
+  await ensureColumn("analyses", "market_regime text");
+  // Broker execution is recorded separately from the requested analytical entry.
+  // A delayed position lookup is expected, so every field is nullable and the
+  // original order remains the source of truth until the broker confirms a fill.
+  await ensureColumn("trade_orders", "executed_entry real");
+  await ensureColumn("trade_orders", "executed_at text");
+  await ensureColumn("trade_orders", "execution_slippage real");
+  await ensureColumn("trade_orders", "execution_metadata text");
   // Four admin-configurable auto-trade parameters requested directly: a cap on
   // total trades opened per day (distinct from max_concurrent_positions, which
   // only limits how many can be OPEN at once -- nothing stopped the bot from
@@ -555,6 +575,11 @@ async function ensureRelationalTablesImpl() {
   // on half_target_secured below) -- ship transparently, not silently as
   // "validated".
   await ensureColumn("auto_trading_accounts", "secure_half_priority_enabled integer NOT NULL DEFAULT 0");
+  // Experimental hybrid exit: keep the fixed reference TP on top of the
+  // validated trailing stop, only for pairs that clear the two-split hybrid
+  // backtest. Durable user preference, OFF by default; existing orders are
+  // never rewritten when this toggle changes.
+  await ensureColumn("auto_trading_accounts", "hybrid_trailing_enabled integer NOT NULL DEFAULT 0");
   // The user-side half of every admin-set bot parameter above (plus the
   // pre-existing user_min_confidence) -- each one lets the account owner
   // tighten their own bot's behavior, never loosen it past whatever the admin
@@ -566,9 +591,9 @@ async function ensureRelationalTablesImpl() {
   await ensureColumn("auto_trading_accounts", "user_risk_percent real");
   // Not a "tighten the admin's limit" field like the others in this block --
   // there's no admin-set ceiling to tighten against. Purely a self-imposed
-  // sizing basis: "trade my real account, but size positions as if it only
-  // held $X" (see sizingBalance in processAutoTradeForUser). NULL/0 means the
-  // real broker balance is used as-is, unchanged from before this existed.
+  // sizing cap: "trade my real account, but size positions as if it only held
+  // $X" (see sizingBalanceForAccount). NULL/0 means the conservative broker
+  // funds basis (minimum of balance, equity, and free margin) is used.
   await ensureColumn("auto_trading_accounts", "user_capital_cap real");
   await ensureColumn("auto_trading_accounts", "user_max_concurrent_positions integer");
   await ensureColumn("auto_trading_accounts", "user_max_trades_per_day integer");
@@ -599,11 +624,10 @@ async function ensureRelationalTablesImpl() {
   // XAU/USD) -- unlike the swing bot's approved_pairs, which covers everything
   // in `symbols`, scalp mode only ever trades pairs with an actual backtested
   // edge (see scripts/backtest-scalp-fx-meanrev.mjs), never "whatever's
-  // approved". scalp_lot_mode: 'auto' (same balance x risk% sizing as swing,
-  // computeAutoTradeVolume) or 'fixed' (always the same lot, scalp_fixed_lot --
-  // requested directly: "priorite tout petit lot pour ne pas cramer le compte
-  // d'un coup", an explicit small fixed lot the admin can impose regardless of
-  // balance/stop distance).
+  // approved". scalp_lot_mode: 'auto' sizes to the configured maximum loss
+  // amount and 'fixed' always uses the configured lot. Both modes still require
+  // a fresh positive broker funds snapshot before opening; the fixed-lot mode is
+  // intentionally admin-controlled rather than inferred from account balance.
   await ensureColumn("auto_trading_accounts", "scalp_pairs text");
   await ensureColumn("auto_trading_accounts", "scalp_lot_mode text NOT NULL DEFAULT 'auto'");
   await ensureColumn("auto_trading_accounts", "scalp_fixed_lot real");
@@ -615,11 +639,11 @@ async function ensureRelationalTablesImpl() {
   // owner action, just one that no longer needs a fresh admin round-trip each
   // time. See runScalpTradingTick: both must be true for a tick to process.
   await ensureColumn("auto_trading_accounts", "user_scalp_enabled integer NOT NULL DEFAULT 0");
-  // Progressive risk by capital tier, requested directly: as the real account
-  // balance crosses thresholds the admin defines, risk% per trade steps up
+  // Progressive risk by capital tier, requested directly: as the conservative
+  // available-funds basis crosses thresholds the admin defines, risk% per trade steps up
   // automatically -- e.g. 0.3% under $100, 1% past $1000. Stored as a JSON array
-  // of {minBalance, riskPercent}, resolved against the REAL live balance at
-  // trade time (see resolveAdminRiskPercent), not the balance at approval time.
+  // of {minBalance, riskPercent}, resolved against the REAL available-funds basis
+  // at trade time (see resolveAdminRiskPercent), not the funds at approval time.
   // Only takes effect when risk_tiers_enabled is set -- disabled accounts keep
   // using the existing flat risk_percent exactly as before, zero behavior
   // change for anyone who hasn't opted in.
@@ -976,11 +1000,17 @@ const memoryCache = {
   prices: { value: null, expiresAt: 0 },
   histories: { key: "", value: null, expiresAt: 0 },
   calendar: { value: null, expiresAt: 0 },
+  calendarMeta: { status: "unknown", checkedAt: null, reason: null },
   news: new Map(),
+  newsMeta: new Map(),
   signals: { value: null, expiresAt: 0 },
   performance: { value: null, expiresAt: 0 },
 };
 
+// Avoid duplicate provider/Neon work when several pages miss the same cache
+// during a deploy or a simultaneous first load.
+let pricesInFlight = null;
+let historiesInFlight = null;
 const newsInFlight = new Map();
 const GROQ_MODEL = env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile";
@@ -1490,7 +1520,7 @@ async function sendCrashAlert(message) {
 // anonymous_usage row per unique visitor per day), same growth problem, just durable
 // instead of RAM-only. Deletes expired rows on the same schedule the old in-memory
 // sweep used.
-const RATE_LIMIT_SWEEP_INTERVAL_MS = boundedEnvNumber(env.RATE_LIMIT_SWEEP_INTERVAL_MINUTES, 30, 1, 1440) * 60 * 1000;
+const RATE_LIMIT_SWEEP_INTERVAL_MS = boundedEnvNumber(env.RATE_LIMIT_SWEEP_INTERVAL_MINUTES, 60, 1, 1440) * 60 * 1000;
 
 function startRateLimitMapSweeper() {
   const sweep = async () => {
@@ -1520,7 +1550,7 @@ function startRateLimitMapSweeper() {
   setInterval(sweep, RATE_LIMIT_SWEEP_INTERVAL_MS);
 }
 
-const LEARNING_OUTCOMES_INTERVAL_MS = boundedEnvNumber(env.LEARNING_OUTCOMES_INTERVAL_SECONDS, 90, 10, 86400) * 1000;
+const LEARNING_OUTCOMES_INTERVAL_MS = boundedEnvNumber(env.LEARNING_OUTCOMES_INTERVAL_SECONDS, 600, 10, 86400) * 1000;
 
 function startLearningOutcomesScheduler() {
   const tick = async () => {
@@ -1573,7 +1603,7 @@ const MAX_SIGNAL_STREAM_CLIENTS = Math.trunc(boundedEnvNumber(env.MAX_SIGNAL_STR
 // caps how many of those slots any one source can hold at once.
 const signalStreamByClient = new Map();
 const MAX_SIGNAL_STREAM_PER_CLIENT = Math.trunc(boundedEnvNumber(env.MAX_SIGNAL_STREAM_PER_CLIENT, 3, 1, 50));
-const SIGNALS_BROADCAST_INTERVAL_MS = boundedEnvNumber(env.SIGNALS_BROADCAST_INTERVAL_SECONDS, 60, 5, 3600) * 1000;
+const SIGNALS_BROADCAST_INTERVAL_MS = boundedEnvNumber(env.SIGNALS_BROADCAST_INTERVAL_SECONDS, 300, 5, 3600) * 1000;
 
 function startSignalsBroadcastScheduler() {
   const tick = async () => {
@@ -1617,7 +1647,7 @@ function startSignalsBroadcastScheduler() {
 // the same kind of "quota-conscious, don't run unless it can actually reach
 // someone" gate the ticker scheduler uses, just checking for an actual new_signal
 // subscriber instead of an SSE connection.
-const NEW_SIGNAL_CHECK_INTERVAL_MS = boundedEnvNumber(env.NEW_SIGNAL_CHECK_INTERVAL_SECONDS, 60, 10, 3600) * 1000;
+const NEW_SIGNAL_CHECK_INTERVAL_MS = boundedEnvNumber(env.NEW_SIGNAL_CHECK_INTERVAL_SECONDS, 300, 10, 3600) * 1000;
 
 function startNewSignalAlertScheduler() {
   const tick = async () => {
@@ -1644,6 +1674,11 @@ function startNewSignalAlertScheduler() {
 // plan this implements.
 const AUTO_TRADE_INTERVAL_MS = boundedEnvNumber(env.AUTO_TRADE_INTERVAL_SECONDS, 60, 10, 3600) * 1000;
 const AUTO_TRADE_LEASE_MS = boundedEnvNumber(env.AUTO_TRADE_LEASE_SECONDS, 300, 120, 86400) * 1000;
+// The account-level max_concurrent_positions remains the total bot cap. This
+// second cap permits diversification while preventing repeated entries from
+// turning one pair into an unbounded concentration. The environment may only
+// tighten the hard maximum of three positions per pair.
+const MAX_AUTO_POSITIONS_PER_PAIR = Math.trunc(boundedEnvNumber(env.AUTO_POSITIONS_PER_PAIR, 3, 1, 3));
 
 // Shared by all three lease flavors below (auto-trade, scheduler,
 // trade-operation) -- they were three structurally identical
@@ -1691,6 +1726,25 @@ async function releaseAutoTradeLease(userId, brokerSlot, leaseToken) {
   return releaseLease("auto_trade_leases", ["user_id", "broker_slot"], [userId, brokerSlot], leaseToken);
 }
 
+async function getAutoTradeLeaseState(userId, brokerSlot) {
+  try {
+    const row = await sqlGet(
+      "SELECT lease_until, updated_at FROM auto_trade_leases WHERE user_id = ? AND broker_slot = ?",
+      [userId, brokerSlot],
+    );
+    if (!row?.lease_until) return { active: false, leaseUntil: null, updatedAt: null };
+    const leaseUntil = new Date(row.lease_until);
+    return {
+      active: Number.isFinite(leaseUntil.getTime()) && leaseUntil.getTime() > Date.now(),
+      leaseUntil: row.lease_until,
+      updatedAt: row.updated_at || null,
+    };
+  } catch (error) {
+    logOnce("auto-trade-lease-state-" + brokerSlot, "lease state read failed for " + brokerSlot + " (" + error.message + ")");
+    return { active: null, leaseUntil: null, updatedAt: null };
+  }
+}
+
 const SCHEDULER_LEASE_MS = boundedEnvNumber(env.SCHEDULER_LEASE_SECONDS, 120, 120, 86400) * 1000;
 
 async function tryAcquireSchedulerLease(leaseKey) {
@@ -1718,14 +1772,19 @@ async function releaseTradeOperationLease(orderId, operation, leaseToken) {
 // for whoever remembers to check logs -- a genuinely stopped scheduler
 // produces total silence otherwise, the worse and more insidious failure).
 let lastAutoTradeTickAttemptAt = null;
+let autoTradeTickInFlight = false;
 
 function startAutoTradeScheduler() {
   const tick = async () => {
     lastAutoTradeTickAttemptAt = Date.now();
+    if (autoTradeTickInFlight) return;
+    autoTradeTickInFlight = true;
     try {
       await runAutoTradeTick();
     } catch (error) {
       logOnce("auto-trade-scheduler", `cycle auto-trading échoué (${error.message})`);
+    } finally {
+      autoTradeTickInFlight = false;
     }
   };
   tick();
@@ -1771,7 +1830,7 @@ async function runAutoTradeTick() {
         continue;
       }
       try {
-        await processAutoTradeForUser(account, tradable, slot);
+        await processAutoTradeForUser(account, tradable, slot, payload.newsRisk || null);
       } catch (error) {
         logOnce(`auto-trade-user-${account.user_id}-${slot}`, `bot échoué pour un utilisateur (${error.message})`);
       } finally {
@@ -1792,14 +1851,19 @@ const SCALP_TRADING_INTERVAL_MS = boundedEnvNumber(env.SCALP_TRADING_INTERVAL_SE
 
 // Same heartbeat purpose as lastAutoTradeTickAttemptAt above.
 let lastScalpTickAttemptAt = null;
+let scalpTradeTickInFlight = false;
 
 function startScalpTradingScheduler() {
   const tick = async () => {
     lastScalpTickAttemptAt = Date.now();
+    if (scalpTradeTickInFlight) return;
+    scalpTradeTickInFlight = true;
     try {
       await runScalpTradingTick();
     } catch (error) {
       logOnce("scalp-trading-scheduler", `cycle scalp échoué (${error.message})`);
+    } finally {
+      scalpTradeTickInFlight = false;
     }
   };
   tick();
@@ -1865,6 +1929,15 @@ async function runScalpTradingTick() {
     [],
   );
   if (!accounts.length) return;
+  const newsRisk = await economicRiskWindow();
+  if (newsRisk.status !== "ok") {
+    for (const account of accounts) {
+      for (const slot of activeBrokerSlots(account)) {
+        recordAutoTradeStatus(account.user_id, slot, "economic_calendar_unavailable", { reason: newsRisk.reason });
+      }
+    }
+    return;
+  }
   for (const account of accounts) {
     for (const slot of activeBrokerSlots(account)) {
       const credentials = resolveBrokerCredentialsFromAccount(account, slot);
@@ -1874,7 +1947,7 @@ async function runScalpTradingTick() {
         continue;
       }
       try {
-        await processScalpForUser(account, credentials, slot);
+        await processScalpForUser(account, credentials, slot, newsRisk);
       } catch (error) {
         logOnce(`scalp-user-${account.user_id}-${slot}`, `scalp échoué pour un utilisateur (${error.message})`);
       } finally {
@@ -1910,10 +1983,21 @@ async function dailyRealizedPnlPercent(userId, slot) {
 
 async function countOpenAutoPositions(userId, slot) {
   const row = await sqlGet(
-    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source = 'auto_signal' AND broker_slot = ? AND status = 'OPEN' AND active = 1`,
+    `SELECT COUNT(*) as n FROM analyses WHERE user_id = ? AND source IN ('auto_signal', 'auto_scalp') AND broker_slot = ? AND status = 'OPEN' AND active = 1`,
     [userId, slot],
   );
   return Number(row?.n || 0);
+}
+
+async function countOpenAutoPositionsByPair(userId, slot) {
+  const rows = await sqlAll(
+    `SELECT pair, COUNT(*) as n FROM analyses
+     WHERE user_id = ? AND source IN ('auto_signal', 'auto_scalp')
+       AND broker_slot = ? AND status = 'OPEN' AND active = 1
+     GROUP BY pair`,
+    [userId, slot],
+  );
+  return new Map(rows.filter((row) => row.pair).map((row) => [row.pair, Number(row.n || 0)]));
 }
 
 // Distinct from countOpenAutoPositions: that one counts positions currently open
@@ -2074,8 +2158,87 @@ function resolveAdminRiskPercent(account, balance) {
   return eligible.length ? Number(eligible[0].riskPercent) : account.risk_percent;
 }
 
-async function processAutoTradeForUser(account, signals, slot) {
+function buildAutomaticNewsContext(newsRisk) {
+  return {
+    enabled: true,
+    status: newsRisk?.status || "unknown",
+    calendarStatus: newsRisk?.status || "unknown",
+    headlinesStatus: "not_requested",
+    checkedAt: newsRisk?.checkedAt || null,
+    summary: newsRisk?.reason || (newsRisk?.active ? "Fenêtre news active." : "Calendrier vérifié, aucune fenêtre bloquante."),
+    activeRisk: Boolean(newsRisk?.active),
+    events: Array.isArray(newsRisk?.events) ? newsRisk.events.slice(0, 5) : [],
+    headlines: [],
+  };
+}
+
+function buildAutomaticSignalSnapshot(signal, newsRisk, timeframe = "Auto") {
+  const quality = signal?.quality || {};
+  const newsContext = buildAutomaticNewsContext(newsRisk);
+  return {
+    capturedAt: new Date().toISOString(),
+    pair: signal?.paire || null,
+    timeframe,
+    livePrice: {
+      value: Number.isFinite(Number(signal?.entree)) ? Number(signal.entree) : null,
+      source: quality.source || signal?.source || null,
+      asOf: quality.asOf || null,
+      ageSeconds: timestampAgeSeconds(quality.asOf),
+      trustworthy: Boolean(quality.valid && !quality.stale),
+      stale: Boolean(quality.stale),
+      reliability: Number(quality.reliability) || 0,
+      open: Boolean(quality.open),
+      bid: null,
+      ask: null,
+    },
+    history: {
+      bars: Number(quality.bars) || 0,
+      source: quality.historySource || null,
+      asOf: quality.asOf || null,
+      stale: Boolean(quality.historyStale),
+      timeframe,
+    },
+    technical: {
+      valid: Boolean(quality.valid),
+      trend: signal?.direction || null,
+      marketRegime: "unknown",
+      confirmations: Number(signal?.indicators?.confluence) || 0,
+      rsi: Number.isFinite(Number(signal?.indicators?.rsi)) ? Number(signal.indicators.rsi) : null,
+      volatility: null,
+    },
+    multiTimeframe: [],
+    news: {
+      status: newsContext.status,
+      calendarStatus: newsContext.calendarStatus,
+      headlinesStatus: newsContext.headlinesStatus,
+      checkedAt: newsContext.checkedAt,
+      activeRisk: newsContext.activeRisk,
+      events: newsContext.events,
+      headlines: newsContext.headlines,
+    },
+  };
+}
+
+function automaticSignalDecisionReasons(signal, newsRisk) {
+  const quality = signal?.quality || {};
+  const reasons = [];
+  if (!quality.valid || quality.stale || !quality.open) reasons.push("DATA_LIVE_UNUSABLE");
+  if (quality.historyStale) reasons.push("DATA_HISTORY_STALE");
+  if (!quality.valid) reasons.push("DATA_TECHNICAL_WEAK");
+  if (newsRisk?.active) reasons.push("NEWS_HIGH_IMPACT_WINDOW");
+  if (newsRisk?.status !== "ok") reasons.push("NEWS_CONTEXT_UNAVAILABLE");
+  return [...new Set(reasons)];
+}
+
+async function processAutoTradeForUser(account, signals, slot, newsRisk = null) {
   const userId = account.user_id;
+  // Defense in depth: no autonomous swing order is allowed without a successful
+  // calendar check, even if a future caller forgets to pass the news context.
+  if (!newsRisk || newsRisk.status !== 'ok') {
+    return recordAutoTradeStatus(userId, slot, 'economic_calendar_unavailable', {
+      reason: newsRisk?.reason || 'economic_calendar_unavailable',
+    });
+  }
   const adminWindowBlock = windowBlockReason(account.trading_hours_start, account.trading_hours_end, account.trading_days);
   if (adminWindowBlock)
     return recordAutoTradeStatus(userId, slot, adminWindowBlock === "day" ? "outside_admin_trading_days" : "outside_admin_trading_hours",
@@ -2124,9 +2287,10 @@ async function processAutoTradeForUser(account, signals, slot) {
   if (monthlyLossLimitAmount > 0 && (await monthlyRealizedPnlAmount(userId, slot)) <= -monthlyLossLimitAmount)
     return recordAutoTradeStatus(userId, slot, "monthly_loss_limit_amount_reached", { monthlyLossLimitAmount });
 
-  const maxConcurrent = combineTightened(account.max_concurrent_positions || 2, account.user_max_concurrent_positions, "lower");
+  const maxConcurrent = combineTightened(account.max_concurrent_positions || 3, account.user_max_concurrent_positions, "lower");
   let openCount = await countOpenAutoPositions(userId, slot);
   if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, slot, "max_concurrent_positions_reached", { maxConcurrent, openCount });
+  const openPositionsByPair = await countOpenAutoPositionsByPair(userId, slot);
   const maxTradesPerDay = combineTightened(account.max_trades_per_day, account.user_max_trades_per_day, "lower");
   let tradesOpenedToday = maxTradesPerDay > 0 ? await countAutoTradesOpenedToday(userId, slot) : 0;
   if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay)
@@ -2134,7 +2298,10 @@ async function processAutoTradeForUser(account, signals, slot) {
 
   const credentials = resolveBrokerCredentialsFromAccount(account, slot);
   const accountInfo = credentials ? await getBrokerAccountInformation(credentials).catch(() => null) : null;
-  if (!accountInfo || !(accountInfo.balance > 0)) return recordAutoTradeStatus(userId, slot, "broker_unreachable"); // fail closed: no confirmed real balance, no trade
+  if (!accountInfo) return recordAutoTradeStatus(userId, slot, "broker_unreachable"); // fail closed: no confirmed broker state, no trade
+  if (accountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
+  let sizingBalance = sizingBalanceForAccount(account, accountInfo);
+  if (!(sizingBalance > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
 
   // user_capital_cap: "trade this real account, but size every position as if
   // it only held $X" -- requested directly so someone with e.g. a real $45,000
@@ -2144,38 +2311,41 @@ async function processAutoTradeForUser(account, signals, slot) {
   // follow the smaller, real number -- never size as if money exists that
   // doesn't. Unset/0 (the default) changes nothing, full real balance as
   // before. Deliberately only affects sizing math (tiers + volume) below, not
-  // the balance>0 connectivity check above -- that must always reflect the
+  // the broker-state check above -- that must always reflect the
   // real broker connection, capped or not.
-  const sizingBalance = account.user_capital_cap > 0 ? Math.min(accountInfo.balance, account.user_capital_cap) : accountInfo.balance;
-
-  // Tiers need the REAL (or capped) balance just fetched above, not a cached/
-  // approval-time figure -- resolved fresh every tick so a balance that just
+  // Tiers need the REAL available (or capped) funds just fetched above, not a
+  // cached/approval-time figure -- resolved fresh every tick so a balance that just
   // crossed a tier threshold takes effect on the very next trade, not after
   // some delay. Demo and live have their own balances, so a tier crossed on
   // one slot has zero effect on the other's sizing.
-  const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, sizingBalance), account.user_risk_percent, "lower");
-
   let openedThisTick = 0;
-  const skipped = { alreadyOpen: 0, correlation: 0, noSpec: 0, noVolume: 0, rejected: 0 };
+  const skipped = { alreadyOpen: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, rejected: 0 };
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
     if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
-    // Dedup: reuses `analyses` directly instead of a separate tracking table -- an
-    // OPEN auto_signal position already exists for this pair ON THIS SLOT means
-    // this signal (or one like it) has already been acted on there; don't fire
-    // again every tick while it's still live. Scoped to broker_slot, not just
-    // pair, so the same signal can legitimately be open on demo AND live at once
-    // -- they're independent books, not a single position being double-counted.
-    const alreadyOpen = await sqlGet(
-      `SELECT 1 FROM analyses WHERE user_id = ? AND pair = ? AND source = 'auto_signal' AND status = 'OPEN' AND active = 1 AND broker_slot = ? LIMIT 1`,
-      [userId, signal.paire, slot],
-    );
-    if (alreadyOpen) { skipped.alreadyOpen += 1; continue; }
+    // Allow a bounded number of entries on one pair, while keeping the account
+    // total cap and all broker/correlation checks below. The durable per-user,
+    // per-slot lease prevents two scheduler instances from exceeding this map.
+    const pairOpenCount = openPositionsByPair.get(signal.paire) || 0;
+    if (pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR) { skipped.alreadyOpen += 1; continue; }
     // Hard block here (unlike the manual flow, where this is only advisory) --
     // there's no human to read a correlation warning in an unattended path.
     // Scoped to this slot: a demo position isn't real exposure, so it can't
     // create a correlation warning against a real live trade or vice versa.
     if (await correlationWarnings(userId, signal.paire, signal.direction, null, slot)) { skipped.correlation += 1; continue; }
+
+    // A confirmed order consumes margin and can change floating equity. Refresh
+    // the broker account before every subsequent opening in this same tick so
+    // several candidates cannot all size themselves from the old free margin.
+    if (openedThisTick > 0) {
+      const refreshedAccountInfo = await getBrokerAccountInformation(credentials).catch(() => null);
+      if (!refreshedAccountInfo) { skipped.noFunds += 1; continue; }
+      if (refreshedAccountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
+      const refreshedSizingBalance = sizingBalanceForAccount(account, refreshedAccountInfo);
+      if (!(refreshedSizingBalance > 0)) { skipped.noFunds += 1; continue; }
+      sizingBalance = refreshedSizingBalance;
+    }
+    const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, sizingBalance), account.user_risk_percent, "lower");
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) { skipped.noSpec += 1; continue; }
@@ -2192,13 +2362,18 @@ async function processAutoTradeForUser(account, signals, slot) {
     });
     if (!volume) { skipped.noVolume += 1; continue; }
 
-    // SWING_TRAILING_PARAMS_BY_PAIR pairs skip the broker-side TP1 entirely --
-    // same reasoning as processScalpForUser: the backtested exit for these
-    // three is the trailing stop alone, which needs room to run past where a
-    // fixed target would have closed the trade. tp2 stays as-is for
-    // display/reference, never sent to the broker either way (see
-    // sendOrderToBroker).
+    // SWING_TRAILING_PARAMS_BY_PAIR pairs skip the broker-side TP1 by default:
+    // the backtested production exit for these three is the trailing stop alone.
+    // The opt-in hybrid exception restores the fixed TP1 only for a pair in
+    // HYBRID_TRAILING_PAIRS_BY_SOURCE, and only for this new order. tp2 stays
+    // display/reference-only and is never sent to the broker.
     const swingTrailingParams = SWING_TRAILING_PARAMS_BY_PAIR[signal.paire];
+    const hybridTrailingTarget = hybridTrailingTargetFor(
+      "auto_signal",
+      signal.paire,
+      signal,
+      Number(account.hybrid_trailing_enabled) === 1,
+    );
     const analysisId = `auto_${Date.now()}_${randomBytes(4).toString("hex")}`;
     await upsertAnalysisRow({
       id: analysisId,
@@ -2219,18 +2394,21 @@ async function processAutoTradeForUser(account, signals, slot) {
       active: true,
       status: "OPEN",
       technicalSnapshot: signal.quality || null,
+      dataSnapshot: buildAutomaticSignalSnapshot(signal, newsRisk),
+      newsSnapshot: buildAutomaticNewsContext(newsRisk),
+      decisionReasons: automaticSignalDecisionReasons(signal, newsRisk),
+      marketRegime: "unknown",
       source: "auto_signal",
       brokerSlot: slot,
     });
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
-    // secure_half_priority_enabled, fixed-TP pairs only (swingTrailingParams
-    // pairs already have no broker TP to halve -- checkTrailingStops handles
-    // those live, once price actually reaches halfway to tp2). "Baked in from
-    // the start" per the direct request ("meme avant de lancer n'importe
-    // quelle position... avant qu'il ne lance les positions suivantes
-    // automatiquement") -- the broker never even sees the full target.
-    const securingHalfAtOpen = !swingTrailingParams && Number(account.secure_half_priority_enabled) === 1;
-    const orderTp1 = swingTrailingParams ? null : securingHalfAtOpen ? signal.entree + (signal.tp1 - signal.entree) * 0.5 : signal.tp1;
+    // secure_half_priority_enabled applies to any order with a broker TP,
+    // including a hybrid order. It can only make this new target smaller.
+    const baseOrderTp1 = hybridTrailingTarget ?? (swingTrailingParams ? null : signal.tp1);
+    const securingHalfAtOpen = baseOrderTp1 != null && Number(account.secure_half_priority_enabled) === 1;
+    const orderTp1 = baseOrderTp1 == null
+      ? null
+      : securingHalfAtOpen ? signal.entree + (baseOrderTp1 - signal.entree) * 0.5 : baseOrderTp1;
     const orderTrailingStopPrice = swingTrailingParams ? signal.sl : null;
     const orderBestFavorablePrice = swingTrailingParams ? signal.entree : null;
     await sqlRun(
@@ -2242,6 +2420,7 @@ async function processAutoTradeForUser(account, signals, slot) {
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
     if (result.status === 200) {
       openCount += 1;
+      openPositionsByPair.set(signal.paire, pairOpenCount + 1);
       tradesOpenedToday += 1;
       openedThisTick += 1;
     } else {
@@ -2249,7 +2428,7 @@ async function processAutoTradeForUser(account, signals, slot) {
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
-  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, ...skipped });
+  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR, ...skipped });
 }
 
 // clampVolumeToSpec both callers below need: round down to the broker's
@@ -2264,35 +2443,55 @@ function clampVolumeToSpec(rawVolume, specification) {
 }
 
 // Scalp mode's opening logic -- deliberately its own function, never merged
-// into processAutoTradeForUser above. Requested directly: "sans detruire en
-// priorite les anciens edge" -- the swing engine's tested code path is not
+// into processAutoTradeForUser above. Requested directly: "sans détruire en
+// priorité les anciens edge" -- the swing engine's tested code path is not
 // touched by any of this. Only ever trades SCALP_PARAMS_BY_PAIR's two
-// validated pairs, one position at a time per account (deliberately
-// conservative), sized either automatically (risk exactly
+// validated pairs, bounded by the same account and per-pair caps as swing
+// (deliberately conservative), sized either automatically (loss exactly
 // scalp_loss_limit_amount if the stop is hit) or to a fixed lot the admin
-// imposes -- "priorite tout petit lot pour ne pas cramer le compte d'un coup".
-async function processScalpForUser(account, credentials, slot) {
+// imposes.
+async function processScalpForUser(account, credentials, slot, newsRisk = null) {
   if (!Number(account.scalp_enabled) || !Number(account.user_scalp_enabled)) return;
+  if (!newsRisk || newsRisk.status !== "ok") {
+    return recordAutoTradeStatus(account.user_id, slot, "economic_calendar_unavailable", {
+      reason: "Calendrier économique indisponible : aucune nouvelle position scalp autorisée.",
+    });
+  }
   const scalpPairs = String(account.scalp_pairs || "").split(",").filter((p) => SCALP_PARAMS_BY_PAIR[p]);
   if (!scalpPairs.length) return;
   const userId = account.user_id;
 
-  // One open scalp position at a time PER SLOT -- keeps worst-case exposure on
-  // each book bounded to a single scalp_loss_limit_amount (or fixed-lot
-  // equivalent) regardless of how many validated pairs are enabled, and demo
-  // being open never blocks live (or the reverse) since they're independent.
-  const alreadyOpen = await sqlGet(
-    `SELECT 1 FROM analyses WHERE user_id = ? AND source = 'auto_scalp' AND status = 'OPEN' AND active = 1 AND broker_slot = ? LIMIT 1`,
-    [userId, slot],
-  );
-  if (alreadyOpen) return;
+  // Scalp may use a fixed lot or a fixed dollar loss target, but it still must
+  // verify that the real broker account has usable funds before opening.
+  const accountInfo = credentials ? await getBrokerAccountInformation(credentials).catch(() => null) : null;
+  if (!accountInfo) return recordAutoTradeStatus(userId, slot, "broker_unreachable");
+  if (accountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
+  if (!(sizingBalanceForAccount(account, accountInfo) > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
+
+  // Scalp shares the account total cap with swing and allows up to the same
+  // bounded number per pair. One opening attempt per tick is retained so an
+  // enabled pair cannot burst several orders in one scheduler pass.
+  const maxConcurrent = combineTightened(account.max_concurrent_positions || 3, account.user_max_concurrent_positions, "lower");
+  const openCount = await countOpenAutoPositions(userId, slot);
+  if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, slot, "max_concurrent_positions_reached", { maxConcurrent, openCount });
+  const openPositionsByPair = await countOpenAutoPositionsByPair(userId, slot);
 
   for (const pair of scalpPairs) {
+    const pairOpenCount = openPositionsByPair.get(pair) || 0;
+    if (pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR) continue;
     const price = await getAnalysisPrice(pair).catch(() => null);
     if (!price || !isUsableLivePrice(price)) continue;
     const history = await getHistoryForSymbol(pair, price, { timeframe: "M1", historyBudgetMs: 4000 }).catch(() => []);
     const signal = computeScalpMeanReversionSignal(pair, price, history);
     if (!signal) continue;
+    const newsBlocked = newsRisk.active && newsRisk.events.some((event) => signalAffectedByNews(pair, event.currency));
+    if (newsBlocked) {
+      recordAutoTradeStatus(userId, slot, "economic_news_window", {
+        pair,
+        events: newsRisk.events.filter((event) => signalAffectedByNews(pair, event.currency)).slice(0, 5),
+      });
+      continue;
+    }
 
     // Found during an engine audit: correlationWarnings was only ever called
     // from the swing side (processAutoTradeForUser) and the manual flow, never
@@ -2338,6 +2537,22 @@ async function processScalpForUser(account, credentials, slot) {
       if (Number(todayLoss?.total) <= -dailyLossLimitAmount * 3) continue; // circuit breaker: 3 real scalp losses worth in one day, stop for today
     }
 
+    const scalpNewsContext = buildAutomaticNewsContext(newsRisk);
+    const scalpTechnicalSnapshot = {
+      valid: true,
+      trend: signal.direction === "ACHAT" ? "mean-reversion-long" : "mean-reversion-short",
+      marketRegime: "range",
+      confirmations: 1,
+      volatility: Number.isFinite(Number(signal.risk)) && Number(price.price) > 0 ? (Number(signal.risk) / Number(price.price)) * 100 : null,
+    };
+    const scalpDataSnapshot = buildAnalysisSnapshot({
+      pair,
+      timeframe: "M1",
+      livePrice: price,
+      history,
+      technicalSnapshot: scalpTechnicalSnapshot,
+      newsContext: scalpNewsContext,
+    });
     const analysisId = `scalp_${Date.now()}_${randomBytes(4).toString("hex")}`;
     await upsertAnalysisRow({
       id: analysisId,
@@ -2357,6 +2572,15 @@ async function processScalpForUser(account, credentials, slot) {
       score: 0,
       active: true,
       status: "OPEN",
+      technicalSnapshot: scalpTechnicalSnapshot,
+      dataSnapshot: scalpDataSnapshot,
+      newsSnapshot: scalpNewsContext,
+      decisionReasons: buildDecisionReasonCodes({
+        livePrice: price,
+        technicalSnapshot: scalpTechnicalSnapshot,
+        newsContext: scalpNewsContext,
+      }),
+      marketRegime: scalpTechnicalSnapshot.marketRegime,
       source: "auto_scalp",
       brokerSlot: slot,
     });
@@ -2367,18 +2591,21 @@ async function processScalpForUser(account, credentials, slot) {
     const validatedHoldSeconds = signal.maxHoldBars * 60;
     const holdSeconds = account.scalp_max_hold_seconds > 0 ? Math.min(validatedHoldSeconds, account.scalp_max_hold_seconds) : validatedHoldSeconds;
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
-    // tp1 is deliberately NULL, not signal.tp -- sendOrderToBroker only ever
-    // sends a broker-side takeProfit when tp1 is set, and the backtested,
-    // validated exit for these two pairs is the trailing stop alone (no fixed
-    // target at all -- that's WHY it beats the old fixed-TP baseline, letting a
-    // winner run further than tp would have allowed). tp2 keeps the original
-    // mean-reversion target for reference/display only, never sent to the
-    // broker. trailing_stop_price/best_favorable_price start at sl/entry --
-    // checkTrailingStops takes over from here.
+    // Scalp remains trailing-only by default. For a user who explicitly opted
+    // into the hybrid experiment, tp1 restores the same fixed mean-reversion
+    // target used by the baseline, while the trailing stop still protects the
+    // position before that target. tp2 remains display/reference-only.
+    const hybridTrailingTarget = hybridTrailingTargetFor(
+      "auto_scalp",
+      pair,
+      signal,
+      Number(account.hybrid_trailing_enabled) === 1,
+    );
+    const orderTp1 = hybridTrailingTarget ?? null;
     await sqlRun(
       `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds, broker_slot, trailing_stop_price, best_favorable_price)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?)`,
-      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, null, signal.tp, new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry],
+      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, orderTp1, signal.tp, new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
@@ -2535,11 +2762,11 @@ async function handleApi(req, res, url) {
       });
     } catch (error) {
       lastAdminMembersError = { at: new Date().toISOString(), message: String(error?.message || error), stack: String(error?.stack || "") };
-      logOnce("admin-members", "lecture membres echouee (" + error.message + ")");
+      logOnce("admin-members", "lecture membres échouée (" + error.message + ")");
       sendJson(res, 500, {
         ok: false,
         error: "server_error",
-        message: "Impossible de charger la liste des comptes pour le moment. V�rifie les logs Render.",
+        message: "Impossible de charger la liste des comptes pour le moment. Vérifie les logs Render.",
       });
     }
     return;
@@ -2653,7 +2880,12 @@ async function handleApi(req, res, url) {
       `SELECT a.*, u.email as user_email, u.name as user_name FROM auto_trading_accounts a
        JOIN users u ON u.id = a.user_id ORDER BY a.requested_at DESC`,
     );
-    const requests = rows.map((row) => ({
+    const requests = await Promise.all(rows.map(async (row) => {
+      const [demoExecutionLease, liveExecutionLease] = await Promise.all([
+        getAutoTradeLeaseState(row.user_id, "demo"),
+        getAutoTradeLeaseState(row.user_id, "live"),
+      ]);
+      return {
       userId: row.user_id,
       userEmail: row.user_email,
       userName: row.user_name,
@@ -2665,6 +2897,7 @@ async function handleApi(req, res, url) {
       riskPercent: row.risk_percent,
       dailyLossLimitPercent: row.daily_loss_limit_percent,
       maxConcurrentPositions: row.max_concurrent_positions,
+      maxPositionsPerPair: MAX_AUTO_POSITIONS_PER_PAIR,
       minConfidenceFloor: row.min_confidence_floor,
       // The account owner can raise their own floor above the admin's (see
       // processAutoTradeForUser: Math.max(minConfidenceFloor, userMinConfidence)) --
@@ -2694,6 +2927,7 @@ async function handleApi(req, res, url) {
         brokerConnected: Boolean(row.broker_demo_token && row.broker_demo_account_id && row.broker_demo_connected_at),
         brokerLastCheckStatus: row.broker_demo_last_check_status,
         enabled: Boolean(Number(row.demo_trading_enabled ?? 1)),
+        executionLease: demoExecutionLease,
         lastTick: autoTradeTickStatus.get(`${row.user_id}:demo`) || null,
       },
       live: {
@@ -2703,8 +2937,10 @@ async function handleApi(req, res, url) {
         authorized: Boolean(Number(row.live_trading_authorized)),
         authorizedAt: row.live_trading_authorized_at || null,
         authorizedBy: row.live_trading_authorized_by || null,
+        executionLease: liveExecutionLease,
         lastTick: autoTradeTickStatus.get(`${row.user_id}:live`) || null,
       },
+      };
     }));
     sendJson(res, 200, { ok: true, requests });
     return;
@@ -2766,7 +3002,7 @@ async function handleApi(req, res, url) {
     // a fat-fingered value, not a meaningful trading-risk decision) -- requested
     // directly: the actual portfolio-risk ceiling is the admin's call to make,
     // not something baked into the code past what they can even type.
-    const maxConcurrentPositions = Math.max(1, Math.min(20, Math.round(Number(body?.maxConcurrentPositions) || 2)));
+    const maxConcurrentPositions = Math.max(1, Math.min(20, Math.round(Number(body?.maxConcurrentPositions) || 3)));
     const minConfidenceFloor = Math.max(60, Math.min(95, Number(body?.minConfidenceFloor) || NEW_SIGNAL_ALERT_MIN_CONFIDENCE));
     // All four below are optional -- 0/absent means "no restriction on this axis",
     // same as before this feature existed, so approving an account without
@@ -3379,7 +3615,14 @@ async function handleApi(req, res, url) {
        ON CONFLICT(user_id) DO UPDATE SET ${c.token} = excluded.${c.token}, ${c.accountId} = excluded.${c.accountId}, ${c.region} = excluded.${c.region}, ${c.connectedAt} = excluded.${c.connectedAt}, ${c.lastCheckStatus} = 'ok', ${c.lastCheckAt} = excluded.${c.lastCheckAt}, updated_at = excluded.updated_at`,
       [session.user.id, storedToken, accountId, region, now, now, now, now],
     );
-    sendJson(res, 200, { ok: true, balance: check.balance, currency: check.currency });
+    sendJson(res, 200, {
+      ok: true,
+      balance: check.balance,
+      equity: check.equity,
+      freeMargin: check.freeMargin,
+      currency: check.currency,
+      tradeAllowed: check.tradeAllowed,
+    });
     return;
   }
 
@@ -3487,6 +3730,30 @@ async function handleApi(req, res, url) {
   // stops the behavior going forward; it deliberately never un-halves a TP
   // that's already been moved (there's no "original" to restore once the
   // broker TP itself has changed).
+  if (url.pathname === "/api/auto-trade/toggle-hybrid-trailing") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    // Do not use Boolean("false"): accepting stringified values here could
+    // accidentally enable a live-account behavior from a malformed client.
+    if (body?.enabled !== true && body?.enabled !== false) {
+      return sendJson(res, 400, { ok: false, error: "invalid_boolean" });
+    }
+    await ensureRelationalTables();
+    const enabled = body.enabled;
+    const now = new Date().toISOString();
+    await sqlRun(
+      `INSERT INTO auto_trading_accounts (user_id, hybrid_trailing_enabled, created_at, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET hybrid_trailing_enabled = excluded.hybrid_trailing_enabled, updated_at = excluded.updated_at`,
+      [session.user.id, enabled ? 1 : 0, now, now],
+    );
+    // This preference is intentionally future-only. Existing broker orders
+    // retain their original TP/trailing setup and are not modified here.
+    sendJson(res, 200, { ok: true, enabled });
+    return;
+  }
+
   if (url.pathname === "/api/auto-trade/toggle-secure-half") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -3659,6 +3926,10 @@ async function handleApi(req, res, url) {
     // already stops trading the instant this passes, this just gives the UI a
     // clearer label than silently showing a stale "approved" badge forever.
     const expired = row?.approval_status === "approved" && approvedUntil && approvedUntil <= now;
+    const [demoExecutionLease, liveExecutionLease] = await Promise.all([
+      getAutoTradeLeaseState(session.user.id, "demo"),
+      getAutoTradeLeaseState(session.user.id, "live"),
+    ]);
     sendJson(res, 200, {
       ok: true,
       approvalStatus: expired ? "expired" : row?.approval_status || "none",
@@ -3667,6 +3938,7 @@ async function handleApi(req, res, url) {
       riskPercent: row?.risk_percent ?? null,
       dailyLossLimitPercent: row?.daily_loss_limit_percent ?? null,
       maxConcurrentPositions: row?.max_concurrent_positions ?? null,
+      maxPositionsPerPair: MAX_AUTO_POSITIONS_PER_PAIR,
       minConfidenceFloor: row?.min_confidence_floor ?? null,
       maxTradesPerDay: row?.max_trades_per_day ?? null,
       minRiskReward: row?.min_risk_reward ?? null,
@@ -3684,6 +3956,7 @@ async function handleApi(req, res, url) {
       userRiskPercent: row?.user_risk_percent ?? null,
       userCapitalCap: row?.user_capital_cap ?? null,
       userMaxConcurrentPositions: row?.user_max_concurrent_positions ?? null,
+      effectiveMaxConcurrentPositions: combineTightened(row?.max_concurrent_positions || 3, row?.user_max_concurrent_positions, "lower"),
       userMaxTradesPerDay: row?.user_max_trades_per_day ?? null,
       userDailyLossLimitPercent: row?.user_daily_loss_limit_percent ?? null,
       userDailyLossLimitAmount: row?.user_daily_loss_limit_amount ?? null,
@@ -3702,6 +3975,7 @@ async function handleApi(req, res, url) {
       scalpEnabled: Boolean(Number(row?.scalp_enabled)),
       scalpUserEnabled: Boolean(Number(row?.user_scalp_enabled)),
       secureHalfPriorityEnabled: Boolean(Number(row?.secure_half_priority_enabled)),
+      hybridTrailingEnabled: Boolean(Number(row?.hybrid_trailing_enabled)),
       scalpPairs: row?.scalp_pairs ? row.scalp_pairs.split(",").filter(Boolean) : [],
       scalpLotMode: row?.scalp_lot_mode || "auto",
       scalpFixedLot: row?.scalp_fixed_lot ?? null,
@@ -3726,6 +4000,7 @@ async function handleApi(req, res, url) {
         dailyPnlPercent: demoConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id, "demo")) * 100) / 100 : 0,
         dailyPnlAmount: demoConnected ? Math.round((await dailyRealizedPnlAmount(session.user.id, "demo")) * 100) / 100 : 0,
         openPositions: demoConnected ? await countOpenAutoPositions(session.user.id, "demo") : 0,
+        executionLease: demoExecutionLease,
         lastTick: autoTradeTickStatus.get(`${session.user.id}:demo`) || null,
       },
       live: {
@@ -3736,6 +4011,7 @@ async function handleApi(req, res, url) {
         dailyPnlPercent: liveConnected ? Math.round((await dailyRealizedPnlPercent(session.user.id, "live")) * 100) / 100 : 0,
         dailyPnlAmount: liveConnected ? Math.round((await dailyRealizedPnlAmount(session.user.id, "live")) * 100) / 100 : 0,
         openPositions: liveConnected ? await countOpenAutoPositions(session.user.id, "live") : 0,
+        executionLease: liveExecutionLease,
         lastTick: autoTradeTickStatus.get(`${session.user.id}:live`) || null,
       },
       rejectReason: row?.reject_reason || null,
@@ -3983,7 +4259,9 @@ Format : PAIRE DIRECTION · résumé court`;
   if (url.pathname === "/api/news") {
     const normalizedSymbol = normalizePair(url.searchParams.get("symbol"));
     const symbol = normalizedSymbol ? toNewsSymbol(normalizedSymbol) : "EURUSD";
-    sendJson(res, 200, { provider: "marketaux", news: await getMarketauxNews(symbol) });
+    const news = await getMarketauxNews(symbol);
+    const meta = memoryCache.newsMeta.get(symbol) || { status: "unknown", checkedAt: null };
+    sendJson(res, 200, { provider: "marketaux", news, status: meta.status, checkedAt: meta.checkedAt });
     return;
   }
 
@@ -4027,7 +4305,8 @@ Réponds uniquement avec cet objet JSON, sans aucun texte avant ou après, sans 
   }
 
   if (url.pathname === "/api/economic-calendar") {
-    sendJson(res, 200, { events: await getEconomicCalendar() });
+    const events = await getEconomicCalendar();
+    sendJson(res, 200, { events, status: memoryCache.calendarMeta.status, checkedAt: memoryCache.calendarMeta.checkedAt });
     return;
   }
 
@@ -4234,7 +4513,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
     }
     const imageQuality = assessImageQuality(images);
     if (images.length && imageQuality.score < 20) {
-      return {
+      const result = {
         direction: "AUCUN SIGNAL",
         entry: "—",
         sl: "—",
@@ -4244,12 +4523,34 @@ async function runKronosAnalysis({ body, images, req, user }) {
         score: imageQuality.score,
         technique: "Image non validée",
         explanation: `Qualité image trop faible (${imageQuality.reason}). Kronos bloque seulement les images quasi illisibles.`,
-        meta: { imageQuality },
+        meta: { imageQuality, decisionReasons: ['DATA_TECHNICAL_WEAK', 'NO_ACTIONABLE_SIGNAL'] },
         noSignal: true,
       };
+      await recordLearningAnalysis(result, body, {
+        livePrice: null,
+        imageQuality,
+        calibration: null,
+        technicalSnapshot: null,
+        multiTimeframe: [],
+        newsContext: {
+          enabled: false,
+          status: "not_requested",
+          calendarStatus: "not_requested",
+          headlinesStatus: "not_requested",
+          checkedAt: null,
+          summary: "News non vérifiée: capture bloquée avant l'appel marché.",
+          events: [],
+          headlines: [],
+        },
+        history: [],
+        analysisDepth: normalizeAnalysisDepth(body.analysisDepth),
+        user,
+        isTest: isTestRequest(req),
+      });
+      return result;
     }
     if (images.length && !hasVisionProvider()) {
-      return {
+      const result = {
         direction: "AUCUN SIGNAL",
         entry: "—",
         sl: "—",
@@ -4261,6 +4562,28 @@ async function runKronosAnalysis({ body, images, req, user }) {
         explanation: "Aucune clé Groq Vision ou Gemini Vision n'est disponible pour analyser un screenshot. Kronos bloque le signal pour éviter une analyse inventée.",
         noSignal: true,
       };
+      await recordLearningAnalysis(result, body, {
+        livePrice: null,
+        imageQuality,
+        calibration: null,
+        technicalSnapshot: null,
+        multiTimeframe: [],
+        newsContext: {
+          enabled: false,
+          status: "not_requested",
+          calendarStatus: "not_requested",
+          headlinesStatus: "not_requested",
+          checkedAt: null,
+          summary: "News non vérifiée: vision indisponible avant l'appel marché.",
+          events: [],
+          headlines: [],
+        },
+        history: [],
+        analysisDepth: normalizeAnalysisDepth(body.analysisDepth),
+        user,
+        isTest: isTestRequest(req),
+      });
+      return result;
     }
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
     const analysisDepth = normalizeAnalysisDepth(body.analysisDepth);
@@ -4291,10 +4614,22 @@ async function runKronosAnalysis({ body, images, req, user }) {
         historyBudgetMs: images.length ? 7000 : 9000,
       })
       : [];
-    const newsContext = includeNewsContext ? await analysisNewsContext(selectedPair) : { enabled: false, summary: "Contexte news/API désactivé par l'utilisateur.", events: [], headlines: [] };
+    const newsContext = includeNewsContext
+      ? await analysisNewsContext(selectedPair)
+      : {
+        enabled: false,
+        status: "not_requested",
+        calendarStatus: "not_requested",
+        headlinesStatus: "not_requested",
+        checkedAt: null,
+        summary: "Contexte news/API désactivé par l'utilisateur.",
+        events: [],
+        headlines: [],
+      };
     const calibration = calibrationFor({ outcomes: await loadCalibrationOutcomes() }, body);
     const quickApiSetup = !deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice);
-    const deepAssistedSetup = deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice) && !newsContext?.activeRisk && technicalSnapshot?.valid;
+    const deepAssistedSetup = deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice)
+      && newsContext?.calendarStatus === "ok" && !newsContext?.activeRisk && technicalSnapshot?.valid;
     const apiOnlySetup = deepAssistedSetup || (!images.length && includeNewsContext && shouldUseApiOnlySetup({
       livePrice,
       technicalSnapshot,
@@ -4410,7 +4745,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         multiTimeframe,
       });
     }
-    if (deepAnalysis && isUnproductiveAnalysis(answer) && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice) && !newsContext?.activeRisk) {
+    if (deepAnalysis && isUnproductiveAnalysis(answer) && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice)
+      && newsContext?.calendarStatus === "ok" && !newsContext?.activeRisk) {
       answer = buildApiOnlyAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
@@ -4437,22 +4773,56 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     // last step.
     const refreshedPrice = await getAnalysisPrice(selectedPair).catch(() => null);
     if (refreshedPrice && Number.isFinite(Number(refreshedPrice.price))) livePrice = refreshedPrice;
-    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, { livePrice, imageQuality, calibration, chartContext, technicalSnapshot, newsContext, multiTimeframe, apiOnlySetup: apiOnlySetup || quickApiSetup, visionConsensus, deterministicCrossCheck: deterministicCheck });
-    if (!result.educationalOnly && !result.noSignal) await recordLearningAnalysis(result, body, { livePrice, imageQuality, calibration, technicalSnapshot, multiTimeframe, analysisDepth, user, isTest: isTestRequest(req) });
+    const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, {
+      livePrice,
+      imageQuality,
+      calibration,
+      chartContext,
+      technicalSnapshot,
+      newsContext,
+      multiTimeframe,
+      history,
+      apiOnlySetup: apiOnlySetup || quickApiSetup,
+      visionConsensus,
+      deterministicCrossCheck: deterministicCheck,
+    });
+    if (!result.educationalOnly) {
+      await recordLearningAnalysis(result, body, {
+        livePrice,
+        imageQuality,
+        calibration,
+        technicalSnapshot,
+        multiTimeframe,
+        newsContext,
+        history,
+        analysisDepth,
+        user,
+        isTest: isTestRequest(req),
+      });
+    }
     return result;
 }
 
 async function getPrices() {
   if (memoryCache.prices.value && Date.now() < memoryCache.prices.expiresAt) return memoryCache.prices.value;
-  const cache = await loadMarketCache();
-  const entries = await Promise.all(symbols.map(async (symbol) => [symbol, await fetchBestPrice(symbol, cache.prices?.[symbol])]));
-  const prices = Object.fromEntries(entries);
-  await saveMarketCache({
-    ...cache,
-    prices: mergeCachedPrices(cache.prices || {}, prices),
-  });
-  memoryCache.prices = { value: prices, expiresAt: Date.now() + 2 * 60 * 1000 };
-  return prices;
+  if (pricesInFlight) return pricesInFlight;
+  const promise = (async () => {
+    const cache = await loadMarketCache();
+    const entries = await Promise.all(symbols.map(async (symbol) => [symbol, await fetchBestPrice(symbol, cache.prices?.[symbol])]));
+    const prices = Object.fromEntries(entries);
+    await saveMarketCache({
+      ...cache,
+      prices: mergeCachedPrices(cache.prices || {}, prices),
+    });
+    memoryCache.prices = { value: prices, expiresAt: Date.now() + 2 * 60 * 1000 };
+    return prices;
+  })();
+  pricesInFlight = promise;
+  try {
+    return await promise;
+  } finally {
+    if (pricesInFlight === promise) pricesInFlight = null;
+  }
 }
 
 function signalCacheTtlMs(signals = [], newsRisk = null) {
@@ -4462,8 +4832,8 @@ function signalCacheTtlMs(signals = [], newsRisk = null) {
 }
 
 async function fetchBestPrice(symbol, cached, ttlMs = cacheTtlMs(symbol)) {
-  if (MOCK_MARKET_DATA && Number.isFinite(Number(fallbackPrices[symbol]))) {
-    return pricePayload(symbol, { price: Number(fallbackPrices[symbol]), change: 0 }, "twelve_data", null, { stale: false, reliability: 100 });
+  if (MOCK_MARKET_DATA && Number.isFinite(Number(fallbackPrices[symbol]?.price))) {
+    return pricePayload(symbol, { price: Number(fallbackPrices[symbol]?.price), change: 0 }, "twelve_data", null, { stale: false, reliability: 100 });
   }
   if (isRecentCache(cached, ttlMs)) {
     return pricePayload(symbol, cached, cached.source || "cache", "fresh_cache", {
@@ -4814,6 +5184,17 @@ async function getHistories(prices) {
   if (memoryCache.histories.value && memoryCache.histories.key === usableKey && Date.now() < memoryCache.histories.expiresAt) {
     return memoryCache.histories.value;
   }
+  if (historiesInFlight?.key === usableKey) return historiesInFlight.promise;
+  const promise = loadHistories(prices, usableKey);
+  historiesInFlight = { key: usableKey, promise };
+  try {
+    return await promise;
+  } finally {
+    if (historiesInFlight?.promise === promise) historiesInFlight = null;
+  }
+}
+
+async function loadHistories(prices, usableKey) {
   const cache = await loadMarketCache();
   const cached = cachedHistories(cache, prices);
   const cachedCount = Object.values(cached).filter((bars) => Array.isArray(bars) && bars.length >= 30 && !bars._meta?.stale).length;
@@ -5600,6 +5981,23 @@ const SWING_TRAILING_PARAMS_BY_PAIR = {
   "EUR/USD": { trailActivationR: 0.2, trailR: 0.3, trailBufferR: 0.15 },
 };
 
+// Hybrid is deliberately narrower than the trailing-only set. The backtests
+// show a robust improvement over the fixed baseline for XAU/USD in scalp and
+// EUR/USD in swing. GBP/USD did not hold the comparison over the longer
+// one-year M1 sample, so it is deliberately excluded. XAU/USD and USD/CHF swing did not clear the
+// same two-split bar, so enabling the checkbox does not alter those positions.
+const HYBRID_TRAILING_PAIRS_BY_SOURCE = {
+  auto_scalp: new Set(["XAU/USD"]),
+  auto_signal: new Set(["EUR/USD"]),
+};
+
+function hybridTrailingTargetFor(source, pair, signal, enabled) {
+  if (!enabled || !HYBRID_TRAILING_PAIRS_BY_SOURCE[source]?.has(pair)) return null;
+  const target = source === "auto_scalp" ? signal?.tp : signal?.tp1;
+  if (target == null || !Number.isFinite(Number(target))) return null;
+  return Number(target);
+}
+
 // Small-account mode (see user_capital_cap / computeAutoTradeVolume's
 // allowMinVolumeFloor): which pairs are allowed to floor to the broker's
 // minimum lot when the target risk% would otherwise round to zero, and how
@@ -5921,7 +6319,12 @@ function formatInTimeZone(date, timeZone) {
 
 async function getEconomicCalendar() {
   if (memoryCache.calendar.value && Date.now() < memoryCache.calendar.expiresAt) return memoryCache.calendar.value;
-  if (!FINNHUB_KEYS.length) return [];
+  const checkedAt = new Date().toISOString();
+  if (!FINNHUB_KEYS.length) {
+    memoryCache.calendarMeta = { status: "unavailable", checkedAt, reason: "missing_api_key" };
+    recordProviderHealth("finnhub_calendar", false, "missing_api_key");
+    return [];
+  }
   try {
     const today = new Date();
     const from = today.toISOString().slice(0, 10);
@@ -5935,16 +6338,23 @@ async function getEconomicCalendar() {
     });
     const events = data.economicCalendar || [];
     memoryCache.calendar = { value: events, expiresAt: Date.now() + 30 * 60 * 1000 };
+    memoryCache.calendarMeta = { status: "ok", checkedAt, reason: null };
     recordProviderHealth("finnhub_calendar", true);
     return events;
   } catch (error) {
+    memoryCache.calendarMeta = { status: "unavailable", checkedAt, reason: "provider_error" };
     recordProviderHealth("finnhub_calendar", false, error.message);
     return [];
   }
 }
 
 async function getMarketauxNews(symbol = "EURUSD") {
-  if (!MARKETAUX_KEYS.length) return [];
+  const checkedAt = new Date().toISOString();
+  if (!MARKETAUX_KEYS.length) {
+    memoryCache.newsMeta.set(symbol, { status: "unavailable", checkedAt, reason: "missing_api_key" });
+    recordProviderHealth("marketaux_news", false, "missing_api_key");
+    return [];
+  }
   const cacheKey = toNewsSymbol(symbol);
   const cached = memoryCache.news.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) return cached.value;
@@ -5962,10 +6372,12 @@ async function getMarketauxNews(symbol = "EURUSD") {
       });
       const news = Array.isArray(data?.data) ? data.data.slice(0, 12) : [];
       memoryCache.news.set(cacheKey, { value: news, expiresAt: Date.now() + 10 * 60 * 1000 });
+      memoryCache.newsMeta.set(cacheKey, { status: "ok", checkedAt, reason: null });
       while (memoryCache.news.size > 32) memoryCache.news.delete(memoryCache.news.keys().next().value);
       recordProviderHealth("marketaux_news", true);
       return news;
     } catch (error) {
+      memoryCache.newsMeta.set(cacheKey, { status: "unavailable", checkedAt, reason: "provider_error" });
       recordProviderHealth("marketaux_news", false, error.message);
       return [];
     } finally {
@@ -6006,12 +6418,20 @@ async function analysisNewsContext(pair = "EUR/USD") {
   const headlineText = compactHeadlines.length
     ? compactHeadlines.map((item) => item.title).join(" | ")
     : "Aucun titre Marketaux récent exploitable.";
+  const headlineMeta = memoryCache.newsMeta.get(toNewsSymbol(pair)) || { status: "unknown", checkedAt: null };
   return {
     enabled: true,
+    // The economic calendar is safety-critical for execution. Market headlines
+    // are supplementary context: their outage is recorded, but must not be
+    // confused with a calendar outage or silently treated as "no news".
+    status: risk.status === "ok" ? "ok" : "unavailable",
+    calendarStatus: risk.status || "unknown",
+    headlinesStatus: headlineMeta.status,
+    checkedAt: risk.checkedAt || headlineMeta.checkedAt || null,
     activeRisk: Boolean(risk.active),
     events: risk.events || [],
     headlines: compactHeadlines,
-    summary: `Calendrier: ${eventText}. News: ${headlineText}`,
+    summary: `Calendrier (${risk.status}): ${eventText}. News (${headlineMeta.status}): ${headlineText}`,
   };
 }
 
@@ -6058,12 +6478,23 @@ function newsKeywordsForPair(pair = "") {
 
 async function economicRiskWindow(now = new Date()) {
   const events = await getEconomicCalendar();
+  const calendarStatus = memoryCache.calendarMeta.status;
+  if (calendarStatus !== "ok") {
+    return {
+      status: "unavailable",
+      active: false,
+      events: [],
+      checkedAt: memoryCache.calendarMeta.checkedAt,
+      reason: "Calendrier économique indisponible : aucune nouvelle position automatique autorisée.",
+    };
+  }
   const windowMs = 45 * 60 * 1000;
   const relevant = events
     .map(normalizeCalendarEvent)
     .filter((event) => event.time && Math.abs(event.time.getTime() - now.getTime()) <= windowMs)
     .filter((event) => event.impact === "high");
   return {
+    status: "ok",
     active: relevant.length > 0,
     events: relevant.slice(0, 5).map((event) => ({
       name: event.name,
@@ -6103,6 +6534,15 @@ function normalizeCalendarEvent(event = {}) {
 }
 
 function applyNewsRisk(signals, newsRisk) {
+  if (newsRisk?.status === "unavailable") {
+    return signals.map((signal) => ({
+      ...signal,
+      direct: false,
+      suspended: true,
+      raison: newsRisk.reason,
+      quality: { ...signal.quality, valid: false, reason: newsRisk.reason, newsBlocked: true, calendarUnavailable: true },
+    }));
+  }
   if (!newsRisk?.active) return signals;
   return signals.map((signal) => {
     const affected = newsRisk.events.some((event) => signalAffectedByNews(signal.paire, event.currency));
@@ -6693,6 +7133,7 @@ function isUnproductiveAnalysis(answer = "") {
 function shouldUseApiOnlySetup({ livePrice, technicalSnapshot, newsContext, multiTimeframe = [] }) {
   if (!Number.isFinite(Number(livePrice?.price)) || !isUsableLivePrice(livePrice)) return false;
   if (!technicalSnapshot?.valid) return false;
+  if (newsContext?.enabled && newsContext.calendarStatus !== "ok") return false;
   if (newsContext?.activeRisk) return false;
   const consensus = analyzeMultiTimeframeConsensus(multiTimeframe);
   if (consensus.conflict && consensus.usable >= 2) return false;
@@ -6704,6 +7145,9 @@ function shouldUseApiOnlySetup({ livePrice, technicalSnapshot, newsContext, mult
 }
 
 function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, multiTimeframe = [] }) {
+  if (newsContext?.enabled && newsContext.calendarStatus !== "ok") {
+    return "Calendrier économique indisponible: aucune position ne doit être proposée sans vérification fiable des annonces.";
+  }
   if (!Number.isFinite(Number(livePrice?.price)) || !isUsableLivePrice(livePrice)) {
     return "Prix live absent ou source trop faible.";
   }
@@ -6905,6 +7349,85 @@ function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
   return `Swing Trading ${timeframe}: setup prudent basé sur structure, support/résistance et prix live`;
 }
 
+function classifyMarketRegime(technical = {}) {
+  const trend = String(technical.trend || "").toLowerCase();
+  const volatility = Number(technical.volatility);
+  if (!trend || !Number.isFinite(volatility)) return "unknown";
+  if (trend.includes("range") || trend === "neutre") return volatility >= 0.8 ? "range_volatile" : "range";
+  return volatility >= 0.8 ? "trend_volatile" : "trend";
+}
+
+function timestampAgeSeconds(value, now = Date.now()) {
+  const timestamp = Date.parse(String(value || ""));
+  return Number.isFinite(timestamp) ? Math.max(0, Math.round((now - timestamp) / 1000)) : null;
+}
+
+function buildAnalysisSnapshot({ pair, timeframe, livePrice, history = [], technicalSnapshot = {}, multiTimeframe = [], newsContext = null }) {
+  const historyMeta = history?._meta || {};
+  const lastBar = Array.isArray(history) ? history.at(-1) : null;
+  const liveAsOf = livePrice?.asOf || null;
+  return {
+    capturedAt: new Date().toISOString(),
+    pair: pair || null,
+    timeframe: timeframe || null,
+    livePrice: {
+      value: Number.isFinite(Number(livePrice?.price)) ? Number(livePrice.price) : null,
+      source: livePrice?.source || null,
+      asOf: liveAsOf,
+      ageSeconds: timestampAgeSeconds(liveAsOf),
+      trustworthy: isUsableLivePrice(livePrice),
+      stale: Boolean(livePrice?.stale),
+      reliability: Number(livePrice?.reliability) || 0,
+      open: Boolean(livePrice?.open),
+      bid: Number.isFinite(Number(livePrice?.bid)) ? Number(livePrice.bid) : null,
+      ask: Number.isFinite(Number(livePrice?.ask)) ? Number(livePrice.ask) : null,
+    },
+    history: {
+      bars: Array.isArray(history) ? history.length : 0,
+      source: historyMeta.source || null,
+      asOf: historyMeta.asOf || lastBar?.datetime || lastBar?.timestamp || lastBar?.time || null,
+      stale: Boolean(historyMeta.stale),
+      timeframe: historyMeta.timeframe || timeframe || null,
+    },
+    technical: {
+      valid: Boolean(technicalSnapshot.valid),
+      trend: technicalSnapshot.trend || null,
+      marketRegime: technicalSnapshot.marketRegime || classifyMarketRegime(technicalSnapshot),
+      confirmations: Number(technicalSnapshot.confirmations) || 0,
+      rsi: Number.isFinite(Number(technicalSnapshot.rsi)) ? Number(technicalSnapshot.rsi) : null,
+      volatility: Number.isFinite(Number(technicalSnapshot.volatility)) ? Number(technicalSnapshot.volatility) : null,
+    },
+    multiTimeframe: Array.isArray(multiTimeframe)
+      ? multiTimeframe.slice(0, 8).map((item) => ({ timeframe: item?.timeframe || null, trend: item?.trend || null, source: item?.source || null, stale: Boolean(item?.stale) }))
+      : [],
+    news: newsContext
+      ? {
+        status: newsContext.status || "unknown",
+        calendarStatus: newsContext.calendarStatus || newsContext.status || "unknown",
+        headlinesStatus: newsContext.headlinesStatus || "unknown",
+        checkedAt: newsContext.checkedAt || null,
+        activeRisk: Boolean(newsContext.activeRisk),
+        events: Array.isArray(newsContext.events) ? newsContext.events.slice(0, 5) : [],
+        headlines: Array.isArray(newsContext.headlines) ? newsContext.headlines.slice(0, 5) : [],
+      }
+      : { status: "not_requested", activeRisk: false, events: [], headlines: [] },
+  };
+}
+
+function buildDecisionReasonCodes({ livePrice, technicalSnapshot = {}, multiTimeframe = [], newsContext = null, validation = {}, noSignal = false }) {
+  const reasons = [];
+  if (!isUsableLivePrice(livePrice)) reasons.push("DATA_LIVE_UNUSABLE");
+  if (technicalSnapshot?.stale) reasons.push("DATA_HISTORY_STALE");
+  if (!technicalSnapshot?.valid) reasons.push("DATA_TECHNICAL_WEAK");
+  const consensus = analyzeMultiTimeframeConsensus(multiTimeframe);
+  if (consensus.conflict) reasons.push("MTF_CONFLICT");
+  if (newsContext?.activeRisk) reasons.push("NEWS_HIGH_IMPACT_WINDOW");
+  if (newsContext?.enabled && newsContext.status !== "ok") reasons.push("NEWS_CONTEXT_UNAVAILABLE");
+  if (validation?.valid === false) reasons.push("LEVELS_NOT_VALIDATED");
+  if (noSignal) reasons.push("NO_ACTIONABLE_SIGNAL");
+  return [...new Set(reasons)];
+}
+
 function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = {}) {
   const bars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
   const closes = bars.map((bar) => Number(bar.close));
@@ -6919,6 +7442,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       source: meta.source || livePrice?.source || "aucun historique",
       stale: Boolean(meta.stale || livePrice?.stale),
       valid: false,
+      marketRegime: "unknown",
       text: "Historique insuffisant: lecture visuelle prioritaire, aucun setup direct à forcer.",
     };
   }
@@ -6976,6 +7500,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     support: Number.isFinite(support) ? Number(formatLevel(support, pair)) : null,
     resistance: Number.isFinite(resistance) ? Number(formatLevel(resistance, pair)) : null,
     trend,
+    marketRegime: classifyMarketRegime({ trend, volatility }),
     momentum: Number(momentum.toFixed(3)),
     volatility: Number(volatility.toFixed(3)),
     volumeRatio,
@@ -7107,6 +7632,22 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     multiTimeframe: context.multiTimeframe || [],
     hasChartImages,
   });
+  const dataSnapshot = buildAnalysisSnapshot({
+    pair: body.pair || "EUR/USD",
+    timeframe: body.timeframe || "H1",
+    livePrice,
+    history: context.history || [],
+    technicalSnapshot: context.technicalSnapshot || {},
+    multiTimeframe: context.multiTimeframe || [],
+    newsContext: context.newsContext || null,
+  });
+  const decisionReasons = buildDecisionReasonCodes({
+    livePrice,
+    technicalSnapshot: context.technicalSnapshot || {},
+    multiTimeframe: context.multiTimeframe || [],
+    newsContext: context.newsContext || null,
+    validation,
+  });
   const meta = {
     pair: body.pair || "EUR/USD",
     timeframe: body.timeframe || "H1",
@@ -7129,6 +7670,9 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     multiTimeframe: context.multiTimeframe || [],
     mtfConsensus,
     dataReliability,
+    dataSnapshot,
+    decisionReasons,
+    marketRegime: context.technicalSnapshot?.marketRegime || "unknown",
     styleComparison: validation.styleComparison,
     // The three genuinely new narrative fields (everything else the raw answer says
     // is already available as clean structured data elsewhere in this payload) and a
@@ -7358,12 +7902,32 @@ VALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.
       styleComparison: validation.styleComparison,
       assistedLevels: assistedLevels.used ? assistedLevels.reason : null,
       targetConstraint: targetConstraint.used ? targetConstraint.reason : null,
+      decisionReasons: buildDecisionReasonCodes({
+        livePrice,
+        technicalSnapshot: meta.technicalSnapshot || {},
+        multiTimeframe: meta.multiTimeframe || [],
+        newsContext: meta.newsContext || null,
+        validation: { ...validation, valid: true },
+      }),
     },
   };
 }
 
 function blockAnalysis(normalized, details) {
   const diagnostic = buildNoSignalDiagnostic(details);
+  const auditReasons = [
+    ...(details.meta?.decisionReasons || []),
+    ...buildDecisionReasonCodes({
+      livePrice: details.meta?.liveUsable
+        ? { price: details.meta.livePrice, asOf: details.meta.livePriceAsOf, reliability: details.meta.dataReliability?.score, stale: false }
+        : null,
+      technicalSnapshot: details.meta?.technicalSnapshot || {},
+      multiTimeframe: details.meta?.multiTimeframe || [],
+      newsContext: details.meta?.newsContext || null,
+      validation: details.validation || {},
+      noSignal: true,
+    }),
+  ];
   const danger = details.meta?.danger || computeDangerScore({ meta: details.meta || {}, validation: details.validation || {}, levelCheck: details.meta?.levelCheck || null });
   const qualityGate = details.meta?.qualityGate || {
     ...buildQualityGate({
@@ -7388,7 +7952,7 @@ function blockAnalysis(normalized, details) {
     technique: details.technique,
     explanation: details.explanation,
     validation: details.validation,
-    meta: details.meta,
+    meta: details.meta ? { ...details.meta, decisionReasons: [...new Set(auditReasons)] } : details.meta,
     noSignal: true,
     dangerScore: danger.score,
     status: diagnostic.status,
@@ -8678,7 +9242,7 @@ function healthRecommendations() {
   const providers = providerHealthSnapshot();
   if (!supabaseUrl) tips.push("Ajouter SUPABASE_URL dans secret.dev pour connecter le stockage Supabase.");
   if (!supabaseKey) tips.push("Ajouter SUPABASE_SERVICE_ROLE_KEY dans secret.dev pour autoriser la persistance serveur Supabase.");
-  if (supabaseLastError) tips.push(`Supabase indisponible: ${supabaseLastError}. Le serveur utilise le fallback fichier local.`);
+  if (supabaseLastError) tips.push(`Supabase indisponible : ${supabaseLastError}. Le serveur utilise le fallback fichier local.`);
   for (const [name, health] of Object.entries(providers)) {
     if (["down", "degraded"].includes(health.status) && name !== "supabase") {
       tips.push(`${name} ${health.status}: ${health.lastError || "erreur inconnue"}. Kronos bascule sur les sources alternatives et bloque les signaux trop faibles.`);
@@ -9121,7 +9685,7 @@ async function loginUser(body = {}, req = null) {
       return {
         ok: false,
         error: "too_many_attempts",
-        message: `Trop de tentatives. R�essaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
+        message: `Trop de tentatives. Réessaie dans ${Math.ceil(rateLimit.retryAfterSeconds / 60)} min.`,
         retryAfterSeconds: rateLimit.retryAfterSeconds,
       };
     }
@@ -9139,17 +9703,17 @@ async function loginUser(body = {}, req = null) {
       user.lastLoginAt = new Date().toISOString();
       const saved = await persistLoginSession(user, session);
       if (authPersistenceRequired() && saved.persisted !== "supabase") {
-        return { ok: false, error: "Persistance Supabase indisponible. R�essaie dans quelques secondes." };
+        return { ok: false, error: "Persistance Supabase indisponible. Réessaie dans quelques secondes." };
       }
       return { ok: true, user, session };
     });
   } catch (error) {
     lastAuthLoginError = { at: new Date().toISOString(), message: String(error?.message || error), stack: String(error?.stack || "") };
-    logOnce("auth-login", "connexion echouee (" + error.message + ")");
+    logOnce("auth-login", "connexion échouée (" + error.message + ")");
     return {
       ok: false,
       error: "server_error",
-      message: "Connexion impossible pour le moment. V�rifie les logs Render.",
+      message: "Connexion impossible pour le moment. Vérifie les logs Render.",
     };
   }
 }
@@ -9536,7 +10100,7 @@ async function grantPremiumAccess(body = {}) {
       return { ok: true, user: adminUserPayload(user), message: `Premium activé pour ${email} jusqu'au ${premiumUntil}.` };
     });
   } catch (error) {
-    logOnce("admin-premium", `activation premium echouee (${error.message})`);
+    logOnce("admin-premium", `activation premium échouée (${error.message})`);
     return { ok: false, error: "server_error", message: "Activation impossible pour le moment. Vérifie les logs Render." };
   }
 }
@@ -9558,7 +10122,7 @@ async function revokePremiumAccess(body = {}) {
       return { ok: true, user: adminUserPayload(user), message: `Premium retiré pour ${email}.` };
     });
   } catch (error) {
-    logOnce("admin-premium", `revocation premium echouee (${error.message})`);
+    logOnce("admin-premium", `révocation premium échouée (${error.message})`);
     return { ok: false, error: "server_error", message: "Révocation impossible pour le moment. Vérifie les logs Render." };
   }
 }
@@ -9751,6 +10315,11 @@ function rowToAnalysis(row) {
     outcomeReason: row.outcome_reason || null,
     rMultiple: row.r_multiple ?? null,
     brokerProfitAmount: row.broker_profit_amount ?? null,
+    executedEntry: row.executed_entry ?? null,
+    dataSnapshot: safeJsonParse(row.data_snapshot, null),
+    newsSnapshot: safeJsonParse(row.news_snapshot, null),
+    decisionReasons: safeJsonParse(row.decision_reasons, []),
+    marketRegime: row.market_regime || null,
     isTest: Boolean(Number(row.is_test)),
     source: row.source || "manual",
     brokerSlot: row.broker_slot || null,
@@ -9762,13 +10331,22 @@ async function upsertAnalysisRow(analysis) {
     `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth,
        direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal,
        image_quality, calibration, validation, technical_snapshot, multi_timeframe,
-       closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount, is_test, source, broker_slot)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount,
+       executed_entry, data_snapshot, news_snapshot, decision_reasons, market_regime, is_test, source, broker_slot)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        user_id = excluded.user_id, status = excluded.status, block_reason = excluded.block_reason,
        closed_at = excluded.closed_at, close_price = excluded.close_price,
        outcome = excluded.outcome, outcome_reason = excluded.outcome_reason, r_multiple = excluded.r_multiple,
-       broker_profit_amount = excluded.broker_profit_amount`,
+       broker_profit_amount = excluded.broker_profit_amount,
+       executed_entry = COALESCE(executed_entry, excluded.executed_entry),
+       data_snapshot = COALESCE(data_snapshot, excluded.data_snapshot),
+       news_snapshot = COALESCE(news_snapshot, excluded.news_snapshot),
+       decision_reasons = COALESCE(decision_reasons, excluded.decision_reasons),
+       market_regime = COALESCE(market_regime, excluded.market_regime)`,
     [
       analysis.id,
       analysis.userId || null,
@@ -9802,6 +10380,11 @@ async function upsertAnalysisRow(analysis) {
       analysis.outcomeReason || null,
       Number.isFinite(analysis.rMultiple) ? analysis.rMultiple : null,
       Number.isFinite(analysis.brokerProfitAmount) ? analysis.brokerProfitAmount : null,
+      Number.isFinite(analysis.executedEntry) ? analysis.executedEntry : null,
+      analysis.dataSnapshot ? JSON.stringify(analysis.dataSnapshot) : null,
+      analysis.newsSnapshot ? JSON.stringify(analysis.newsSnapshot) : null,
+      analysis.decisionReasons ? JSON.stringify(analysis.decisionReasons) : null,
+      analysis.marketRegime || null,
       analysis.isTest ? 1 : 0,
       analysis.source || "manual",
       analysis.brokerSlot || null,
@@ -9876,6 +10459,10 @@ function rowToTradeOrder(row) {
     volume: row.volume ?? null,
     status: row.status,
     brokerOrderId: row.broker_order_id || null,
+    executedEntry: row.executed_entry ?? null,
+    executedAt: row.executed_at || null,
+    executionSlippage: row.execution_slippage ?? null,
+    executionMetadata: safeJsonParse(row.execution_metadata, null),
     errorMessage: row.error_message || null,
     createdAt: row.created_at,
     confirmedAt: row.confirmed_at || null,
@@ -10022,7 +10609,7 @@ async function getUserBrokerCredentials(userId, slot) {
     try {
       await sqlRun("UPDATE auto_trading_accounts SET " + c.token + " = ? WHERE user_id = ?", [encryptBrokerCredential(token), userId]);
     } catch (error) {
-      logOnce("broker-credential-migrate-" + slot, "migration d un identifiant broker echouee (" + error.message + ")");
+      logOnce("broker-credential-migrate-" + slot, "migration d'un identifiant broker échouée (" + error.message + ")");
     }
   }
   return { token, accountId: row.account_id, region: row.region || "new-york" };
@@ -10030,10 +10617,10 @@ async function getUserBrokerCredentials(userId, slot) {
 
 function publicBrokerError(value) {
   const raw = String(value || "");
-  if (/504|timeout|timed out/i.test(raw)) return "Le broker met trop de temps a repondre. Reessaie dans quelques instants.";
-  if (/401|403|unauthor|forbidden|auth/i.test(raw)) return "Le broker a refuse l authentification. Verifie le jeton et l identifiant du compte.";
-  if (/10016|invalid.?stops/i.test(raw)) return "Le broker a refuse les niveaux de protection. Reanalyse le marche puis reessaie.";
-  return "Le broker a refuse l operation. Verifie la connexion et les niveaux de l ordre.";
+  if (/504|timeout|timed out/i.test(raw)) return "Le broker met trop de temps à répondre. Réessaie dans quelques instants.";
+  if (/401|403|unauthor|forbidden|auth/i.test(raw)) return "Le broker a refusé l'authentification. Vérifie le jeton et l'identifiant du compte.";
+  if (/10016|invalid.?stops/i.test(raw)) return "Le broker a refusé les niveaux de protection. Réanalyse le marché puis réessaie.";
+  return "Le broker a refusé l'opération. Vérifie la connexion et les niveaux de l'ordre.";
 }
 
 async function sendOrderToBroker(order, credentials = null) {
@@ -10169,13 +10756,14 @@ async function modifyBrokerPositionTakeProfit(credentials, positionId, newTakePr
 // checkTrailingStops.
 async function secureHalfForOrderUnlocked(order, orderRow, credentials) {
   const buy = order.direction === "ACHAT";
+  const entry = Number.isFinite(Number(order.executedEntry)) ? Number(order.executedEntry) : Number(order.entry);
   const brokerPrice = await getBrokerCurrentPrice(credentials, order.pair).catch(() => null);
   if (!brokerPrice) return { status: 502, body: { ok: false, error: "broker_price_unavailable" } };
   const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
 
   if (Number.isFinite(order.tp1)) {
     // Case A: a real broker TP exists -- halve its distance from entry.
-    const halfTp = order.entry + (order.tp1 - order.entry) * 0.5;
+    const halfTp = entry + (order.tp1 - entry) * 0.5;
     const minDistance = executionCostBuffer(order.pair);
     const sideOk = buy ? halfTp > currentPrice + minDistance : halfTp < currentPrice - minDistance;
     if (!sideOk) {
@@ -10196,13 +10784,13 @@ async function secureHalfForOrderUnlocked(order, orderRow, credentials) {
   // profit via the position's real stop instead. entry/sl on trade_orders
   // are the ORIGINAL, unmoved levels (see checkTrailingStops), so risk here
   // is always the position's real original risk distance, never a moved value.
-  const risk = Math.abs(order.entry - order.sl);
+  const risk = Math.abs(entry - order.sl);
   if (!(risk > 0)) return { status: 400, body: { ok: false, error: "invalid_position_levels" } };
-  const favorableR = buy ? (currentPrice - order.entry) / risk : (order.entry - currentPrice) / risk;
+  const favorableR = buy ? (currentPrice - entry) / risk : (entry - currentPrice) / risk;
   if (favorableR <= 0) {
     return { status: 409, body: { ok: false, error: "not_currently_profitable", message: "La position n'est pas en profit actuellement -- rien à sécuriser." } };
   }
-  let halfLockStop = buy ? order.entry + (favorableR / 2) * risk : order.entry - (favorableR / 2) * risk;
+  let halfLockStop = buy ? entry + (favorableR / 2) * risk : entry - (favorableR / 2) * risk;
   const minDistance = executionCostBuffer(order.pair, orderRow.source === "auto_scalp" ? "scalp" : "swing");
   const safeStop = buy ? currentPrice - minDistance : currentPrice + minDistance;
   if (buy && halfLockStop > safeStop) halfLockStop = safeStop;
@@ -10286,11 +10874,16 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     // itself (order stays PENDING_CONFIRMATION, doesn't touch the daily cap) rather
     // than silently sending a stale setup to the broker. Doesn't mutate the order,
     // so this is safe to fail before the daily-cap count below.
-    const currentPrice = await getAnalysisPrice(order.pair).catch(() => null);
-    if (!currentPrice || !isUsableLivePrice(currentPrice)) {
-      return { status: 409, body: { ok: false, error: "price_unavailable" } };
+    const brokerCredentials = resolveBrokerCredentials(credentials);
+    const protection = await getBrokerProtectionContext(brokerCredentials, order.pair).catch(() => null);
+    if (!protection) {
+      return { status: 409, body: { ok: false, error: "broker_protection_unavailable" } };
     }
-    const priceDistance = Math.abs(order.entry - currentPrice.price) / Math.max(Math.abs(currentPrice.price), 1);
+    const buyOrder = order.direction === "ACHAT";
+    // A BUY executes at ask and a SELL at bid. Use the same side-specific quote
+    // for the entry freshness check that the broker will use for the fill.
+    const brokerExecutionPrice = buyOrder ? protection.ask : protection.bid;
+    const priceDistance = Math.abs(order.entry - brokerExecutionPrice) / Math.max(Math.abs(brokerExecutionPrice), 1);
     const priceTolerance = levelTolerance(order.pair);
     if (priceDistance > priceTolerance) {
       return {
@@ -10310,7 +10903,6 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     // already drifted past TP1 itself. A market order executes at the live price,
     // not "entry", so SL/TP have to be validated against live price directly, not
     // just checked for being "close enough" to a number that's about to be ignored.
-    const buyOrder = order.direction === "ACHAT";
     // Found live during an engine audit: order.tp1 is deliberately NULL for scalp
     // and the trailing-stop swing pairs (no broker-side TP, see processScalpForUser
     // / processAutoTradeForUser) -- but a BUY order's check below used to be
@@ -10324,15 +10916,19 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     // tp1 side of the check entirely when there's no broker-side TP to validate
     // against, on both sides, instead of silently degenerating into a bogus bound.
     const hasBrokerTp = Number.isFinite(order.tp1);
+    const brokerStopDistance = Math.max(executionCostBuffer(order.pair), protection.stopsLevel * protection.point);
+    const stopReference = buyOrder ? protection.bid : protection.ask;
+    const targetReference = buyOrder ? protection.ask : protection.bid;
     const sideValid = buyOrder
-      ? (!hasBrokerTp || currentPrice.price < order.tp1) && currentPrice.price > order.sl
-      : (!hasBrokerTp || currentPrice.price > order.tp1) && currentPrice.price < order.sl;
+      ? (!hasBrokerTp || order.tp1 > targetReference) && order.sl < stopReference
+      : (!hasBrokerTp || order.tp1 < targetReference) && order.sl > stopReference;
     if (!sideValid) {
-      return { status: 409, body: { ok: false, error: "levels_crossed_by_price" } };
+      return { status: 409, body: { ok: false, error: "levels_crossed_by_broker_price" } };
     }
-    const minDistance = executionCostBuffer(order.pair);
-    if (Math.abs(currentPrice.price - order.sl) < minDistance || (hasBrokerTp && Math.abs(order.tp1 - currentPrice.price) < minDistance)) {
-      return { status: 409, body: { ok: false, error: "levels_too_close_to_price" } };
+    const stopDistance = buyOrder ? stopReference - order.sl : order.sl - stopReference;
+    const targetDistance = buyOrder ? order.tp1 - targetReference : targetReference - order.tp1;
+    if (!(stopDistance > brokerStopDistance) || (hasBrokerTp && !(targetDistance > brokerStopDistance))) {
+      return { status: 409, body: { ok: false, error: "broker_protection_too_close" } };
     }
     // Safety net, not a business limit: caps how many real orders one account can
     // send to a broker in a single day, so a UI bug or a confused user (or a runaway
@@ -10398,6 +10994,12 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
 // rejected with TRADE_RETCODE_INVALID_STOPS. checkTrailingStops needs the
 // exact same price the broker will itself validate the modify request against.
 async function getBrokerCurrentPrice(credentials, pair) {
+  if (MOCK_BROKER_ENABLED) {
+    const current = await getAnalysisPrice(pair).catch(() => null);
+    const price = Number(current?.price);
+    if (!Number.isFinite(price) || price <= 0) throw new Error("invalid_mock_price");
+    return { bid: price, ask: price };
+  }
   const region = credentials.region || "new-york";
   const symbol = String(pair).replace("/", "");
   const response = await fetch(`https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/symbols/${symbol}/current-price`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(15000) });
@@ -10408,9 +11010,59 @@ async function getBrokerCurrentPrice(credentials, pair) {
   return { bid, ask };
 }
 
+// Opening a market order needs the broker's own quote and symbol rules, not the
+// general market-provider cache used to generate the signal. MetaApi exposes the
+// minimum protection distance as stopsLevel points multiplied by point; checking
+// it here prevents a stale/provider price from reaching the trade endpoint.
+async function getBrokerProtectionContext(credentials, pair) {
+  const creds = resolveBrokerCredentials(credentials);
+  if (!creds) throw new Error("broker_not_configured");
+  if (MOCK_BROKER_ENABLED) {
+    const quote = await getBrokerCurrentPrice(creds, pair);
+    return { ...quote, point: 0, stopsLevel: 0, tickSize: 0 };
+  }
+  const region = creds.region || "new-york";
+  const symbol = String(pair).replace("/", "");
+  const [quote, specificationResponse] = await Promise.all([
+    getBrokerCurrentPrice(creds, pair),
+    fetch(`https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${creds.accountId}/symbols/${symbol}/specification`, { headers: { "auth-token": creds.token }, signal: AbortSignal.timeout(15000) }),
+  ]);
+  if (!specificationResponse.ok) throw new Error(`broker_http_${specificationResponse.status}`);
+  const specification = await readResponseJsonLimited(specificationResponse);
+  const point = Number(specification?.point);
+  const stopsLevel = Number(specification?.stopsLevel);
+  const tickSize = Number(specification?.tickSize);
+  if (!(quote.bid > 0) || !(quote.ask > 0) || !Number.isFinite(point) || point <= 0 || !Number.isFinite(stopsLevel) || stopsLevel < 0 || !Number.isFinite(tickSize) || tickSize <= 0) {
+    throw new Error("invalid_protection_context");
+  }
+  return { ...quote, point, stopsLevel, tickSize };
+}
+
+function conservativeBrokerRiskBalance(accountInfo) {
+  const values = [accountInfo?.balance, accountInfo?.equity, accountInfo?.freeMargin].map(Number);
+  if (values.some((value) => !Number.isFinite(value) || value <= 0)) return null;
+  return Math.min(...values);
+}
+
+function sizingBalanceForAccount(account, accountInfo) {
+  const availableFunds = conservativeBrokerRiskBalance(accountInfo);
+  if (!(availableFunds > 0)) return null;
+  const capitalCap = Number(account?.user_capital_cap);
+  return Number.isFinite(capitalCap) && capitalCap > 0 ? Math.min(availableFunds, capitalCap) : availableFunds;
+}
+
 async function getBrokerAccountInformation(credentials) {
   if (MOCK_BROKER_ENABLED) {
-    return { balance: 10000, equity: 10000, currency: "USD" };
+    return {
+      balance: 10000,
+      equity: 10000,
+      freeMargin: 10000,
+      currency: "USD",
+      tradeAllowed: true,
+      margin: 0,
+      marginLevel: null,
+      marginMode: null,
+    };
   }
   const region = credentials.region || "new-york";
   const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/account-information`;
@@ -10418,8 +11070,21 @@ async function getBrokerAccountInformation(credentials) {
   if (!response.ok) throw new Error(`broker_http_${response.status}`);
   const data = await readResponseJsonLimited(response);
   const balance = Number(data?.balance);
-  if (!Number.isFinite(balance)) throw new Error("invalid_account_information");
-  return { balance, equity: Number(data?.equity), currency: data?.currency || null };
+  const equity = Number(data?.equity);
+  const freeMargin = Number(data?.freeMargin);
+  if (![balance, equity, freeMargin].every((value) => Number.isFinite(value)) || balance <= 0 || equity <= 0 || freeMargin <= 0) {
+    throw new Error("invalid_account_information");
+  }
+  return {
+    balance,
+    equity,
+    freeMargin,
+    currency: data?.currency || null,
+    tradeAllowed: data?.tradeAllowed !== false,
+    margin: Number(data?.margin),
+    marginLevel: Number(data?.marginLevel),
+    marginMode: data?.marginMode || null,
+  };
 }
 
 // tickSize/minVolume/maxVolume/volumeStep come from the symbol specification
@@ -10516,13 +11181,15 @@ async function getBrokerOpenPositions(credentials) {
 async function getBrokerPositionOutcome(credentials, positionId) {
   const positions = await getBrokerOpenPositions(credentials);
   if (!positions) return null;
-  if (positions.some((p) => String(p.id) === String(positionId))) {
-    return { status: "still_open" };
+  const openPosition = positions.find((p) => String(p.id) === String(positionId));
+  if (openPosition) {
+    return { status: "still_open", position: openPosition };
   }
   const dealsRes = await fetch(`${brokerApiBase(credentials)}/history-deals/position/${positionId}`, { headers: { "auth-token": credentials.token }, signal: AbortSignal.timeout(10000) });
   if (!dealsRes.ok) return null;
   const deals = await readResponseJsonLimited(dealsRes);
   if (!Array.isArray(deals)) return null;
+  const openingDeal = deals.find((deal) => deal.entryType === "DEAL_ENTRY_IN");
   const closingDeal = deals.find((deal) => deal.entryType === "DEAL_ENTRY_OUT");
   if (!closingDeal) return null; // position not open, but no closing deal found yet -- treat as unresolved, try again next tick
   return {
@@ -10531,7 +11198,58 @@ async function getBrokerPositionOutcome(credentials, positionId) {
     profit: Number(closingDeal.profit || 0) + Number(closingDeal.commission || 0) + Number(closingDeal.swap || 0),
     reason: closingDeal.reason || null,
     closedAt: closingDeal.time || new Date().toISOString(),
+    executedEntry: Number(openingDeal?.price),
+    executedAt: openingDeal?.time || null,
   };
+}
+
+function brokerExecutionPrice(positionOrOutcome) {
+  const candidates = [
+    positionOrOutcome?.openPrice,
+    positionOrOutcome?.entryPrice,
+    positionOrOutcome?.open_price,
+    positionOrOutcome?.entry_price,
+    positionOrOutcome?.price,
+    positionOrOutcome?.executedEntry,
+  ];
+  const value = candidates.map(Number).find(Number.isFinite);
+  return Number.isFinite(value) ? value : null;
+}
+
+function executionSlippage(requestedEntry, executedEntry, direction) {
+  const requested = Number(requestedEntry);
+  const executed = Number(executedEntry);
+  if (!Number.isFinite(requested) || !Number.isFinite(executed)) return null;
+  const adverseMove = direction === "ACHAT" ? executed - requested : requested - executed;
+  return Math.round(adverseMove * 1e8) / 1e8;
+}
+
+async function persistBrokerExecution(analysis, brokerOrder, positionOrOutcome) {
+  const executedEntry = brokerExecutionPrice(positionOrOutcome);
+  if (!Number.isFinite(executedEntry)) return false;
+  const capturedAt = new Date().toISOString();
+  const executedAt = positionOrOutcome?.executedAt || positionOrOutcome?.time || capturedAt;
+  const slippage = executionSlippage(analysis.entry, executedEntry, analysis.direction);
+  const metadata = {
+    brokerOrderId: brokerOrder?.broker_order_id || null,
+    capturedAt,
+    source: positionOrOutcome?.executedEntry != null ? "history_deal" : "open_position",
+  };
+  await sqlRun(
+    `UPDATE trade_orders
+     SET executed_entry = COALESCE(executed_entry, ?),
+         executed_at = COALESCE(executed_at, ?),
+         execution_slippage = COALESCE(execution_slippage, ?),
+         execution_metadata = COALESCE(execution_metadata, ?)
+     WHERE analysis_id = ?`,
+    [executedEntry, executedAt, slippage, JSON.stringify(metadata), analysis.id],
+  );
+  await sqlRun(
+    `UPDATE analyses SET executed_entry = COALESCE(executed_entry, ?) WHERE id = ?`,
+    [executedEntry, analysis.id],
+  );
+  analysis.executedEntry = Number.isFinite(Number(analysis.executedEntry)) ? analysis.executedEntry : executedEntry;
+  return true;
 }
 
 // Never guessed, never rounded up. valuePerUnit = lossTickValue / tickSize is the
@@ -10680,6 +11398,18 @@ async function recordLearningAnalysis(result, body, context) {
     validation: result.validation,
     technicalSnapshot: context.technicalSnapshot || null,
     multiTimeframe: context.multiTimeframe || [],
+    dataSnapshot: result.meta?.dataSnapshot || buildAnalysisSnapshot({
+      pair: body.pair || "EUR/USD",
+      timeframe: body.timeframe || "H1",
+      livePrice: context.livePrice,
+      history: context.history || [],
+      technicalSnapshot: context.technicalSnapshot || {},
+      multiTimeframe: context.multiTimeframe || [],
+      newsContext: context.newsContext || null,
+    }),
+    newsSnapshot: result.meta?.newsContext || context.newsContext || null,
+    decisionReasons: result.meta?.decisionReasons || (result.noSignal ? ['NO_ACTIONABLE_SIGNAL'] : []),
+    marketRegime: result.meta?.marketRegime || context.technicalSnapshot?.marketRegime || "unknown",
     isTest: Boolean(context.isTest),
   });
   result.learningId = id;
@@ -10715,8 +11445,14 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
   if (!credentials) return { brokerUnavailable: true };
   const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
   if (!brokerOutcome) return { brokerUnavailable: true };
-  if (brokerOutcome?.status === "still_open") return { stillOpen: true }; // confirmed still live at the broker -- no 24h EXPIRED fallback needed, this is authoritative
+  if (brokerOutcome?.status === "still_open") {
+    await persistBrokerExecution(analysis, brokerOrder, brokerOutcome.position).catch((error) =>
+      logOnce(`broker-execution-${analysis.id}`, `enregistrement du prix d'exécution échoué (${error.message})`));
+    return { stillOpen: true };
+  }
   if (brokerOutcome?.status === "closed") {
+    await persistBrokerExecution(analysis, brokerOrder, brokerOutcome).catch((error) =>
+      logOnce(`broker-execution-${analysis.id}`, `enregistrement du prix d'exécution échoué (${error.message})`));
     const brokerStatus = brokerOutcome.reason === "DEAL_REASON_SL" ? "SL_HIT"
       : brokerOutcome.reason === "DEAL_REASON_TP" ? "TP1_HIT" // the broker only ever receives tp1 as a real order-level TP (see sendOrderToBroker) -- tp2 is purely an internal secondary target this site tracks itself, never sent to the broker, so a broker-side TP hit is always tp1
       : "CLOSED_MANUALLY"; // DEAL_REASON_MOBILE/CLIENT/DEALER -- a human closed it directly at the broker, not an automatic level touch
@@ -10844,13 +11580,13 @@ async function recoverStaleSendingOrders() {
       }
     }
   } finally {
-    await releaseSchedulerLease("sending-recovery", schedulerLeaseToken).catch((error) => logOnce("sending-recovery-release", "liberation du verrou de recuperation echouee (" + error.message + ")"));
+    await releaseSchedulerLease("sending-recovery", schedulerLeaseToken).catch((error) => logOnce("sending-recovery-release", "libération du verrou de récupération échouée (" + error.message + ")"));
     sendingRecoveryInFlight = false;
   }
 }
 
 function startSendingRecoveryScheduler() {
-  const tick = () => recoverStaleSendingOrders().catch((error) => logOnce("sending-recovery", "recuperation des ordres SENDING echouee (" + error.message + ")"));
+  const tick = () => recoverStaleSendingOrders().catch((error) => logOnce("sending-recovery", "récupération des ordres SENDING échouée (" + error.message + ")"));
   tick();
   setInterval(tick, SENDING_RECOVERY_INTERVAL_MS);
 }
@@ -10964,7 +11700,7 @@ async function checkTrailingStops() {
     await ensureRelationalTables();
     const rows = await sqlAll(
       `SELECT a.id as analysis_id, a.user_id as user_id, a.pair as pair, a.direction as direction, a.entry as entry, a.sl as sl, a.broker_slot as broker_slot, a.source as source,
-              o.id as order_id, o.broker_order_id as broker_order_id, o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price,
+              o.id as order_id, o.broker_order_id as broker_order_id, o.executed_entry as executed_entry, o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price,
               o.tp1 as tp1, o.tp2 as tp2, o.half_target_secured as half_target_secured, acc.secure_half_priority_enabled as secure_half_priority_enabled
        FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
        LEFT JOIN auto_trading_accounts acc ON acc.user_id = a.user_id
@@ -10978,8 +11714,9 @@ async function checkTrailingStops() {
       if (!params) continue; // no demonstrated edge for this source/pair combo -- leave its original fixed TP/SL alone
       const isScalp = row.source === "auto_scalp";
       const buy = row.direction === "ACHAT";
-      const entry = Number(row.entry);
-      const risk = Math.abs(entry - Number(row.sl));
+      const analyticalEntry = Number(row.entry);
+      let entry = Number.isFinite(Number(row.executed_entry)) ? Number(row.executed_entry) : analyticalEntry;
+      let risk = Math.abs(entry - Number(row.sl));
       if (!(risk > 0)) continue;
       // Credentials resolved BEFORE the price fetch now -- needed for the price
       // itself, not just the eventual modify call.
@@ -10994,11 +11731,14 @@ async function checkTrailingStops() {
       if (!positionLeaseToken) continue;
       try {
       const latestOrderRow = await sqlGet(
-        `SELECT status, broker_order_id, trailing_stop_price, best_favorable_price, tp1, tp2, half_target_secured FROM trade_orders WHERE id = ?`,
+        `SELECT status, broker_order_id, executed_entry, trailing_stop_price, best_favorable_price, tp1, tp2, half_target_secured FROM trade_orders WHERE id = ?`,
         [row.order_id],
       ).catch(() => null);
       if (!latestOrderRow || latestOrderRow.status !== "SENT" || String(latestOrderRow.broker_order_id) !== String(row.broker_order_id)) continue;
       Object.assign(row, latestOrderRow);
+      entry = Number.isFinite(Number(row.executed_entry)) ? Number(row.executed_entry) : analyticalEntry;
+      risk = Math.abs(entry - Number(row.sl));
+      if (!(risk > 0)) continue;
       const latestAccountRow = await sqlGet(
         `SELECT secure_half_priority_enabled FROM auto_trading_accounts WHERE user_id = ?`,
         [row.user_id],
@@ -11378,10 +12118,11 @@ function evaluateOutcome(analysis, price) {
 // same convention scripts/backtest.mjs uses for its "expired" bucket, so
 // live results and backtested results are computed the same way.
 function markToMarketRMultiple(analysis, price) {
-  const risk = Math.abs(analysis.entry - analysis.sl);
+  const entry = Number.isFinite(Number(analysis.executedEntry)) ? Number(analysis.executedEntry) : analysis.entry;
+  const risk = Math.abs(entry - analysis.sl);
   if (!(risk > 0) || !Number.isFinite(price)) return 0;
   const buy = analysis.direction === "ACHAT";
-  const signedMove = buy ? price - analysis.entry : analysis.entry - price;
+  const signedMove = buy ? price - entry : entry - price;
   return Math.round((signedMove / risk) * 1000) / 1000;
 }
 
@@ -11494,6 +12235,13 @@ function buildEquityCurve(outcomes) {
 
 function learningSummary(log) {
   const closed = log.outcomes.filter((item) => ["win", "loss"].includes(item.result));
+  const totalAnalyses = log.analyses.length;
+  const openAnalyses = log.analyses.filter((item) => item.status === "OPEN").length;
+  const blockedAnalyses = log.analyses.filter((item) => item.status === "BLOCKED").length;
+  const decisionCoverage = totalAnalyses
+    ? Math.round(((closed.length + openAnalyses) / totalAnalyses) * 100)
+    : null;
+  const blockedRate = totalAnalyses ? Math.round((blockedAnalyses / totalAnalyses) * 100) : null;
   const global = winRateBucket(closed);
   const byStyle = Object.fromEntries(Object.keys(styleRules).map((style) => [
     style,
@@ -11510,10 +12258,12 @@ function learningSummary(log) {
   ]));
   return {
     updatedAt: log.updatedAt,
-    totalAnalyses: log.analyses.length,
-    openAnalyses: log.analyses.filter((item) => item.status === "OPEN").length,
-    blockedAnalyses: log.analyses.filter((item) => item.status === "BLOCKED").length,
+    totalAnalyses,
+    openAnalyses,
+    blockedAnalyses,
     closedAnalyses: closed.length,
+    decisionCoverage,
+    blockedRate,
     globalWinRate: global.winRate,
     globalAvgR: global.avgR,
     globalConfidenceLabel: global.confidenceLabel,
@@ -11535,6 +12285,8 @@ async function performancePayload(log) {
   // pull real user data (password hashes included) into memory for a count.
   await ensureRelationalTables();
   const memberCount = Number((await sqlGet(`SELECT COUNT(*) as n FROM users`))?.n || 0);
+  const blockedRateLabel = summary.blockedRate === null ? "—" : `${summary.blockedRate}%`;
+  const decisionCoverageLabel = summary.decisionCoverage === null ? "—" : `${summary.decisionCoverage}%`;
   const precisionLabel = summary.globalWinRate !== null
     ? `${summary.globalWinRate}% (${summary.globalConfidenceLabel}, n=${summary.closedAnalyses})`
     : "Pas encore de données";
@@ -11546,6 +12298,10 @@ async function performancePayload(log) {
     precisionAudited: summary.closedAnalyses >= 100,
     closedAnalyses: summary.closedAnalyses,
     totalAnalyses: summary.totalAnalyses,
+    decisionCoverage: summary.decisionCoverage,
+    decisionCoverageLabel,
+    blockedRate: summary.blockedRate,
+    blockedRateLabel,
     activeSignals: totalSignals,
     blockedAnalyses: summary.blockedAnalyses,
     openAnalyses: summary.openAnalyses,
@@ -11609,6 +12365,11 @@ function personalAnalysesPayload(log, userId) {
       outcomeReason: item.outcomeReason,
       rMultiple: Number.isFinite(item.rMultiple) ? item.rMultiple : null,
       brokerProfitAmount: Number.isFinite(item.brokerProfitAmount) ? item.brokerProfitAmount : null,
+      executedEntry: Number.isFinite(Number(item.executedEntry)) ? Number(item.executedEntry) : null,
+      dataSnapshot: item.dataSnapshot || null,
+      newsSnapshot: item.newsSnapshot || null,
+      decisionReasons: Array.isArray(item.decisionReasons) ? item.decisionReasons : [],
+      marketRegime: item.marketRegime || null,
       closePrice: Number.isFinite(item.closePrice) ? item.closePrice : null,
       closedAt: item.closedAt || null,
       brokerSlot: item.brokerSlot || null,
@@ -11955,6 +12716,3 @@ async function send404Page(res) {
     sendJson(res, 404, { error: "not_found" });
   }
 }
-
-
-

@@ -18,7 +18,10 @@
     // three round trips instead of the slowest one. Home page performance rendering
     // itself lives in home-performance.js (a fuller, more correct implementation --
     // see the removed updatePerformancePanel below), not here.
-    await Promise.all([updatePrices(), updateSignals(), wireNewsSummaries()]);
+    // The public news feed is already rendered by home-market-effects.js. Do not
+    // call the paid /api/news-summary endpoint for every visible row: it added
+    // decorative Groq requests and six avoidable quota/database writes per page.
+    await Promise.all([updatePrices(), updateSignals()]);
     setInterval(updateCountdowns, 1000);
     setInterval(updatePrices, 60000);
     setInterval(updateSignals, 15 * 60 * 1000);
@@ -29,80 +32,90 @@
   async function updatePrices() {
     if (pricesRefreshInFlight) return;
     pricesRefreshInFlight = true;
-    const data = await getJson("/api/prices", 9000);
-    if (!data?.prices) {
-      const market = await getJson("/api/market-status", 5000);
-      updateMarketBanner(market, null, "Connexion marché en synchronisation");
-      return;
-    }
-    updateMarketBanner(data.market, data.prices);
-
-    for (const symbol of marketSymbols) {
-      const next = data.prices[symbol];
-      if (!next) continue;
-      const previous = state.prices[symbol]?.price;
-      state.prices[symbol] = next;
-      renderMarket(symbol, next);
-
-      if (previous && Math.abs(((next.price - previous) / previous) * 100) >= 0.1) {
-        renderLiveComment(symbol, previous, next.price);
+    try {
+      const data = await getJson("/api/prices", 9000);
+      if (!data?.prices) {
+        const market = await getJson("/api/market-status", 5000);
+        updateMarketBanner(market, null, "Connexion marché en synchronisation");
+        return;
       }
+      updateMarketBanner(data.market, data.prices);
+      window.__oraclePricesPayload = data;
+      window.dispatchEvent(new CustomEvent("oracle:prices", { detail: data }));
+
+      for (const symbol of marketSymbols) {
+        const next = data.prices[symbol];
+        if (!next) continue;
+        const previous = state.prices[symbol]?.price;
+        state.prices[symbol] = next;
+        renderMarket(symbol, next);
+
+        if (previous && Math.abs(((next.price - previous) / previous) * 100) >= 0.1) {
+          renderLiveComment(symbol, previous, next.price);
+        }
+      }
+    } finally {
+      pricesRefreshInFlight = false;
     }
-    pricesRefreshInFlight = false;
   }
 
   let signalsRefreshInFlight = false;
   async function updateSignals() {
     if (signalsRefreshInFlight) return;
     signalsRefreshInFlight = true;
-    const data = await getJson("/api/signals", 18000);
-    const signals = Array.isArray(data?.signals) ? data.signals : [];
-    if (!signals.length) {
-      const market = data?.market || await getJson("/api/market-status", 5000);
-      updateMarketBanner(market, state.prices, "Signaux en synchronisation");
+    try {
+      const data = await getJson("/api/signals", 18000);
+      const signals = Array.isArray(data?.signals) ? data.signals : [];
+      if (!signals.length) {
+        const market = data?.market || await getJson("/api/market-status", 5000);
+        updateMarketBanner(market, state.prices, "Signaux en synchronisation");
+        return;
+      }
+      state.signals = signals;
+      state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
+      state.nextSignalAt = new Date(Date.now() + 15 * 60 * 1000);
+      updateMarketBanner(data.market, state.prices);
+      renderSignals(signals);
+      updateCountdowns();
+    } finally {
       signalsRefreshInFlight = false;
-      return;
     }
-    state.signals = signals;
-    state.generatedAt = data.generatedAt ? new Date(data.generatedAt) : new Date();
-    state.nextSignalAt = new Date(Date.now() + 15 * 60 * 1000);
-    updateMarketBanner(data.market, state.prices);
-    renderSignals(signals);
-    updateCountdowns();
-    signalsRefreshInFlight = false;
   }
 
   let signalScoresRefreshInFlight = false;
   async function updateSignalScores() {
     if (signalScoresRefreshInFlight) return;
     signalScoresRefreshInFlight = true;
-    // Concurrent, not one-at-a-time -- a sequential loop meant later cards visibly
-    // updated their score noticeably after earlier ones on every refresh, an
-    // avoidable staggered pop-in with no ordering requirement between signals.
-    await Promise.all(state.signals.map(async (signal) => {
-      const price = state.prices[signal.paire]?.price;
-      if (!price) return;
-      const changePercent = (((price - Number(signal.entree)) / Number(signal.entree)) * 100).toFixed(2);
-      const score = await postJson("/api/confidence", {
-        pair: signal.paire,
-        direction: signal.direction,
-        entry: signal.entree,
-        current: price,
-        changePercent,
-      });
-      const card = document.querySelector(`[data-kronos-pair="${cssEscape(signal.paire)}"]`);
-      if (!card || !score) return;
-      const scoreEl = card.querySelector("[data-kronos-score]");
-      const barEl = card.querySelector("[data-kronos-bar]");
-      const badgeEl = card.querySelector("[data-kronos-status]");
-      if (scoreEl) scoreEl.innerHTML = flap(String(Math.round(score.score || signal.confiance)));
-      if (barEl) barEl.style.width = `${Math.max(0, Math.min(100, Number(score.score) || 0))}%`;
-      if (badgeEl) {
-        badgeEl.textContent = Number(score.score) < 20 ? "SIGNAL ANNULÉ" : Number(score.score) < 40 ? "SIGNAL FAIBLIT" : score.statut || "FORT";
-        badgeEl.className = `kronos-status ${Number(score.score) < 40 ? "danger" : ""}`;
-      }
-    }));
-    signalScoresRefreshInFlight = false;
+    try {
+      // Concurrent, not one-at-a-time -- a sequential loop meant later cards visibly
+      // updated their score noticeably after earlier ones on every refresh, an
+      // avoidable staggered pop-in with no ordering requirement between signals.
+      await Promise.all(state.signals.map(async (signal) => {
+        const price = state.prices[signal.paire]?.price;
+        if (!price) return;
+        const changePercent = (((price - Number(signal.entree)) / Number(signal.entree)) * 100).toFixed(2);
+        const score = await postJson("/api/confidence", {
+          pair: signal.paire,
+          direction: signal.direction,
+          entry: signal.entree,
+          current: price,
+          changePercent,
+        });
+        const card = document.querySelector(`[data-kronos-pair="${cssEscape(signal.paire)}"]`);
+        if (!card || !score) return;
+        const scoreEl = card.querySelector("[data-kronos-score]");
+        const barEl = card.querySelector("[data-kronos-bar]");
+        const badgeEl = card.querySelector("[data-kronos-status]");
+        if (scoreEl) scoreEl.innerHTML = flap(String(Math.round(score.score || signal.confiance)));
+        if (barEl) barEl.style.width = `${Math.max(0, Math.min(100, Number(score.score) || 0))}%`;
+        if (badgeEl) {
+          badgeEl.textContent = Number(score.score) < 20 ? "SIGNAL ANNULÉ" : Number(score.score) < 40 ? "SIGNAL FAIBLIT" : score.statut || "FORT";
+          badgeEl.className = `kronos-status ${Number(score.score) < 40 ? "danger" : ""}`;
+        }
+      }));
+    } finally {
+      signalScoresRefreshInFlight = false;
+    }
   }
 
   // Anchored on data-market-row/-price/-change instead of the row's visual Tailwind
@@ -342,20 +355,6 @@
       frankfurter_daily: "Frankfurter",
       exchangerate_api: "ExchangeRate",
     })[source] || source;
-  }
-
-  async function wireNewsSummaries() {
-    const rows = [...document.querySelectorAll("#news li")].slice(0, 6);
-    // Concurrent, not one-at-a-time -- each row's summary is independent, a
-    // sequential loop just staggered how long the later rows sat unsummarized.
-    await Promise.all(rows.map(async (row) => {
-      const title = row.textContent.replace(/\s+/g, " ").trim();
-      const firstCell = row.children[1];
-      if (!firstCell || firstCell.dataset.kronosSummarized) return;
-      firstCell.dataset.kronosSummarized = "true";
-      const data = await postJson("/api/news-summary", { title });
-      if (data?.summary) firstCell.innerHTML = `<span class="inline-flex text-xs md:text-sm">${flap(data.summary.slice(0, 38))}</span>`;
-    }));
   }
 
   function flap(value) {

@@ -33,14 +33,16 @@ SUPABASE_STATE_TABLE=oracle_app_state
 SUPABASE_TIMEOUT_MS=5000
 ADMIN_TOKEN=une_phrase_secrete_longue
 PUBLIC_ORIGIN=https://forex-by-kronos-oracle.onrender.com
+RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+RESEND_FROM=Oracle Forex <noreply@domaine-verifie.example>
 BROKER_CREDENTIALS_ENCRYPTION_KEY=genere_un_secret_aleatoire_d_au_moins_32_caracteres
 BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS=ancienne_cle_pendant_une_rotation
 BROKER_CREDENTIALS_ENCRYPTION_REQUIRED=true
 ```
 
-Le navigateur appelle seulement `/api/...`; les cles restent cote serveur local.
+Le navigateur appelle seulement `/api/...`; les clés restent côté serveur local.
 
-Les jetons MetaApi des utilisateurs sont chiffres au repos avec AES-256-GCM lorsque BROKER_CREDENTIALS_ENCRYPTION_KEY est configure. En production, le mode obligatoire est actif par defaut : sans cette cle, une nouvelle connexion broker est refusee plutot que d enregistrer un secret en clair. Les anciennes valeurs sont relues pour assurer la migration puis rechiffrees automatiquement. Conserver cette cle dans le gestionnaire de secrets de l hebergeur et hors du depot. Pendant une rotation, renseigner la nouvelle cle dans BROKER_CREDENTIALS_ENCRYPTION_KEY et l ancienne dans BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS. Le serveur relit puis rechiffre automatiquement les valeurs encore protegees par l ancienne cle. Apres verification, retirer la variable PREVIOUS. Conserver ces cles dans le gestionnaire de secrets de l hebergeur et hors du depot.
+Les jetons MetaApi des utilisateurs sont chiffrés au repos avec AES-256-GCM lorsque BROKER_CREDENTIALS_ENCRYPTION_KEY est configurée. En production, le mode obligatoire est actif par défaut : sans cette clé, une nouvelle connexion broker est refusée plutôt que d'enregistrer un secret en clair. Les anciennes valeurs sont relues pour assurer la migration puis rechiffrées automatiquement. Conserver cette clé dans le gestionnaire de secrets de l'hébergeur et hors du dépôt. Pendant une rotation, renseigner la nouvelle clé dans BROKER_CREDENTIALS_ENCRYPTION_KEY et l'ancienne dans BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS. Le serveur relit puis rechiffre automatiquement les valeurs encore protégées par l'ancienne clé. Après vérification, retirer la variable PREVIOUS. Conserver ces clés dans le gestionnaire de secrets de l'hébergeur et hors du dépôt.
 
 Table Supabase attendue pour la persistance serveur:
 
@@ -65,7 +67,7 @@ MARKETAUX_API_KEY_1=...
 EXCHANGERATE_API_KEY_1=...
 ```
 
-Voir l'etat des rotations avec:
+Voir l'état des rotations avec :
 
 ```txt
 http://127.0.0.1:4174/api/provider-status
@@ -73,15 +75,15 @@ http://127.0.0.1:4174/api/provider-status
 
 ## Sauvegarde et restauration
 
-L'etat serveur (comptes, historique d'apprentissage, cache marche) vit dans la table Postgres `oracle_app_state` (`DATABASE_URL`), avec un fallback local `data/*.json` si Postgres est injoignable. Ce fallback n'est jamais resynchronise vers Postgres une fois qu'il revient en ligne, et sur la plupart des hebergeurs le disque est ephemere entre deux deploiements â€” sans sauvegarde independante, une panne Postgres mal synchronisee avec un redeploiement peut faire perdre des donnees de facon definitive.
+L'état serveur (comptes, historique d'apprentissage, cache marché) vit dans la table Postgres `oracle_app_state` (`DATABASE_URL`), avec un fallback local `data/*.json` si Postgres est injoignable. Ce fallback n'est jamais resynchronisé vers Postgres une fois qu'il revient en ligne, et sur la plupart des hébergeurs le disque est éphémère entre deux déploiements - sans sauvegarde indépendante, une panne Postgres mal synchronisée avec un redéploiement peut faire perdre des données de façon définitive.
 
-Sauvegarder (ecrit un fichier horodate dans `backups/`, ignore par git):
+Sauvegarder (écrit un fichier horodaté dans `backups/`, ignoré par git) :
 
 ```sh
 node scripts/backup.mjs
 ```
 
-A planifier regulierement (cron systeme, Render Cron Job, GitHub Actions sur un schedule) et a copier hors de la machine qui heberge la base â€” une sauvegarde qui reste sur le meme disque que la base n'est pas une vraie sauvegarde.
+À planifier régulièrement (cron système, Render Cron Job, GitHub Actions sur un schedule) et à copier hors de la machine qui héberge la base - une sauvegarde qui reste sur le même disque que la base n'est pas une vraie sauvegarde.
 
 Restaurer (dry-run par defaut, n'ecrit rien sans `--confirm`):
 
@@ -92,16 +94,16 @@ node scripts/restore.mjs --file backups/backup-2026-08-06T12-00-00-000Z.json --c
 
 ## Integration continue
 
-`.github/workflows/ci.yml` verifie la syntaxe de `server.mjs` et de `scripts/*.mjs`, puis demarre le serveur sans aucune cle API configuree (le chemin degrade exact que traverse un depot fraichement clone ou une prod partiellement en panne) et interroge `/`, `/api/health`, `/api/signals` et `/api/analyze-chart` pour verifier qu'il repond sans planter.
+`.github/workflows/ci.yml` vérifie la syntaxe de `server.mjs` et de `scripts/*.mjs`, puis démarre le serveur sans aucune clé API configurée (le chemin dégradé exact que traverse un dépôt fraîchement cloné ou une production partiellement en panne) et interroge `/`, `/api/health`, `/api/signals` et `/api/analyze-chart` pour vérifier qu'il répond sans planter.
 
 ## Acces premium manuel
 
-Avant de connecter le paiement, vous pouvez donner Premium a des testeurs:
+Avant de connecter le paiement, vous pouvez donner Premium à des testeurs :
 
 1. Ajoutez `ADMIN_TOKEN=...` dans `secret.dev` puis relancez `node server.mjs`.
 2. Demandez au testeur de creer un compte sur `/signup`.
 3. Ouvrez `/premium-admin`.
-4. Entrez le token admin, l'email du compte et la duree en jours.
+4. Entrez le token admin, l'email du compte et la durée en jours.
 
 Les visiteurs anonymes et comptes free restent limites par quotas journaliers. Les comptes premium/admin sont illimites.
 
