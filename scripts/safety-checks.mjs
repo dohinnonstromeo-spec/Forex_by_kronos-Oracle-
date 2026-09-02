@@ -538,6 +538,12 @@ check("free and trade quotas are bounded", serverSource.includes("FREE_DAILY_ANA
 check("browser isolation headers are present", serverSource.includes("X-DNS-Prefetch-Control") && serverSource.includes("Cross-Origin-Resource-Policy"));
 check("lease and recovery intervals are bounded", serverSource.includes("AUTO_TRADE_LEASE_MS = boundedEnvNumber") && serverSource.includes("SCHEDULER_LEASE_MS = boundedEnvNumber") && serverSource.includes("TRADE_OPERATION_LEASE_MS = boundedEnvNumber") && serverSource.includes("HEARTBEAT_STALE_MS = boundedEnvNumber") && serverSource.includes("SENDING_RECOVERY_INTERVAL_MS = boundedEnvNumber") && serverSource.includes("SENDING_RECOVERY_AFTER_MS = boundedEnvNumber"));
 check("relational readiness waits for legacy migration", serverSource.indexOf("await migrateLegacyJsonIntoRelationalTables();") < serverSource.lastIndexOf("relationalTablesReady = true;"));
+check(
+  "schema marker cannot skip later additive migrations",
+  serverSource.includes("async function ensureRelationalTables()") &&
+    serverSource.includes("if (relationalTablesPromise) return relationalTablesPromise;") &&
+    !serverSource.includes("if (schemaVersion?.ready) {\n    relationalTablesReady = true;\n    return;\n  }"),
+);
 check("chat prompts are bounded", serverSource.includes("sanitizeUserText(cleanLine") && serverSource.includes(".slice(0, 4000)"));
 check("image payloads are bounded before decoding", serverSource.includes("MAX_IMAGE_DATA_URL_CHARS = 8 * 1024 * 1024") && serverSource.includes("image.length > MAX_IMAGE_DATA_URL_CHARS"));
 check("SSE clients cannot create an unbounded backlog", serverSource.includes("if (!client.write(message)) client.destroy()") && serverSource.includes("client.writableEnded"));

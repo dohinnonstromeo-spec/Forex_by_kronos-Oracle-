@@ -200,19 +200,6 @@ let relationalTablesReady = false;
 let relationalTablesPromise = null;
 async function ensureRelationalTables() {
   if (relationalTablesReady) return;
-  let schemaVersion = null;
-  try {
-    schemaVersion = await sqlGet(`SELECT 1 as ready FROM schema_migrations WHERE name = ?`, ["relational-schema-v2"]);
-  } catch (error) {
-    const message = String(error?.message || error);
-    if (!/schema_migrations|no such table|does not exist/i.test(message)) {
-      throw error;
-    }
-  }
-  if (schemaVersion?.ready) {
-    relationalTablesReady = true;
-    return;
-  }
   if (relationalTablesPromise) return relationalTablesPromise;
   relationalTablesPromise = ensureRelationalTablesImpl();
   try {
