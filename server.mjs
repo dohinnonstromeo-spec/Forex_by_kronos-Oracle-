@@ -1696,6 +1696,23 @@ const AUTO_TRADE_LEASE_MS = boundedEnvNumber(env.AUTO_TRADE_LEASE_SECONDS, 300, 
 // turning one pair into an unbounded concentration. The environment may only
 // tighten the hard maximum of three positions per pair.
 const MAX_AUTO_POSITIONS_PER_PAIR = Math.trunc(boundedEnvNumber(env.AUTO_POSITIONS_PER_PAIR, 3, 1, 3));
+// Temporary recovery mode when the economic calendar provider is unavailable.
+// It is explicit, demo-only, and risk-capped; the default remains fail-closed.
+const DEMO_NEWS_FALLBACK_ENABLED = env.ALLOW_DEMO_TRADING_WITHOUT_CALENDAR === "true";
+const DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT = boundedEnvNumber(
+  env.DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT,
+  0.25,
+  0.01,
+  1,
+);
+function demoNewsFallbackAllowed(slot, newsRisk) {
+  return slot === "demo" && DEMO_NEWS_FALLBACK_ENABLED && newsRisk?.status === "unavailable";
+}
+function calendarFallbackSignalsFromPayload(payload) {
+  if (!DEMO_NEWS_FALLBACK_ENABLED || payload?.newsRisk?.status !== "unavailable") return [];
+  const signals = payload?.signals || [];
+  return signals.filter((s) => s.calendarFallbackEligible && s.direction && s.direction !== "AUCUN SIGNAL");
+}
 
 // Shared by all three lease flavors below (auto-trade, scheduler,
 // trade-operation) -- they were three structurally identical
@@ -1835,19 +1852,21 @@ async function runAutoTradeTick() {
   const stale = !cached || Date.now() >= memoryCache.signals.expiresAt;
   const payload = stale ? await computeSignalsPayload() : cached;
   const tradable = (payload?.signals || []).filter((s) => s.direct && !s.suspended);
-  if (!tradable.length) {
+  const calendarFallbackSignals = calendarFallbackSignalsFromPayload(payload);
+  if (!tradable.length && !calendarFallbackSignals.length) {
     for (const account of accounts) for (const slot of activeBrokerSlots(account)) recordAutoTradeStatus(account.user_id, slot, "no_tradable_market_signals_this_tick");
     return;
   }
   for (const account of accounts) {
     for (const slot of activeBrokerSlots(account)) {
+      const slotSignals = demoNewsFallbackAllowed(slot, payload?.newsRisk) ? calendarFallbackSignals : tradable;
       const leaseToken = await tryAcquireAutoTradeLease(account.user_id, slot);
       if (!leaseToken) {
         recordAutoTradeStatus(account.user_id, slot, "another_execution_instance_running");
         continue;
       }
       try {
-        await processAutoTradeForUser(account, tradable, slot, payload.newsRisk || null);
+        await processAutoTradeForUser(account, slotSignals, slot, payload.newsRisk || null);
       } catch (error) {
         logOnce(`auto-trade-user-${account.user_id}-${slot}`, `bot échoué pour un utilisateur (${error.message})`);
       } finally {
@@ -2284,9 +2303,10 @@ function automaticSignalDecisionReasons(signal, newsRisk) {
 
 async function processAutoTradeForUser(account, signals, slot, newsRisk = null) {
   const userId = account.user_id;
+  const newsFallback = demoNewsFallbackAllowed(slot, newsRisk);
   // Defense in depth: no autonomous swing order is allowed without a successful
   // calendar check, even if a future caller forgets to pass the news context.
-  if (!newsRisk || newsRisk.status !== 'ok') {
+  if ((!newsRisk || newsRisk.status !== 'ok') && !newsFallback) {
     return recordAutoTradeStatus(userId, slot, 'economic_calendar_unavailable', {
       reason: newsRisk?.reason || 'economic_calendar_unavailable',
     });
@@ -2397,7 +2417,10 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       if (!(refreshedSizingBalance > 0)) { skipped.noFunds += 1; continue; }
       sizingBalance = refreshedSizingBalance;
     }
-    const effectiveRiskPercent = combineTightened(resolveAdminRiskPercent(account, sizingBalance), account.user_risk_percent, "lower");
+    const requestedRiskPercent = combineTightened(resolveAdminRiskPercent(account, sizingBalance), account.user_risk_percent, "lower");
+    const effectiveRiskPercent = newsFallback
+      ? Math.min(requestedRiskPercent, DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT)
+      : requestedRiskPercent;
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) { skipped.noSpec += 1; continue; }
@@ -2480,7 +2503,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
-  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR, ...skipped });
+  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR, newsCalendarFallback: newsFallback, ...skipped });
 }
 
 // clampVolumeToSpec both callers below need: round down to the broker's
@@ -4065,6 +4088,8 @@ async function handleApi(req, res, url) {
       minConfidenceFloor: row?.min_confidence_floor ?? null,
       maxTradesPerDay: row?.max_trades_per_day ?? null,
       minRiskReward: row?.min_risk_reward ?? null,
+      demoNewsCalendarFallback: DEMO_NEWS_FALLBACK_ENABLED,
+      demoNewsCalendarFallbackMaxRiskPercent: DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT,
       tradingHoursStart: row?.trading_hours_start || null,
       tradingHoursEnd: row?.trading_hours_end || null,
       tradingDays: row?.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
@@ -6692,6 +6717,7 @@ function applyNewsRisk(signals, newsRisk) {
       ...signal,
       direct: false,
       suspended: true,
+      calendarFallbackEligible: Boolean(signal.direct && !signal.suspended),
       raison: newsRisk.reason,
       quality: { ...signal.quality, valid: false, reason: newsRisk.reason, newsBlocked: true, calendarUnavailable: true },
     }));
@@ -10509,11 +10535,11 @@ async function upsertAnalysisRow(analysis) {
        closed_at = excluded.closed_at, close_price = excluded.close_price,
        outcome = excluded.outcome, outcome_reason = excluded.outcome_reason, r_multiple = excluded.r_multiple,
        broker_profit_amount = excluded.broker_profit_amount,
-       executed_entry = COALESCE(executed_entry, excluded.executed_entry),
-       data_snapshot = COALESCE(data_snapshot, excluded.data_snapshot),
-       news_snapshot = COALESCE(news_snapshot, excluded.news_snapshot),
-       decision_reasons = COALESCE(decision_reasons, excluded.decision_reasons),
-       market_regime = COALESCE(market_regime, excluded.market_regime)`,
+       executed_entry = COALESCE(analyses.executed_entry, excluded.executed_entry),
+       data_snapshot = COALESCE(analyses.data_snapshot, excluded.data_snapshot),
+       news_snapshot = COALESCE(analyses.news_snapshot, excluded.news_snapshot),
+       decision_reasons = COALESCE(analyses.decision_reasons, excluded.decision_reasons),
+       market_regime = COALESCE(analyses.market_regime, excluded.market_regime)`,
     [
       analysis.id,
       analysis.userId || null,

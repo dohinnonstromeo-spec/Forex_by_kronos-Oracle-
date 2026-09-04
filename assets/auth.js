@@ -1532,6 +1532,7 @@
     no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché à cet instant -- normal, pas une erreur",
+    economic_calendar_unavailable: "Calendrier économique indisponible : aucune position automatique autorisée",
     another_execution_instance_running: "Passage ignoré : une autre exécution occupait le verrou, nouvel essai automatique",
   };
 
@@ -1545,6 +1546,7 @@
   function formatTickDetail(reason, detail) {
     if (!detail) return "";
     const parts = [];
+    if (detail.newsCalendarFallback) parts.push("secours calendrier actif, démo uniquement");
     if (reason === "no_valid_setup_this_tick") {
       if (detail.candidateCount) parts.push(`${detail.candidateCount} signal(s) évalué(s)`);
       if (detail.alreadyOpen) parts.push(`${detail.alreadyOpen} déjà ouvert(s)`);

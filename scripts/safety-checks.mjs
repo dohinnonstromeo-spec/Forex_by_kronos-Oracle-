@@ -799,6 +799,15 @@ check(
     && serverSource.includes('status: "unavailable"')
     && serverSource.includes("aucune nouvelle position automatique"),
 );
+check(
+  "missing calendar fallback is explicit, demo-only, and risk-capped",
+  serverSource.includes('env.ALLOW_DEMO_TRADING_WITHOUT_CALENDAR === "true"')
+    && serverSource.includes('env.DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT')
+    && serverSource.includes('return slot === "demo"')
+    && serverSource.includes("calendarFallbackEligible")
+    && serverSource.includes("Math.min(requestedRiskPercent, DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT)")
+    && serverSource.includes('economic_calendar_unavailable'),
+);
 const scalpTickStart = serverSource.indexOf("async function runScalpTradingTick");
 const scalpTickEnd = serverSource.indexOf("async function processScalpForUser", scalpTickStart);
 const scalpTickBlock = scalpTickStart >= 0 && scalpTickEnd > scalpTickStart ? serverSource.slice(scalpTickStart, scalpTickEnd) : "";
@@ -824,7 +833,12 @@ check(
     && serverSource.includes("executionSlippage")
     && serverSource.includes("persistBrokerExecution")
     && serverSource.includes("executedEntry: row.executed_entry")
-    && serverSource.includes("COALESCE(executed_entry, excluded.executed_entry)"),
+    && serverSource.includes("COALESCE(analyses.executed_entry, excluded.executed_entry)")
+    && serverSource.includes("COALESCE(analyses.data_snapshot, excluded.data_snapshot)")
+    && serverSource.includes("COALESCE(analyses.news_snapshot, excluded.news_snapshot)")
+    && serverSource.includes("COALESCE(analyses.decision_reasons, excluded.decision_reasons)")
+    && serverSource.includes("COALESCE(analyses.market_regime, excluded.market_regime)")
+    && !serverSource.includes("COALESCE(executed_entry, excluded.executed_entry)"),
 );
 check(
   "broker history can recover the opening fill even after a fast close",
