@@ -496,6 +496,15 @@ async function ensureRelationalTablesImpl() {
   // have one) keeps improving on top of this floor exactly as before,
   // untouched.
   await ensureColumn("trade_orders", "half_target_secured integer NOT NULL DEFAULT 0");
+  // Durable trailing diagnostics. A broker-side stop modification can fail after
+  // the position is already profitable; keeping the last attempt and error in the
+  // order row makes that state visible to the dashboard instead of log-only.
+  await ensureColumn("trade_orders", "trailing_last_attempt_at text");
+  await ensureColumn("trade_orders", "trailing_last_success_at text");
+  await ensureColumn("trade_orders", "trailing_last_error text");
+  await ensureColumn("trade_orders", "trailing_last_error_at text");
+  await ensureColumn("trade_orders", "trailing_last_requested_stop real");
+  await ensureColumn("trade_orders", "trailing_modify_attempts integer NOT NULL DEFAULT 0");
   // Marks how far a user has read into their own trade-open/close feed (see
   // /api/notifications/summary) -- the in-app fallback for anyone without an
   // active push subscription. NULL until they ever open the notifications panel,
@@ -4225,12 +4234,41 @@ async function handleApi(req, res, url) {
     // card it belongs to by this id, so it has to be present here, not just on the
     // semi-automatic order list.
     const rows = await sqlAll(
-      `SELECT a.*, o.broker_order_id as broker_order_id FROM analyses a
+      `SELECT a.*, o.id as order_id, o.broker_order_id as broker_order_id,
+              o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price,
+              o.trailing_last_attempt_at as trailing_last_attempt_at, o.trailing_last_success_at as trailing_last_success_at,
+              o.trailing_last_error as trailing_last_error, o.trailing_last_error_at as trailing_last_error_at,
+              o.trailing_last_requested_stop as trailing_last_requested_stop, o.trailing_modify_attempts as trailing_modify_attempts
+       FROM analyses a
        LEFT JOIN trade_orders o ON o.analysis_id = a.id
        WHERE a.user_id = ? AND a.source = 'auto_signal' ORDER BY a.created_at DESC LIMIT 50`,
       [session.user.id],
     );
-    sendJson(res, 200, { ok: true, trades: rows.map((row) => ({ ...rowToAnalysis(row), brokerOrderId: row.broker_order_id || null })) });
+    const trades = rows.map((row) => {
+      const analysis = rowToAnalysis(row);
+      const originalStop = Number(row.sl);
+      const currentStop = row.trailing_stop_price == null ? NaN : Number(row.trailing_stop_price);
+      const trailingEnabled = Boolean(trailingStopParamsFor(row.source, row.pair));
+      const trailingStopMoved = Number.isFinite(originalStop) && Number.isFinite(currentStop)
+        && (row.direction === "ACHAT" ? currentStop > originalStop : currentStop < originalStop);
+      return {
+        ...analysis,
+        orderId: row.order_id || null,
+        brokerOrderId: row.broker_order_id || null,
+        trailingEnabled,
+        trailingStopPrice: row.trailing_stop_price ?? null,
+        bestFavorablePrice: row.best_favorable_price ?? null,
+        trailingStopMoved,
+        trailingProtectionState: !trailingEnabled ? "fixed_levels" : row.trailing_last_error ? "error" : trailingStopMoved ? "active" : "waiting",
+        trailingLastAttemptAt: row.trailing_last_attempt_at || null,
+        trailingLastSuccessAt: row.trailing_last_success_at || null,
+        trailingLastError: row.trailing_last_error || null,
+        trailingLastErrorAt: row.trailing_last_error_at || null,
+        trailingLastRequestedStop: row.trailing_last_requested_stop ?? null,
+        trailingModifyAttempts: Number(row.trailing_modify_attempts) || 0,
+      };
+    });
+    sendJson(res, 200, { ok: true, trades });
     return;
   }
 
@@ -10715,6 +10753,13 @@ function rowToTradeOrder(row) {
     // enabled (sl there never changes, so there's nothing extra to show). See
     // checkTrailingStops.
     trailingStopPrice: row.trailing_stop_price ?? null,
+    bestFavorablePrice: row.best_favorable_price ?? null,
+    trailingLastAttemptAt: row.trailing_last_attempt_at || null,
+    trailingLastSuccessAt: row.trailing_last_success_at || null,
+    trailingLastError: row.trailing_last_error || null,
+    trailingLastErrorAt: row.trailing_last_error_at || null,
+    trailingLastRequestedStop: row.trailing_last_requested_stop ?? null,
+    trailingModifyAttempts: Number(row.trailing_modify_attempts) || 0,
   };
 }
 
@@ -11944,6 +11989,9 @@ async function checkTrailingStops() {
     const rows = await sqlAll(
       `SELECT a.id as analysis_id, a.user_id as user_id, a.pair as pair, a.direction as direction, a.entry as entry, a.sl as sl, a.broker_slot as broker_slot, a.source as source,
               o.id as order_id, o.broker_order_id as broker_order_id, o.executed_entry as executed_entry, o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price,
+              o.trailing_last_attempt_at as trailing_last_attempt_at, o.trailing_last_success_at as trailing_last_success_at,
+              o.trailing_last_error as trailing_last_error, o.trailing_last_error_at as trailing_last_error_at,
+              o.trailing_last_requested_stop as trailing_last_requested_stop, o.trailing_modify_attempts as trailing_modify_attempts,
               o.tp1 as tp1, o.tp2 as tp2, o.half_target_secured as half_target_secured, acc.secure_half_priority_enabled as secure_half_priority_enabled
        FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
        LEFT JOIN auto_trading_accounts acc ON acc.user_id = a.user_id
@@ -11969,12 +12017,24 @@ async function checkTrailingStops() {
         credentialsCache.set(cacheKey, await getUserBrokerCredentials(row.user_id, slot).catch(() => null));
       }
       const credentials = credentialsCache.get(cacheKey);
-      if (!credentials) continue;
+      if (!credentials) {
+        const failure = "broker_credentials_missing";
+        const failedAt = new Date().toISOString();
+        await sqlRun(
+          `UPDATE trade_orders SET trailing_last_error = ?, trailing_last_error_at = ? WHERE id = ?`,
+          [failure, failedAt, row.order_id],
+        ).catch(() => {});
+        logOnce(`trailing-${row.analysis_id}`, `protection du stop impossible (${failure})`);
+        continue;
+      }
       const positionLeaseToken = await tryAcquireTradeOperationLease(row.order_id, "position-modify").catch(() => null);
       if (!positionLeaseToken) continue;
       try {
       const latestOrderRow = await sqlGet(
-        `SELECT status, broker_order_id, executed_entry, trailing_stop_price, best_favorable_price, tp1, tp2, half_target_secured FROM trade_orders WHERE id = ?`,
+        `SELECT status, broker_order_id, executed_entry, trailing_stop_price, best_favorable_price,
+                trailing_last_attempt_at, trailing_last_success_at, trailing_last_error, trailing_last_error_at,
+                trailing_last_requested_stop, trailing_modify_attempts, tp1, tp2, half_target_secured
+         FROM trade_orders WHERE id = ?`,
         [row.order_id],
       ).catch(() => null);
       if (!latestOrderRow || latestOrderRow.status !== "SENT" || String(latestOrderRow.broker_order_id) !== String(row.broker_order_id)) continue;
@@ -11999,7 +12059,19 @@ async function checkTrailingStops() {
       // same side used for both the favorable-price tracking and the
       // distance-to-stop safety check below, so both reason about the price the
       // position would actually realize.
-      const brokerPrice = await getBrokerCurrentPrice(credentials, row.pair).catch(() => null);
+      let brokerPrice;
+      try {
+        brokerPrice = await getBrokerCurrentPrice(credentials, row.pair);
+      } catch (error) {
+        const failure = String(publicBrokerError(error.message || "broker_price_unavailable")).slice(0, 400);
+        const failedAt = new Date().toISOString();
+        await sqlRun(
+          `UPDATE trade_orders SET trailing_last_error = ?, trailing_last_error_at = ? WHERE id = ?`,
+          [failure, failedAt, row.order_id],
+        ).catch(() => {});
+        logOnce(`trailing-${row.analysis_id}`, `prix broker indisponible pour le trailing (${failure})`);
+        continue;
+      }
       if (!brokerPrice) continue;
       const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
       const priorBest = Number(row.best_favorable_price) || entry;
@@ -12014,8 +12086,9 @@ async function checkTrailingStops() {
       // SAME candidateStop the normal trailing curve already computed (never a
       // second, competing modify call), taking whichever is more favorable.
       let justSecuredHalf = false;
-      if (row.tp1 == null && Number(row.secure_half_priority_enabled) === 1 && !Number(row.half_target_secured) && Number.isFinite(row.tp2)) {
-        const halfTarget = buy ? entry + (row.tp2 - entry) * 0.5 : entry - (entry - row.tp2) * 0.5;
+      if (row.tp1 == null && Number(row.secure_half_priority_enabled) === 1 && !Number(row.half_target_secured) && Number.isFinite(Number(row.tp2))) {
+        const referenceTarget = Number(row.tp2);
+        const halfTarget = buy ? entry + (referenceTarget - entry) * 0.5 : entry - (entry - referenceTarget) * 0.5;
         const reached = buy ? currentPrice >= halfTarget : currentPrice <= halfTarget;
         if (reached) {
           justSecuredHalf = true;
@@ -12036,7 +12109,12 @@ async function checkTrailingStops() {
         if (buy && candidateStop > safeStop) candidateStop = safeStop;
         if (!buy && candidateStop < safeStop) candidateStop = safeStop;
       }
-      const currentStop = Number(row.trailing_stop_price);
+      // Rows created before staged trailing was introduced can have no live stop
+      // snapshot. Their broker stop is still the original SL, so using NaN here
+      // would make every SELL candidate look like it failed to improve anything.
+      const storedStop = row.trailing_stop_price == null ? NaN : Number(row.trailing_stop_price);
+      const originalStop = Number(row.sl);
+      const currentStop = Number.isFinite(storedStop) ? storedStop : originalStop;
       const stopImproved = candidateStop != null && (buy ? candidateStop > currentStop : candidateStop < currentStop);
       if (!stopImproved) {
         // Still record a new best-favorable-price even when the stop itself
@@ -12055,14 +12133,38 @@ async function checkTrailingStops() {
         }
         continue;
       }
+      const attemptAt = new Date().toISOString();
+      await sqlRun(
+        `UPDATE trade_orders
+         SET trailing_last_attempt_at = ?, trailing_last_requested_stop = ?,
+             trailing_modify_attempts = COALESCE(trailing_modify_attempts, 0) + 1
+         WHERE id = ?`,
+        [attemptAt, candidateStop, row.order_id],
+      ).catch(() => {});
       const result = await modifyBrokerPositionStopLoss(credentials, row.broker_order_id, candidateStop).catch((error) => ({ ok: false, error: "broker_operation_failed", message: publicBrokerError(error.message) }));
       if (result.ok) {
         await sqlRun(
-          `UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ?${justSecuredHalf ? ", half_target_secured = 1" : ""} WHERE id = ?`,
-          [candidateStop, newBest, row.order_id],
+          `UPDATE trade_orders
+           SET trailing_stop_price = ?, best_favorable_price = ?, trailing_last_success_at = ?,
+               trailing_last_error = NULL, trailing_last_error_at = NULL, trailing_last_requested_stop = NULL
+               ${justSecuredHalf ? ", half_target_secured = 1" : ""}
+           WHERE id = ?`,
+          [candidateStop, newBest, attemptAt, row.order_id],
         ).catch(() => {});
       } else {
-        logOnce(`trailing-${row.analysis_id}`, `déplacement du stop suiveur échoué (${result.error})`);
+        // Keep the peak even when the broker rejects this particular request.
+        // Otherwise a short-lived favourable move disappears on the next tick and
+        // the retry is calculated from a worse price, exactly when protection is
+        // most needed. The broker stop itself is not changed on failure.
+        const failure = String(result.message || result.error || "broker_modify_failed").slice(0, 400);
+        await sqlRun(
+          `UPDATE trade_orders
+           SET best_favorable_price = ?, trailing_last_error = ?, trailing_last_error_at = ?,
+               trailing_last_requested_stop = ?
+           WHERE id = ?`,
+          [newBest, failure, attemptAt, candidateStop, row.order_id],
+        ).catch(() => {});
+        logOnce(`trailing-${row.analysis_id}`, `déplacement du stop suiveur échoué (${failure})`);
       }
       } finally {
         await releaseTradeOperationLease(row.order_id, "position-modify", positionLeaseToken).catch((error) =>

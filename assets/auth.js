@@ -1838,6 +1838,17 @@
     });
   }
 
+  function trailingProtectionLabel(item) {
+    if (item.trailingProtectionState === "active") return "Stop suiveur actif : le dernier déplacement a été accepté par le broker.";
+    if (item.trailingProtectionState === "error") {
+      const attempts = item.trailingModifyAttempts ? ` (${item.trailingModifyAttempts} tentative(s))` : "";
+      return `Alerte protection : dernière modification refusée${attempts} — ${item.trailingLastError || "erreur broker non détaillée"}`;
+    }
+    if (item.trailingProtectionState === "waiting") return "Stop suiveur en attente du seuil d'activation.";
+    if (item.trailingProtectionState === "fixed_levels") return "Protection fixe broker : les gains flottants ne sont pas encore verrouillés par un trailing.";
+    return "État de protection non disponible.";
+  }
+
   async function loadAutoTradeHistory() {
     const host = document.querySelector("[data-autotrade-trades]");
     if (!host) return;
@@ -1869,6 +1880,7 @@
           <span>TP1 ${escapeHtml(item.tp1 ?? "—")}</span>
         </div>
         <div class="dashboard-live-protection" data-live-protection hidden></div>
+        ${item.status === "OPEN" && item.trailingProtectionState ? `<p class="dashboard-history-note ${item.trailingProtectionState === "error" ? "dashboard-prepare-error" : ""}">${escapeHtml(trailingProtectionLabel(item))}</p>` : ""}
         <details class="dashboard-trade-details">
           <summary>Voir le suivi détaillé</summary>
           <dl class="dashboard-trade-detail-grid">
@@ -1881,6 +1893,7 @@
             <div><dt>Durée</dt><dd>${escapeHtml(historyDuration(item) || (item.status === "OPEN" ? "En cours" : "Non disponible"))}</dd></div>
             <div><dt>Résultat broker</dt><dd>${escapeHtml(historyResultLabel(item) || "Non disponible")}</dd></div>
           </dl>
+          ${item.status === "OPEN" && item.trailingProtectionState ? `<p class="dashboard-history-note">Protection : ${escapeHtml(trailingProtectionLabel(item))}${item.bestFavorablePrice != null ? ` · meilleur prix observé ${escapeHtml(item.bestFavorablePrice)}` : ""}${item.trailingLastSuccessAt ? ` · dernière réussite ${escapeHtml(formatDate(item.trailingLastSuccessAt))}` : ""}</p>` : ""}
           ${item.outcomeReason ? `<p class="dashboard-history-note">Motif : ${escapeHtml(item.outcomeReason)}</p>` : ""}
           ${item.marketRegime ? `<p class="dashboard-history-note">Régime détecté : ${escapeHtml(item.marketRegime)}</p>` : ""}
         </details>

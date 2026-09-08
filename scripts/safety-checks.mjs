@@ -1094,6 +1094,29 @@ check(
     && dashboardHybridSource.includes('data-runtime-last-detail')
     && dashboardHybridSource.includes('data-autotrade-trades'),
 );
+check(
+  'trailing protection keeps broker failures durable and visible',
+  serverSource.includes('trailing_last_attempt_at')
+    && serverSource.includes('trailing_last_success_at')
+    && serverSource.includes('trailing_last_error')
+    && serverSource.includes('trailing_modify_attempts')
+    && serverSource.includes('trailingProtectionState')
+    && authClientSource.includes('function trailingProtectionLabel')
+    && authClientSource.includes('dernière modification refusée'),
+);
+check(
+  'trailing protection never treats a SQL NULL stop as zero',
+  serverSource.includes('row.trailing_stop_price == null ? NaN : Number(row.trailing_stop_price)')
+    && serverSource.includes('const originalStop = Number(row.sl)')
+    && serverSource.includes('Number.isFinite(storedStop) ? storedStop : originalStop'),
+);
+check(
+  'trailing retries retain the favourable peak after a broker rejection',
+  serverSource.includes('Keep the peak even when the broker rejects')
+    && serverSource.includes('SET best_favorable_price = ?, trailing_last_error = ?')
+    && serverSource.includes('trailing_last_requested_stop = ?')
+    && serverSource.includes('trailing_last_success_at = ?'),
+);
 
 console.log(`
 ${pass} passed, ${fail} failed.`);
