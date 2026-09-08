@@ -808,6 +808,30 @@ check(
     && serverSource.includes("Math.min(requestedRiskPercent, DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT)")
     && serverSource.includes('economic_calendar_unavailable'),
 );
+check(
+  "automatic repetition and losing streaks are fail-closed by default",
+  serverSource.includes('env.AUTO_ALLOW_PYRAMIDING === "true"')
+    && serverSource.includes('pairOpenCount > 0 && !AUTO_ALLOW_PYRAMIDING')
+    && serverSource.includes("recentAutoLossStreak")
+    && serverSource.includes("consecutive_auto_losses_circuit_breaker")
+    && serverSource.includes("AUTO_CONSECUTIVE_LOSS_LIMIT"),
+);
+check(
+  "admin trade-count and weekly/monthly limits remain optional",
+  serverSource.includes("const maxTradesPerDayRaw = Number(body?.maxTradesPerDay) || 0")
+    && serverSource.includes("const weeklyLossLimitPercentRaw = Number(body?.weeklyLossLimitPercent) || 0")
+    && serverSource.includes("const monthlyLossLimitPercentRaw = Number(body?.monthlyLossLimitPercent) || 0")
+    && serverSource.includes("maxTradesPerDay > 0")
+    && serverSource.includes("weeklyLossLimitPercent > 0")
+    && serverSource.includes("monthlyLossLimitPercent > 0"),
+);
+check(
+  "scalp max hold stays capped at one hour",
+  serverSource.includes("const validatedHoldSeconds = 60 * 60")
+    && serverSource.includes("scalpMaxHoldSeconds) || 3600")
+    && serverSource.includes("Number(row.scalp_max_hold_seconds) === 120 ? 3600")
+    && scalpBacktestSource.includes("maxHoldBars: 60"),
+);
 const scalpTickStart = serverSource.indexOf("async function runScalpTradingTick");
 const scalpTickEnd = serverSource.indexOf("async function processScalpForUser", scalpTickStart);
 const scalpTickBlock = scalpTickStart >= 0 && scalpTickEnd > scalpTickStart ? serverSource.slice(scalpTickStart, scalpTickEnd) : "";

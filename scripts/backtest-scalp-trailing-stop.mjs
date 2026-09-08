@@ -28,8 +28,8 @@ const VALIDATED = {
   // Keep these values in lockstep with SCALP_PARAMS_BY_PAIR in server.mjs.
   // They are explicit here so the hybrid comparison can never silently fall
   // back to an undefined trailing configuration.
-  GBPUSD: { spreadPct: 0.0037, maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 30, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
-  XAUUSD: { spreadPct: 0.0039, maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 30, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
+  GBPUSD: { spreadPct: 0.0037, maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 60, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
+  XAUUSD: { spreadPct: 0.0039, maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 60, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
 };
 
 function loadCsv(pair) {

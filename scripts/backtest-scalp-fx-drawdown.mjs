@@ -168,12 +168,12 @@ const CANDIDATES = [
   {
     label: "GBPUSD -- meilleur candidat (ma20 rsi20/80 stretch0.1% atr1 tp4R hold30)",
     pair: "GBPUSD", spreadPct: 0.0037,
-    params: { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 30 },
+    params: { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 60 },
   },
   {
     label: "XAUUSD -- meilleur candidat (ma55 rsi20/80 stretch0.03% atr1.3 tp4R hold30)",
     pair: "XAUUSD", spreadPct: 0.0039,
-    params: { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 30 },
+    params: { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 60 },
   },
 ];
 

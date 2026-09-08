@@ -1696,6 +1696,14 @@ const AUTO_TRADE_LEASE_MS = boundedEnvNumber(env.AUTO_TRADE_LEASE_SECONDS, 300, 
 // turning one pair into an unbounded concentration. The environment may only
 // tighten the hard maximum of three positions per pair.
 const MAX_AUTO_POSITIONS_PER_PAIR = Math.trunc(boundedEnvNumber(env.AUTO_POSITIONS_PER_PAIR, 3, 1, 3));
+// Re-entering the same pair is opt-in. The hard maximum above remains available
+// for deliberate pyramiding, but a repeated signal must not add exposure by default.
+const AUTO_ALLOW_PYRAMIDING = env.AUTO_ALLOW_PYRAMIDING === "true";
+// A short losing streak pauses new autonomous entries long enough for the market
+// regime and the data to be re-evaluated. This reads closed outcomes from SQL, so
+// the lesson survives a restart instead of living only in process memory.
+const AUTO_CONSECUTIVE_LOSS_LIMIT = Math.trunc(boundedEnvNumber(env.AUTO_CONSECUTIVE_LOSS_LIMIT, 3, 2, 10));
+const AUTO_LOSS_COOLDOWN_MS = boundedEnvNumber(env.AUTO_LOSS_COOLDOWN_MINUTES, 360, 15, 10080) * 60 * 1000;
 // Temporary recovery mode when the economic calendar provider is unavailable.
 // It is explicit, demo-only, and risk-capped; the default remains fail-closed.
 const DEMO_NEWS_FALLBACK_ENABLED = env.ALLOW_DEMO_TRADING_WITHOUT_CALENDAR === "true";
@@ -2087,6 +2095,33 @@ async function countAutoTradesOpenedToday(userId, slot) {
   return Number(row?.n || 0);
 }
 
+async function recentAutoLossStreak(userId, slot) {
+  const rows = await sqlAll(
+    "SELECT outcome, closed_at FROM analyses " +
+    "WHERE user_id = ? AND broker_slot = ? " +
+    "AND source IN ('auto_signal', 'auto_scalp') " +
+    "AND outcome IN ('win', 'loss') AND closed_at IS NOT NULL " +
+    "ORDER BY closed_at DESC LIMIT 11",
+    [userId, slot],
+  );
+  let consecutiveLosses = 0;
+  for (const row of rows) {
+    if (row.outcome !== "loss") break;
+    consecutiveLosses += 1;
+  }
+  const latestClosedAt = rows[0]?.closed_at || null;
+  const latestClosedAtMs = latestClosedAt ? new Date(latestClosedAt).getTime() : NaN;
+  const blocked = consecutiveLosses >= AUTO_CONSECUTIVE_LOSS_LIMIT
+    && Number.isFinite(latestClosedAtMs)
+    && Date.now() < latestClosedAtMs + AUTO_LOSS_COOLDOWN_MS;
+  return {
+    consecutiveLosses,
+    latestClosedAt,
+    cooldownUntil: blocked ? new Date(latestClosedAtMs + AUTO_LOSS_COOLDOWN_MS).toISOString() : null,
+    blocked,
+  };
+}
+
 // Real broker-reported P&L for the day, in the account's own currency -- the
 // monetary counterpart to dailyRealizedPnlPercent's %-of-balance approximation,
 // since "tout depend du broker de chacun" (each account's own currency, USD/EUR/
@@ -2335,6 +2370,13 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   );
   if (!candidates.length)
     return recordAutoTradeStatus(userId, slot, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
+  const lossStreak = await recentAutoLossStreak(userId, slot);
+  if (lossStreak.blocked)
+    return recordAutoTradeStatus(userId, slot, "consecutive_auto_losses_circuit_breaker", {
+      consecutiveLosses: lossStreak.consecutiveLosses,
+      lossLimit: AUTO_CONSECUTIVE_LOSS_LIMIT,
+      cooldownUntil: lossStreak.cooldownUntil,
+    });
 
   const dailyLossLimitPercent = combineTightened(account.daily_loss_limit_percent || 3, account.user_daily_loss_limit_percent, "lower");
   if ((await dailyRealizedPnlPercent(userId, slot)) <= -dailyLossLimitPercent)
@@ -2391,7 +2433,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   // some delay. Demo and live have their own balances, so a tier crossed on
   // one slot has zero effect on the other's sizing.
   let openedThisTick = 0;
-  const skipped = { alreadyOpen: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, rejected: 0 };
+  const skipped = { alreadyOpen: 0, pyramidingDisabled: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, rejected: 0 };
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
     if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
@@ -2400,6 +2442,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     // per-slot lease prevents two scheduler instances from exceeding this map.
     const pairOpenCount = openPositionsByPair.get(signal.paire) || 0;
     if (pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR) { skipped.alreadyOpen += 1; continue; }
+    if (pairOpenCount > 0 && !AUTO_ALLOW_PYRAMIDING) { skipped.pyramidingDisabled += 1; continue; }
     // Hard block here (unlike the manual flow, where this is only advisory) --
     // there's no human to read a correlation warning in an unattended path.
     // Scoped to this slot: a demo position isn't real exposure, so it can't
@@ -2503,7 +2546,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
-  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR, newsCalendarFallback: newsFallback, ...skipped });
+  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR, pyramidingEnabled: AUTO_ALLOW_PYRAMIDING, newsCalendarFallback: newsFallback, ...skipped });
 }
 
 // clampVolumeToSpec both callers below need: round down to the broker's
@@ -2660,11 +2703,14 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
       brokerSlot: slot,
     });
     // The admin's scalp_max_hold_seconds may only shorten the validated
-    // signal's own hold time (30min for both pairs), never extend it past what
+    // signal's own hold time (1h for both pairs), never extend it past what
     // was actually backtested -- same "tighten only" rule as every other
     // admin/user parameter pair this session.
-    const validatedHoldSeconds = signal.maxHoldBars * 60;
-    const holdSeconds = account.scalp_max_hold_seconds > 0 ? Math.min(validatedHoldSeconds, account.scalp_max_hold_seconds) : validatedHoldSeconds;
+    const validatedHoldSeconds = 60 * 60;
+    const configuredHoldSeconds = Number(account.scalp_max_hold_seconds);
+    const holdSeconds = configuredHoldSeconds === 120
+      ? validatedHoldSeconds
+      : configuredHoldSeconds > 0 ? Math.min(validatedHoldSeconds, configuredHoldSeconds) : validatedHoldSeconds;
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
     // Scalp remains trailing-only by default. For a user who explicitly opted
     // into the hybrid experiment, tp1 restores the same fixed mean-reversion
@@ -2993,7 +3039,7 @@ async function handleApi(req, res, url) {
       scalpEnabled: Boolean(Number(row.scalp_enabled)),
       scalpProfitTargetAmount: row.scalp_profit_target_amount ?? null,
       scalpLossLimitAmount: row.scalp_loss_limit_amount ?? null,
-      scalpMaxHoldSeconds: row.scalp_max_hold_seconds ?? null,
+      scalpMaxHoldSeconds: Number(row.scalp_max_hold_seconds) === 120 ? 3600 : (row.scalp_max_hold_seconds ?? null),
       scalpPairs: row.scalp_pairs ? row.scalp_pairs.split(",").filter(Boolean) : [],
       scalpLotMode: row.scalp_lot_mode || "auto",
       scalpFixedLot: row.scalp_fixed_lot ?? null,
@@ -3210,7 +3256,7 @@ async function handleApi(req, res, url) {
     // 3x round-trip cost) would reject nearly every real-world spread anyway.
     const scalpProfitTargetAmount = Math.max(0.3, Math.min(100, Number(body?.scalpProfitTargetAmount) || 1));
     const scalpLossLimitAmount = Math.max(0.3, Math.min(200, Number(body?.scalpLossLimitAmount) || 2));
-    const scalpMaxHoldSeconds = Math.max(5, Math.min(3600, Math.round(Number(body?.scalpMaxHoldSeconds) || 120)));
+    const scalpMaxHoldSeconds = Math.max(5, Math.min(3600, Math.round(Number(body?.scalpMaxHoldSeconds) || 3600)));
     // Restricted to SCALP_PARAMS_BY_PAIR's validated set only -- an admin
     // cannot enable scalp on a pair with no demonstrated edge, unlike the
     // swing bot's approved_pairs which accepts anything in `symbols`.
@@ -4090,6 +4136,9 @@ async function handleApi(req, res, url) {
       minRiskReward: row?.min_risk_reward ?? null,
       demoNewsCalendarFallback: DEMO_NEWS_FALLBACK_ENABLED,
       demoNewsCalendarFallbackMaxRiskPercent: DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT,
+      autoPyramidingEnabled: AUTO_ALLOW_PYRAMIDING,
+      consecutiveLossLimit: AUTO_CONSECUTIVE_LOSS_LIMIT,
+      lossCooldownMinutes: Math.round(AUTO_LOSS_COOLDOWN_MS / 60000),
       tradingHoursStart: row?.trading_hours_start || null,
       tradingHoursEnd: row?.trading_hours_end || null,
       tradingDays: row?.trading_days ? row.trading_days.split(",").filter(Boolean).map(Number) : null,
@@ -4129,7 +4178,7 @@ async function handleApi(req, res, url) {
       scalpFixedLot: row?.scalp_fixed_lot ?? null,
       scalpProfitTargetAmount: row?.scalp_profit_target_amount ?? null,
       scalpLossLimitAmount: row?.scalp_loss_limit_amount ?? null,
-      scalpMaxHoldSeconds: row?.scalp_max_hold_seconds ?? null,
+      scalpMaxHoldSeconds: Number(row?.scalp_max_hold_seconds) === 120 ? 3600 : (row?.scalp_max_hold_seconds ?? null),
       userPaused: Boolean(Number(row?.user_paused)),
       // Two independent books from here down -- demo always available once
       // connected, live gated behind the admin's one-time grant (liveAuthorized)
@@ -6135,8 +6184,8 @@ async function deterministicCrossCheck(pair, livePrice) {
 // worst case once the stop moves is a real, if small, locked-in gain, never a
 // bare breakeven.
 const SCALP_PARAMS_BY_PAIR = {
-  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 30, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
-  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 30, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
+  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 60, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
+  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 60, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
 };
 
 // Same staged trailing stop as SCALP_PARAMS_BY_PAIR above, this time for the
@@ -11805,7 +11854,7 @@ async function checkScalpTimeouts() {
     const credentialsCache = new Map();
     for (const row of rows) {
       const heldSeconds = (Date.now() - new Date(row.sent_at).getTime()) / 1000;
-      const maxHold = Number(row.scalp_max_hold_seconds) || 0;
+      const maxHold = Number(row.scalp_max_hold_seconds) === 120 ? 3600 : Number(row.scalp_max_hold_seconds) || 0;
       if (!maxHold || heldSeconds < maxHold) continue;
       const slot = row.broker_slot || "demo";
       const cacheKey = `${row.user_id}:${slot}`;
@@ -11825,7 +11874,8 @@ async function checkScalpTimeouts() {
         ).catch(() => null);
         if (!latestRow || latestRow.status !== "SENT" || latestRow.analysis_status !== "OPEN" || String(latestRow.broker_order_id) !== String(row.broker_order_id)) continue;
         const latestHeldSeconds = (Date.now() - new Date(latestRow.sent_at).getTime()) / 1000;
-        if (latestHeldSeconds < (Number(latestRow.scalp_max_hold_seconds) || 0)) continue;
+        const latestMaxHold = Number(latestRow.scalp_max_hold_seconds) === 120 ? 3600 : Number(latestRow.scalp_max_hold_seconds) || 0;
+        if (latestHeldSeconds < latestMaxHold) continue;
         const result = await closeBrokerPosition(credentials, latestRow.broker_order_id);
         if (!result.ok) {
           logOnce(`scalp-timeout-${row.analysis_id}`, `fermeture scalp échouée (${result.error})`);

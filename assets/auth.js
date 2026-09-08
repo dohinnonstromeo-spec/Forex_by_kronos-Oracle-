@@ -1522,7 +1522,8 @@
     weekly_loss_limit_percent_reached: "Limite de perte hebdomadaire (%) atteinte -- reprend lundi",
     weekly_loss_limit_amount_reached: "Limite de perte hebdomadaire ($) atteinte -- reprend lundi",
     monthly_loss_limit_percent_reached: "Limite de perte mensuelle (%) atteinte -- reprend le mois prochain",
-    monthly_loss_limit_amount_reached: "Limite de perte mensuelle ($) atteinte -- reprend le mois prochain",
+   monthly_loss_limit_amount_reached: "Limite de perte mensuelle ($) atteinte -- reprend le mois prochain",
+    consecutive_auto_losses_circuit_breaker: "Robot temporairement arrêté après une série de pertes",
     max_concurrent_positions_reached: "Nombre maximum de positions ouvertes déjà atteint",
     max_trades_per_day_reached: "Nombre maximum de trades/jour déjà atteint",
     broker_unreachable: "Broker injoignable au dernier passage (solde non confirmé)",
@@ -1554,7 +1555,8 @@
       if (detail.noSpec) parts.push(`${detail.noSpec} specs broker indisponibles`);
       if (detail.noVolume) parts.push(`${detail.noVolume} taille de position trop petite`);
       if (detail.noFunds) parts.push(`${detail.noFunds} état des fonds broker indisponible`);
-      if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
+     if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
+      if (detail.pyramidingDisabled) parts.push(`${detail.pyramidingDisabled} entrée(s) ignorée(s) : paire déjà ouverte`);
     } else if (reason === "no_signal_meets_confidence_or_rr") {
       if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
@@ -1573,8 +1575,11 @@
       parts.push(`limite ${detail.weeklyLossLimitAmount}`);
     } else if (reason === "monthly_loss_limit_percent_reached") {
       parts.push(`limite ${detail.monthlyLossLimitPercent}%`);
-    } else if (reason === "monthly_loss_limit_amount_reached") {
-      parts.push(`limite ${detail.monthlyLossLimitAmount}`);
+   } else if (reason === "monthly_loss_limit_amount_reached") {
+     parts.push(`limite ${detail.monthlyLossLimitAmount}`);
+    } else if (reason === "consecutive_auto_losses_circuit_breaker") {
+      if (detail.consecutiveLosses != null) parts.push(`${detail.consecutiveLosses}/${detail.lossLimit} pertes consécutives`);
+      if (detail.cooldownUntil) parts.push(`reprise prévue ${formatDate(detail.cooldownUntil)}`);
     } else if (reason === "outside_admin_trading_hours" || reason === "outside_user_trading_hours") {
       if (detail.tradingHoursStart && detail.tradingHoursEnd) parts.push(`${detail.tradingHoursStart}-${detail.tradingHoursEnd} UTC`);
     } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {

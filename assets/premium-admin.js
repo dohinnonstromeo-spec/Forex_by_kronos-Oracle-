@@ -370,7 +370,8 @@
     weekly_loss_limit_percent_reached: "Limite de perte hebdomadaire (%) atteinte",
     weekly_loss_limit_amount_reached: "Limite de perte hebdomadaire ($) atteinte",
     monthly_loss_limit_percent_reached: "Limite de perte mensuelle (%) atteinte",
-    monthly_loss_limit_amount_reached: "Limite de perte mensuelle ($) atteinte",
+   monthly_loss_limit_amount_reached: "Limite de perte mensuelle ($) atteinte",
+    consecutive_auto_losses_circuit_breaker: "Robot arrêté après une série de pertes",
     max_concurrent_positions_reached: "Max positions ouvertes atteint",
     max_trades_per_day_reached: "Max trades/jour atteint",
     broker_unreachable: "Broker injoignable au dernier passage",
@@ -397,7 +398,8 @@
       if (detail.noSpec) parts.push(`${detail.noSpec} specs broker indisponibles`);
       if (detail.noVolume) parts.push(`${detail.noVolume} taille de position trop petite`);
       if (detail.noFunds) parts.push(`${detail.noFunds} état des fonds broker indisponible`);
-      if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
+     if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
+      if (detail.pyramidingDisabled) parts.push(`${detail.pyramidingDisabled} entrée(s) ignorée(s) : paire déjà ouverte`);
     } else if (reason === "no_signal_meets_confidence_or_rr") {
       if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
@@ -416,8 +418,11 @@
       parts.push(`limite ${detail.weeklyLossLimitAmount}`);
     } else if (reason === "monthly_loss_limit_percent_reached") {
       parts.push(`limite ${detail.monthlyLossLimitPercent}%`);
-    } else if (reason === "monthly_loss_limit_amount_reached") {
-      parts.push(`limite ${detail.monthlyLossLimitAmount}`);
+   } else if (reason === "monthly_loss_limit_amount_reached") {
+     parts.push(`limite ${detail.monthlyLossLimitAmount}`);
+    } else if (reason === "consecutive_auto_losses_circuit_breaker") {
+      if (detail.consecutiveLosses != null) parts.push(`${detail.consecutiveLosses}/${detail.lossLimit} pertes consécutives`);
+      if (detail.cooldownUntil) parts.push(`reprise prévue ${formatDate(detail.cooldownUntil)}`);
     } else if (reason === "outside_admin_trading_hours" || reason === "outside_user_trading_hours") {
       if (detail.tradingHoursStart && detail.tradingHoursEnd) parts.push(`${detail.tradingHoursStart}-${detail.tradingHoursEnd} UTC`);
     } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {
@@ -599,8 +604,8 @@
             <label class="dashboard-autotrade-field">Objectif de profit (montant) <span class="dashboard-autotrade-hint">(indicatif -- la vraie cible vient du signal)</span>
               <input type="number" min="0.3" max="100" step="0.1" value="${request.scalpProfitTargetAmount ?? 1}" data-scalp-field="scalpProfitTargetAmount">
             </label>
-            <label class="dashboard-autotrade-field">Durée max de détention (secondes) <span class="dashboard-autotrade-hint">(plafond -- le signal vise 30min)</span>
-              <input type="number" min="5" max="3600" step="5" value="${request.scalpMaxHoldSeconds ?? 120}" data-scalp-field="scalpMaxHoldSeconds">
+            <label class="dashboard-autotrade-field">Durée max de détention (secondes) <span class="dashboard-autotrade-hint">(plafond -- le signal vise 1h)</span>
+              <input type="number" min="5" max="3600" step="5" value="${request.scalpMaxHoldSeconds ?? 3600}" data-scalp-field="scalpMaxHoldSeconds">
             </label>
           </div>
           <div class="premium-admin-actions">
