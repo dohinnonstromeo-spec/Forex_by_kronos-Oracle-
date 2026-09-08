@@ -1598,6 +1598,14 @@ function startLearningOutcomesScheduler() {
 // burns through the same API key quota the rotation fix earlier was trying to
 // stretch further. Concurrent callers now share the one in-flight computation.
 let signalsComputeInFlight = null;
+// The deterministic swing engine is validated on daily candles. This profile is
+// stored separately from the generic outcome history so a cached M1 scalp series
+// can never silently become the swing engine's input.
+const SWING_SIGNAL_HISTORY_OPTIONS = Object.freeze({
+  timeframe: "D1",
+  strategy: "Swing Trading",
+  strictDaily: true,
+});
 
 async function computeSignalsPayload() {
   if (signalsComputeInFlight) return signalsComputeInFlight;
@@ -1605,8 +1613,10 @@ async function computeSignalsPayload() {
     try {
       const prices = await getPrices();
       const market = marketStatus();
-      const histories = await getHistories(prices);
-      await updateLearningOutcomes(prices, histories);
+      const histories = await getHistories(prices, SWING_SIGNAL_HISTORY_OPTIONS);
+      // Outcome reconciliation has its own scheduler with the appropriate
+      // history profile. Do not feed it daily swing candles for scalp outcomes.
+      await updateLearningOutcomes(prices);
       const newsRisk = await economicRiskWindow();
       const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
       const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
@@ -2309,9 +2319,9 @@ function buildAutomaticSignalSnapshot(signal, newsRisk, timeframe = "Auto") {
     history: {
       bars: Number(quality.bars) || 0,
       source: quality.historySource || null,
+      timeframe: quality.historyTimeframe || timeframe,
       asOf: quality.asOf || null,
       stale: Boolean(quality.historyStale),
-      timeframe,
     },
     technical: {
       valid: Boolean(quality.valid),
@@ -2375,12 +2385,18 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   // was set above 0. parseRr already exists for exactly this format elsewhere in
   // the file (inspectSuspiciousLevels) -- just never used here.
   const candidates = signals.filter((s) =>
-    approvedPairs.has(s.paire) && Number(s.confiance) >= minConfidence && (!minRiskReward || parseRr(s.rr) >= minRiskReward),
+    s.direct && !s.suspended
+    && approvedPairs.has(s.paire)
+    && Number(s.confiance) >= minConfidence
+    && (!minRiskReward || parseRr(s.rr) >= minRiskReward),
   );
   if (!candidates.length)
     return recordAutoTradeStatus(userId, slot, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
   const lossStreak = await recentAutoLossStreak(userId, slot);
-  if (lossStreak.blocked)
+  // The consecutive-loss circuit breaker remains mandatory for live trading.
+  // Demo accounts are for observation and strategy validation, so this
+  // production safety control must not silently pause the demo slot.
+  if (slot !== 'demo' && lossStreak.blocked)
     return recordAutoTradeStatus(userId, slot, "consecutive_auto_losses_circuit_breaker", {
       consecutiveLosses: lossStreak.consecutiveLosses,
       lossLimit: AUTO_CONSECUTIVE_LOSS_LIMIT,
@@ -5444,13 +5460,18 @@ async function fetchYahooPrice(symbol) {
   }
 }
 
-async function getHistories(prices) {
-  const usableKey = symbols.map((symbol) => `${symbol}:${prices[symbol]?.source || "none"}:${prices[symbol]?.asOf || ""}`).join("|");
+function historyVariantKey(options = {}) {
+  return options.strictDaily ? "swing_daily" : "default";
+}
+
+async function getHistories(prices, options = {}) {
+  const variant = historyVariantKey(options);
+  const usableKey = `${variant}|${symbols.map((symbol) => `${symbol}:${prices[symbol]?.source || "none"}:${prices[symbol]?.asOf || ""}`).join("|")}`;
   if (memoryCache.histories.value && memoryCache.histories.key === usableKey && Date.now() < memoryCache.histories.expiresAt) {
     return memoryCache.histories.value;
   }
   if (historiesInFlight?.key === usableKey) return historiesInFlight.promise;
-  const promise = loadHistories(prices, usableKey);
+  const promise = loadHistories(prices, usableKey, options);
   historiesInFlight = { key: usableKey, promise };
   try {
     return await promise;
@@ -5459,28 +5480,29 @@ async function getHistories(prices) {
   }
 }
 
-async function loadHistories(prices, usableKey) {
+async function loadHistories(prices, usableKey, options = {}) {
   const cache = await loadMarketCache();
-  const cached = cachedHistories(cache, prices);
+  const cached = cachedHistories(cache, prices, options);
   const cachedCount = Object.values(cached).filter((bars) => Array.isArray(bars) && bars.length >= 30 && !bars._meta?.stale).length;
-  if (cachedCount >= 4) {
+  const minimumCachedCount = historyVariantKey(options) === "swing_daily" ? symbols.length : 4;
+  if (cachedCount >= minimumCachedCount) {
     memoryCache.histories = { key: usableKey, value: cached, expiresAt: Date.now() + 8 * 60 * 1000 };
     return cached;
   }
   if (!TWELVE_DATA_KEYS.length) {
-    const histories = await fetchFreeHistories(cache, prices);
+    const histories = await fetchFreeHistories(cache, prices, options);
     memoryCache.histories = { key: usableKey, value: histories, expiresAt: Date.now() + 15 * 60 * 1000 };
     return histories;
   }
   const entries = await Promise.all(symbols.map(async (symbol) => {
     const price = prices[symbol];
-    if (!price?.open || !isUsableLivePrice(price)) return [symbol, cachedHistory(symbol, cache)];
+    if (!price?.open || !isUsableLivePrice(price)) return [symbol, cachedHistory(symbol, cache, options)];
     const errors = [];
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchBinanceHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `binance:${interval}`, false);
+          tagHistory(bars, `binance:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("binance_history", true);
           return [symbol, bars];
         }
@@ -5489,11 +5511,11 @@ async function loadHistories(prices, usableKey) {
         errors.push(`binance_${interval}:${error.message}`);
       }
     }
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchMassiveHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `massive:${interval}`, false);
+          tagHistory(bars, `massive:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("massive_history", true);
           return [symbol, bars];
         }
@@ -5502,11 +5524,11 @@ async function loadHistories(prices, usableKey) {
         errors.push(`massive_${interval}:${error.message}`);
       }
     }
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchTwelveDataHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `twelve_data:${interval}`, false);
+          tagHistory(bars, `twelve_data:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("twelve_data_history", true);
           return [symbol, bars];
         }
@@ -5515,11 +5537,11 @@ async function loadHistories(prices, usableKey) {
         errors.push(`${interval}:${error.message}`);
       }
     }
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchStooqHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `stooq:${interval}`, false);
+          tagHistory(bars, `stooq:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("stooq_history", true);
           return [symbol, bars];
         }
@@ -5531,7 +5553,7 @@ async function loadHistories(prices, usableKey) {
     try {
       const bars = await fetchDukascopyHistory(symbol);
       if (bars.length >= 30) {
-        tagHistory(bars, "dukascopy:daily", true);
+        tagHistory(bars, "dukascopy:daily", true, null, options.timeframe || null);
         recordProviderHealth("dukascopy_history", true);
         return [symbol, bars];
       }
@@ -5540,13 +5562,10 @@ async function loadHistories(prices, usableKey) {
       errors.push(`dukascopy:${error.message}`);
     }
     recordProviderHealth("twelve_data_history", false, errors.join(" | "));
-    return [symbol, cachedHistory(symbol, cache)];
+    return [symbol, cachedHistory(symbol, cache, options)];
   }));
   const histories = Object.fromEntries(entries);
-  await saveMarketCache({
-    ...cache,
-    histories: mergeCachedHistories(cache.histories || {}, histories),
-  }, { force: true });
+  await saveMarketCache(historyCacheUpdate(cache, histories, options), { force: true });
   memoryCache.histories = { key: usableKey, value: histories, expiresAt: Date.now() + 10 * 60 * 1000 };
   return histories;
 }
@@ -5654,16 +5673,16 @@ function uniqueList(values) {
   return [...new Set(values.filter(Boolean))];
 }
 
-async function fetchFreeHistories(cache, prices) {
+async function fetchFreeHistories(cache, prices, options = {}) {
   const entries = await Promise.all(symbols.map(async (symbol) => {
     const price = prices[symbol];
-    if (!price?.open) return [symbol, cachedHistory(symbol, cache)];
+    if (!price?.open) return [symbol, cachedHistory(symbol, cache, options)];
     const errors = [];
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchBinanceHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `binance:${interval}`, false);
+          tagHistory(bars, `binance:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("binance_history", true);
           return [symbol, bars];
         }
@@ -5672,11 +5691,11 @@ async function fetchFreeHistories(cache, prices) {
         errors.push(`binance_${interval}:${error.message}`);
       }
     }
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchYahooHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `yahoo:${interval}`, false);
+          tagHistory(bars, `yahoo:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("yahoo_history", true);
           return [symbol, bars];
         }
@@ -5685,11 +5704,11 @@ async function fetchFreeHistories(cache, prices) {
         errors.push(`yahoo_${interval}:${error.message}`);
       }
     }
-    for (const interval of historyIntervals(symbol)) {
+    for (const interval of historyIntervals(symbol, options)) {
       try {
         const bars = await fetchStooqHistory(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `stooq:${interval}`, false);
+          tagHistory(bars, `stooq:${interval}`, false, null, options.timeframe || null);
           recordProviderHealth("stooq_history", true);
           return [symbol, bars];
         }
@@ -5701,7 +5720,7 @@ async function fetchFreeHistories(cache, prices) {
     try {
       const bars = await fetchDukascopyHistory(symbol);
       if (bars.length >= 30) {
-        tagHistory(bars, "dukascopy:daily", true);
+        tagHistory(bars, "dukascopy:daily", true, null, options.timeframe || null);
         recordProviderHealth("dukascopy_history", true);
         return [symbol, bars];
       }
@@ -5710,13 +5729,10 @@ async function fetchFreeHistories(cache, prices) {
       errors.push(`dukascopy:${error.message}`);
     }
     recordProviderHealth("free_history", false, errors.join(" | "));
-    return [symbol, cachedHistory(symbol, cache)];
+    return [symbol, cachedHistory(symbol, cache, options)];
   }));
   const histories = Object.fromEntries(entries);
-  await saveMarketCache({
-    ...cache,
-    histories: mergeCachedHistories(cache.histories || {}, histories),
-  }, { force: true });
+  await saveMarketCache(historyCacheUpdate(cache, histories, options), { force: true });
   return histories;
 }
 
@@ -5850,6 +5866,7 @@ async function fetchDukascopyHistory(symbol) {
 }
 
 function historyIntervals(symbol, options = {}) {
+  if (options.strictDaily) return ["1day"];
   const timeframe = normalizeTimeframe(options.timeframe);
   const strategy = String(options.strategy || "");
   if (timeframe === "M1") return ["1min", "5min", "15min"];
@@ -5878,6 +5895,7 @@ function isHistoryCompatible(history, options = {}) {
   const source = String(history?._meta?.source || "");
   const strategy = String(options.strategy || "");
   const timeframe = normalizeTimeframe(options.timeframe);
+  if (options.strictDaily) return historySourceHasInterval(source, ["1day"]);
   if (timeframe === "M1") return historySourceHasInterval(source, ["1min"]);
   if (timeframe === "M5") return historySourceHasInterval(source, ["1min", "5min"]);
   if (timeframe === "M15") {
@@ -6015,16 +6033,26 @@ function massiveLookbackMs(interval = "") {
   return 7 * 24 * 60 * 60 * 1000;
 }
 
-function cachedHistories(cache, prices) {
+function cachedHistories(cache, prices, options = {}) {
   return Object.fromEntries(symbols.map((symbol) => {
     const price = prices[symbol];
-    return [symbol, price?.open && isUsableLivePrice(price) ? cachedHistory(symbol, cache) : []];
+    return [symbol, price?.open && isUsableLivePrice(price) ? cachedHistory(symbol, cache, options) : []];
   }));
 }
 
-function cachedHistory(symbol, cache) {
-  const cached = cache.histories?.[symbol];
+function historyFreshnessTtlMs(options = {}) {
+  // Daily swing candles remain valid for one trading session; intraday outcome
+  // history keeps the shorter freshness window used by the live schedulers.
+  return options.strictDaily ? 6 * 60 * 60 * 1000 : 20 * 60 * 1000;
+}
+
+function cachedHistory(symbol, cache, options = {}) {
+  const variant = historyVariantKey(options);
+  const cached = variant === "default"
+    ? cache.histories?.[symbol]
+    : cache.historyVariants?.[variant]?.[symbol];
   if (!cached || !Array.isArray(cached.bars) || !isRecentCache(cached, 6 * 60 * 60 * 1000)) return [];
+  const freshnessTtlMs = historyFreshnessTtlMs(options);
   const bars = cached.bars
     .map((bar) => ({ close: Number(bar.close), high: Number(bar.high), low: Number(bar.low), datetime: bar.datetime }))
     .filter((bar) => Number.isFinite(bar.close));
@@ -6033,13 +6061,19 @@ function cachedHistory(symbol, cache) {
   // otherwise mergeCachedHistories below persists that fresh-looking stamp right back
   // to the cache, and under regular traffic the history (SMA/RSI/support-resistance
   // all derive from it) could freeze indefinitely without ever being re-fetched.
-  tagHistory(bars, `cache:${cached.source || "history"}`, !isRecentCache(cached, 20 * 60 * 1000), cached.asOf);
+  tagHistory(
+    bars,
+    `cache:${cached.source || "history"}`,
+    !isRecentCache(cached, freshnessTtlMs),
+    cached.asOf,
+    cached.timeframe || options.timeframe || null,
+  );
   return bars;
 }
 
-function tagHistory(bars, source, stale, asOf) {
+function tagHistory(bars, source, stale, asOf, timeframe = null) {
   Object.defineProperty(bars, "_meta", {
-    value: { source, stale, asOf: asOf || new Date().toISOString() },
+    value: { source, stale, asOf: asOf || new Date().toISOString(), timeframe: timeframe || null },
     enumerable: false,
   });
   return bars;
@@ -6067,7 +6101,13 @@ function computeDeterministicSignal(symbol, price, history) {
     if (!isUsableLivePrice(price)) return inactive("Analyse auto suspendue · donnée non fiable ou fallback.");
     const dataQuality = assessSignalDataQuality(price, history);
     if (dataQuality.score < 70) return cautiousSignal(symbol, price, base, `Fiabilité données insuffisante (${dataQuality.score}%, grade ${dataQuality.grade}) · aucun signal direct validé.`, history);
-    if (history.length < 50) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
+    if (history._meta?.timeframe !== "D1" || !historySourceHasInterval(history._meta?.source, ["1day"])) {
+      return cautiousSignal(symbol, price, base, "Historique swing incompatible · le signal direct exige des bougies journalières.", history);
+    }
+    // The backtest starts only after 60 completed bars so the Wilder RSI and
+    // SMA30 are stable. Keeping 50 here created a live-only warm-up zone that
+    // had never been validated historically.
+    if (history.length < 60) return cautiousSignal(symbol, price, base, "Historique insuffisant · aucun signal direct validé.", history);
     if (PAIRS_WITHOUT_VALIDATED_EDGE.has(symbol)) {
       // Two genuinely different findings share this gate -- said honestly
       // rather than reusing one generic reason for both (GBP/JPY's original
@@ -6369,6 +6409,7 @@ function qualityPayload(price, history, valid, reason) {
     grade: reliability.grade,
     blockers: reliability.blockers,
     historySource: history._meta?.source || (history.length ? "twelve_data" : "none"),
+    historyTimeframe: history._meta?.timeframe || null,
     historyStale: Boolean(history._meta?.stale),
     bars: history.length,
     asOf: price.asOf,
@@ -9253,6 +9294,7 @@ async function loadMarketCache() {
       version: 1,
       prices: fromState.prices && typeof fromState.prices === "object" ? fromState.prices : {},
       histories: fromState.histories && typeof fromState.histories === "object" ? fromState.histories : {},
+      historyVariants: fromState.historyVariants && typeof fromState.historyVariants === "object" ? fromState.historyVariants : {},
       updatedAt: fromState.updatedAt || null,
     };
     return memoryCache.marketDocument;
@@ -9264,18 +9306,20 @@ async function loadMarketCache() {
       version: 1,
       prices: parsed.prices && typeof parsed.prices === "object" ? parsed.prices : {},
       histories: parsed.histories && typeof parsed.histories === "object" ? parsed.histories : {},
+      historyVariants: parsed.historyVariants && typeof parsed.historyVariants === "object" ? parsed.historyVariants : {},
       updatedAt: parsed.updatedAt || null,
     };
     return memoryCache.marketDocument;
   } catch {
-    memoryCache.marketDocument = { version: 1, prices: {}, histories: {}, updatedAt: null };
+    memoryCache.marketDocument = { version: 1, prices: {}, histories: {}, historyVariants: {}, updatedAt: null };
     return memoryCache.marketDocument;
   }
 }
 
 const MARKET_CACHE_PERSIST_INTERVAL_MS = boundedEnvNumber(env.MARKET_CACHE_PERSIST_INTERVAL_SECONDS, 600, 60, 86400) * 1000;
 async function saveMarketCache(cache, { force = false } = {}) {
-  const current = memoryCache.marketDocument || { prices: {}, histories: {} };
+  const current = memoryCache.marketDocument || { prices: {}, histories: {}, historyVariants: {} };
+  const mergedHistoryVariants = mergeHistoryVariantDocuments(current.historyVariants || {}, cache.historyVariants || {});
   const trimmed = {
     version: 1,
     // Price and history refreshes can overlap. Merge symbol maps so an older
@@ -9283,9 +9327,19 @@ async function saveMarketCache(cache, { force = false } = {}) {
     prices: { ...(current.prices || {}), ...(cache.prices || {}) },
     histories: Object.fromEntries(Object.entries({ ...(current.histories || {}), ...(cache.histories || {}) }).map(([symbol, history]) => [symbol, {
       source: history.source,
+      timeframe: history.timeframe || null,
       asOf: history.asOf,
       bars: Array.isArray(history.bars) ? history.bars.slice(-80) : [],
     }])),
+    historyVariants: Object.fromEntries(Object.entries(mergedHistoryVariants).map(([variant, histories]) => [
+      variant,
+      Object.fromEntries(Object.entries(histories || {}).map(([symbol, history]) => [symbol, {
+        source: history.source,
+        timeframe: history.timeframe || null,
+        asOf: history.asOf,
+        bars: Array.isArray(history.bars) ? history.bars.slice(-80) : [],
+      }])),
+    ])),
     updatedAt: new Date().toISOString(),
   };
   memoryCache.marketDocument = trimmed;
@@ -9316,12 +9370,37 @@ function mergeCachedPrices(existing, prices) {
   return next;
 }
 
-function mergeCachedHistories(existing, histories) {
+function mergeHistoryVariantDocuments(existing, incoming) {
+  const next = { ...(existing || {}) };
+  for (const [variant, histories] of Object.entries(incoming || {})) {
+    next[variant] = { ...(next[variant] || {}), ...(histories || {}) };
+  }
+  return next;
+}
+
+function historyCacheUpdate(cache, histories, options = {}) {
+  const variant = historyVariantKey(options);
+  if (variant === "default") {
+    return {
+      ...cache,
+      histories: mergeCachedHistories(cache.histories || {}, histories, options),
+    };
+  }
+  return {
+    ...cache,
+    historyVariants: mergeHistoryVariantDocuments(cache.historyVariants || {}, {
+      [variant]: mergeCachedHistories(cache.historyVariants?.[variant] || {}, histories, options),
+    }),
+  };
+}
+
+function mergeCachedHistories(existing, histories, options = {}) {
   const next = { ...existing };
   for (const [symbol, bars] of Object.entries(histories)) {
     if (Array.isArray(bars) && bars.length >= 30 && !bars._meta?.stale) {
       next[symbol] = {
         source: bars._meta?.source || "twelve_data",
+        timeframe: bars._meta?.timeframe || options.timeframe || null,
         // Same root cause as pricePayload's asOf bug: this used to always stamp "now",
         // including when the bars being "merged" back in were just a reused cache
         // read (see cachedHistory/tagHistory above) rather than a genuine fresh fetch.

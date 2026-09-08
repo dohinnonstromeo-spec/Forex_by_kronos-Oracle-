@@ -1117,6 +1117,31 @@ check(
     && serverSource.includes('trailing_last_requested_stop = ?')
     && serverSource.includes('trailing_last_success_at = ?'),
 );
+check(
+  'swing signal history is strictly daily and isolated from scalp history',
+  serverSource.includes('strictDaily: true')
+    && serverSource.includes('timeframe: "D1"')
+    && serverSource.includes('historyVariantKey(options)')
+    && serverSource.includes('historyVariants')
+    && serverSource.includes('if (options.strictDaily) return ["1day"];'),
+);
+check(
+  'swing signal history rejects an intraday timeframe before entry',
+  serverSource.includes('history._meta?.timeframe !== "D1"')
+    && serverSource.includes('historySourceHasInterval(history._meta?.source, ["1day"])')
+    && serverSource.includes('if (history.length < 60)'),
+);
+check(
+  'autonomous execution has a second direct-signal guard',
+  serverSource.includes('s.direct && !s.suspended')
+    && serverSource.includes('approvedPairs.has(s.paire)'),
+);
+
+check(
+  'demo accounts bypass only the consecutive-loss circuit breaker',
+  serverSource.includes(`slot !== 'demo' && lossStreak.blocked`)
+    && serverSource.includes('consecutive_auto_losses_circuit_breaker'),
+);
 
 console.log(`
 ${pass} passed, ${fail} failed.`);
