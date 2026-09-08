@@ -623,6 +623,7 @@ const serviceWorkerSource = await readFile(new URL("../sw.js", import.meta.url),
 const frontendHtmlSources = await Promise.all(
   ["index.html", "analyse.html", "dashboard.html", "legal.html", "404.html", "paiement.html", "admin-contenu.html", "admin-health.html", "premium-admin.html"].map((file) => readFile(new URL("../" + file, import.meta.url), "utf8")),
 );
+const frontendStylesSource = await readFile(new URL("../assets/oracle-extras.css", import.meta.url), "utf8");
 check("frontend analysis refresh is single-flight", frontendAnalyseSource.includes("let signalsRefreshInFlight = false") && frontendAnalyseSource.includes("if (signalsRefreshInFlight) return"));
 check("homepage live refreshes are single-flight", frontendHomeSource.includes("let pricesRefreshInFlight = false") && frontendHomeSource.includes("let signalsRefreshInFlight = false") && frontendHomeSource.includes("let signalScoresRefreshInFlight = false"));
 check(
@@ -669,7 +670,14 @@ check("chat and analysis previews stay lazy", frontendChatSource.includes('loadi
 check("public and internal pages expose skip links", frontendHtmlSources.every((source) => source.includes('class="oracle-skip-link"') && source.includes('id="main-content"')));
 check(
   "user-facing sources contain no replacement or common mojibake characters",
-  [...frontendHtmlSources, authClientSource, ...boundedFrontendSources, serviceWorkerSource].every((source) => !/[\uFFFD\u00C3\u00C2\u00E2\u00F0]/.test(source)),
+  [...frontendHtmlSources, authClientSource, ...boundedFrontendSources, serviceWorkerSource, frontendStylesSource].every((source) => !/[\uFFFD\u00C3\u00C2\u00E2\u00F0]/.test(source)),
+);
+check(
+  "frontend pages declare UTF-8 and keep readable theme tokens",
+  frontendHtmlSources.every((source) => /<meta\s+charset=["']utf-8["']/i.test(source))
+    && frontendStylesSource.includes('--font-display: "Space Grotesk"')
+    && frontendStylesSource.includes('--font-sans: "Manrope"')
+    && frontendStylesSource.includes('--text-secondary: #d3dbe8'),
 );
 check("forms declare an HTTP method", frontendHtmlSources.concat(privateHtmlSources).every((source) => !/<form\\b(?![^>]*\\bmethod=)[^>]*>/i.test(source)));
 check("private pages keep noindex", privateHtmlSources.every((source) => source.includes('name="robots" content="noindex, nofollow"')));

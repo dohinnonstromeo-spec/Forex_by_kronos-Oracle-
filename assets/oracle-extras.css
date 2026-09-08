@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Montserrat:wght@400;500;600;700;800&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=Space+Mono:wght@400;700&display=swap");
 
 .badge-start-clickable {
   justify-content: flex-start;
@@ -10,20 +10,23 @@
 }
 
 :root {
-  /* Site-wide font swap: Montserrat replaces Syne (headings, via --font-display) and
-     the React bundle's own --font-sans (body text) -- both custom properties are
+  /* Site-wide font swap: Space Grotesk handles headings and Manrope handles body
+     text. Both custom properties are
      redefined here rather than editing the generated Tailwind bundle
      (assets/styles-nTlncI0E.css) directly, and this file loads after that bundle in
      both index.html and analyse.html so these definitions win the cascade. --font-mono
      stays Space Mono: numeric columns (price grids, SL/TP levels) rely on fixed-width
-     digits for alignment, which Montserrat (not monospace) would break. */
-  --font-display: "Montserrat", ui-sans-serif, system-ui, sans-serif;
-  --font-sans: "Montserrat", ui-sans-serif, system-ui, sans-serif;
+     digits for alignment, which proportional fonts would break. */
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --background: oklch(13% .03 265);
   --foreground: oklch(96% .01 240);
   --card: oklch(18% .04 265);
-  --muted-foreground: oklch(74% .03 245);
+  --muted-foreground: oklch(80% .025 245);
+  --text-primary: #f6f8fb;
+  --text-secondary: #d3dbe8;
+  --text-tertiary: #aebacc;
   /* The hue values below used to be a cyan (85% .18 210) and a violet (55% .25 295)
      instead of amber/orange (confirmed via an audit this session: converted to
      sRGB they were rgb(0,235,255) and rgb(131,58,240)). The generated Tailwind
@@ -48,7 +51,7 @@
   --shadow-card: 0 24px 80px rgba(0, 0, 0, .36);
   --shadow-glow-amber: 0 0 26px oklch(81% .16 78 / .34);
   --oracle-panel: rgba(14, 19, 34, .78);
-  --oracle-border: rgba(180, 230, 255, .13);
+  --oracle-border: rgba(180, 230, 255, .19);
   --oracle-gradient: linear-gradient(135deg, oklch(81% .16 78), oklch(78% .18 60));
 
   /* Spacing/radius scale -- introduced to stop new components from picking
@@ -4356,6 +4359,81 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .dashboard-disclosure-summary::after {
     transition: none;
+  }
+}
+
+/* Readability baseline: keep the premium dark theme, but make body copy and
+   secondary metadata readable without relying on a bright screen. */
+.oracle-page {
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  text-rendering: optimizeLegibility;
+}
+
+.oracle-page :is(button, input, select, textarea) {
+  font-family: var(--font-sans);
+}
+
+.oracle-page :is(
+  .analysis-subtitle,
+  .auth-hint,
+  .auth-switch,
+  .dashboard-card p,
+  .dashboard-history-note,
+  .dashboard-history-meta,
+  .dashboard-empty,
+  .dashboard-trade-note,
+  .dashboard-autotrade-hint,
+  .dashboard-status-card > div > span,
+  .dashboard-status-card > div > small,
+  .dashboard-status-feed span,
+  .admin-hero-subtitle,
+  .admin-stat-meta,
+  .admin-section-note,
+  .health-empty,
+  .health-provider-meta,
+  .health-cache-meta,
+  .health-recommendation,
+  .payment-note
+) {
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.oracle-page :is(
+  .analysis-field label,
+  .auth-form label,
+  .dashboard-card span,
+  .dashboard-metrics span,
+  .dashboard-history span,
+  .admin-stat-label
+) {
+  color: var(--text-tertiary);
+}
+
+.oracle-page :is(input, select, textarea) {
+  color: var(--text-primary);
+}
+
+.oracle-page ::placeholder {
+  color: var(--text-tertiary);
+  opacity: 1;
+}
+
+.oracle-page select option {
+  background: #101827;
+  color: var(--text-primary);
+}
+
+@media (prefers-contrast: more) {
+  .oracle-page {
+    --oracle-border: rgba(210, 232, 255, .42);
+    --text-secondary: #e2e8f0;
+    --text-tertiary: #c5d0df;
+  }
+
+  .oracle-page :is(.analysis-card, .auth-card, .dashboard-card, .dashboard-panel, .payment-method-card) {
+    border-color: var(--oracle-border);
   }
 }
 
