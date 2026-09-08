@@ -2384,8 +2384,11 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   // min_risk_reward or a user's own preference, both real, live-settable fields)
   // was set above 0. parseRr already exists for exactly this format elsewhere in
   // the file (inspectSuspiciousLevels) -- just never used here.
+  // Calendar fallback signals deliberately carry direct=false so the UI can
+  // show that the economic feed is unavailable. They may enter the demo-only
+  // recovery path only when the explicit fallback flag was already accepted.
   const candidates = signals.filter((s) =>
-    s.direct && !s.suspended
+    ((s.direct && !s.suspended) || (newsFallback && s.calendarFallbackEligible))
     && approvedPairs.has(s.paire)
     && Number(s.confiance) >= minConfidence
     && (!minRiskReward || parseRr(s.rr) >= minRiskReward),

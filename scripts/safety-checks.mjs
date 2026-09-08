@@ -1143,6 +1143,12 @@ check(
     && serverSource.includes('consecutive_auto_losses_circuit_breaker'),
 );
 
+check(
+  'demo calendar fallback bypasses only the direct-signal guard',
+  serverSource.includes('newsFallback && s.calendarFallbackEligible')
+    && serverSource.includes('((s.direct && !s.suspended) || (newsFallback && s.calendarFallbackEligible))'),
+);
+
 console.log(`
 ${pass} passed, ${fail} failed.`);
 if (fail) process.exit(1);
