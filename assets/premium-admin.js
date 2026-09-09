@@ -335,6 +335,14 @@
   // `symbols` const) -- offering any other pair here would let an admin "approve"
   // something the bot can never act on.
   const AUTOTRADE_PAIRS = ["EUR/USD", "XAU/USD", "BTC/USD", "GBP/JPY", "US500", "ETH/USD", "USD/JPY", "USD/CHF"];
+  const AUTOTRADE_ANALYSIS_STYLES = [
+    { value: "legacy_momentum", label: "Compatibilit\u00e9 actuelle (SMA/RSI)" },
+    { value: "price_action", label: "Price Action (exp\u00e9rimental)" },
+    { value: "ichimoku", label: "Ichimoku (exp\u00e9rimental)" },
+    { value: "smc", label: "SMC (exp\u00e9rimental)" },
+    { value: "wyckoff", label: "Wyckoff (volume requis)" },
+    { value: "mixte", label: "Mixte (2 confirmations minimum)" },
+  ];
   // Only pairs with a real, backtested mean-reversion edge (see
   // scripts/backtest-scalp-fx-meanrev.mjs) -- deliberately a much shorter list
   // than AUTOTRADE_PAIRS above, and the server rejects anything else anyway.
@@ -380,6 +388,8 @@
     opened_trade: "Position ouverte au dernier passage",
     no_valid_setup_this_tick: "Signal(s) repéré(s), aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement",
+    no_style_evidence_this_tick: "Aucune preuve suffisante pour le style choisi",
+    experimental_style_live_disabled: "Style experimental bloque en reel",
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché (normal)",
     another_execution_instance_running: "Passage ignoré : une autre exécution occupait le verrou, nouvel essai automatique",
   };
@@ -508,6 +518,14 @@
               ${escapeHtml(pair)}
             </label>
           `).join("")}
+        </div>
+        <div class="dashboard-autotrade-form">
+          <label class="dashboard-autotrade-field">Style d'analyse du robot
+            <select data-field="analysisStyle">
+              ${AUTOTRADE_ANALYSIS_STYLES.map((style) => `<option value="${style.value}" ${style.value === (request.analysisStyle || "legacy_momentum") ? "selected" : ""}>${style.label}</option>`).join("")}
+            </select>
+            <span class="dashboard-autotrade-hint">Le mode legacy reste le choix par d\u00e9faut. Les autres modes exigent des preuves techniques r\u00e9elles.</span>
+          </label>
         </div>
         <div class="dashboard-autotrade-form">
           <label class="dashboard-autotrade-field">Durée (jours)
@@ -643,6 +661,7 @@
           token, userId, pairs, tradingDays,
           days: field("days"), riskPercent: field("riskPercent"), dailyLossLimitPercent: field("dailyLossLimitPercent"),
           maxConcurrentPositions: field("maxConcurrentPositions"), minConfidenceFloor: field("minConfidenceFloor"),
+          analysisStyle: card.querySelector('[data-field="analysisStyle"]')?.value || "legacy_momentum",
           maxTradesPerDay: field("maxTradesPerDay"), minRiskReward: field("minRiskReward"), dailyLossLimitAmount: field("dailyLossLimitAmount"),
           weeklyLossLimitPercent: field("weeklyLossLimitPercent"), weeklyLossLimitAmount: field("weeklyLossLimitAmount"),
           monthlyLossLimitPercent: field("monthlyLossLimitPercent"), monthlyLossLimitAmount: field("monthlyLossLimitAmount"),

@@ -1532,6 +1532,8 @@
     opened_trade: "Position ouverte lors de la dernière évaluation",
     no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
+    no_style_evidence_this_tick: "Aucune preuve suffisante pour le style choisi",
+    experimental_style_live_disabled: "Style experimental bloque en reel jusqu'a validation explicite",
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché à cet instant -- normal, pas une erreur",
     economic_calendar_unavailable: "Calendrier économique indisponible : aucune position automatique autorisée",
     another_execution_instance_running: "Passage ignoré : une autre exécution occupait le verrou, nouvel essai automatique",
@@ -1585,6 +1587,9 @@
     } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {
       if (detail.tradingDays) parts.push(`jours autorisés : ${String(detail.tradingDays).split(",").map((d) => TICK_DAY_NAMES[Number(d)]).join(", ")}`);
     }
+    if (detail?.analysisStyle && (reason === "no_signal_meets_confidence_or_rr" || reason === "no_valid_setup_this_tick")) {
+      parts.push("style: " + detail.analysisStyle);
+    }
     return parts.length ? ` [${parts.join(", ")}]` : "";
   }
 
@@ -1601,6 +1606,15 @@
     const label = AUTOTRADE_TICK_REASON_LABELS[lastTick.reason] || lastTick.reason;
     return `${label}${formatTickDetail(lastTick.reason, lastTick.detail)} (${formatDate(lastTick.at)})`;
   }
+
+  const AUTO_ANALYSIS_STYLE_LABELS = {
+    legacy_momentum: "Legacy SMA/RSI",
+    price_action: "Price Action",
+    ichimoku: "Ichimoku",
+    smc: "SMC",
+    wyckoff: "Wyckoff",
+    mixte: "Mixte",
+  };
 
   async function refreshAutoTradeStatus() {
     const status = await fetchJson("/api/auto-trade/status");
@@ -1670,7 +1684,7 @@
       if (statusText) {
         statusText.textContent = status.userPaused
           ? `En pause (approuvé jusqu'au ${until}).`
-          : `Actif jusqu'au ${until} · paires : ${status.approvedPairs.join(", ") || "aucune"} · risque ${status.riskPercent}% par trade.`;
+          : `Actif jusqu'au ${until} · paires : ${status.approvedPairs.join(", ") || "aucune"} · style : ${AUTO_ANALYSIS_STYLE_LABELS[status.analysisStyle] || "Legacy SMA/RSI"} · risque ${status.riskPercent}% par trade.`;
       }
       if (pauseButton) pauseButton.hidden = status.userPaused;
       if (resumeButton) resumeButton.hidden = !status.userPaused;

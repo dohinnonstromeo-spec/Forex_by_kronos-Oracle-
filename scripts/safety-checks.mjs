@@ -9,6 +9,12 @@
 // quick mode based on the same false signal.
 //
 import { readFile } from "node:fs/promises";
+import {
+  DEFAULT_AUTO_ANALYSIS_STYLE,
+  buildStyleSignal,
+  isExperimentalAutoAnalysisStyle,
+  normalizeAutoAnalysisStyle,
+} from "../strategy-engines.mjs";
 
 // Standalone on purpose, same reason as scripts/backtest.mjs: importing server.mjs
 // starts a real HTTP server as a side effect. The functions below are copied from
@@ -502,6 +508,8 @@ const serverSource = await readFile(new URL("../server.mjs", import.meta.url), "
 const ciSource = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const apiTestSource = await readFile(new URL("../scripts/api-tests.mjs", import.meta.url), "utf8");
 const readmeSource = await readFile(new URL("../README.md", import.meta.url), "utf8");
+const backtestStyleSource = await readFile(new URL("../scripts/backtest-analysis-styles.mjs", import.meta.url), "utf8");
+const packageSource = await readFile(new URL("../package.json", import.meta.url), "utf8");
 check("Render runbook documents broker encryption, push keys and readiness", readmeSource.includes("BROKER_CREDENTIALS_ENCRYPTION_KEY") && readmeSource.includes("VAPID_PUBLIC_KEY") && readmeSource.includes("VAPID_PRIVATE_KEY") && readmeSource.includes("/api/ready"));
 check("durable auto-trade lease table exists", /CREATE TABLE IF NOT EXISTS auto_trade_leases/.test(serverSource));
 check("lease acquisition uses an expiry condition", /async function tryAcquireLease[\s\S]{0,600}\$\{table\} SET[\s\S]{0,300}lease_until < \?/.test(serverSource));
@@ -1155,6 +1163,48 @@ check(
   'demo calendar fallback bypasses only the direct-signal guard',
   serverSource.includes('newsFallback && s.calendarFallbackEligible')
     && serverSource.includes('((s.direct && !s.suspended) || (newsFallback && s.calendarFallbackEligible))'),
+);
+
+check(
+  'autonomous strategy selection is explicit and legacy-compatible',
+  normalizeAutoAnalysisStyle("legacy_momentum") === DEFAULT_AUTO_ANALYSIS_STYLE
+    && normalizeAutoAnalysisStyle("not-a-style") === null
+    && serverSource.includes("analysis_style text NOT NULL DEFAULT 'legacy_momentum'")
+    && serverSource.includes("normalizeAutoAnalysisStyle(account.analysis_style) || DEFAULT_AUTO_ANALYSIS_STYLE"),
+);
+check(
+  'experimental styles cannot silently trade live',
+  isExperimentalAutoAnalysisStyle("price_action")
+    && !isExperimentalAutoAnalysisStyle("legacy_momentum")
+    && serverSource.includes("experimental_style_live_disabled")
+    && serverSource.includes("ALLOW_EXPERIMENTAL_AUTO_STYLES"),
+);
+check(
+  'strategy evidence is persisted and not cosmetic',
+  serverSource.includes("buildStyleSignalSet(style, prices, histories, symbols)")
+    && serverSource.includes("styleEvidence")
+    && serverSource.includes("analysisStyle: signal?.style || DEFAULT_AUTO_ANALYSIS_STYLE")
+    && serverSource.includes('style: "Signal automatique (bot) - " + autoAnalysisStyleLabel(analysisStyle)'),
+);
+check(
+  'Wyckoff fails closed when volume is unavailable',
+  buildStyleSignal(
+    "wyckoff",
+    "XAU/USD",
+    { price: 2000 },
+    Array.from({ length: 60 }, (_, index) => ({
+      open: 2000,
+      high: 2001 + index * 0.01,
+      low: 1999 - index * 0.01,
+      close: 2000,
+    })),
+  ) === null,
+);
+check(
+  'style backtest is wired to the same pure engines',
+  backtestStyleSource.includes("buildStyleSignal")
+    && backtestStyleSource.includes("70% train / 30% held-out test")
+    && packageSource.includes("backtest:styles"),
 );
 
 console.log(`

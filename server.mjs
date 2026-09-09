@@ -8,6 +8,14 @@ import { createGzip, createBrotliCompress, brotliCompressSync, gzipSync } from "
 import { DatabaseSync } from "node:sqlite";
 import pg from "pg";
 import webpush from "web-push";
+import {
+  DEFAULT_AUTO_ANALYSIS_STYLE,
+  EXPERIMENTAL_AUTO_ANALYSIS_STYLES,
+  autoAnalysisStyleLabel,
+  buildStyleSignalSet,
+  isExperimentalAutoAnalysisStyle,
+  normalizeAutoAnalysisStyle,
+} from "./strategy-engines.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
@@ -422,6 +430,7 @@ async function ensureRelationalTablesImpl() {
       reject_reason text,
       approved_until text,
       approved_pairs text,
+      analysis_style text NOT NULL DEFAULT 'legacy_momentum',
       risk_percent real,
       daily_loss_limit_percent real,
       max_concurrent_positions integer,
@@ -547,6 +556,9 @@ async function ensureRelationalTablesImpl() {
   await ensureColumn("auto_trading_accounts", "trading_hours_end text");
   await ensureColumn("auto_trading_accounts", "trading_days text");
   await ensureColumn("auto_trading_accounts", "daily_loss_limit_amount real");
+  // Existing accounts stay on the production-tested engine until an admin
+  // explicitly selects another strategy family.
+  await ensureColumn("auto_trading_accounts", "analysis_style text NOT NULL DEFAULT 'legacy_momentum'");
   // Insufficiency #4 from an engine audit: the daily cap above resets to zero
   // every UTC midnight, so nothing stopped hitting it 5 days running and
   // losing a real cumulative amount while each individual day still looked
@@ -1619,7 +1631,11 @@ async function computeSignalsPayload() {
       await updateLearningOutcomes(prices);
       const newsRisk = await economicRiskWindow();
       const signals = applyNewsRisk(buildDeterministicSignals(prices, histories), newsRisk);
-      const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, cached: false };
+      const styleSignals = Object.fromEntries(EXPERIMENTAL_AUTO_ANALYSIS_STYLES.map((style) => [
+        style,
+        applyNewsRisk(buildValidatedStyleSignals(style, prices, histories), newsRisk),
+      ]));
+      const payload = { generatedAt: new Date().toISOString(), market, newsRisk, signals, styleSignals, cached: false };
       memoryCache.signals = { value: payload, expiresAt: Date.now() + signalCacheTtlMs(signals, newsRisk) };
       // Fire-and-forget: a slow/failing push send must never delay the signals
       // response itself, which is on the hot path for every visitor on the site.
@@ -1732,6 +1748,10 @@ const DEMO_NEWS_FALLBACK_MAX_RISK_PERCENT = boundedEnvNumber(
   0.01,
   1,
 );
+// New evidence engines are explicitly selectable in demo. Live use requires
+// a deliberate environment switch after the operator has reviewed their own
+// walk-forward results; existing legacy live behavior is unchanged.
+const ALLOW_EXPERIMENTAL_AUTO_STYLES_IN_LIVE = env.ALLOW_EXPERIMENTAL_AUTO_STYLES === "true";
 function demoNewsFallbackAllowed(slot, newsRisk) {
   return slot === "demo" && DEMO_NEWS_FALLBACK_ENABLED && newsRisk?.status === "unavailable";
 }
@@ -1879,14 +1899,39 @@ async function runAutoTradeTick() {
   const stale = !cached || Date.now() >= memoryCache.signals.expiresAt;
   const payload = stale ? await computeSignalsPayload() : cached;
   const tradable = (payload?.signals || []).filter((s) => s.direct && !s.suspended);
+  const styleSignals = payload?.styleSignals || {};
+  const tradableStyles = Object.fromEntries(Object.entries(styleSignals).map(([style, signals]) => [
+    style,
+    (signals || []).filter((signal) => signal.direct && !signal.suspended),
+  ]));
   const calendarFallbackSignals = calendarFallbackSignalsFromPayload(payload);
-  if (!tradable.length && !calendarFallbackSignals.length) {
+  const anyStyleSignal = Object.values(tradableStyles).some((signals) => signals.length > 0);
+  if (!tradable.length && !anyStyleSignal && !calendarFallbackSignals.length) {
     for (const account of accounts) for (const slot of activeBrokerSlots(account)) recordAutoTradeStatus(account.user_id, slot, "no_tradable_market_signals_this_tick");
     return;
   }
   for (const account of accounts) {
     for (const slot of activeBrokerSlots(account)) {
-      const slotSignals = demoNewsFallbackAllowed(slot, payload?.newsRisk) ? calendarFallbackSignals : tradable;
+      const analysisStyle = normalizeAutoAnalysisStyle(account.analysis_style) || DEFAULT_AUTO_ANALYSIS_STYLE;
+      if (isExperimentalAutoAnalysisStyle(analysisStyle) && slot !== "demo" && !ALLOW_EXPERIMENTAL_AUTO_STYLES_IN_LIVE) {
+        recordAutoTradeStatus(account.user_id, slot, "experimental_style_live_disabled", {
+          analysisStyle,
+          requiredSetting: "ALLOW_EXPERIMENTAL_AUTO_STYLES",
+        });
+        continue;
+      }
+      const configuredSignals = analysisStyle === DEFAULT_AUTO_ANALYSIS_STYLE
+        ? tradable
+        : (tradableStyles[analysisStyle] || []);
+      if (!configuredSignals.length && analysisStyle !== DEFAULT_AUTO_ANALYSIS_STYLE) {
+        recordAutoTradeStatus(account.user_id, slot, "no_style_evidence_this_tick", { analysisStyle });
+      }
+      // Calendar fallback is intentionally limited to the legacy engine. An
+      // unavailable news feed must never make an experimental style look
+      // confirmed when its own evidence set is empty.
+      const slotSignals = analysisStyle === DEFAULT_AUTO_ANALYSIS_STYLE && demoNewsFallbackAllowed(slot, payload?.newsRisk)
+        ? calendarFallbackSignals
+        : configuredSignals;
       const leaseToken = await tryAcquireAutoTradeLease(account.user_id, slot);
       if (!leaseToken) {
         recordAutoTradeStatus(account.user_id, slot, "another_execution_instance_running");
@@ -2330,6 +2375,10 @@ function buildAutomaticSignalSnapshot(signal, newsRisk, timeframe = "Auto") {
       confirmations: Number(signal?.indicators?.confluence) || 0,
       rsi: Number.isFinite(Number(signal?.indicators?.rsi)) ? Number(signal.indicators.rsi) : null,
       volatility: null,
+      analysisStyle: signal?.style || DEFAULT_AUTO_ANALYSIS_STYLE,
+      styleScore: Number(signal?.styleScore) || null,
+      evidence: Array.isArray(signal?.styleEvidence) ? signal.styleEvidence : [],
+      methodVersion: signal?.styleVersion || "legacy-v1",
     },
     multiTimeframe: [],
     news: {
@@ -2357,7 +2406,14 @@ function automaticSignalDecisionReasons(signal, newsRisk) {
 
 async function processAutoTradeForUser(account, signals, slot, newsRisk = null) {
   const userId = account.user_id;
-  const newsFallback = demoNewsFallbackAllowed(slot, newsRisk);
+  const analysisStyle = normalizeAutoAnalysisStyle(account.analysis_style) || DEFAULT_AUTO_ANALYSIS_STYLE;
+  if (isExperimentalAutoAnalysisStyle(analysisStyle) && slot !== "demo" && !ALLOW_EXPERIMENTAL_AUTO_STYLES_IN_LIVE) {
+    return recordAutoTradeStatus(userId, slot, "experimental_style_live_disabled", {
+      analysisStyle,
+      requiredSetting: "ALLOW_EXPERIMENTAL_AUTO_STYLES",
+    });
+  }
+  const newsFallback = analysisStyle === DEFAULT_AUTO_ANALYSIS_STYLE && demoNewsFallbackAllowed(slot, newsRisk);
   // Defense in depth: no autonomous swing order is allowed without a successful
   // calendar check, even if a future caller forgets to pass the news context.
   if ((!newsRisk || newsRisk.status !== 'ok') && !newsFallback) {
@@ -2389,12 +2445,20 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   // recovery path only when the explicit fallback flag was already accepted.
   const candidates = signals.filter((s) =>
     ((s.direct && !s.suspended) || (newsFallback && s.calendarFallbackEligible))
+    && (analysisStyle === DEFAULT_AUTO_ANALYSIS_STYLE
+      ? (!s.style || s.style === DEFAULT_AUTO_ANALYSIS_STYLE)
+      : s.style === analysisStyle)
     && approvedPairs.has(s.paire)
     && Number(s.confiance) >= minConfidence
     && (!minRiskReward || parseRr(s.rr) >= minRiskReward),
   );
   if (!candidates.length)
-    return recordAutoTradeStatus(userId, slot, "no_signal_meets_confidence_or_rr", { minConfidence, minRiskReward, approvedPairs: [...approvedPairs] });
+    return recordAutoTradeStatus(userId, slot, "no_signal_meets_confidence_or_rr", {
+      minConfidence,
+      minRiskReward,
+      approvedPairs: [...approvedPairs],
+      analysisStyle,
+    });
   const lossStreak = await recentAutoLossStreak(userId, slot);
   // The consecutive-loss circuit breaker remains mandatory for live trading.
   // Demo accounts are for observation and strategy validation, so this
@@ -2527,7 +2591,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       userId,
       pair: signal.paire,
       timeframe: "Auto",
-      style: "Signal automatique (bot)",
+      style: "Signal automatique (bot) - " + autoAnalysisStyleLabel(analysisStyle),
       strategy: "Swing Trading",
       risk: `${effectiveRiskPercent}%`,
       direction: signal.direction,
@@ -2543,7 +2607,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       dataSnapshot: buildAutomaticSignalSnapshot(signal, newsRisk),
       newsSnapshot: buildAutomaticNewsContext(newsRisk),
       decisionReasons: automaticSignalDecisionReasons(signal, newsRisk),
-      marketRegime: "unknown",
+      marketRegime: signal.indicators?.marketRegime || "unknown",
       source: "auto_signal",
       brokerSlot: slot,
     });
@@ -2574,7 +2638,15 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
-  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", { openedThisTick, candidateCount: candidates.length, maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR, pyramidingEnabled: AUTO_ALLOW_PYRAMIDING, newsCalendarFallback: newsFallback, ...skipped });
+  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", {
+    openedThisTick,
+    candidateCount: candidates.length,
+    analysisStyle,
+    maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR,
+    pyramidingEnabled: AUTO_ALLOW_PYRAMIDING,
+    newsCalendarFallback: newsFallback,
+    ...skipped,
+  });
 }
 
 // clampVolumeToSpec both callers below need: round down to the broker's
@@ -3043,6 +3115,7 @@ async function handleApi(req, res, url) {
       decidedAt: row.decided_at,
       approvedUntil: row.approved_until,
       approvedPairs: row.approved_pairs ? row.approved_pairs.split(",").filter(Boolean) : [],
+      analysisStyle: normalizeAutoAnalysisStyle(row.analysis_style) || DEFAULT_AUTO_ANALYSIS_STYLE,
       riskPercent: row.risk_percent,
       dailyLossLimitPercent: row.daily_loss_limit_percent,
       maxConcurrentPositions: row.max_concurrent_positions,
@@ -3145,6 +3218,11 @@ async function handleApi(req, res, url) {
     const days = Math.max(1, Math.min(90, Number(body?.days) || 7));
     const pairs = Array.isArray(body?.pairs) ? body.pairs.filter((p) => symbols.includes(p)) : [];
     if (!pairs.length) return sendJson(res, 400, { ok: false, error: "no_valid_pairs" });
+    const requestedAnalysisStyle = body?.analysisStyle === undefined
+      ? DEFAULT_AUTO_ANALYSIS_STYLE
+      : normalizeAutoAnalysisStyle(body.analysisStyle);
+    if (!requestedAnalysisStyle) return sendJson(res, 400, { ok: false, error: "invalid_analysis_style" });
+    const analysisStyle = requestedAnalysisStyle;
     const riskPercent = Math.max(0.1, Math.min(3, Number(body?.riskPercent) || 0.5));
     const dailyLossLimitPercent = Math.max(1, Math.min(10, Number(body?.dailyLossLimitPercent) || 3));
     // Ceiling raised from a hardcoded 5 to 20 (still a real sanity bound against
@@ -3219,7 +3297,8 @@ async function handleApi(req, res, url) {
         riskTiersEnabled ? 1 : 0, riskTiersJson, now, now,
       ],
     );
-    sendJson(res, 200, { ok: true, approvedUntil });
+    await sqlRun("UPDATE auto_trading_accounts SET analysis_style = ?, updated_at = ? WHERE user_id = ?", [analysisStyle, now, userId]);
+    sendJson(res, 200, { ok: true, approvedUntil, analysisStyle });
     return;
   }
 
@@ -4155,6 +4234,7 @@ async function handleApi(req, res, url) {
       approvalStatus: expired ? "expired" : row?.approval_status || "none",
       approvedUntil: row?.approved_until || null,
       approvedPairs: row?.approved_pairs ? row.approved_pairs.split(",").filter(Boolean) : [],
+      analysisStyle: normalizeAutoAnalysisStyle(row?.analysis_style) || DEFAULT_AUTO_ANALYSIS_STYLE,
       riskPercent: row?.risk_percent ?? null,
       dailyLossLimitPercent: row?.daily_loss_limit_percent ?? null,
       maxConcurrentPositions: row?.max_concurrent_positions ?? null,
@@ -6057,7 +6137,14 @@ function cachedHistory(symbol, cache, options = {}) {
   if (!cached || !Array.isArray(cached.bars) || !isRecentCache(cached, 6 * 60 * 60 * 1000)) return [];
   const freshnessTtlMs = historyFreshnessTtlMs(options);
   const bars = cached.bars
-    .map((bar) => ({ close: Number(bar.close), high: Number(bar.high), low: Number(bar.low), datetime: bar.datetime }))
+    .map((bar) => ({
+      open: Number(bar.open),
+      close: Number(bar.close),
+      high: Number(bar.high),
+      low: Number(bar.low),
+      volume: Number(bar.volume),
+      datetime: bar.datetime,
+    }))
     .filter((bar) => Number.isFinite(bar.close));
   // Same bug class as pricePayload's asOf (see that function's comment): re-tagging a
   // cache read must preserve when the bars were actually fetched, not stamp "now" --
@@ -6162,7 +6249,7 @@ function computeDeterministicSignal(symbol, price, history) {
     const tp2 = direction === "ACHAT" ? entry + risk * 2.5 : entry - risk * 2.5;
     const freshnessPenalty = historyFresh ? 0 : 10;
     const confidence = Math.round(Math.max(48, Math.min(88, 52 + strength * 8 + history.length / 12 + confluence * 4 + (price.reliability || 60) / 12 - freshnessPenalty)));
-    const technique = chooseTechnique(symbol, momentum, move);
+    const technique = autoAnalysisStyleLabel(DEFAULT_AUTO_ANALYSIS_STYLE);
 
     return applySignalSafety({
       paire: symbol,
@@ -6174,6 +6261,14 @@ function computeDeterministicSignal(symbol, price, history) {
       rr: "1:2.0",
       confiance: Math.min(confidence, dataQuality.score),
       technique,
+      style: DEFAULT_AUTO_ANALYSIS_STYLE,
+      styleScore: Math.min(confidence, dataQuality.score),
+      styleEvidence: [
+        "SMA10/SMA30",
+        "RSI",
+        "confluence " + confluence + "/4",
+      ],
+      styleVersion: "legacy-v1",
       raison: `Signal calculé: SMA10 ${direction === "ACHAT" ? ">" : "<"} SMA30, RSI ${rsi.toFixed(0)}, confluence ${confluence}/4.`,
       open: true,
       direct: true,
@@ -6191,6 +6286,42 @@ function buildDeterministicSignals(prices, histories) {
     const history = histories[symbol] || [];
     return computeDeterministicSignal(symbol, price, history);
   });
+}
+
+// The experimental engines consume the same already-fetched D1 snapshot as the
+// legacy engine. They still pass through the production data-quality and level
+// safety gates before becoming direct signals.
+function buildValidatedStyleSignals(style, prices, histories) {
+  return buildStyleSignalSet(style, prices, histories, symbols)
+    .filter((signal) => {
+      const price = prices[signal.paire];
+      const history = histories[signal.paire] || [];
+      return price && isUsableLivePrice(price)
+        && history._meta?.timeframe === "D1"
+        && historySourceHasInterval(history._meta?.source, ["1day"])
+        && assessSignalDataQuality(price, history).score >= 70;
+    })
+    .map((signal) => {
+      const price = prices[signal.paire];
+      const history = histories[signal.paire] || [];
+      return applySignalSafety({
+        ...signal,
+        entree: roundLevel(signal.entree),
+        sl: roundLevel(signal.sl),
+        tp1: roundLevel(signal.tp1),
+        tp2: roundLevel(signal.tp2),
+        open: true,
+        source: price.source,
+        suspended: false,
+        nextOpen: null,
+        quality: qualityPayload(
+          price,
+          history,
+          true,
+          "Style " + autoAnalysisStyleLabel(style) + " confirme par preuves: " + signal.styleEvidence.join(", "),
+        ),
+      });
+    });
 }
 
 // Real, honestly-measured PER-PAIR stats from a 2026-08-13 run of
