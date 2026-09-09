@@ -1,4 +1,4 @@
-// Walk-forward test for the four evidence engines.
+// Held-out test for the five evidence engines.
 // Input is local Dukascopy M1 data; no provider or database call is made.
 // This is intentionally separate from the server so a backtest cannot open
 // an order or consume the production API quota.
@@ -11,6 +11,7 @@ const root = process.cwd();
 const COST_R = 0.10;
 const FORWARD_BARS = 10;
 const WARMUP_BARS = 90;
+const MINIMUM_EVALUABLE_BARS = WARMUP_BARS + FORWARD_BARS + 1;
 const PAIRS = {
   "GBP/USD": "GBPUSD_M1_365d.csv",
   "USD/JPY": "USDJPY_M1.csv",
@@ -96,6 +97,15 @@ function summarize(results) {
 }
 
 function testStyle(style, bars) {
+  const eligibleBars = Math.max(0, bars.length - WARMUP_BARS - FORWARD_BARS);
+  if (bars.length < MINIMUM_EVALUABLE_BARS) {
+    return {
+      status: "insufficient_data",
+      eligibleBars,
+      train: summarize([]),
+      test: summarize([]),
+    };
+  }
   const split = Math.floor(bars.length * 0.7);
   const results = [];
   for (let index = WARMUP_BARS; index < bars.length - FORWARD_BARS; index += 1) {
@@ -105,6 +115,8 @@ function testStyle(style, bars) {
     if (r != null && Number.isFinite(r)) results.push({ index, r });
   }
   return {
+    status: "ok",
+    eligibleBars,
     train: summarize(results.filter((result) => result.index < split).map((result) => result.r)),
     test: summarize(results.filter((result) => result.index >= split).map((result) => result.r)),
   };
@@ -123,7 +135,13 @@ const report = {
 
 for (const [pair, file] of Object.entries(PAIRS)) {
   const daily = aggregateDaily(parseCsv(file));
-  report.pairs[pair] = { sourceFile: file, dailyBars: daily.length, styles: {} };
+  report.pairs[pair] = {
+    sourceFile: file,
+    dailyBars: daily.length,
+    minimumDailyBars: MINIMUM_EVALUABLE_BARS,
+    status: daily.length >= MINIMUM_EVALUABLE_BARS ? "ok" : "insufficient_data",
+    styles: {},
+  };
   for (const style of STYLES) report.pairs[pair].styles[style] = testStyle(style, daily);
 }
 

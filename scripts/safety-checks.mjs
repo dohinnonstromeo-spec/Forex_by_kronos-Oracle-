@@ -382,8 +382,12 @@ check(
   computeAutoTradeVolume({ balance: 50, riskPercent: 1, entry: 1.1000, sl: 1.0930, specification: eurusdSpec }) === null,
 );
 check(
-  "small-account floor ON, min-lot's real risk ($7) fits under the ceiling ($7.50 = 15% of $50) -- floors to minVolume",
-  computeAutoTradeVolume({ balance: 50, riskPercent: 1, entry: 1.1000, sl: 1.0930, specification: eurusdSpec, allowMinVolumeFloor: true, maxRiskAmount: 7.5 }) === 0.01,
+  "small-account floor ON blocks a $7 minimum-lot loss above the new $1 ceiling (2% of $50)",
+  computeAutoTradeVolume({ balance: 50, riskPercent: 1, entry: 1.1000, sl: 1.0930, specification: eurusdSpec, allowMinVolumeFloor: true, maxRiskAmount: 1 }) === null,
+);
+check(
+  "small-account floor ON accepts a $7 minimum-lot loss only when it stays below 2% of sizing capital ($10 on $500)",
+  computeAutoTradeVolume({ balance: 500, riskPercent: 0.25, entry: 1.1000, sl: 1.0930, specification: eurusdSpec, allowMinVolumeFloor: true, maxRiskAmount: 10 }) === 0.01,
 );
 check(
   "small-account floor ON but min-lot's real risk ($7) exceeds a tighter ceiling ($5) -- still skipped, never forced past the ceiling",
@@ -392,6 +396,27 @@ check(
 check(
   "small-account floor ON but the target already sizes above min lot on its own -- returns the normally-computed volume, not forced down to minVolume",
   computeAutoTradeVolume({ balance: 43230.85, riskPercent: 0.1, entry: 4400.13601, sl: 4385.13601, specification: xauSpec, allowMinVolumeFloor: true, maxRiskAmount: 1000000 }) === 0.02,
+);
+
+function estimatedStopLossAmountForTest({ entry, sl, volume, specification }) {
+  const distance = Math.abs(Number(entry) - Number(sl));
+  const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
+  return distance * valuePerUnitPerLot * volume;
+}
+check(
+  "displayed maximum loss uses the broker tick value and actual selected volume",
+  Math.abs(estimatedStopLossAmountForTest({ entry: 1.1, sl: 1.093, volume: 0.01, specification: eurusdSpec }) - 7) < 0.000001,
+);
+function effectiveScalpRiskPercentForTest(configured) {
+  return configured > 0 ? Math.min(0.5, configured) : 0.25;
+}
+check(
+  "scalp defaults to 0.25% but never raises a stricter user/admin cap",
+  effectiveScalpRiskPercentForTest(0) === 0.25 && effectiveScalpRiskPercentForTest(0.1) === 0.1,
+);
+check(
+  "scalp caps an aggressive configured risk at 0.5%",
+  effectiveScalpRiskPercentForTest(3) === 0.5,
 );
 
 console.log("\n=== confirmAndSendOrder's sideValid: a BUY order with no broker-side TP (tp1=null) must not be spuriously rejected ===");
@@ -491,24 +516,52 @@ check("mid-month resolves to the 1st of that month", startOfMonthUtc(new Date("2
 check("the 1st itself resolves to itself", startOfMonthUtc(new Date("2026-08-01T00:00:01Z")).toISOString() === "2026-08-01T00:00:00.000Z");
 check("crosses a real year boundary correctly (Jan 2027)", startOfMonthUtc(new Date("2027-01-15T00:00:00Z")).toISOString() === "2027-01-01T00:00:00.000Z");
 
-console.log("\n=== secure_half_priority_enabled: half-target formulas (Case A open-time, Case B trigger) ===");
+console.log("\n=== secure_half_priority_enabled: staged partial-close plans ===");
 
-// Copy of processAutoTradeForUser's Case A open-time formula.
-function halfTpAtOpen(entry, tp1) { return entry + (tp1 - entry) * 0.5; }
-// Copy of checkTrailingStops' Case B halfway-to-tp2 trigger formula.
-function halfTargetFromTp2(buy, entry, tp2) { return buy ? entry + (tp2 - entry) * 0.5 : entry - (entry - tp2) * 0.5; }
+// Copies of the pure decision branches used when automatic orders are created.
+// They ensure TP1 remains an internal trigger while TP2, when applicable, is
+// the actual broker target. No automatic position is ever opened with TP1
+// merely halved by this preference.
+function swingPartialPlanForTest({ enabled, hybridTarget = null, trailingOnly = false, tp1, tp2 }) {
+  const partialCloseEnabled = Boolean(enabled)
+    && hybridTarget == null
+    && Number.isFinite(Number(tp1))
+    && Number.isFinite(Number(tp2));
+  const baseBrokerTarget = hybridTarget ?? (trailingOnly ? null : tp1);
+  return {
+    partialCloseEnabled,
+    partialCloseTarget: partialCloseEnabled ? Number(tp1) : null,
+    brokerTakeProfit: partialCloseEnabled && !trailingOnly ? Number(tp2) : baseBrokerTarget,
+  };
+}
+function scalpPartialPlanForTest({ enabled, hybridTarget = null, tp }) {
+  const partialCloseEnabled = Boolean(enabled) && hybridTarget == null && Number.isFinite(Number(tp));
+  return {
+    partialCloseEnabled,
+    partialCloseTarget: partialCloseEnabled ? Number(tp) : null,
+    brokerTakeProfit: hybridTarget,
+  };
+}
 
-check("Case A, BUY: half TP sits exactly midway between entry and the full 1.6R target", halfTpAtOpen(1.1000, 1.1160) === 1.1080);
-check("Case A, SELL: half TP sits exactly midway (entry above tp1)", Math.round(halfTpAtOpen(1.1000, 1.0840) * 10000) / 10000 === 1.0920);
-check("Case B, BUY: half-target trigger sits midway between entry and tp2 (2.5R reference)", halfTargetFromTp2(true, 4400, 4450) === 4425);
-check("Case B, SELL: half-target trigger sits midway (tp2 below entry)", halfTargetFromTp2(false, 4400, 4350) === 4375);
+const stagedFixedPlan = swingPartialPlanForTest({ enabled: true, tp1: 1.11, tp2: 1.12 });
+check("fixed-TP swing keeps TP1 internal and sends TP2 to the broker", stagedFixedPlan.partialCloseEnabled && stagedFixedPlan.partialCloseTarget === 1.11 && stagedFixedPlan.brokerTakeProfit === 1.12);
+const stagedTrailingPlan = swingPartialPlanForTest({ enabled: true, trailingOnly: true, tp1: 1.11, tp2: 1.12 });
+check("trailing swing arms TP1 partial protection without inventing a broker TP", stagedTrailingPlan.partialCloseEnabled && stagedTrailingPlan.partialCloseTarget === 1.11 && stagedTrailingPlan.brokerTakeProfit === null);
+const hybridPlan = swingPartialPlanForTest({ enabled: true, hybridTarget: 1.115, tp1: 1.11, tp2: 1.12 });
+check("hybrid target remains distinct from staged partial protection", !hybridPlan.partialCloseEnabled && hybridPlan.brokerTakeProfit === 1.115);
+const disabledPlan = swingPartialPlanForTest({ enabled: false, tp1: 1.11, tp2: 1.12 });
+check("disabled preference leaves the original fixed broker TP unchanged", !disabledPlan.partialCloseEnabled && disabledPlan.partialCloseTarget === null && disabledPlan.brokerTakeProfit === 1.11);
+const scalpPlan = scalpPartialPlanForTest({ enabled: true, tp: 4405 });
+check("scalp arms TP1 partial protection without a full broker TP", scalpPlan.partialCloseEnabled && scalpPlan.partialCloseTarget === 4405 && scalpPlan.brokerTakeProfit === null);
 
 console.log("=== distributed scheduler lease: autonomous execution stays single-flight across replicas ===");
 const serverSource = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
 const ciSource = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const apiTestSource = await readFile(new URL("../scripts/api-tests.mjs", import.meta.url), "utf8");
 const readmeSource = await readFile(new URL("../README.md", import.meta.url), "utf8");
-const backtestStyleSource = await readFile(new URL("../scripts/backtest-analysis-styles.mjs", import.meta.url), "utf8");
+const backtestStyleSource = await readFile(new URL("../scripts/backtest-analysis-styles-realistic.mjs", import.meta.url), "utf8");
+const exitRulesSource = await readFile(new URL("../trading-exit-rules.mjs", import.meta.url), "utf8");
+const brokerE2eSource = await readFile(new URL("../scripts/broker-e2e-tests.mjs", import.meta.url), "utf8");
 const packageSource = await readFile(new URL("../package.json", import.meta.url), "utf8");
 check("Render runbook documents broker encryption, push keys and readiness", readmeSource.includes("BROKER_CREDENTIALS_ENCRYPTION_KEY") && readmeSource.includes("VAPID_PUBLIC_KEY") && readmeSource.includes("VAPID_PRIVATE_KEY") && readmeSource.includes("/api/ready"));
 check("durable auto-trade lease table exists", /CREATE TABLE IF NOT EXISTS auto_trade_leases/.test(serverSource));
@@ -531,7 +584,7 @@ check("position modification lease table exists", /CREATE TABLE IF NOT EXISTS tr
 check("secure-half acquires a durable position lease", /tryAcquireTradeOperationLease\(order\.id, "position-modify"\)/.test(serverSource));
 check("trailing acquires a durable position lease per order", /tryAcquireTradeOperationLease\(row\.order_id, "position-modify"\)/.test(serverSource));
 check("position modification leases are always released", /releaseTradeOperationLease\(row\.order_id, "position-modify", positionLeaseToken\)/.test(serverSource) && /releaseTradeOperationLease\(order\.id, "position-modify", leaseToken\)/.test(serverSource));
-check("scalp timeout shares the position mutex with trailing", /closeBrokerPosition\(credentials, latestRow\.broker_order_id\)/.test(serverSource) && /tryAcquireTradeOperationLease\(row\.order_id, "position-modify"\)/.test(serverSource));
+check("scalp timeout shares the position mutex with trailing", /closeBrokerPosition\(credentials, brokerPositionId\)/.test(serverSource) && /tryAcquireTradeOperationLease\(row\.order_id, "position-modify"\)/.test(serverSource));
 check("scalp close network failures are marked uncertain", /async function closeBrokerPosition[\s\S]{0,1800}broker_request_uncertain/.test(serverSource));
 check("secure-half and trailing share one mutex namespace", serverSource.includes('"position-modify"'));
 check("trailing rereads the order after locking", /const latestOrderRow = await sqlGet/.test(serverSource) && /Object\.assign\(row, latestOrderRow\)/.test(serverSource));
@@ -658,11 +711,11 @@ check(
     serverSource.includes("if (historiesInFlight?.key === usableKey) return historiesInFlight.promise;"),
 );
 check(
-  "market cache avoids repeated Neon reads and price writes",
+  "market cache avoids repeated Neon reads and batches timeframe writes",
   serverSource.includes("if (memoryCache.marketDocument) return memoryCache.marketDocument;") &&
     serverSource.includes("MARKET_CACHE_PERSIST_INTERVAL_MS = boundedEnvNumber(env.MARKET_CACHE_PERSIST_INTERVAL_SECONDS, 600, 60, 86400) * 1000") &&
     serverSource.includes("if (!force && Date.now() - memoryCache.marketCachePersistedAt < MARKET_CACHE_PERSIST_INTERVAL_MS) return trimmed") &&
-    serverSource.includes("}, { force: true });"),
+    serverSource.includes("await saveMarketCache(historyCacheUpdate(cache, { [symbol]: bars }, options));"),
 );
 check(
   "frontend score refresh lock also recovers after rendering errors",
@@ -866,6 +919,36 @@ check(
     && scalpProcessBlock.includes("signalAffectedByNews(pair, event.currency)")
     && scalpProcessBlock.includes("newsSnapshot: scalpNewsContext")
     && scalpProcessBlock.includes("scalpDataSnapshot"),
+);
+check(
+  "scalp requires exact D1/H4/H1/M15/M5/M1 histories before it can open a position",
+  serverSource.includes("const SCALP_TIMEFRAME_PLAN")
+    && serverSource.includes("const SCALP_TIMEFRAMES")
+    && scalpProcessBlock.includes("SCALP_TIMEFRAMES.map")
+    && scalpProcessBlock.includes("requireExactTimeframe: true")
+    && scalpProcessBlock.includes("buildScalpMultiTimeframeSignal"),
+);
+check(
+  "a scalp uses M5 for its setup, M1 only for entry confirmation, and M15/M5 for its stop structure",
+  serverSource.includes("function buildScalpStructuralStop")
+    && serverSource.includes("m15History: histories.M15")
+    && serverSource.includes("m5History: histories.M5")
+    && serverSource.includes("computeScalpMeanReversionSignal(pair, price, histories.M5)")
+    && serverSource.includes("scalpEntryCandleConfirms(m5Signal.direction, histories.M1, snapshots.M5)")
+    && serverSource.includes("signalTimeframe: SCALP_TIMEFRAME_PLAN.signal")
+    && serverSource.includes("entryTimeframe: SCALP_TIMEFRAME_PLAN.entry"),
+);
+check(
+  "minimum-lot protection is capped at 2%, never the former 15% exception",
+  serverSource.includes("const SMALL_ACCOUNT_MIN_LOT_RISK_PCT = 2")
+    && !serverSource.includes("const SMALL_ACCOUNT_MIN_LOT_RISK_PCT = 15"),
+);
+check(
+  "each new scalp persists its horizons, stop distance and estimated loss for dashboard audit",
+  serverSource.includes('ensureColumn("trade_orders", "signal_timeframe text")')
+    && serverSource.includes('ensureColumn("trade_orders", "estimated_max_loss_amount real")')
+    && serverSource.includes("risk_percent_at_trade, signal_timeframe, entry_timeframe, setup_timeframe, sl_distance")
+    && serverSource.includes("estimatedMaxLossAmount"),
 );
 check(
   "execution columns are persisted and exposed without replacing analytical entry",
@@ -1082,12 +1165,13 @@ check(
     && !authClientSource.includes('renderTradeOrders(data?.orders || [], Boolean(data?.brokerConfigured))'),
 );
 check(
-  'live positions are matched by broker slot and order id',
+  'live positions are matched by broker slot and position id',
   authClientSource.includes('data-broker-slot')
     && authClientSource.includes('data-broker-slot="${escapeHtml(order.brokerSlot || "")}"')
     && authClientSource.includes('data-broker-slot="${escapeHtml(item.brokerSlot || "")}"')
+    && authClientSource.includes('data-broker-position-id')
     && authClientSource.includes('`${p.brokerSlot || ""}:${p.id}`')
-    && authClientSource.includes('`${card.dataset.brokerSlot || ""}:${card.dataset.brokerOrderId}`'),
+    && authClientSource.includes('`${card.dataset.brokerSlot || ""}:${card.dataset.brokerPositionId}`'),
 );
 check(
   'push test is explicit, authenticated, and rate-limited',
@@ -1203,8 +1287,114 @@ check(
 check(
   'style backtest is wired to the same pure engines',
   backtestStyleSource.includes("buildStyleSignal")
-    && backtestStyleSource.includes("70% train / 30% held-out test")
+    && backtestStyleSource.includes("rolling held-out windows")
+    && backtestStyleSource.includes("local M1 data")
+    && backtestStyleSource.includes("production staged trailing stop")
+    && backtestStyleSource.includes("exitPrice - entryFill")
+    && backtestStyleSource.includes("entryFill - exitPrice")
+    && backtestStyleSource.includes('status: "insufficient_data"')
+    && backtestStyleSource.includes("MINIMUM_DAILY_BARS")
+    && backtestStyleSource.includes("../trading-exit-rules.mjs")
+    && serverSource.includes("./trading-exit-rules.mjs")
+    && exitRulesSource.includes("export function computeTrailingStopPrice")
+    && exitRulesSource.includes("XAU/USD")
     && packageSource.includes("backtest:styles"),
+);
+check(
+  'real broker E2E fails closed before any order when MetaApi preflight is invalid',
+  brokerE2eSource.includes("let brokerReady = false")
+    && brokerE2eSource.includes('getRealPrice("EURUSD")')
+    && brokerE2eSource.includes("brokerPreflightError")
+    && brokerE2eSource.includes("skip: !hasSecrets || !brokerReady")
+    && brokerE2eSource.includes("await stopServerProcess()")
+    && brokerE2eSource.includes("removeTemporaryFile"),
+);
+function partialCloseTargetReachedForTest(direction, currentPrice, target) {
+  if (!(currentPrice > 0) || !(target > 0)) return false;
+  return direction === "ACHAT" ? currentPrice >= target : currentPrice <= target;
+}
+function partialCloseVolumeForTest(position, specification) {
+  const currentVolume = Number(position?.volume);
+  const minVolume = Number(specification?.minVolume);
+  const volumeStep = Number(specification?.volumeStep);
+  if (!(currentVolume > 0) || !(minVolume > 0) || !(volumeStep > 0)) return null;
+  const closeVolume = Math.floor((currentVolume / 2) / volumeStep + 1e-9) * volumeStep;
+  const remainingVolume = currentVolume - closeVolume;
+  if (!(closeVolume >= minVolume) || !(remainingVolume >= minVolume)) return null;
+  return Number(closeVolume.toFixed(8));
+}
+function breakevenStopForTest({ entry, direction, currentPrice }) {
+  const buffer = executionCostBuffer();
+  const buy = direction === "ACHAT";
+  const desired = buy ? entry + buffer : entry - buffer;
+  const safe = buy ? currentPrice - buffer : currentPrice + buffer;
+  const stop = buy ? Math.min(desired, safe) : Math.max(desired, safe);
+  return buy ? (stop > entry ? stop : null) : (stop < entry ? stop : null);
+}
+check(
+  'partial protection has durable fields and a dedicated MetaApi action',
+  serverSource.includes("broker_take_profit real")
+    && serverSource.includes("broker_position_id text")
+    && serverSource.includes("partial_close_enabled integer NOT NULL DEFAULT 0")
+    && serverSource.includes("partial_close_status text NOT NULL DEFAULT 'disabled'")
+    && serverSource.includes("breakeven_applied integer NOT NULL DEFAULT 0")
+    && serverSource.includes('actionType: "POSITION_PARTIAL"')
+    && serverSource.includes('clientId: String(order.id)')
+    && serverSource.includes('async function resolveBrokerPositionId')
+    && serverSource.includes('brokerPositionId = await resolveBrokerPositionId')
+    && serverSource.includes("numericCode !== 10009")
+    && serverSource.includes("partial_close_status = 'uncertain'")
+    && serverSource.includes("if (partialProtectionBlocked) continue"),
+);
+check(
+  'partial protection never reuses legacy TP-halving or a full-close fallback',
+  serverSource.includes('if (order.partialCloseEnabled)')
+    && serverSource.includes('error: "partial_close_already_armed"')
+    && serverSource.includes('AND o.partial_close_enabled = 0')
+    && serverSource.includes('partialCloseVolumeForPosition(openPosition, specification)')
+    && serverSource.includes('body: JSON.stringify({ actionType: "POSITION_PARTIAL"')
+    && serverSource.includes('if (partialActionPerformed) continue'),
+);
+check(
+  'staged protection stays readable and hides the obsolete manual action',
+  dashboardHybridSource.includes('data-autotrade-preferences-section-secure-half')
+    && dashboardHybridSource.includes('TP1')
+    && dashboardHybridSource.includes('TP2')
+    && authClientSource.includes('function partialProtectionLabel')
+    && authClientSource.includes('order.status === "SENT" && order.brokerOrderId && !order.partialCloseEnabled')
+    && authClientSource.includes('/api/auto-trade/toggle-secure-half'),
+);
+check(
+  'all broker position actions use position ids, not only opening order ids',
+  serverSource.includes('modifyBrokerPositionStopLoss(credentials, brokerPositionId')
+    && serverSource.includes('partialCloseBrokerPosition(credentials, brokerPositionId')
+    && serverSource.includes('closeBrokerPosition(credentials, brokerPositionId)')
+    && serverSource.includes('broker_position_id = ? WHERE id = ?')
+    && !/(?:modifyBrokerPositionStopLoss|partialCloseBrokerPosition|closeBrokerPosition)\(credentials, (?:row|order|latestRow)\.broker_order_id/.test(serverSource),
+);
+check(
+  'broker outcome distinguishes TP2 from TP1 and preserves legacy closed rows',
+  serverSource.includes('const brokerTargetIsTp2 = Number(brokerOrder.partial_close_enabled) === 1')
+    && serverSource.includes('brokerTargetIsTp2 ? "TP2_HIT" : "TP1_HIT"')
+    && serverSource.includes('"TP2 touché (confirmé par le broker)."')
+    && serverSource.includes('brokerPositionId || brokerOrder.broker_order_id')
+    && serverSource.includes('if (!brokerPositionId && brokerOutcome.status !== "closed") return { brokerUnavailable: true };'),
+);
+check(
+  'partial close volume respects broker minimums and step increments',
+  partialCloseVolumeForTest({ volume: 0.10 }, { minVolume: 0.01, volumeStep: 0.01 }) === 0.05
+    && partialCloseVolumeForTest({ volume: 0.01 }, { minVolume: 0.01, volumeStep: 0.01 }) === null
+    && partialCloseVolumeForTest({ volume: 0.13 }, { minVolume: 0.01, volumeStep: 0.01 }) === 0.06,
+);
+check(
+  'partial trigger and breakeven directions are symmetric',
+  partialCloseTargetReachedForTest("ACHAT", 101, 101)
+    && !partialCloseTargetReachedForTest("ACHAT", 100.99, 101)
+    && partialCloseTargetReachedForTest("VENTE", 99, 99)
+    && !partialCloseTargetReachedForTest("VENTE", 99.01, 99)
+    && breakevenStopForTest({ entry: 100, direction: "ACHAT", currentPrice: 102 }) === 100.35
+    && breakevenStopForTest({ entry: 100, direction: "VENTE", currentPrice: 98 }) === 99.65
+    && breakevenStopForTest({ entry: 100, direction: "ACHAT", currentPrice: 100.1 }) === null,
 );
 
 console.log(`

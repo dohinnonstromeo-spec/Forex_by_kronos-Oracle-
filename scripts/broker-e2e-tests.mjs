@@ -26,7 +26,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -34,7 +34,7 @@ import { randomBytes } from "node:crypto";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const secretPath = join(root, "secret.dev");
-const dbPath = join(root, "data", "oracle.db");
+const dbPath = join(root, "data", "broker-e2e-" + process.pid + ".db");
 const PORT = 4178; // distinct from api-tests.mjs's 4177 -- safe to run both at once
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -57,6 +57,8 @@ let db = null;
 let testUserId = null;
 let testEmail = null;
 let cookie = null;
+let brokerReady = false;
+let brokerPreflightError = null;
 const openedPositions = []; // broker position ids to force-close in after()
 const seededIds = []; // { analysisId } to delete from analyses/trade_orders in after()
 
@@ -101,6 +103,34 @@ async function getRealPrice(symbol) {
   return brokerFetch(`/symbols/${symbol}/current-price`);
 }
 
+async function stopServerProcess() {
+  const processToStop = serverProcess;
+  if (!processToStop || processToStop.exitCode !== null) return;
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    processToStop.once("exit", finish);
+    processToStop.kill();
+    setTimeout(finish, 5000).unref();
+  });
+}
+
+async function removeTemporaryFile(filePath) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      rmSync(filePath, { force: true });
+      return;
+    } catch (error) {
+      if (!['EPERM', 'EBUSY'].includes(error?.code) || attempt === 9) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 function seedOrder({ pair, direction, entry, sl, tp1, status, brokerOrderId, trailingStopPrice, bestFavorablePrice }) {
   const id = "e2e_" + randomBytes(4).toString("hex");
   const orderId = "ord_" + id;
@@ -130,20 +160,51 @@ before(async () => {
   // spawned instance is fully isolated (its own port), never the dev server.
   serverProcess = spawn(process.execPath, ["server.mjs"], {
     cwd: root,
-    env: { ...process.env, PORT: String(PORT), TRAILING_STOP_INTERVAL_SECONDS: "4" },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      NODE_ENV: "test",
+      SQLITE_DB_PATH: dbPath,
+      DATABASE_URL: "",
+      SUPABASE_URL: "",
+      SUPABASE_PROJECT_URL: "",
+      SUPABASE_SERVICE_ROLE_KEY: "",
+      SUPABASE_ANON_KEY: "",
+      MOCK_MARKET_DATA: "true",
+      BROKER_CREDENTIALS_ENCRYPTION_KEY: "broker-e2e-test-encryption-key-0123456789",
+      TRAILING_STOP_INTERVAL_SECONDS: "4",
+    },
     stdio: "pipe",
   });
+  const startupLogs = [];
+  serverProcess.stdout.on("data", (chunk) => startupLogs.push(String(chunk)));
+  serverProcess.stderr.on("data", (chunk) => startupLogs.push(String(chunk)));
   const ready = await Promise.race([
     (async () => {
-      for (let i = 0; i < 40; i++) {
+      for (let i = 0; i < 120; i++) {
         try { const res = await fetch(`${BASE}/api/prices`); if (res.ok) return true; } catch { /* not up yet */ }
         await new Promise((r) => setTimeout(r, 250));
       }
       return false;
     })(),
-    new Promise((r) => setTimeout(() => r(false), 15000)),
+    new Promise((r) => setTimeout(() => r(false), 30000)),
   ]);
-  if (!ready) throw new Error("server did not become ready in time");
+  if (!ready) {
+    await stopServerProcess();
+    throw new Error("server did not become ready in time\n" + startupLogs.join("").slice(-5000));
+  }
+
+  // Refuse to open or seed anything when the configured MetaApi account cannot
+  // provide one valid quote. This catches a wrong account region before the
+  // suite can create local rows or send a demo order.
+  const preflightPrice = await getRealPrice("EURUSD").catch((error) => ({ error: error.message }));
+  if (!Number.isFinite(Number(preflightPrice?.bid)) || !Number.isFinite(Number(preflightPrice?.ask))) {
+    brokerPreflightError = String(preflightPrice?.error || preflightPrice?.message || "invalid_price_response");
+    console.warn(`[broker-e2e] skipped: MetaApi preflight failed for region ${METAAPI_REGION} (${brokerPreflightError})`);
+    await stopServerProcess();
+    return;
+  }
+  brokerReady = true;
 
   db = new DatabaseSync(dbPath);
   db.exec("PRAGMA busy_timeout = 5000"); // see the identical pragma added to server.mjs's getSqliteDb() -- same "database is locked" flakiness class, now on both sides of every DB access this suite does concurrently with the spawned server.
@@ -193,10 +254,12 @@ after(async () => {
     }
     db.close();
   }
-  serverProcess?.kill();
+  await stopServerProcess();
+  db = null;
+  for (const suffix of ["", "-shm", "-wal"]) await removeTemporaryFile(dbPath + suffix);
 });
 
-test("confirm: BUY with NO broker TP opens successfully -- regression test for the sideValid/tp1-null bug", { skip: !hasSecrets }, async () => {
+test("confirm: BUY with NO broker TP opens successfully -- regression test for the sideValid/tp1-null bug", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const entry = price.ask;
   const sl = Math.round((entry - 0.0030) * 100000) / 100000;
@@ -209,7 +272,7 @@ test("confirm: BUY with NO broker TP opens successfully -- regression test for t
   await closeReal(data.order.brokerOrderId);
 });
 
-test("confirm: SELL with NO broker TP opens successfully (this direction always worked -- symmetry check)", { skip: !hasSecrets }, async () => {
+test("confirm: SELL with NO broker TP opens successfully (this direction always worked -- symmetry check)", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const entry = price.bid;
   const sl = Math.round((entry + 0.0030) * 100000) / 100000;
@@ -221,7 +284,7 @@ test("confirm: SELL with NO broker TP opens successfully (this direction always 
   await closeReal(data.order.brokerOrderId);
 });
 
-test("confirm: BUY WITH a real broker TP (fixed-TP pairs) opens successfully", { skip: !hasSecrets }, async () => {
+test("confirm: BUY WITH a real broker TP (fixed-TP pairs) opens successfully", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const entry = price.ask;
   const sl = Math.round((entry - 0.0030) * 100000) / 100000;
@@ -233,7 +296,7 @@ test("confirm: BUY WITH a real broker TP (fixed-TP pairs) opens successfully", {
   await closeReal(data.order.brokerOrderId);
 });
 
-test("secure-half: halves a real broker TP", { skip: !hasSecrets }, async () => {
+test("secure-half: halves a real broker TP", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const entry = price.ask;
   const sl = Math.round((entry - 0.0030) * 100000) / 100000;
@@ -257,7 +320,7 @@ test("secure-half: halves a real broker TP", { skip: !hasSecrets }, async () => 
   await closeReal(brokerOrderId);
 });
 
-test("secure-half: locks half of unrealized profit via the stop when there is no broker TP", { skip: !hasSecrets }, async () => {
+test("secure-half: locks half of unrealized profit via the stop when there is no broker TP", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const realEntry = price.bid;
   const realSl = Math.round((realEntry + 0.0030) * 100000) / 100000;
@@ -284,7 +347,7 @@ test("secure-half: locks half of unrealized profit via the stop when there is no
   await closeReal(brokerOrderId);
 });
 
-test("trailing-stop scheduler moves a real position's stop on its own, on a real tick", { skip: !hasSecrets }, async () => {
+test("trailing-stop scheduler moves a real position's stop on its own, on a real tick", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const realEntry = price.bid;
   const realSl = Math.round((realEntry + 0.0030) * 100000) / 100000;
@@ -311,7 +374,7 @@ test("trailing-stop scheduler moves a real position's stop on its own, on a real
   await closeReal(brokerOrderId);
 });
 
-test("secure-half priority: turning the toggle ON retroactively halves an already-open fixed-TP position", { skip: !hasSecrets }, async () => {
+test("secure-half priority: turning the toggle ON retroactively halves an already-open fixed-TP position", { skip: !hasSecrets || !brokerReady }, async () => {
   const price = await getRealPrice("EURUSD");
   const entry = price.ask;
   const sl = Math.round((entry - 0.0030) * 100000) / 100000;
@@ -329,7 +392,7 @@ test("secure-half priority: turning the toggle ON retroactively halves an alread
   await closeReal(brokerOrderId);
 });
 
-test("secure-half priority: with the toggle on, the scheduler locks the stop once price has reached halfway to the reference target (tp2)", { skip: !hasSecrets }, async () => {
+test("secure-half priority: with the toggle on, the scheduler locks the stop once price has reached halfway to the reference target (tp2)", { skip: !hasSecrets || !brokerReady }, async () => {
   // Toggle already ON from the previous test, but explicit here so this test
   // is self-contained regardless of run order.
   await postJson("/api/auto-trade/toggle-secure-half", { enabled: true });

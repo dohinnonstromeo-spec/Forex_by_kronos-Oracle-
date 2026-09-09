@@ -272,6 +272,37 @@ test("admin: grant-premium then revoke-premium work with the real token", { skip
   assert.equal(revoked.data.user.plan, "free");
 });
 
+test("admin: auto-trade approval persists and validates the analysis style", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+  resetRateLimits();
+  const email = uniqueEmail("apitest_auto_style");
+  const signup = await postJson("/api/signup", { name: "ApiTest", email, password: "ValidPass123!" });
+  assert.equal(signup.status, 200);
+  const userId = signup.data.user.id;
+
+  const approved = await postJson(
+    "/api/admin/auto-trade/approve",
+    { userId, days: 7, pairs: ["XAU/USD"], analysisStyle: "price_action" },
+    { "X-Admin-Token": ADMIN_TOKEN },
+  );
+  assert.equal(approved.status, 200);
+  assert.equal(approved.data.ok, true);
+  assert.equal(approved.data.analysisStyle, "price_action");
+
+  const db = new DatabaseSync(dbPath);
+  const row = db.prepare("SELECT analysis_style, approved_pairs FROM auto_trading_accounts WHERE user_id = ?").get(userId);
+  db.close();
+  assert.equal(row?.analysis_style, "price_action");
+  assert.equal(row?.approved_pairs, "XAU/USD");
+
+  const invalid = await postJson(
+    "/api/admin/auto-trade/approve",
+    { userId, days: 7, pairs: ["XAU/USD"], analysisStyle: "invented_style" },
+    { "X-Admin-Token": ADMIN_TOKEN },
+  );
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.data.error, "invalid_analysis_style");
+});
+
 test("admin: member detail returns safe account telemetry", { skip: !hasSecrets && "needs secret.dev" }, async () => {
   resetRateLimits();
   const email = uniqueEmail("apitest_member_detail");
@@ -560,7 +591,8 @@ test("position modifications are serialized across replicas", () => {
   assert.match(source, /tryAcquireTradeOperationLease\(order\.id, "position-modify"\)/);
   assert.match(source, /tryAcquireTradeOperationLease\(row\.order_id, "position-modify"\)/);
   assert.match(source, /releaseTradeOperationLease\(row\.order_id, "position-modify", positionLeaseToken\)/);
-  assert.match(source, /closeBrokerPosition\(credentials, latestRow\.broker_order_id\)/);
+  assert.match(source, /closeBrokerPosition\(credentials, brokerPositionId\)/);
+  assert.match(source, /async function resolveBrokerPositionId/);
   assert.match(source, /broker_request_uncertain/);
   assert.match(source, /releaseTradeOperationLease\(order\.id, "position-modify", leaseToken\)/);
   assert.match(source, /const latestOrderRow = await sqlGet/);
@@ -822,12 +854,13 @@ test("premium user can confirm and send an order with the mock broker", { skip: 
   assert.equal(confirmRes.data.ok, true);
   assert.equal(confirmRes.data.order.status, "SENT");
   assert.match(confirmRes.data.order.brokerOrderId || "", /^mock_/);
+  assert.equal(confirmRes.data.order.brokerPositionId, confirmRes.data.order.brokerOrderId);
 
   const ordersRes = await fetch(`${BASE}/api/trade/orders`, { headers: { Cookie: cookie } });
   const ordersData = await ordersRes.json();
   assert.equal(ordersRes.status, 200);
   assert.equal(ordersData.ok, true);
-  assert.ok(ordersData.orders.some((order) => order.id === prepareRes.data.order.id && order.status === "SENT" && order.brokerOrderId));
+  assert.ok(ordersData.orders.some((order) => order.id === prepareRes.data.order.id && order.status === "SENT" && order.brokerOrderId && order.brokerPositionId));
 });
 test("trade confirm is single-flight under concurrent requests", { skip: !hasSecrets && "needs secret.dev" }, async () => {
   resetRateLimits();

@@ -16,6 +16,10 @@ import {
   isExperimentalAutoAnalysisStyle,
   normalizeAutoAnalysisStyle,
 } from "./strategy-engines.mjs";
+import {
+  SWING_TRAILING_PARAMS_BY_PAIR,
+  computeTrailingStopPrice,
+} from "./trading-exit-rules.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const env = await loadEnv(join(root, "secret.dev"));
@@ -336,9 +340,25 @@ async function ensureRelationalTablesImpl() {
       sl real NOT NULL,
       tp1 real,
       tp2 real,
+      broker_take_profit real,
       volume real,
+      partial_close_enabled integer NOT NULL DEFAULT 0,
+      partial_close_target real,
+      partial_close_status text NOT NULL DEFAULT 'disabled',
+      partial_close_volume real,
+      partial_close_at text,
+      partial_close_error text,
+      breakeven_applied integer NOT NULL DEFAULT 0,
+      risk_percent_at_trade real,
+      signal_timeframe text,
+      entry_timeframe text,
+      setup_timeframe text,
+      sl_distance real,
+      estimated_max_loss_amount real,
+      sizing_balance_at_trade real,
       status text NOT NULL DEFAULT 'PENDING_CONFIRMATION',
       broker_order_id text,
+      broker_position_id text,
       executed_entry real,
       executed_at text,
       execution_slippage real,
@@ -479,6 +499,15 @@ async function ensureRelationalTablesImpl() {
   // personal "Mes analyses" feed can filter by origin -- see auto_trading_accounts.
   await ensureColumn("analyses", "source text NOT NULL DEFAULT 'manual'");
   await ensureColumn("trade_orders", "risk_percent_at_trade real");
+  // The order must keep the analysis horizons and risk calculation that were
+  // actually used at creation. Dashboard history must not infer them later from
+  // a changed account setting or a subsequently moved trailing stop.
+  await ensureColumn("trade_orders", "signal_timeframe text");
+  await ensureColumn("trade_orders", "entry_timeframe text");
+  await ensureColumn("trade_orders", "setup_timeframe text");
+  await ensureColumn("trade_orders", "sl_distance real");
+  await ensureColumn("trade_orders", "estimated_max_loss_amount real");
+  await ensureColumn("trade_orders", "sizing_balance_at_trade real");
   // Snapshotted at order-creation time, same reasoning as risk_percent_at_trade
   // above -- an account's scalp settings can change after a position is already
   // open, and an in-flight trade must keep the timeout it was actually opened
@@ -540,6 +569,17 @@ async function ensureRelationalTablesImpl() {
   await ensureColumn("trade_orders", "executed_at text");
   await ensureColumn("trade_orders", "execution_slippage real");
   await ensureColumn("trade_orders", "execution_metadata text");
+  await ensureColumn("trade_orders", "broker_position_id text");
+  // TP1 remains the analytical trigger. broker_take_profit is the actual TP
+  // sent to MetaApi, which becomes TP2 when real partial protection is armed.
+  await ensureColumn("trade_orders", "broker_take_profit real");
+  await ensureColumn("trade_orders", "partial_close_enabled integer NOT NULL DEFAULT 0");
+  await ensureColumn("trade_orders", "partial_close_target real");
+  await ensureColumn("trade_orders", "partial_close_status text NOT NULL DEFAULT 'disabled'");
+  await ensureColumn("trade_orders", "partial_close_volume real");
+  await ensureColumn("trade_orders", "partial_close_at text");
+  await ensureColumn("trade_orders", "partial_close_error text");
+  await ensureColumn("trade_orders", "breakeven_applied integer NOT NULL DEFAULT 0");
   // Four admin-configurable auto-trade parameters requested directly: a cap on
   // total trades opened per day (distinct from max_concurrent_positions, which
   // only limits how many can be OPEN at once -- nothing stopped the bot from
@@ -568,26 +608,14 @@ async function ensureRelationalTablesImpl() {
   await ensureColumn("auto_trading_accounts", "weekly_loss_limit_amount real");
   await ensureColumn("auto_trading_accounts", "monthly_loss_limit_percent real");
   await ensureColumn("auto_trading_accounts", "monthly_loss_limit_amount real");
-  // "Securiser a mi-TP" as the bot's own automatic priority, requested
-  // directly: "Securiser a mi-TP maintenant quand c'est actif devrait etre
-  // donc la priorite du robot... meme avant de lancer n'importe quelle
-  // position... quand c'est active bien sur avant qu'il ne lance les
-  // positions suivantes automatiquement". A pure user choice, not admin-gated
-  // like live trading -- this only ever REDUCES risk/target (never increases
-  // exposure), same reasoning user_capital_cap and the small-account floor
-  // exception used. Applied in 3 places when on: new fixed-TP orders
-  // (US500/BTC/USD/USD/JPY) are opened with the broker TP already at half
-  // distance from the very start (see processAutoTradeForUser); turning the
-  // toggle on retroactively halves every currently open fixed-TP position's
-  // real broker TP too (see /api/auto-trade/toggle-secure-half); and for the
-  // 3 trailing-stop pairs + scalp (no fixed broker TP to halve up front),
-  // checkTrailingStops watches for price actually reaching halfway to the
-  // reference target (tp2) and locks the stop there the moment it does. Off
-  // by default -- no existing account's behavior changes until this is
-  // explicitly turned on, and it deliberately has NOT been backtested the
-  // way every other exit-mechanism change this session was (see the comment
-  // on half_target_secured below) -- ship transparently, not silently as
-  // "validated".
+  // The optional staged-protection preference is OFF by default. New automatic
+  // positions with a usable TP1 and TP2 persist TP1 as a partial-close trigger:
+  // the scheduler verifies the live broker volume, closes one valid half, moves
+  // the remainder to breakeven, then lets the existing trailing curve continue.
+  // A fixed-TP position receives TP2 at the broker so it cannot be fully closed
+  // at TP1 before that partial action. Existing positions are never converted
+  // into this new scenario; the legacy immediate TP-tightening action remains
+  // deliberately isolated to eligible pre-existing fixed-TP positions.
   await ensureColumn("auto_trading_accounts", "secure_half_priority_enabled integer NOT NULL DEFAULT 0");
   // Experimental hybrid exit: keep the fixed reference TP on top of the
   // validated trailing stop, only for pairs that clear the two-split hybrid
@@ -2615,16 +2643,21 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     // secure_half_priority_enabled applies to any order with a broker TP,
     // including a hybrid order. It can only make this new target smaller.
     const baseOrderTp1 = hybridTrailingTarget ?? (swingTrailingParams ? null : signal.tp1);
-    const securingHalfAtOpen = baseOrderTp1 != null && Number(account.secure_half_priority_enabled) === 1;
-    const orderTp1 = baseOrderTp1 == null
-      ? null
-      : securingHalfAtOpen ? signal.entree + (baseOrderTp1 - signal.entree) * 0.5 : baseOrderTp1;
+    const partialCloseEnabled = Number(account.secure_half_priority_enabled) === 1
+      && hybridTrailingTarget == null
+      && Number.isFinite(Number(signal.tp1))
+      && Number.isFinite(Number(signal.tp2));
+    const orderTp1 = baseOrderTp1;
+    // TP1 stays in our database as the partial-close trigger. Fixed-TP orders
+    // use TP2 at the broker so MetaApi cannot close the whole position before
+    // the scheduler has a chance to close the first half.
+    const brokerTakeProfit = partialCloseEnabled && !swingTrailingParams ? signal.tp2 : baseOrderTp1;
     const orderTrailingStopPrice = swingTrailingParams ? signal.sl : null;
     const orderBestFavorablePrice = swingTrailingParams ? signal.entree : null;
     await sqlRun(
-      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, risk_percent_at_trade, broker_slot, trailing_stop_price, best_favorable_price, half_target_secured)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?, ?)`,
-      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice, securingHalfAtOpen ? 1 : 0],
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, broker_take_profit, partial_close_enabled, partial_close_target, partial_close_status, status, created_at, risk_percent_at_trade, broker_slot, trailing_stop_price, best_favorable_price, half_target_secured)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?, 0)`,
+      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, brokerTakeProfit, partialCloseEnabled ? 1 : 0, partialCloseEnabled ? signal.tp1 : null, partialCloseEnabled ? "armed" : "disabled", new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
@@ -2657,7 +2690,9 @@ function clampVolumeToSpec(rawVolume, specification) {
   if (!(rawVolume > 0)) return null;
   const stepped = Math.floor(rawVolume / specification.volumeStep) * specification.volumeStep;
   const volume = Math.min(stepped, specification.maxVolume);
-  return volume >= specification.minVolume ? Math.round(volume * 100) / 100 : null;
+  // Some brokers use a 0.001 lot step. Keeping eight decimals preserves that
+  // broker-supplied step instead of silently rounding it to the wrong 0.01 lot.
+  return volume >= specification.minVolume ? Number(volume.toFixed(8)) : null;
 }
 
 // Scalp mode's opening logic -- deliberately its own function, never merged
@@ -2684,7 +2719,8 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
   const accountInfo = credentials ? await getBrokerAccountInformation(credentials).catch(() => null) : null;
   if (!accountInfo) return recordAutoTradeStatus(userId, slot, "broker_unreachable");
   if (accountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
-  if (!(sizingBalanceForAccount(account, accountInfo) > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
+  const sizingBalance = sizingBalanceForAccount(account, accountInfo);
+  if (!(sizingBalance > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
 
   // Scalp shares the account total cap with swing and allows up to the same
   // bounded number per pair. One opening attempt per tick is retained so an
@@ -2699,9 +2735,25 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
     if (pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR) continue;
     const price = await getAnalysisPrice(pair).catch(() => null);
     if (!price || !isUsableLivePrice(price)) continue;
-    const history = await getHistoryForSymbol(pair, price, { timeframe: "M1", historyBudgetMs: 4000 }).catch(() => []);
-    const signal = computeScalpMeanReversionSignal(pair, price, history);
-    if (!signal) continue;
+    const historyEntries = await Promise.all(SCALP_TIMEFRAMES.map(async (timeframe) => [
+      timeframe,
+      await getHistoryForSymbol(pair, price, {
+        timeframe,
+        strategy: "Scalping",
+        requireExactTimeframe: true,
+        historyBudgetMs: 6500,
+      }).catch(() => []),
+    ]));
+    const histories = Object.fromEntries(historyEntries);
+    const scalpSetup = buildScalpMultiTimeframeSignal(pair, price, histories);
+    const signal = scalpSetup.signal;
+    if (!signal) {
+      recordAutoTradeStatus(userId, slot, `scalp_${scalpSetup.reason || "no_valid_setup"}`, {
+        pair,
+        missingTimeframes: scalpSetup.missing || [],
+      });
+      continue;
+    }
     const newsBlocked = newsRisk.active && newsRisk.events.some((event) => signalAffectedByNews(pair, event.currency));
     if (newsBlocked) {
       recordAutoTradeStatus(userId, slot, "economic_news_window", {
@@ -2726,15 +2778,50 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
     const specification = await getBrokerSymbolSpecification(credentials, pair).catch(() => null);
     if (!specification) continue;
 
+    const effectiveRiskPercent = effectiveScalpRiskPercent(account, sizingBalance);
+    const configuredLossLimitAmount = Number(account.scalp_loss_limit_amount);
+    const percentageRiskAmount = sizingBalance * (effectiveRiskPercent / 100);
+    const riskBudgetAmount = Math.min(
+      percentageRiskAmount,
+      configuredLossLimitAmount > 0 ? configuredLossLimitAmount : Number.POSITIVE_INFINITY,
+    );
+    const minimumLotRiskCeiling = Math.min(
+      sizingBalance * (SMALL_ACCOUNT_MIN_LOT_RISK_PCT / 100),
+      configuredLossLimitAmount > 0 ? configuredLossLimitAmount : Number.POSITIVE_INFINITY,
+    );
+    if (!(riskBudgetAmount > 0) || !(minimumLotRiskCeiling > 0)) continue;
+
     let volume;
-    if (account.scalp_lot_mode === "fixed" && Number(account.scalp_fixed_lot) > 0) {
+    const fixedLot = account.scalp_lot_mode === "fixed" && Number(account.scalp_fixed_lot) > 0;
+    if (fixedLot) {
       volume = clampVolumeToSpec(Number(account.scalp_fixed_lot), specification);
     } else {
-      const lossLimitAmount = Number(account.scalp_loss_limit_amount) || 2;
-      const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
-      volume = valuePerUnitPerLot > 0 ? clampVolumeToSpec(lossLimitAmount / (signal.risk * valuePerUnitPerLot), specification) : null;
+      volume = computeVolumeForRiskAmount({
+        riskAmount: riskBudgetAmount,
+        entry: signal.entry,
+        sl: signal.sl,
+        specification,
+        allowMinVolumeFloor: true,
+        maxRiskAmount: minimumLotRiskCeiling,
+      });
     }
-    if (!volume) continue;
+    if (!volume) {
+      recordAutoTradeStatus(userId, slot, "scalp_minimum_lot_risk_exceeds_limit", { pair, riskBudgetAmount, minimumLotRiskCeiling });
+      continue;
+    }
+    const estimatedMaxLossAmount = estimateStopLossAmount({ entry: signal.entry, sl: signal.sl, volume, specification });
+    const isMinimumLot = Math.abs(volume - specification.minVolume) < Math.max(0.0000001, specification.volumeStep / 100);
+    const maximumAllowedLoss = !fixedLot && isMinimumLot ? minimumLotRiskCeiling : riskBudgetAmount;
+    if (!(estimatedMaxLossAmount > 0) || estimatedMaxLossAmount > maximumAllowedLoss * 1.000001) {
+      recordAutoTradeStatus(userId, slot, "scalp_volume_risk_exceeds_limit", {
+        pair,
+        estimatedMaxLossAmount,
+        maximumAllowedLoss,
+        effectiveRiskPercent,
+        isMinimumLot,
+      });
+      continue;
+    }
 
     // Cost-viability guard (see estimateScalpRoundTripCost/isScalpTargetCostViable):
     // reject if the real spread would eat too much of this specific trade's
@@ -2758,17 +2845,18 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
     const scalpNewsContext = buildAutomaticNewsContext(newsRisk);
     const scalpTechnicalSnapshot = {
       valid: true,
-      trend: signal.direction === "ACHAT" ? "mean-reversion-long" : "mean-reversion-short",
-      marketRegime: "range",
-      confirmations: 1,
+      trend: signal.direction === "ACHAT" ? "haussiere multi-timeframe" : "baissiere multi-timeframe",
+      marketRegime: "trend_pullback",
+      confirmations: SCALP_TIMEFRAMES.length,
       volatility: Number.isFinite(Number(signal.risk)) && Number(price.price) > 0 ? (Number(signal.risk) / Number(price.price)) * 100 : null,
     };
     const scalpDataSnapshot = buildAnalysisSnapshot({
       pair,
-      timeframe: "M1",
+      timeframe: signal.signalTimeframe,
       livePrice: price,
-      history,
+      history: histories[signal.signalTimeframe],
       technicalSnapshot: scalpTechnicalSnapshot,
+      multiTimeframe: scalpSetup.multiTimeframe,
       newsContext: scalpNewsContext,
     });
     const analysisId = `scalp_${Date.now()}_${randomBytes(4).toString("hex")}`;
@@ -2777,10 +2865,10 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
       createdAt: new Date().toISOString(),
       userId,
       pair,
-      timeframe: "M1",
-      style: "Mean-reversion (bot scalp)",
+      timeframe: signal.signalTimeframe,
+      style: "Mean-reversion multi-timeframe (bot scalp)",
       strategy: "Scalp",
-      risk: account.scalp_lot_mode === "fixed" ? `lot fixe ${volume}` : `${account.scalp_loss_limit_amount || 2}$`,
+      risk: `${effectiveRiskPercent}% - perte estimee ${estimatedMaxLossAmount.toFixed(2)}`,
       direction: signal.direction,
       entry: signal.entry,
       sl: signal.sl,
@@ -2792,11 +2880,14 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
       status: "OPEN",
       technicalSnapshot: scalpTechnicalSnapshot,
       dataSnapshot: scalpDataSnapshot,
+      multiTimeframe: scalpSetup.multiTimeframe,
       newsSnapshot: scalpNewsContext,
       decisionReasons: buildDecisionReasonCodes({
         livePrice: price,
         technicalSnapshot: scalpTechnicalSnapshot,
+        multiTimeframe: scalpSetup.multiTimeframe,
         newsContext: scalpNewsContext,
+        validation: { valid: true },
       }),
       marketRegime: scalpTechnicalSnapshot.marketRegime,
       source: "auto_scalp",
@@ -2822,11 +2913,15 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
       signal,
       Number(account.hybrid_trailing_enabled) === 1,
     );
+    const partialCloseEnabled = Number(account.secure_half_priority_enabled) === 1
+      && hybridTrailingTarget == null
+      && Number.isFinite(Number(signal.tp));
     const orderTp1 = hybridTrailingTarget ?? null;
+    const brokerTakeProfit = hybridTrailingTarget ?? null;
     await sqlRun(
-      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, status, created_at, scalp_max_hold_seconds, broker_slot, trailing_stop_price, best_favorable_price)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?)`,
-      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, orderTp1, signal.tp, new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry],
+      `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, broker_take_profit, partial_close_enabled, partial_close_target, partial_close_status, status, created_at, scalp_max_hold_seconds, broker_slot, trailing_stop_price, best_favorable_price, risk_percent_at_trade, signal_timeframe, entry_timeframe, setup_timeframe, sl_distance, estimated_max_loss_amount, sizing_balance_at_trade)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, orderTp1, signal.tp, brokerTakeProfit, partialCloseEnabled ? 1 : 0, partialCloseEnabled ? signal.tp : null, partialCloseEnabled ? "armed" : "disabled", new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry, effectiveRiskPercent, signal.signalTimeframe, signal.entryTimeframe, signal.setupTimeframe, signal.risk, estimatedMaxLossAmount, sizingBalance],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
@@ -3948,16 +4043,10 @@ async function handleApi(req, res, url) {
   // admin's scalp_enabled (pairs/lot mode/amounts configured there too) before
   // the owner can turn their own switch on -- same authorize-once/enable-freely
   // split as live_trading_enabled/authorized.
-  // "Securiser a mi-TP" as the bot's own priority (see
-  // secure_half_priority_enabled's schema comment for the full request and
-  // reasoning). Turning this ON retroactively halves every currently open
-  // fixed-TP position's real broker TP right away -- requested directly
-  // ("meme avec des positions ouverte deja de base") -- using the exact same
-  // secureHalfForOrder the manual button and future auto-opened positions
-  // both go through, never a separate reimplementation. Turning it OFF only
-  // stops the behavior going forward; it deliberately never un-halves a TP
-  // that's already been moved (there's no "original" to restore once the
-  // broker TP itself has changed).
+  // The preference arms staged partial protection for future automatic
+  // positions. Existing fixed-TP positions retain the historical opt-in
+  // behavior below: their broker target can be tightened immediately, but they
+  // are never converted into a partial-close plan while already open.
   if (url.pathname === "/api/auto-trade/toggle-hybrid-trailing") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -3998,7 +4087,8 @@ async function handleApi(req, res, url) {
     if (enabled) {
       const openRows = await sqlAll(
         `SELECT o.*, a.source as source FROM trade_orders o LEFT JOIN analyses a ON a.id = o.analysis_id
-         WHERE o.user_id = ? AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL AND o.tp1 IS NOT NULL AND o.half_target_secured = 0`,
+         WHERE o.user_id = ? AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL
+           AND o.tp1 IS NOT NULL AND o.half_target_secured = 0 AND o.partial_close_enabled = 0`,
         [session.user.id],
       );
       for (const row of openRows) {
@@ -4333,14 +4423,23 @@ async function handleApi(req, res, url) {
     // card it belongs to by this id, so it has to be present here, not just on the
     // semi-automatic order list.
     const rows = await sqlAll(
-      `SELECT a.*, o.id as order_id, o.broker_order_id as broker_order_id,
+      `SELECT a.*, o.id as order_id, o.broker_order_id as broker_order_id, o.broker_position_id as broker_position_id,
               o.trailing_stop_price as trailing_stop_price, o.best_favorable_price as best_favorable_price,
               o.trailing_last_attempt_at as trailing_last_attempt_at, o.trailing_last_success_at as trailing_last_success_at,
               o.trailing_last_error as trailing_last_error, o.trailing_last_error_at as trailing_last_error_at,
-              o.trailing_last_requested_stop as trailing_last_requested_stop, o.trailing_modify_attempts as trailing_modify_attempts
+              o.trailing_last_requested_stop as trailing_last_requested_stop, o.trailing_modify_attempts as trailing_modify_attempts,
+              o.partial_close_enabled as partial_close_enabled, o.partial_close_target as partial_close_target,
+              o.partial_close_status as partial_close_status, o.partial_close_volume as partial_close_volume,
+              o.partial_close_at as partial_close_at, o.partial_close_error as partial_close_error,
+              o.breakeven_applied as breakeven_applied,
+              o.risk_percent_at_trade as risk_percent_at_trade,
+              o.signal_timeframe as signal_timeframe, o.entry_timeframe as entry_timeframe,
+              o.setup_timeframe as setup_timeframe, o.sl_distance as sl_distance,
+              o.estimated_max_loss_amount as estimated_max_loss_amount,
+              o.sizing_balance_at_trade as sizing_balance_at_trade
        FROM analyses a
        LEFT JOIN trade_orders o ON o.analysis_id = a.id
-       WHERE a.user_id = ? AND a.source = 'auto_signal' ORDER BY a.created_at DESC LIMIT 50`,
+       WHERE a.user_id = ? AND a.source IN ('auto_signal', 'auto_scalp') ORDER BY a.created_at DESC LIMIT 50`,
       [session.user.id],
     );
     const trades = rows.map((row) => {
@@ -4354,6 +4453,7 @@ async function handleApi(req, res, url) {
         ...analysis,
         orderId: row.order_id || null,
         brokerOrderId: row.broker_order_id || null,
+        brokerPositionId: row.broker_position_id || null,
         trailingEnabled,
         trailingStopPrice: row.trailing_stop_price ?? null,
         bestFavorablePrice: row.best_favorable_price ?? null,
@@ -4365,6 +4465,20 @@ async function handleApi(req, res, url) {
         trailingLastErrorAt: row.trailing_last_error_at || null,
         trailingLastRequestedStop: row.trailing_last_requested_stop ?? null,
         trailingModifyAttempts: Number(row.trailing_modify_attempts) || 0,
+        partialCloseEnabled: Boolean(row.partial_close_enabled),
+        partialCloseTarget: row.partial_close_target ?? null,
+        partialCloseStatus: row.partial_close_status || "disabled",
+        partialCloseVolume: row.partial_close_volume ?? null,
+        partialCloseAt: row.partial_close_at || null,
+        partialCloseError: row.partial_close_error || null,
+        breakevenApplied: Boolean(row.breakeven_applied),
+        riskPercentAtTrade: row.risk_percent_at_trade ?? null,
+        signalTimeframe: row.signal_timeframe || null,
+        entryTimeframe: row.entry_timeframe || null,
+        setupTimeframe: row.setup_timeframe || null,
+        slDistance: row.sl_distance ?? null,
+        estimatedMaxLossAmount: row.estimated_max_loss_amount ?? null,
+        sizingBalanceAtTrade: row.sizing_balance_at_trade ?? null,
       };
     });
     sendJson(res, 200, { ok: true, trades });
@@ -5544,7 +5658,13 @@ async function fetchYahooPrice(symbol) {
 }
 
 function historyVariantKey(options = {}) {
-  return options.strictDaily ? "swing_daily" : "default";
+  if (options.strictDaily) return "swing_daily";
+  // A cache entry is meaningful only for the interval it contains. Keeping M1,
+  // M5 and D1 under one key would let a later request reuse the wrong bars as
+  // if they were another timeframe. The default key remains for older generic
+  // callers that deliberately did not request a horizon.
+  const timeframe = normalizeTimeframe(options.timeframe);
+  return timeframe ? `timeframe_${timeframe}` : "default";
 }
 
 async function getHistories(prices, options = {}) {
@@ -5655,7 +5775,7 @@ async function loadHistories(prices, usableKey, options = {}) {
 
 async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cache = await loadMarketCache();
-  const cached = cachedHistory(symbol, cache);
+  const cached = cachedHistory(symbol, cache, options);
   const preferredIntervals = historyIntervals(symbol, options);
   if (cached.length >= 30 && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
   if (!price?.open || !isUsableLivePrice(price)) return cached;
@@ -5679,12 +5799,12 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       try {
         const bars = await loader(symbol, interval);
         if (bars.length >= 30) {
-          tagHistory(bars, `${source}:${interval}`, false);
+          tagHistory(bars, `${source}:${interval}`, false, null, options.timeframe || null);
           if (isHistoryCompatible(bars, options)) {
-            await saveMarketCache({
-              ...cache,
-              histories: mergeCachedHistories(cache.histories || {}, { [symbol]: bars }),
-            }, { force: true });
+            // Keep the fresh timeframe in memory immediately, but let the normal
+            // persistence throttle batch writes to Neon. A scalp evaluates six
+            // horizons and must never turn a cache refresh into six database writes.
+            await saveMarketCache(historyCacheUpdate(cache, { [symbol]: bars }, options));
             recordProviderHealth(`${source}_history_single`, true);
             return bars;
           }
@@ -5702,7 +5822,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     try {
       const bars = await fetchDukascopyHistory(symbol);
       if (bars.length >= 30) {
-        tagHistory(bars, "dukascopy:daily", true);
+        tagHistory(bars, "dukascopy:daily", true, null, options.timeframe || null);
         recordProviderHealth("dukascopy_history_single", true);
         return bars;
       }
@@ -5952,6 +6072,13 @@ function historyIntervals(symbol, options = {}) {
   if (options.strictDaily) return ["1day"];
   const timeframe = normalizeTimeframe(options.timeframe);
   const strategy = String(options.strategy || "");
+  // The autonomous multi-timeframe scalp is not allowed to silently substitute
+  // another interval. Its D1/H4/H1 structure and M5/M1 trigger are only valid
+  // when the provider returned that exact interval.
+  if (options.requireExactTimeframe) {
+    const exactIntervals = { M1: "1min", M5: "5min", M15: "15min", H1: "1h", H4: "4h", D1: "1day" };
+    return exactIntervals[timeframe] ? [exactIntervals[timeframe]] : [];
+  }
   if (timeframe === "M1") return ["1min", "5min", "15min"];
   if (timeframe === "M5") return ["5min", "1min", "15min"];
   if (timeframe === "M15") {
@@ -5979,6 +6106,10 @@ function isHistoryCompatible(history, options = {}) {
   const strategy = String(options.strategy || "");
   const timeframe = normalizeTimeframe(options.timeframe);
   if (options.strictDaily) return historySourceHasInterval(source, ["1day"]);
+  if (options.requireExactTimeframe) {
+    const exactIntervals = { M1: "1min", M5: "5min", M15: "15min", H1: "1h", H4: "4h", D1: "1day" };
+    return Boolean(exactIntervals[timeframe] && historySourceHasInterval(source, [exactIntervals[timeframe]]));
+  }
   if (timeframe === "M1") return historySourceHasInterval(source, ["1min"]);
   if (timeframe === "M5") return historySourceHasInterval(source, ["1min", "5min"]);
   if (timeframe === "M15") {
@@ -6396,9 +6527,27 @@ async function deterministicCrossCheck(pair, livePrice) {
 // worst case once the stop moves is a real, if small, locked-in gain, never a
 // bare breakeven.
 const SCALP_PARAMS_BY_PAIR = {
-  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 60, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
-  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 60, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
+  "GBP/USD": { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, minTargetR: 0.75, maxHoldBars: 60, trailActivationR: 0.75, trailR: 0.3, trailBufferR: 0.15 },
+  "XAU/USD": { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, minTargetR: 0.5, maxHoldBars: 60, trailActivationR: 0.2, trailR: 0.2, trailBufferR: 0.15 },
 };
+
+// A scalp may enter on M1 only after a six-horizon reading. M1 is deliberately
+// the execution trigger, never the source of the whole trade thesis or its stop.
+const SCALP_TIMEFRAME_PLAN = Object.freeze({
+  context: ["D1", "H4"],
+  structure: ["H1", "M15"],
+  signal: "M5",
+  entry: "M1",
+  setup: "M15",
+});
+const SCALP_TIMEFRAMES = Object.freeze([
+  ...SCALP_TIMEFRAME_PLAN.context,
+  ...SCALP_TIMEFRAME_PLAN.structure,
+  SCALP_TIMEFRAME_PLAN.signal,
+  SCALP_TIMEFRAME_PLAN.entry,
+]);
+const SCALP_DEFAULT_RISK_PERCENT = 0.25;
+const SCALP_MAX_RISK_PERCENT = 0.5;
 
 // Same staged trailing stop as SCALP_PARAMS_BY_PAIR above, this time for the
 // swing engine (processAutoTradeForUser), requested directly after shipping
@@ -6414,12 +6563,6 @@ const SCALP_PARAMS_BY_PAIR = {
 // that bar and are deliberately excluded, still using the fixed TP. Like
 // scalp, tp1 is never sent to the broker for these three pairs (see
 // processAutoTradeForUser) -- the trailing stop is the only exit besides sl.
-const SWING_TRAILING_PARAMS_BY_PAIR = {
-  "XAU/USD": { trailActivationR: 1, trailR: 0.5, trailBufferR: 0.15 },
-  "USD/CHF": { trailActivationR: 0.2, trailR: 0.3, trailBufferR: 0.15 },
-  "EUR/USD": { trailActivationR: 0.2, trailR: 0.3, trailBufferR: 0.15 },
-};
-
 // Hybrid is deliberately narrower than the trailing-only set. The backtests
 // show a robust improvement over the fixed baseline for XAU/USD in scalp and
 // EUR/USD in swing. GBP/USD did not hold the comparison over the longer
@@ -6446,16 +6589,128 @@ function hybridTrailingTargetFor(source, pair, signal, enabled) {
 // Yahoo daily data, two independent 5-year periods, signals filtered to only
 // those whose real min-lot dollar risk stays under each tested ceiling):
 // EUR/USD and USD/CHF both held a positive edge on BOTH periods, train AND
-// test, at a 15% ceiling (higher ceilings tested too, 15% was the tightest
-// that still unlocked most of the population -- 94-97% of all EUR/USD and
-// USD/CHF signals became eligible at $100). XAU/USD never cleared the bar at
-// ANY capital/ceiling combination tried -- today's much higher gold price
-// (vs. when this backtest's older period started) means its natural stop is
-// simply too wide for a small account, confirmed by an empty out-of-sample
-// test split every time it was tried, not a guess. Deliberately excluded, not
-// an oversight -- XAU/USD keeps the old strict skip-if-too-small behavior.
+// test, at a former 15% ceiling. That ceiling was unacceptable for the small
+// account objective: a minimum lot is now allowed only when its calculated
+// loss is at most 2% of the capital actually used for sizing. XAU/USD remains
+// excluded because its natural structural stops are typically too wide.
 const SMALL_ACCOUNT_MIN_LOT_PAIRS = new Set(["EUR/USD", "USD/CHF"]);
-const SMALL_ACCOUNT_MIN_LOT_RISK_PCT = 15;
+const SMALL_ACCOUNT_MIN_LOT_RISK_PCT = 2;
+
+function averageRange(history, bars = 12) {
+  const ranges = (history || []).slice(-bars)
+    .map((bar) => Number(bar.high) - Number(bar.low))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return average(ranges);
+}
+
+function buildScalpStructuralStop({ direction, entry, m15History, m5History }) {
+  const m15Bars = (m15History || []).slice(-10);
+  const m5Bars = (m5History || []).slice(-12);
+  const m15Range = averageRange(m15Bars, m15Bars.length);
+  const m5Range = averageRange(m5Bars, m5Bars.length);
+  if (!m15Bars.length || !m5Bars.length || !(m15Range > 0) || !(m5Range > 0)) return null;
+  // M15 is the setup horizon. The M5 range only supplies a volatility buffer so
+  // an otherwise valid M15 swing is not parked directly in execution noise.
+  const buffer = Math.max(m15Range * 0.12, m5Range * 0.25);
+  const lows = [...m15Bars, ...m5Bars].map((bar) => Number(bar.low)).filter(Number.isFinite);
+  const highs = [...m15Bars, ...m5Bars].map((bar) => Number(bar.high)).filter(Number.isFinite);
+  if (!lows.length || !highs.length) return null;
+  const structuralLevel = direction === "ACHAT" ? Math.min(...lows) : Math.max(...highs);
+  const sl = direction === "ACHAT" ? structuralLevel - buffer : structuralLevel + buffer;
+  const risk = Math.abs(Number(entry) - sl);
+  if (!(risk > 0) || (direction === "ACHAT" && !(sl < entry)) || (direction === "VENTE" && !(sl > entry))) return null;
+  return { sl, risk, structuralLevel, buffer };
+}
+
+function scalpEntryCandleConfirms(direction, m1History, m5Snapshot) {
+  const m1Bars = (m1History || []).slice(-2);
+  const last = m1Bars.at(-1);
+  if (!last || !Number.isFinite(Number(last.open)) || !Number.isFinite(Number(last.close))) return false;
+  // The M5 pullback must still exist, while the final completed M1 candle has
+  // started to reverse. This avoids buying a falling M1 solely because RSI is low.
+  if (direction === "ACHAT") return Number(m5Snapshot?.rsi) <= 55 && Number(last.close) > Number(last.open);
+  return Number(m5Snapshot?.rsi) >= 45 && Number(last.close) < Number(last.open);
+}
+
+function buildScalpMultiTimeframeSignal(pair, price, histories) {
+  const params = SCALP_PARAMS_BY_PAIR[pair];
+  if (!params) return { signal: null, reason: "pair_not_validated", multiTimeframe: [] };
+  const snapshots = Object.fromEntries(SCALP_TIMEFRAMES.map((timeframe) => [
+    timeframe,
+    buildTechnicalSnapshot(pair, histories?.[timeframe] || [], price, { timeframe, requireExactTimeframe: true, strategy: "Scalping" }),
+  ]));
+  const multiTimeframe = SCALP_TIMEFRAMES.map((timeframe) => ({ timeframe, ...snapshots[timeframe] }));
+  // M1/M5 deliberately need fresh exact candles, but not a directional trend:
+  // they are a pullback/entry zone. Requiring buildTechnicalSnapshot.valid there
+  // would reject normal mean-reversion setups simply because M1 is ranging.
+  const missing = SCALP_TIMEFRAMES.filter((timeframe) => {
+    const history = histories?.[timeframe];
+    const minimumBars = timeframe === "M1" ? params.maPeriod + 20 : 30;
+    return !Array.isArray(history)
+      || history.length < minimumBars
+      || Boolean(history._meta?.stale)
+      || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true, strategy: "Scalping" });
+  });
+  if (missing.length) return { signal: null, reason: "timeframe_data_unavailable", missing, multiTimeframe };
+
+  const dailyDirection = trendDirection(snapshots.D1.trend);
+  const h4Direction = trendDirection(snapshots.H4.trend);
+  if (!dailyDirection || dailyDirection !== h4Direction) {
+    return { signal: null, reason: "context_not_aligned", multiTimeframe };
+  }
+  const h1Direction = trendDirection(snapshots.H1.trend);
+  const m15Direction = trendDirection(snapshots.M15.trend);
+  if (!h1Direction || h1Direction !== dailyDirection || (m15Direction && m15Direction !== dailyDirection)) {
+    return { signal: null, reason: "structure_opposes_context", multiTimeframe };
+  }
+
+  // M5 is the actual setup signal. M1 is kept strictly for its final reversal
+  // candle confirmation below, never as the sole basis of a trade decision.
+  const m5Signal = computeScalpMeanReversionSignal(pair, price, histories.M5);
+  if (!m5Signal || m5Signal.direction !== dailyDirection) {
+    return { signal: null, reason: "entry_not_aligned", multiTimeframe };
+  }
+  if (!scalpEntryCandleConfirms(m5Signal.direction, histories.M1, snapshots.M5)) {
+    return { signal: null, reason: "trigger_not_confirmed", multiTimeframe };
+  }
+
+  const structuralStop = buildScalpStructuralStop({
+    direction: m5Signal.direction,
+    entry: m5Signal.entry,
+    m15History: histories.M15,
+    m5History: histories.M5,
+  });
+  if (!structuralStop) return { signal: null, reason: "structural_stop_unavailable", multiTimeframe };
+
+  const m5Mean = average(histories.M5.slice(-params.maPeriod).map((bar) => Number(bar.close)));
+  const cappedTarget = m5Signal.direction === "ACHAT"
+    ? Math.min(m5Signal.entry + structuralStop.risk * params.tpR, m5Mean)
+    : Math.max(m5Signal.entry - structuralStop.risk * params.tpR, m5Mean);
+  const targetR = Math.abs(cappedTarget - m5Signal.entry) / structuralStop.risk;
+  if (!Number.isFinite(cappedTarget)
+    || (m5Signal.direction === "ACHAT" && !(cappedTarget > m5Signal.entry))
+    || (m5Signal.direction === "VENTE" && !(cappedTarget < m5Signal.entry))
+    || targetR < params.minTargetR) {
+    return { signal: null, reason: "target_not_viable", multiTimeframe };
+  }
+
+  return {
+    signal: {
+      ...m5Signal,
+      sl: structuralStop.sl,
+      risk: structuralStop.risk,
+      tp: cappedTarget,
+      structuralStop,
+      signalTimeframe: SCALP_TIMEFRAME_PLAN.signal,
+      entryTimeframe: SCALP_TIMEFRAME_PLAN.entry,
+      setupTimeframe: SCALP_TIMEFRAME_PLAN.setup,
+      contextTimeframes: SCALP_TIMEFRAME_PLAN.context,
+      structureTimeframes: SCALP_TIMEFRAME_PLAN.structure,
+    },
+    reason: null,
+    multiTimeframe,
+  };
+}
 
 function computeScalpMeanReversionSignal(pair, price, history) {
   const params = SCALP_PARAMS_BY_PAIR[pair];
@@ -10949,9 +11204,25 @@ function rowToTradeOrder(row) {
     sl: row.sl,
     tp1: row.tp1 ?? null,
     tp2: row.tp2 ?? null,
+    brokerTakeProfit: row.broker_take_profit ?? null,
     volume: row.volume ?? null,
+    riskPercentAtTrade: row.risk_percent_at_trade ?? null,
+    signalTimeframe: row.signal_timeframe || null,
+    entryTimeframe: row.entry_timeframe || null,
+    setupTimeframe: row.setup_timeframe || null,
+    slDistance: row.sl_distance ?? null,
+    estimatedMaxLossAmount: row.estimated_max_loss_amount ?? null,
+    sizingBalanceAtTrade: row.sizing_balance_at_trade ?? null,
+    partialCloseEnabled: Boolean(row.partial_close_enabled),
+    partialCloseTarget: row.partial_close_target ?? null,
+    partialCloseStatus: row.partial_close_status || "disabled",
+    partialCloseVolume: row.partial_close_volume ?? null,
+    partialCloseAt: row.partial_close_at || null,
+    partialCloseError: row.partial_close_error || null,
+    breakevenApplied: Boolean(row.breakeven_applied),
     status: row.status,
     brokerOrderId: row.broker_order_id || null,
+    brokerPositionId: row.broker_position_id || null,
     executedEntry: row.executed_entry ?? null,
     executedAt: row.executed_at || null,
     executionSlippage: row.execution_slippage ?? null,
@@ -11125,7 +11396,8 @@ function publicBrokerError(value) {
 
 async function sendOrderToBroker(order, credentials = null) {
   if (MOCK_BROKER_ENABLED) {
-    return { ok: true, brokerOrderId: `mock_${Date.now()}_${randomBytes(4).toString("hex")}` };
+    const mockId = `mock_${Date.now()}_${randomBytes(4).toString("hex")}`;
+    return { ok: true, brokerOrderId: mockId, brokerPositionId: mockId };
   }
   const creds = resolveBrokerCredentials(credentials);
   if (!creds) return { ok: false, error: "broker_not_configured" };
@@ -11135,8 +11407,11 @@ async function sendOrderToBroker(order, credentials = null) {
     actionType: order.direction === "ACHAT" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
     symbol: String(order.pair).replace("/", ""),
     volume: order.volume,
+    clientId: String(order.id),
     stopLoss: order.sl,
-    takeProfit: order.tp1 || undefined,
+    takeProfit: order.brokerTakeProfit != null && Number.isFinite(Number(order.brokerTakeProfit))
+      ? Number(order.brokerTakeProfit)
+      : (Number.isFinite(Number(order.tp1)) ? Number(order.tp1) : undefined),
   };
   try {
     const response = await fetch(url, {
@@ -11156,10 +11431,11 @@ async function sendOrderToBroker(order, credentials = null) {
       return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
     }
     const brokerOrderId = String(data?.orderId ?? data?.positionId ?? "");
+    const brokerPositionId = data?.positionId != null ? String(data.positionId) : null;
     // A successful numeric code without an identifier is still ambiguous: the
     // broker may have opened the position, but we cannot reconcile it afterward.
     if (!brokerOrderId) return { ok: false, uncertain: true, error: "broker_ack_missing_order_id" };
-    return { ok: true, brokerOrderId };
+    return { ok: true, brokerOrderId, brokerPositionId };
   } catch (error) {
     // The request may have reached the broker before the connection failed. Never
     // turn this into a retryable FAILED order: that can duplicate a real position.
@@ -11191,6 +11467,57 @@ async function closeBrokerPosition(credentials, positionId) {
   } catch (error) {
     return { ok: false, uncertain: true, error: `broker_request_uncertain: ${error.message}` };
   }
+}
+
+// MetaApi has a distinct partial-close action. A normal POSITION_CLOSE_ID is
+// deliberately not reused here: if a broker rounds an invalid half-volume, it
+// must reject the request rather than close the entire position by accident.
+async function partialCloseBrokerPosition(credentials, positionId, volume) {
+  const region = credentials.region || "new-york";
+  const url = `https://mt-client-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${credentials.accountId}/trade`;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "auth-token": credentials.token },
+      body: JSON.stringify({ actionType: "POSITION_PARTIAL", positionId: String(positionId), volume }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await readResponseJsonLimited(response).catch(() => ({}));
+    if (!response.ok) return { ok: false, error: data?.message || `broker_http_${response.status}` };
+    if (data?.numericCode !== 10009) return { ok: false, error: data?.stringCode || data?.message || "broker_rejected" };
+    return { ok: true, brokerOrderId: data?.orderId ? String(data.orderId) : null };
+  } catch (error) {
+    return { ok: false, uncertain: true, error: `broker_request_uncertain: ${error.message}` };
+  }
+}
+
+function partialCloseTargetReached(direction, currentPrice, target) {
+  if (!(currentPrice > 0) || !(target > 0)) return false;
+  return direction === "ACHAT" ? currentPrice >= target : currentPrice <= target;
+}
+
+function partialCloseVolumeForPosition(position, specification) {
+  const currentVolume = Number(position?.volume);
+  const minVolume = Number(specification?.minVolume);
+  const volumeStep = Number(specification?.volumeStep);
+  if (!(currentVolume > 0) || !(minVolume > 0) || !(volumeStep > 0)) return null;
+  const closeVolume = Math.floor((currentVolume / 2) / volumeStep + 1e-9) * volumeStep;
+  const remainingVolume = currentVolume - closeVolume;
+  if (!(closeVolume >= minVolume) || !(remainingVolume >= minVolume)) return null;
+  return Number(closeVolume.toFixed(8));
+}
+
+function breakevenStopForPosition({ entry, direction, pair, strategy, currentPrice }) {
+  const effectiveEntry = Number(entry);
+  const livePrice = Number(currentPrice);
+  const buffer = executionCostBuffer(pair, strategy);
+  if (!(effectiveEntry > 0) || !(livePrice > 0) || !(buffer > 0)) return null;
+  const buy = direction === "ACHAT";
+  const desired = buy ? effectiveEntry + buffer : effectiveEntry - buffer;
+  const safe = buy ? livePrice - buffer : livePrice + buffer;
+  const stop = buy ? Math.min(desired, safe) : Math.max(desired, safe);
+  if (buy ? !(stop > effectiveEntry) : !(stop < effectiveEntry)) return null;
+  return stop;
 }
 
 // The trailing-stop counterpart to closeBrokerPosition -- same endpoint, same
@@ -11255,6 +11582,28 @@ async function modifyBrokerPositionTakeProfit(credentials, positionId, newTakePr
 // ever be triggered live, once price actually reaches the halfway point, see
 // checkTrailingStops.
 async function secureHalfForOrderUnlocked(order, orderRow, credentials) {
+  if (order.partialCloseEnabled) {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: "partial_close_already_armed",
+        message: "Cette position est deja configuree pour cloturer une moitie a TP1 puis proteger le reliquat au breakeven.",
+      },
+    };
+  }
+  const brokerPositionId = await resolveBrokerPositionId(credentials, {
+    orderId: order.id,
+    brokerOrderId: order.brokerOrderId,
+    brokerPositionId: order.brokerPositionId,
+  });
+  if (!brokerPositionId) {
+    return { status: 409, body: { ok: false, error: "broker_position_unresolved" } };
+  }
+  if (String(order.brokerPositionId || "") !== brokerPositionId) {
+    await sqlRun(`UPDATE trade_orders SET broker_position_id = ? WHERE id = ?`, [brokerPositionId, order.id]);
+    order.brokerPositionId = brokerPositionId;
+  }
   const buy = order.direction === "ACHAT";
   const entry = Number.isFinite(Number(order.executedEntry)) ? Number(order.executedEntry) : Number(order.entry);
   const brokerPrice = await getBrokerCurrentPrice(credentials, order.pair).catch(() => null);
@@ -11274,7 +11623,7 @@ async function secureHalfForOrderUnlocked(order, orderRow, credentials) {
         },
       };
     }
-    const result = await modifyBrokerPositionTakeProfit(credentials, order.brokerOrderId, halfTp);
+    const result = await modifyBrokerPositionTakeProfit(credentials, brokerPositionId, halfTp);
     if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: publicBrokerError(result.error) } };
     await sqlRun(`UPDATE trade_orders SET tp1 = ?, half_target_secured = 1 WHERE id = ?`, [halfTp, order.id]);
     return { status: 200, body: { ok: true, mode: "tp_halved", newTakeProfit: halfTp } };
@@ -11300,7 +11649,7 @@ async function secureHalfForOrderUnlocked(order, orderRow, credentials) {
   if (!improves) {
     return { status: 409, body: { ok: false, error: "already_secured_more", message: "Le stop suiveur protège déjà plus que la moitié du profit actuel -- rien à faire." } };
   }
-  const result = await modifyBrokerPositionStopLoss(credentials, order.brokerOrderId, halfLockStop);
+  const result = await modifyBrokerPositionStopLoss(credentials, brokerPositionId, halfLockStop);
   if (!result.ok) return { status: 502, body: { ok: false, error: "broker_modify_failed", message: publicBrokerError(result.error) } };
   await sqlRun(`UPDATE trade_orders SET trailing_stop_price = ?, best_favorable_price = ?, half_target_secured = 1 WHERE id = ?`, [halfLockStop, currentPrice, order.id]);
   return { status: 200, body: { ok: true, mode: "stop_locked_half_profit", newStopLoss: halfLockStop } };
@@ -11415,18 +11764,21 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     // unnoticed through this session's live scalp/trailing-stop testing. Skip the
     // tp1 side of the check entirely when there's no broker-side TP to validate
     // against, on both sides, instead of silently degenerating into a bogus bound.
-    const hasBrokerTp = Number.isFinite(order.tp1);
+    const brokerTakeProfit = order.brokerTakeProfit != null && Number.isFinite(Number(order.brokerTakeProfit))
+      ? Number(order.brokerTakeProfit)
+      : order.tp1;
+    const hasBrokerTp = brokerTakeProfit != null && Number.isFinite(Number(brokerTakeProfit));
     const brokerStopDistance = Math.max(executionCostBuffer(order.pair), protection.stopsLevel * protection.point);
     const stopReference = buyOrder ? protection.bid : protection.ask;
     const targetReference = buyOrder ? protection.ask : protection.bid;
     const sideValid = buyOrder
-      ? (!hasBrokerTp || order.tp1 > targetReference) && order.sl < stopReference
-      : (!hasBrokerTp || order.tp1 < targetReference) && order.sl > stopReference;
+      ? (!hasBrokerTp || brokerTakeProfit > targetReference) && order.sl < stopReference
+      : (!hasBrokerTp || brokerTakeProfit < targetReference) && order.sl > stopReference;
     if (!sideValid) {
       return { status: 409, body: { ok: false, error: "levels_crossed_by_broker_price" } };
     }
     const stopDistance = buyOrder ? stopReference - order.sl : order.sl - stopReference;
-    const targetDistance = buyOrder ? order.tp1 - targetReference : targetReference - order.tp1;
+    const targetDistance = buyOrder ? brokerTakeProfit - targetReference : targetReference - brokerTakeProfit;
     if (!(stopDistance > brokerStopDistance) || (hasBrokerTp && !(targetDistance > brokerStopDistance))) {
       return { status: 409, body: { ok: false, error: "broker_protection_too_close" } };
     }
@@ -11456,11 +11808,12 @@ async function confirmAndSendOrder({ orderId, userId, volume, credentials = null
     const broker = await sendOrderToBroker(order, credentials);
     order.status = broker.ok ? "SENT" : broker.uncertain ? "DELIVERY_UNKNOWN" : "FAILED";
     order.brokerOrderId = broker.ok ? broker.brokerOrderId : null;
+    order.brokerPositionId = broker.ok ? broker.brokerPositionId : null;
     order.errorMessage = broker.ok ? null : broker.uncertain ? "broker_delivery_uncertain" : publicBrokerError(broker.error);
     order.sentAt = broker.ok ? new Date().toISOString() : null;
     const finalUpdate = await sqlRun(
-      `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ? AND status = 'SENDING'`,
-      [order.volume, order.status, order.brokerOrderId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
+      `UPDATE trade_orders SET volume = ?, status = ?, broker_order_id = ?, broker_position_id = ?, error_message = ?, confirmed_at = ?, sent_at = ? WHERE id = ? AND status = 'SENDING'`,
+      [order.volume, order.status, order.brokerOrderId, order.brokerPositionId, order.errorMessage, order.confirmedAt, order.sentAt, order.id],
     );
     if (Number(pgPool ? finalUpdate.rowCount : finalUpdate.changes) !== 1) {
       // Another instance may have moved SENDING to DELIVERY_UNKNOWN while this
@@ -11678,6 +12031,25 @@ async function getBrokerOpenPositions(credentials) {
   return Array.isArray(positions) ? positions : null;
 }
 
+function findBrokerPosition(positions, { orderId, brokerOrderId, brokerPositionId } = {}) {
+  if (!Array.isArray(positions)) return null;
+  const identifiers = [brokerPositionId, brokerOrderId, orderId]
+    .filter((value) => value != null && String(value) !== "")
+    .map(String);
+  return positions.find((position) => [position?.id, position?.positionId, position?.orderId, position?.clientId]
+    .filter((value) => value != null)
+    .some((value) => identifiers.includes(String(value)))) || null;
+}
+
+async function resolveBrokerPositionId(credentials, identifiers = {}) {
+  if (identifiers.brokerPositionId != null && String(identifiers.brokerPositionId) !== "") {
+    return String(identifiers.brokerPositionId);
+  }
+  const positions = await getBrokerOpenPositions(credentials).catch(() => null);
+  const position = findBrokerPosition(positions, identifiers);
+  return position?.id != null ? String(position.id) : null;
+}
+
 async function getBrokerPositionOutcome(credentials, positionId) {
   const positions = await getBrokerOpenPositions(credentials);
   if (!positions) return null;
@@ -11752,42 +12124,57 @@ async function persistBrokerExecution(analysis, brokerOrder, positionOrOutcome) 
   return true;
 }
 
+function estimateStopLossAmount({ entry, sl, volume, specification }) {
+  const slDistance = Math.abs(Number(entry) - Number(sl));
+  if (!(slDistance > 0) || !(Number(volume) > 0)) return null;
+  const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
+  if (!(valuePerUnitPerLot > 0)) return null;
+  const amount = slDistance * valuePerUnitPerLot * Number(volume);
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+// Both autonomous engines use the same conservative volume calculation. A size is
+// rounded down to the broker step; if it cannot reach the minimum lot, it is skipped
+// unless the caller has explicitly supplied a hard, independently calculated floor.
+function computeVolumeForRiskAmount({ riskAmount, entry, sl, specification, allowMinVolumeFloor = false, maxRiskAmount = null }) {
+  const slDistance = Math.abs(Number(entry) - Number(sl));
+  if (!(slDistance > 0) || !(Number(riskAmount) > 0)) return null;
+  const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
+  if (!(valuePerUnitPerLot > 0)) return null;
+  const rawVolume = riskAmount / (slDistance * valuePerUnitPerLot);
+  const volume = clampVolumeToSpec(rawVolume, specification);
+  if (volume) return volume;
+  if (allowMinVolumeFloor && maxRiskAmount > 0) {
+    const minVolumeRisk = estimateStopLossAmount({ entry, sl, volume: specification.minVolume, specification });
+    if (minVolumeRisk != null && minVolumeRisk <= maxRiskAmount) return specification.minVolume;
+  }
+  return null;
+}
+
 // Never guessed, never rounded up. valuePerUnit = lossTickValue / tickSize is the
 // account-currency P&L of a 1.0-price-unit move for one lot; riskAmount / (slDistance
 // * valuePerUnit) is the volume that risks exactly riskPercent of balance at the SL.
-// Rounds DOWN to the broker's volume step and never up to its minimum -- a sizing
-// bug that silently risks MORE than approved is the one thing this must never do, so
-// a setup too small to reach the broker's minimum volume is skipped, not rounded up.
-//
-// allowMinVolumeFloor/maxRiskAmount: opt-in exception to that, for capital-capped
-// small accounts only (see SMALL_ACCOUNT_MIN_LOT_PAIRS in processAutoTradeForUser).
-// The broker's minimum lot (0.01) has a real dollar-risk floor of its own,
-// independent of riskPercent -- on a $45k account this never matters (the target
-// volume is always well above it), but on a genuinely small account (the whole
-// point of user_capital_cap) it routinely does, and refusing every such trade
-// defeats the purpose of capping capital to try real small-account constraints.
-// Backtested before shipping (scripts/backtest-small-account-swing.mjs, real
-// Yahoo daily data, two independent 5-year periods): flooring to minVolume only
-// when its real dollar risk stays under a hard ceiling (15% of capped capital)
-// keeps a positive, both-periods edge on EUR/USD and USD/CHF; XAU/USD never
-// cleared that bar (today's elevated gold price means its natural stop is too
-// wide, confirmed by an empty out-of-sample test split at every capital/ceiling
-// combination tried) and is deliberately excluded from this exception entirely.
 function computeAutoTradeVolume({ balance, riskPercent, entry, sl, specification, allowMinVolumeFloor = false, maxRiskAmount = null }) {
-  const slDistance = Math.abs(Number(entry) - Number(sl));
-  if (!(slDistance > 0) || !(balance > 0) || !(Number(riskPercent) > 0)) return null;
-  const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
-  if (!(valuePerUnitPerLot > 0)) return null;
-  const riskAmount = balance * (Number(riskPercent) / 100);
-  const rawVolume = riskAmount / (slDistance * valuePerUnitPerLot);
-  const steppedVolume = Math.floor(rawVolume / specification.volumeStep) * specification.volumeStep;
-  const volume = Math.min(steppedVolume, specification.maxVolume);
-  if (volume >= specification.minVolume) return Math.round(volume * 100) / 100;
-  if (allowMinVolumeFloor && maxRiskAmount > 0) {
-    const minVolumeRisk = specification.minVolume * slDistance * valuePerUnitPerLot;
-    if (minVolumeRisk <= maxRiskAmount) return specification.minVolume;
-  }
-  return null;
+  if (!(Number(balance) > 0) || !(Number(riskPercent) > 0)) return null;
+  return computeVolumeForRiskAmount({
+    riskAmount: Number(balance) * (Number(riskPercent) / 100),
+    entry,
+    sl,
+    specification,
+    allowMinVolumeFloor,
+    maxRiskAmount,
+  });
+}
+
+function effectiveScalpRiskPercent(account, sizingBalance) {
+  const configured = combineTightened(
+    resolveAdminRiskPercent(account, sizingBalance),
+    account.user_risk_percent,
+    "lower",
+  );
+  // A user/admin may choose a stricter value than 0.25%. The default is 0.25%,
+  // while any higher configuration is capped at 0.5% for this short-horizon mode.
+  return configured > 0 ? Math.min(SCALP_MAX_RISK_PERCENT, configured) : SCALP_DEFAULT_RISK_PERCENT;
 }
 
 // outcomes was historically a second array, populated only when an analysis closed.
@@ -11943,8 +12330,24 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
   }
   const credentials = credentialsCache.get(cacheKey);
   if (!credentials) return { brokerUnavailable: true };
-  const brokerOutcome = await getBrokerPositionOutcome(credentials, brokerOrder.broker_order_id).catch(() => null);
+  const brokerPositionId = await resolveBrokerPositionId(credentials, {
+    orderId: brokerOrder.order_id,
+    brokerOrderId: brokerOrder.broker_order_id,
+    brokerPositionId: brokerOrder.broker_position_id,
+  });
+  if (brokerPositionId && String(brokerOrder.broker_position_id || "") !== brokerPositionId) {
+    await sqlRun(`UPDATE trade_orders SET broker_position_id = ? WHERE analysis_id = ?`, [brokerPositionId, analysis.id]).catch(() => {});
+    brokerOrder.broker_position_id = brokerPositionId;
+  }
+  // Legacy rows may have closed before this version had a dedicated position
+  // id. The old id is only used for this read-only historical lookup; it is
+  // never used by a broker action such as partial close or stop modification.
+  const brokerOutcome = await getBrokerPositionOutcome(
+    credentials,
+    brokerPositionId || brokerOrder.broker_order_id,
+  ).catch(() => null);
   if (!brokerOutcome) return { brokerUnavailable: true };
+  if (!brokerPositionId && brokerOutcome.status !== "closed") return { brokerUnavailable: true };
   if (brokerOutcome?.status === "still_open") {
     await persistBrokerExecution(analysis, brokerOrder, brokerOutcome.position).catch((error) =>
       logOnce(`broker-execution-${analysis.id}`, `enregistrement du prix d'exécution échoué (${error.message})`));
@@ -11953,8 +12356,11 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
   if (brokerOutcome?.status === "closed") {
     await persistBrokerExecution(analysis, brokerOrder, brokerOutcome).catch((error) =>
       logOnce(`broker-execution-${analysis.id}`, `enregistrement du prix d'exécution échoué (${error.message})`));
+    const brokerTargetIsTp2 = Number(brokerOrder.partial_close_enabled) === 1
+      && Number.isFinite(Number(brokerOrder.broker_take_profit))
+      && Number.isFinite(Number(brokerOrder.tp2));
     const brokerStatus = brokerOutcome.reason === "DEAL_REASON_SL" ? "SL_HIT"
-      : brokerOutcome.reason === "DEAL_REASON_TP" ? "TP1_HIT" // the broker only ever receives tp1 as a real order-level TP (see sendOrderToBroker) -- tp2 is purely an internal secondary target this site tracks itself, never sent to the broker, so a broker-side TP hit is always tp1
+      : brokerOutcome.reason === "DEAL_REASON_TP" ? (brokerTargetIsTp2 ? "TP2_HIT" : "TP1_HIT")
       : "CLOSED_MANUALLY"; // DEAL_REASON_MOBILE/CLIENT/DEALER -- a human closed it directly at the broker, not an automatic level touch
     const profit = brokerOutcome.profit;
     analysis.status = brokerStatus;
@@ -11971,7 +12377,9 @@ async function tryResolveBrokerBackedOutcome(analysis, brokerOrderByAnalysisId, 
       ? `Clôturé manuellement au broker (${profit >= 0 ? "+" : ""}${profit.toFixed(2)}).`
       : brokerStatus === "SL_HIT"
         ? (profit > 0 ? "Stop suiveur : profit sécurisé (confirmé par le broker)." : "Stop Loss touché (confirmé par le broker).")
-        : "TP1 touché (confirmé par le broker).";
+        : brokerStatus === "TP2_HIT"
+          ? "TP2 touché (confirmé par le broker)."
+          : "TP1 touché (confirmé par le broker).";
     analysis.rMultiple = markToMarketRMultiple(analysis, brokerOutcome.closePrice);
     analysis.brokerProfitAmount = profit;
     await upsertAnalysisRow(analysis);
@@ -12014,7 +12422,9 @@ async function reconcileBrokerBackedOutcomes() {
     await withFileLock("learning-log", async () => {
       await ensureRelationalTables();
       const brokerOrderRows = await sqlAll(
-        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id, o.broker_slot as broker_slot
+        `SELECT o.id as order_id, o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.broker_position_id as broker_position_id,
+                o.broker_take_profit as broker_take_profit, o.tp2 as tp2, o.partial_close_enabled as partial_close_enabled,
+                o.user_id as user_id, o.broker_slot as broker_slot
          FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
         [],
       );
@@ -12125,7 +12535,7 @@ async function checkScalpTimeouts() {
       if (!positionLeaseToken) continue;
       try {
         const latestRow = await sqlGet(
-          `SELECT o.status, o.broker_order_id, o.sent_at, o.scalp_max_hold_seconds, a.status as analysis_status
+          `SELECT o.status, o.broker_order_id, o.broker_position_id, o.sent_at, o.scalp_max_hold_seconds, a.status as analysis_status
            FROM trade_orders o JOIN analyses a ON a.id = o.analysis_id
            WHERE o.id = ?`,
           [row.order_id],
@@ -12134,7 +12544,16 @@ async function checkScalpTimeouts() {
         const latestHeldSeconds = (Date.now() - new Date(latestRow.sent_at).getTime()) / 1000;
         const latestMaxHold = Number(latestRow.scalp_max_hold_seconds) === 120 ? 3600 : Number(latestRow.scalp_max_hold_seconds) || 0;
         if (latestHeldSeconds < latestMaxHold) continue;
-        const result = await closeBrokerPosition(credentials, latestRow.broker_order_id);
+        const brokerPositionId = await resolveBrokerPositionId(credentials, {
+          orderId: row.order_id,
+          brokerOrderId: latestRow.broker_order_id,
+          brokerPositionId: latestRow.broker_position_id,
+        });
+        if (!brokerPositionId) continue;
+        if (String(latestRow.broker_position_id || "") !== brokerPositionId) {
+          await sqlRun(`UPDATE trade_orders SET broker_position_id = ? WHERE id = ?`, [brokerPositionId, row.order_id]).catch(() => {});
+        }
+        const result = await closeBrokerPosition(credentials, brokerPositionId);
         if (!result.ok) {
           logOnce(`scalp-timeout-${row.analysis_id}`, `fermeture scalp échouée (${result.error})`);
         }
@@ -12167,16 +12586,6 @@ function startScalpTimeoutScheduler() {
 // caller across ticks, this only ever computes what the stop SHOULD be for a
 // given best-so-far. Returns null while still below trailActivationR (nothing
 // to move yet).
-function computeTrailingStopPrice(entry, direction, risk, bestFavorablePrice, params) {
-  const buy = direction === "ACHAT";
-  const bestFavR = buy ? (bestFavorablePrice - entry) / risk : (entry - bestFavorablePrice) / risk;
-  if (bestFavR < params.trailActivationR) return null;
-  const breakevenStop = buy ? entry + params.trailBufferR * risk : entry - params.trailBufferR * risk;
-  if (bestFavR < params.trailActivationR + params.trailR) return breakevenStop;
-  const trailedStop = buy ? entry + (bestFavR - params.trailR) * risk : entry - (bestFavR - params.trailR) * risk;
-  return buy ? Math.max(breakevenStop, trailedStop) : Math.min(breakevenStop, trailedStop);
-}
-
 const TRAILING_STOP_INTERVAL_MS = boundedEnvNumber(env.TRAILING_STOP_INTERVAL_SECONDS, 15, 5, 3600) * 1000;
 let trailingStopInFlight = false;
 
@@ -12205,7 +12614,11 @@ async function checkTrailingStops() {
               o.trailing_last_attempt_at as trailing_last_attempt_at, o.trailing_last_success_at as trailing_last_success_at,
               o.trailing_last_error as trailing_last_error, o.trailing_last_error_at as trailing_last_error_at,
               o.trailing_last_requested_stop as trailing_last_requested_stop, o.trailing_modify_attempts as trailing_modify_attempts,
-              o.tp1 as tp1, o.tp2 as tp2, o.half_target_secured as half_target_secured, acc.secure_half_priority_enabled as secure_half_priority_enabled
+              o.volume as volume, o.broker_position_id as broker_position_id, o.tp1 as tp1, o.tp2 as tp2, o.partial_close_enabled as partial_close_enabled,
+              o.partial_close_target as partial_close_target, o.partial_close_status as partial_close_status,
+              o.partial_close_volume as partial_close_volume, o.partial_close_at as partial_close_at,
+              o.partial_close_error as partial_close_error, o.breakeven_applied as breakeven_applied,
+              o.half_target_secured as half_target_secured, acc.secure_half_priority_enabled as secure_half_priority_enabled
        FROM analyses a JOIN trade_orders o ON o.analysis_id = a.id
        LEFT JOIN auto_trading_accounts acc ON acc.user_id = a.user_id
        WHERE a.status = 'OPEN' AND a.source IN ('auto_scalp', 'auto_signal') AND o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
@@ -12215,7 +12628,8 @@ async function checkTrailingStops() {
     const credentialsCache = new Map();
     for (const row of rows) {
       const params = trailingStopParamsFor(row.source, row.pair);
-      if (!params) continue; // no demonstrated edge for this source/pair combo -- leave its original fixed TP/SL alone
+      let partialCloseEnabled = Number(row.partial_close_enabled) === 1;
+      if (!params && !partialCloseEnabled) continue; // no demonstrated exit protection for this source/pair
       const isScalp = row.source === "auto_scalp";
       const buy = row.direction === "ACHAT";
       const analyticalEntry = Number(row.entry);
@@ -12246,12 +12660,31 @@ async function checkTrailingStops() {
       const latestOrderRow = await sqlGet(
         `SELECT status, broker_order_id, executed_entry, trailing_stop_price, best_favorable_price,
                 trailing_last_attempt_at, trailing_last_success_at, trailing_last_error, trailing_last_error_at,
-                trailing_last_requested_stop, trailing_modify_attempts, tp1, tp2, half_target_secured
+                trailing_last_requested_stop, trailing_modify_attempts, volume, broker_position_id, tp1, tp2,
+                partial_close_enabled, partial_close_target, partial_close_status, partial_close_volume,
+                partial_close_at, partial_close_error, breakeven_applied, half_target_secured
          FROM trade_orders WHERE id = ?`,
         [row.order_id],
       ).catch(() => null);
       if (!latestOrderRow || latestOrderRow.status !== "SENT" || String(latestOrderRow.broker_order_id) !== String(row.broker_order_id)) continue;
       Object.assign(row, latestOrderRow);
+      partialCloseEnabled = Number(row.partial_close_enabled) === 1;
+      let brokerPositionId = row.broker_position_id || null;
+      if (!brokerPositionId) {
+        brokerPositionId = await resolveBrokerPositionId(credentials, {
+          orderId: row.order_id,
+          brokerOrderId: row.broker_order_id,
+        });
+        if (!brokerPositionId) {
+          await sqlRun(
+            `UPDATE trade_orders SET trailing_last_error = ?, trailing_last_error_at = ? WHERE id = ?`,
+            ["broker_position_unresolved", new Date().toISOString(), row.order_id],
+          ).catch(() => {});
+          continue;
+        }
+        await sqlRun(`UPDATE trade_orders SET broker_position_id = ? WHERE id = ?`, [brokerPositionId, row.order_id]).catch(() => {});
+        row.broker_position_id = brokerPositionId;
+      }
       entry = Number.isFinite(Number(row.executed_entry)) ? Number(row.executed_entry) : analyticalEntry;
       risk = Math.abs(entry - Number(row.sl));
       if (!(risk > 0)) continue;
@@ -12289,7 +12722,125 @@ async function checkTrailingStops() {
       const currentPrice = buy ? brokerPrice.bid : brokerPrice.ask;
       const priorBest = Number(row.best_favorable_price) || entry;
       const newBest = buy ? Math.max(priorBest, currentPrice) : Math.min(priorBest, currentPrice);
-      let candidateStop = computeTrailingStopPrice(entry, row.direction, risk, newBest, params);
+      let partialActionPerformed = false;
+      let partialProtectionBlocked = false;
+
+      // TP1 is a trigger, never a second broker TP. For an armed position the
+      // scheduler first confirms the live broker volume, then closes one valid
+      // half and only afterward moves the remaining position to breakeven.
+      const partialTarget = Number(row.partial_close_target);
+      const partialStatus = row.partial_close_status || (partialCloseEnabled ? "armed" : "disabled");
+      if (partialCloseEnabled && partialTarget > 0 && partialCloseTargetReached(row.direction, currentPrice, partialTarget)) {
+        const specification = await getBrokerSymbolSpecification(credentials, row.pair).catch(() => null);
+        const positions = specification ? await getBrokerOpenPositions(credentials).catch(() => null) : null;
+        const openPosition = positions?.find((position) => String(position.id) === String(brokerPositionId));
+        if (specification && openPosition) {
+          const liveVolume = Number(openPosition.volume);
+          const originalVolume = Number(row.volume);
+          const inferredPartial = originalVolume > 0 && liveVolume > 0
+            && liveVolume < originalVolume - Number(specification.volumeStep) / 2;
+          let partialDone = partialStatus === "done" || partialStatus === "skipped_min_volume" || inferredPartial;
+
+          if (inferredPartial && partialStatus !== "done") {
+            const inferredVolume = Number((originalVolume - liveVolume).toFixed(8));
+            await sqlRun(
+              `UPDATE trade_orders SET partial_close_status = 'done', partial_close_volume = ?, partial_close_at = COALESCE(partial_close_at, ?), partial_close_error = NULL WHERE id = ?`,
+              [inferredVolume > 0 ? inferredVolume : null, new Date().toISOString(), row.order_id],
+            ).catch(() => {});
+            row.partial_close_status = "done";
+            row.partial_close_volume = inferredVolume;
+            partialDone = true;
+          }
+
+          if (!partialDone && partialStatus !== "uncertain") {
+            const closeVolume = partialCloseVolumeForPosition(openPosition, specification);
+            if (!closeVolume) {
+              await sqlRun(
+                `UPDATE trade_orders SET partial_close_status = 'skipped_min_volume', partial_close_volume = NULL, partial_close_at = ?, partial_close_error = ? WHERE id = ?`,
+                [new Date().toISOString(), "broker_minimum_volume", row.order_id],
+              ).catch(() => {});
+              row.partial_close_status = "skipped_min_volume";
+              partialDone = true;
+              partialActionPerformed = true;
+            } else {
+              const result = await partialCloseBrokerPosition(credentials, brokerPositionId, closeVolume);
+              if (result.ok) {
+                await sqlRun(
+                  `UPDATE trade_orders SET partial_close_status = 'done', partial_close_volume = ?, partial_close_at = ?, partial_close_error = NULL WHERE id = ?`,
+                  [closeVolume, new Date().toISOString(), row.order_id],
+                ).catch(() => {});
+                row.partial_close_status = "done";
+                row.partial_close_volume = closeVolume;
+                partialDone = true;
+                partialActionPerformed = true;
+              } else if (result.uncertain) {
+                await sqlRun(
+                  `UPDATE trade_orders SET partial_close_status = 'uncertain', partial_close_error = ? WHERE id = ?`,
+                  [String(result.error || "broker_request_uncertain").slice(0, 400), row.order_id],
+                ).catch(() => {});
+                row.partial_close_status = "uncertain";
+                partialProtectionBlocked = true;
+              } else {
+                await sqlRun(
+                  `UPDATE trade_orders SET partial_close_status = 'armed', partial_close_error = ? WHERE id = ?`,
+                  [String(result.error || "broker_partial_close_failed").slice(0, 400), row.order_id],
+                ).catch(() => {});
+                partialProtectionBlocked = true;
+              }
+            }
+          } else if (!partialDone && partialStatus === "uncertain") {
+            partialProtectionBlocked = true;
+          }
+
+          // An ambiguous partial-close request is never retried blindly. The
+          // next tick can infer completion from the broker's reduced volume;
+          // until then it must not move the stop or send another close.
+          if (partialDone && !Boolean(row.breakeven_applied)) {
+            const breakeven = breakevenStopForPosition({
+              entry,
+              direction: row.direction,
+              pair: row.pair,
+              strategy: isScalp ? "scalp" : "swing",
+              currentPrice,
+            });
+            const storedStop = row.trailing_stop_price == null ? Number(row.sl) : Number(row.trailing_stop_price);
+            const stopAlreadyProtects = Number.isFinite(storedStop)
+              && (buy ? storedStop >= entry : storedStop <= entry);
+            if (stopAlreadyProtects) {
+              await sqlRun(`UPDATE trade_orders SET breakeven_applied = 1 WHERE id = ?`, [row.order_id]).catch(() => {});
+              row.breakeven_applied = 1;
+              partialActionPerformed = true;
+            } else if (breakeven != null) {
+              const result = await modifyBrokerPositionStopLoss(credentials, brokerPositionId, breakeven);
+              if (result.ok) {
+                await sqlRun(
+                  `UPDATE trade_orders SET trailing_stop_price = ?, breakeven_applied = 1, partial_close_error = NULL WHERE id = ?`,
+                  [breakeven, row.order_id],
+                ).catch(() => {});
+                row.trailing_stop_price = breakeven;
+                row.breakeven_applied = 1;
+                partialActionPerformed = true;
+              } else {
+                await sqlRun(
+                  `UPDATE trade_orders SET partial_close_error = ? WHERE id = ?`,
+                  [String(`breakeven: ${result.error || "broker_modify_failed"}`).slice(0, 400), row.order_id],
+                ).catch(() => {});
+              }
+            }
+          }
+        } else {
+          // Do not let the normal trailing curve modify a position while its
+          // partial-close volume cannot be verified at the broker.
+          partialProtectionBlocked = true;
+        }
+      }
+
+      // Never issue a second broker modification in the same tick that just
+      // closed volume or moved the stop to breakeven. The following tick keeps
+      // the normal trailing ratchet moving from the fresh persisted state.
+      if (partialProtectionBlocked) continue;
+      if (partialActionPerformed) continue;
+      let candidateStop = params ? computeTrailingStopPrice(entry, row.direction, risk, newBest, params) : null;
 
       // secure_half_priority_enabled, Case B (see its schema comment): this
       // row has no broker TP to pre-halve at open time (that's Case A, handled
@@ -12299,7 +12850,7 @@ async function checkTrailingStops() {
       // SAME candidateStop the normal trailing curve already computed (never a
       // second, competing modify call), taking whichever is more favorable.
       let justSecuredHalf = false;
-      if (row.tp1 == null && Number(row.secure_half_priority_enabled) === 1 && !Number(row.half_target_secured) && Number.isFinite(Number(row.tp2))) {
+      if (!partialCloseEnabled && row.tp1 == null && Number(row.secure_half_priority_enabled) === 1 && !Number(row.half_target_secured) && Number.isFinite(Number(row.tp2))) {
         const referenceTarget = Number(row.tp2);
         const halfTarget = buy ? entry + (referenceTarget - entry) * 0.5 : entry - (entry - referenceTarget) * 0.5;
         const reached = buy ? currentPrice >= halfTarget : currentPrice <= halfTarget;
@@ -12354,7 +12905,7 @@ async function checkTrailingStops() {
          WHERE id = ?`,
         [attemptAt, candidateStop, row.order_id],
       ).catch(() => {});
-      const result = await modifyBrokerPositionStopLoss(credentials, row.broker_order_id, candidateStop).catch((error) => ({ ok: false, error: "broker_operation_failed", message: publicBrokerError(error.message) }));
+      const result = await modifyBrokerPositionStopLoss(credentials, brokerPositionId, candidateStop).catch((error) => ({ ok: false, error: "broker_operation_failed", message: publicBrokerError(error.message) }));
       if (result.ok) {
         await sqlRun(
           `UPDATE trade_orders
@@ -12413,7 +12964,9 @@ async function updateLearningOutcomes(prices = null, histories = null) {
     if (openRows.length) {
       const livePrices = prices || await getPrices();
       const brokerOrderRows = await sqlAll(
-        `SELECT o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.user_id as user_id, o.broker_slot as broker_slot
+        `SELECT o.id as order_id, o.analysis_id as analysis_id, o.broker_order_id as broker_order_id, o.broker_position_id as broker_position_id,
+                o.broker_take_profit as broker_take_profit, o.tp2 as tp2, o.partial_close_enabled as partial_close_enabled,
+                o.user_id as user_id, o.broker_slot as broker_slot
          FROM trade_orders o WHERE o.status = 'SENT' AND o.broker_order_id IS NOT NULL`,
         [],
       );
@@ -12890,10 +13443,10 @@ async function performancePayload(log) {
 }
 
 function personalAnalysesPayload(log, userId) {
-  // Bot-placed trades (source: "auto_signal") get their own panel/history endpoint
-  // (/api/auto-trade/history) -- mixing them into "Mes analyses Kronos" would bury
-  // a user's own manually-launched analyses under whatever the bot did.
-  const analyses = log.analyses.filter((item) => item.userId === userId && item.source !== "auto_signal");
+  // Bot-placed swing and scalp trades have their own panel/history endpoint
+  // (/api/auto-trade/history). Keeping both out of "Mes analyses Kronos" avoids
+  // displaying the same broker position twice beside a user's manual analyses.
+  const analyses = log.analyses.filter((item) => item.userId === userId && !["auto_signal", "auto_scalp"].includes(item.source));
   const analysisIds = new Set(analyses.map((item) => item.id));
   const closed = log.outcomes.filter((item) => (item.userId === userId || analysisIds.has(item.id)) && ["win", "loss"].includes(item.result));
   const wins = closed.filter((item) => item.result === "win").length;

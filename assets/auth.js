@@ -503,7 +503,7 @@
   // Real floating P&L for whichever open positions are currently rendered on the
   // page, refreshed every 10s -- not a websocket/true push, but close enough that
   // the dashboard stops looking frozen between the 90s server-side outcome-
-  // scheduler ticks. Purely additive: matches cards by data-broker-order-id (set
+  // scheduler ticks. Purely additive: matches cards by the broker position id (set
   // by renderTradeOrders/loadAutoTradeHistory) and only touches the ones it finds
   // a live position for -- a card with no match (position already closed, or the
   // user has no broker connected at all) is left exactly as the order-list
@@ -535,14 +535,14 @@
     if (livePositionsRefreshInFlight) return;
     livePositionsRefreshInFlight = true;
     try {
-      const slots = document.querySelectorAll("[data-broker-order-id]:not([data-broker-order-id=''])");
+      const slots = document.querySelectorAll("[data-broker-position-id]:not([data-broker-position-id=''])");
       if (!slots.length) return;
       const data = await fetchJson("/api/trade/live-positions");
       const positions = new Map((data?.positions || []).map((p) => [`${p.brokerSlot || ""}:${p.id}`, p]));
       slots.forEach((card) => {
         const pnlEl = card.querySelector("[data-live-pnl]");
         if (!pnlEl) return;
-        const position = positions.get(`${card.dataset.brokerSlot || ""}:${card.dataset.brokerOrderId}`);
+        const position = positions.get(`${card.dataset.brokerSlot || ""}:${card.dataset.brokerPositionId}`);
         const profit = Number(position?.profit);
         if (!Number.isFinite(profit)) {
           pnlEl.hidden = true; // no longer open, or broker returned an incomplete quote
@@ -1018,7 +1018,7 @@
     // normally) but start hidden -- "voir plus" just removes the attribute, no re-render.
     const VISIBLE_COUNT = 5;
     const orderCards = orders.map((order, index) => `
-      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}" data-broker-slot="${escapeHtml(order.brokerSlot || "")}" ${index >= VISIBLE_COUNT ? "hidden data-order-extra" : ""}>
+      <article class="dashboard-trade-order" data-order-id="${escapeHtml(order.id)}" data-broker-order-id="${escapeHtml(order.brokerOrderId || "")}" data-broker-position-id="${escapeHtml(order.brokerPositionId || order.brokerOrderId || "")}" data-broker-slot="${escapeHtml(order.brokerSlot || "")}" ${index >= VISIBLE_COUNT ? "hidden data-order-extra" : ""}>
 
         <div>
           <strong>${escapeHtml(order.pair)} · ${escapeHtml(order.direction)}${order.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(order.brokerSlot)}">${order.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
@@ -1030,6 +1030,7 @@
           <span>TP1 ${escapeHtml(order.tp1 ?? "—")}</span>
         </div>
         ${order.correlationWarning ? `<p class="dashboard-history-note dashboard-correlation-warning">⚠ ${escapeHtml(order.correlationWarning)}</p>` : ""}
+        ${order.partialCloseEnabled ? `<p class="dashboard-history-note">${escapeHtml(partialProtectionLabel(order))}</p>` : ""}
         ${order.status === "PENDING_CONFIRMATION" ? `
           <div class="dashboard-trade-confirm">
             <select data-order-slot>
@@ -1042,7 +1043,7 @@
           </div>
           <p class="dashboard-history-note dashboard-prepare-error" data-confirm-error hidden></p>
         ` : ""}
-        ${order.status === "SENT" && order.brokerOrderId ? `
+        ${order.status === "SENT" && order.brokerOrderId && !order.partialCloseEnabled ? `
           <div class="dashboard-trade-confirm">
             <button type="button" class="dashboard-trade-cancel" data-order-secure-half>Sécuriser à mi-TP maintenant</button>
           </div>
@@ -1402,8 +1403,8 @@
           checkbox.checked = !enabled;
         } else if (messageEl && enabled) {
           messageEl.textContent = result.securedCount > 0
-            ? `✓ Activé -- ${result.securedCount} position${result.securedCount > 1 ? "s" : ""} déjà ouverte${result.securedCount > 1 ? "s" : ""} sécurisée${result.securedCount > 1 ? "s" : ""} immédiatement à mi-objectif.`
-            : "✓ Activé -- s'appliquera aux prochaines positions et aux positions actuelles dès que le prix atteint la moitié de l'objectif.";
+            ? `Activé : ${result.securedCount} position${result.securedCount > 1 ? "s" : ""} déjà ouverte${result.securedCount > 1 ? "s" : ""} a reçu le resserrement historique de son objectif. Les prochaines positions utiliseront la protection par étapes à TP1.`
+            : "Activé : les prochaines positions automatiques fermeront une moitié à TP1, passeront le reliquat au breakeven, puis poursuivront avec le stop suiveur.";
           messageEl.classList.remove("dashboard-prepare-error");
           messageEl.hidden = false;
         }
@@ -1537,6 +1538,15 @@
     no_tradable_market_signals_this_tick: "Aucun signal exploitable sur le marché à cet instant -- normal, pas une erreur",
     economic_calendar_unavailable: "Calendrier économique indisponible : aucune position automatique autorisée",
     another_execution_instance_running: "Passage ignoré : une autre exécution occupait le verrou, nouvel essai automatique",
+    scalp_timeframe_data_unavailable: "Scalp bloqu\u00e9 : historique exact indisponible sur au moins une unit\u00e9 de temps",
+    scalp_context_not_aligned: "Scalp en attente : contexte D1 et H4 non align\u00e9",
+    scalp_structure_opposes_context: "Scalp bloqu\u00e9 : structure H1/M15 contraire au contexte",
+    scalp_entry_not_aligned: "Scalp en attente : d\u00e9clenchement M1 non align\u00e9 au contexte",
+    scalp_trigger_not_confirmed: "Scalp en attente : confirmation M5/M1 incompl\u00e8te",
+    scalp_structural_stop_unavailable: "Scalp bloqu\u00e9 : stop structurel M15 indisponible",
+    scalp_target_not_viable: "Scalp en attente : objectif insuffisant face au risque structurel",
+    scalp_minimum_lot_risk_exceeds_limit: "Scalp bloqu\u00e9 : le lot minimum d\u00e9passe la limite de risque",
+    scalp_volume_risk_exceeds_limit: "Scalp bloqu\u00e9 : le volume d\u00e9passe le risque autoris\u00e9",
   };
 
   const TICK_DAY_NAMES = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]; // matches JS getUTCDay()
@@ -1582,6 +1592,11 @@
     } else if (reason === "consecutive_auto_losses_circuit_breaker") {
       if (detail.consecutiveLosses != null) parts.push(`${detail.consecutiveLosses}/${detail.lossLimit} pertes consécutives`);
       if (detail.cooldownUntil) parts.push(`reprise prévue ${formatDate(detail.cooldownUntil)}`);
+    } else if (String(reason || "").startsWith("scalp_")) {
+      if (detail.pair) parts.push(`paire : ${detail.pair}`);
+      if (detail.missingTimeframes?.length) parts.push(`unit\u00e9s manquantes : ${detail.missingTimeframes.join(", ")}`);
+      if (Number.isFinite(Number(detail.estimatedMaxLossAmount))) parts.push(`risque calcul\u00e9 : ${formatTradeRiskAmount(detail.estimatedMaxLossAmount)}`);
+      if (Number.isFinite(Number(detail.maximumAllowedLoss))) parts.push(`plafond : ${formatTradeRiskAmount(detail.maximumAllowedLoss)}`);
     } else if (reason === "outside_admin_trading_hours" || reason === "outside_user_trading_hours") {
       if (detail.tradingHoursStart && detail.tradingHoursEnd) parts.push(`${detail.tradingHoursStart}-${detail.tradingHoursEnd} UTC`);
     } else if (reason === "outside_admin_trading_days" || reason === "outside_user_trading_days") {
@@ -1863,6 +1878,39 @@
     return "État de protection non disponible.";
   }
 
+  function partialProtectionLabel(item) {
+    if (!item.partialCloseEnabled) return "Protection standard : TP et SL broker.";
+    if (item.partialCloseStatus === "uncertain") {
+      return "TP1 atteint : ex\u00e9cution partielle incertaine, aucune nouvelle action envoy\u00e9e.";
+    }
+    if (item.partialCloseStatus === "skipped_min_volume") {
+      return item.breakevenApplied
+        ? "TP1 atteint : volume minimum broker incompatible avec une moiti\u00e9, reliquat prot\u00e9g\u00e9 au breakeven."
+        : "TP1 atteint : volume minimum broker incompatible avec une moiti\u00e9, breakeven en attente.";
+    }
+    if (item.partialCloseStatus === "done") {
+      return item.breakevenApplied
+        ? "TP1 atteint : moiti\u00e9 cl\u00f4tur\u00e9e, reliquat prot\u00e9g\u00e9 au breakeven."
+        : "TP1 atteint : moiti\u00e9 cl\u00f4tur\u00e9e, breakeven en attente.";
+    }
+    if (item.partialCloseError) return `Protection TP1 en attente : ${item.partialCloseError}`;
+    return "Protection arm\u00e9e : moiti\u00e9 \u00e0 TP1 puis breakeven.";
+  }
+
+  function formatTradeRiskAmount(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return "non disponible";
+    return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(amount);
+  }
+
+  function scalpTimeframeSummary(item) {
+    if (!item.signalTimeframe && !item.entryTimeframe && !item.setupTimeframe) return "";
+    const signal = item.signalTimeframe || "-";
+    const entry = item.entryTimeframe || "-";
+    const setup = item.setupTimeframe || "-";
+    return `Contexte D1/H4 \u00b7 structure H1/${setup} \u00b7 signal ${signal} \u00b7 entr\u00e9e ${entry}`;
+  }
+
   async function loadAutoTradeHistory() {
     const host = document.querySelector("[data-autotrade-trades]");
     if (!host) return;
@@ -1883,7 +1931,7 @@
     }
     const HISTORY_VISIBLE = 5;
     const cards = trades.slice(0, 20).map((item) => `
-      <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}" data-broker-slot="${escapeHtml(item.brokerSlot || "")}">
+      <article class="dashboard-trade-order" data-broker-order-id="${escapeHtml(item.brokerOrderId || "")}" data-broker-position-id="${escapeHtml(item.brokerPositionId || item.brokerOrderId || "")}" data-broker-slot="${escapeHtml(item.brokerSlot || "")}">
         <div>
           <strong>${escapeHtml(item.pair)} · ${escapeHtml(item.direction)}${item.brokerSlot ? ` · <span class="dashboard-slot-tag dashboard-slot-tag-${escapeHtml(item.brokerSlot)}">${item.brokerSlot === "live" ? "RÉEL" : "DÉMO"}</span>` : ""}</strong>
           <span class="${historyStatusClass(item)}">${formatDate(item.createdAt)} · ${historyStatusIcon(item)}${escapeHtml(historyStatusLabel(item))}${item.status === "OPEN" && item.brokerOrderId ? ` · <span class="dashboard-live-pnl" data-live-pnl hidden></span>` : ""}</span>
@@ -1893,7 +1941,9 @@
           <span>SL ${escapeHtml(item.sl)}${item.trailingStopPrice != null && item.trailingStopPrice !== item.sl ? " (suiveur)" : ""}</span>
           <span>TP1 ${escapeHtml(item.tp1 ?? "—")}</span>
         </div>
+        ${scalpTimeframeSummary(item) ? `<p class="dashboard-history-note">${escapeHtml(scalpTimeframeSummary(item))}</p>` : ""}
         <div class="dashboard-live-protection" data-live-protection hidden></div>
+        ${item.partialCloseEnabled ? `<p class="dashboard-history-note ${item.partialCloseStatus === "uncertain" ? "dashboard-prepare-error" : ""}">${escapeHtml(partialProtectionLabel(item))}</p>` : ""}
         ${item.status === "OPEN" && item.trailingProtectionState ? `<p class="dashboard-history-note ${item.trailingProtectionState === "error" ? "dashboard-prepare-error" : ""}">${escapeHtml(trailingProtectionLabel(item))}</p>` : ""}
         <details class="dashboard-trade-details">
           <summary>Voir le suivi détaillé</summary>
@@ -1907,6 +1957,10 @@
             <div><dt>Durée</dt><dd>${escapeHtml(historyDuration(item) || (item.status === "OPEN" ? "En cours" : "Non disponible"))}</dd></div>
             <div><dt>Résultat broker</dt><dd>${escapeHtml(historyResultLabel(item) || "Non disponible")}</dd></div>
           </dl>
+          ${item.signalTimeframe ? `<p class="dashboard-history-note">Unit\u00e9s de temps : ${escapeHtml(scalpTimeframeSummary(item))}</p>` : ""}
+          ${item.slDistance != null ? `<p class="dashboard-history-note">Distance SL initiale (unit\u00e9s de prix) : ${escapeHtml(item.slDistance)}</p>` : ""}
+          ${item.estimatedMaxLossAmount != null ? `<p class="dashboard-history-note">Perte maximale estim\u00e9e au SL : ${escapeHtml(formatTradeRiskAmount(item.estimatedMaxLossAmount))} (${escapeHtml(item.riskPercentAtTrade ?? "-")} % du capital de sizing ; devise du compte broker ; hors gap/slippage)</p>` : ""}
+          ${item.sizingBalanceAtTrade != null ? `<p class="dashboard-history-note">Capital de sizing : ${escapeHtml(formatTradeRiskAmount(item.sizingBalanceAtTrade))}</p>` : ""}
           ${item.status === "OPEN" && item.trailingProtectionState ? `<p class="dashboard-history-note">Protection : ${escapeHtml(trailingProtectionLabel(item))}${item.bestFavorablePrice != null ? ` · meilleur prix observé ${escapeHtml(item.bestFavorablePrice)}` : ""}${item.trailingLastSuccessAt ? ` · dernière réussite ${escapeHtml(formatDate(item.trailingLastSuccessAt))}` : ""}</p>` : ""}
           ${item.outcomeReason ? `<p class="dashboard-history-note">Motif : ${escapeHtml(item.outcomeReason)}</p>` : ""}
           ${item.marketRegime ? `<p class="dashboard-history-note">Régime détecté : ${escapeHtml(item.marketRegime)}</p>` : ""}

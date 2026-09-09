@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test --test-concurrency=1 scripts/api-tests.mjs && node scripts/safety-checks.mjs",
-    "backtest:styles": "node scripts/backtest-analysis-styles.mjs"
+    "backtest:styles": "node scripts/backtest-analysis-styles-realistic.mjs",
+    "backtest:styles:legacy": "node scripts/backtest-analysis-styles.mjs"
   },
   "dependencies": {
     "pg": "^8.11.5",
