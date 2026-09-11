@@ -1306,6 +1306,18 @@ check(
     && notificationStylesSource.includes('.auth-notif-panel { position: fixed;'),
 );
 check(
+  'opened robot cycles expose candidates, opened pairs, capacity, and skip reasons',
+  serverSource.includes('const candidatePairs = candidates.slice(0, 10)')
+    && serverSource.includes('const openedPairs = []')
+    && serverSource.includes('openedPairs.push({ pair: signal.paire, direction: signal.direction })')
+    && serverSource.includes('candidatePairs,')
+    && serverSource.includes('openCount,')
+    && serverSource.includes('maxConcurrent,')
+    && authClientSource.includes('reason === "opened_trade" || reason === "no_valid_setup_this_tick"')
+    && authClientSource.includes('position(s) ouverte(s) sur')
+    && authClientSource.includes('candidats :'),
+);
+check(
   'dashboard runtime distinguishes approval blockers from an active scheduler',
   authClientSource.includes('Approbation du robot en attente')
     && authClientSource.includes('Compte requis')

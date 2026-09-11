@@ -1612,15 +1612,28 @@
     if (!detail) return "";
     const parts = [];
     if (detail.newsCalendarFallback) parts.push("secours calendrier actif, démo uniquement");
-    if (reason === "no_valid_setup_this_tick") {
-      if (detail.candidateCount) parts.push(`${detail.candidateCount} signal(s) évalué(s)`);
-      if (detail.alreadyOpen) parts.push(`${detail.alreadyOpen} déjà ouvert(s)`);
-      if (detail.correlation) parts.push(`${detail.correlation} bloqué(s) par corrélation`);
-      if (detail.noSpec) parts.push(`${detail.noSpec} specs broker indisponibles`);
-      if (detail.noVolume) parts.push(`${detail.noVolume} taille de position trop petite`);
-      if (detail.noFunds) parts.push(`${detail.noFunds} état des fonds broker indisponible`);
-     if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
-      if (detail.pyramidingDisabled) parts.push(`${detail.pyramidingDisabled} entrée(s) ignorée(s) : paire déjà ouverte`);
+    if (reason === "opened_trade" || reason === "no_valid_setup_this_tick") {
+      if (Number.isFinite(Number(detail.openedThisTick))) {
+        parts.push(String(detail.openedThisTick) + " position(s) ouverte(s) sur " + String(detail.candidateCount || 0) + " signal(s) candidat(s)");
+      } else if (detail.candidateCount) {
+        parts.push(String(detail.candidateCount) + " signal(s) \u00e9valu\u00e9(s)");
+      }
+      if (detail.openCount != null && detail.maxConcurrent != null) {
+        parts.push(String(detail.openCount) + "/" + String(detail.maxConcurrent) + " position(s) ouverte(s)");
+      }
+      if (detail.openedPairs?.length) {
+        parts.push("ouvertes : " + detail.openedPairs.map((item) => String(item.direction) + " " + String(item.pair)).join(", "));
+      }
+      if (reason === "opened_trade" && detail.candidatePairs?.length) {
+        parts.push("candidats : " + detail.candidatePairs.map((item) => String(item.direction) + " " + String(item.pair)).join(", "));
+      }
+      if (detail.alreadyOpen) parts.push(String(detail.alreadyOpen) + " d\u00e9j\u00e0 ouverte(s)");
+      if (detail.correlation) parts.push(String(detail.correlation) + " bloqu\u00e9(s) par corr\u00e9lation");
+      if (detail.noSpec) parts.push(String(detail.noSpec) + " specs broker indisponibles");
+      if (detail.noVolume) parts.push(String(detail.noVolume) + " taille de position trop petite");
+      if (detail.noFunds) parts.push(String(detail.noFunds) + " \u00e9tat des fonds broker indisponible");
+      if (detail.rejected) parts.push(String(detail.rejected) + " rejet\u00e9(s) par le broker");
+      if (detail.pyramidingDisabled) parts.push(String(detail.pyramidingDisabled) + " entr\u00e9e(s) ignor\u00e9e(s) : paire d\u00e9j\u00e0 ouverte");
     } else if (reason === "no_signal_meets_confidence_or_rr") {
       if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);

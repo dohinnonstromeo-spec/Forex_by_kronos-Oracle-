@@ -2558,6 +2558,13 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   // some delay. Demo and live have their own balances, so a tier crossed on
   // one slot has zero effect on the other's sizing.
   let openedThisTick = 0;
+  // Runtime-only diagnostics for the authenticated dashboard. These names let a
+  // user distinguish "the cap stopped me" from "only two setups were valid".
+  const candidatePairs = candidates.slice(0, 10).map((signal) => ({
+    pair: signal.paire,
+    direction: signal.direction,
+  }));
+  const openedPairs = [];
   const skipped = { alreadyOpen: 0, pyramidingDisabled: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, rejected: 0 };
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
@@ -2683,6 +2690,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       openPositionsByPair.set(signal.paire, pairOpenCount + 1);
       tradesOpenedToday += 1;
       openedThisTick += 1;
+      openedPairs.push({ pair: signal.paire, direction: signal.direction });
     } else {
       skipped.rejected += 1;
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
@@ -2691,6 +2699,10 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", {
     openedThisTick,
     candidateCount: candidates.length,
+    candidatePairs,
+    openedPairs,
+    openCount,
+    maxConcurrent,
     analysisStyle,
     maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR,
     pyramidingEnabled: AUTO_ALLOW_PYRAMIDING,
