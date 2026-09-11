@@ -5,16 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#0a0e1a">
-  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="apple-touch-icon" href="/assets/icon-192.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Oracle Forex">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title data-cms="dashboard.seo.title">Tableau de bord · Oracle Forex</title>
   <meta name="description" content="Dashboard membre Oracle Forex pour suivre Kronos, les signaux et l'abonnement." data-cms="dashboard.seo.description">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
   <meta name="robots" content="noindex, nofollow">
 </head>
-<body class="oracle-page auth-page">
+<body class="oracle-page auth-page dashboard-page">
   <nav class="oracle-nav">
     <div class="oracle-nav-inner">
       <a href="/" class="oracle-brand">
@@ -42,7 +43,8 @@
             <p class="auth-notif-empty" data-notif-empty hidden>Aucun événement pour l'instant.</p>
             <div data-notif-list aria-live="polite"></div>
             <div class="auth-notif-actions">
-              <button class="payment-method-button" type="button" data-push-test>Tester sur cet appareil</button>
+              <button class="payment-method-button" type="button" data-push-enable data-push-toggle="tp_sl" hidden>Activer les alertes sur cet appareil</button>
+              <button class="payment-method-button" type="button" data-push-test hidden>Tester sur cet appareil</button>
               <button class="auth-notif-link" type="button" data-notif-go-trading>Voir le suivi des trades</button>
             </div>
             <p class="auth-notif-test-status" data-push-test-status role="status" aria-live="polite"></p>

@@ -698,6 +698,13 @@
     new_signal: { on: "Désactiver les alertes nouveaux signaux", off: "Activer les alertes nouveaux signaux", active: "Alertes nouveaux signaux actives sur cet appareil." },
   };
 
+  function isAppleMobileOutsideInstalledApp() {
+    const appleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const standalone = Boolean(navigator.standalone)
+      || Boolean(window.matchMedia?.("(display-mode: standalone)").matches);
+    return appleMobile && !standalone;
+  }
   function setPushDeviceStatus(text, state = "pending") {
     const status = document.querySelector("[data-push-device-status]");
     if (status) {
@@ -750,8 +757,19 @@
       return button.dataset.pushToggle !== "new_signal" || isPremium;
     });
     const upsell = document.querySelector("[data-push-upsell]");
+    const pushTestButton = document.querySelector("[data-push-test]");
     bindPushTest();
     if (!buttons.length) return;
+    if (isAppleMobileOutsideInstalledApp()) {
+      setPushDeviceStatus("Sur iPhone ou iPad, ajoute Oracle Forex \u00e0 l'\u00e9cran d'accueil, puis ouvre l'application install\u00e9e pour activer les alertes.", "pending");
+      const quickEnable = document.querySelector("[data-push-enable]");
+      if (quickEnable) {
+        quickEnable.hidden = false;
+        quickEnable.disabled = true;
+        quickEnable.textContent = "Ajoute l'application \u00e0 l'\u00e9cran d'accueil";
+      }
+      return;
+    }
     if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
       setPushDeviceStatus("Les notifications mobiles ne sont pas prises en charge par ce navigateur.", "danger");
       return;
@@ -763,6 +781,7 @@
         return;
       }
       if (upsell && !isPremium) upsell.hidden = false;
+      if (pushTestButton) pushTestButton.hidden = false;
 
       const registration = await navigator.serviceWorker.register("/sw.js");
       const existing = await registration.pushManager.getSubscription();
@@ -783,6 +802,11 @@
       button.addEventListener("click", async () => {
         button.disabled = true;
         try {
+          // Request permission before the first asynchronous browser call. Some
+          // mobile browsers reject a permission prompt once the user gesture ends.
+          const requestedPermission = !activeTopics.has(topic) && Notification.permission === "default"
+            ? await Notification.requestPermission()
+            : Notification.permission;
           const current = await registration.pushManager.getSubscription();
           if (activeTopics.has(topic)) {
             if (current) {
@@ -805,15 +829,16 @@
             }
             activeTopics.delete(topic);
             pushDeviceReady = activeTopics.size > 0;
-            setPushButtonState(button, status, topic, false);
+            buttons
+              .filter((candidate) => candidate.dataset.pushToggle === topic)
+              .forEach((candidate) => setPushButtonState(candidate, document.querySelector(`[data-push-status="${topic}"]`), topic, false));
             setPushDeviceStatus(pushDeviceReady ? "Alertes mobiles actives sur cet appareil." : "Alertes mobiles désactivées sur cet appareil.", pushDeviceReady ? "ready" : "pending");
             renderDashboardOnboarding(dashboardRuntimeStatus);
             return;
           }
           let subscription = current;
           if (!subscription) {
-            const permission = await Notification.requestPermission();
-            if (permission !== "granted") {
+            if (requestedPermission !== "granted") {
               if (status) status.textContent = "Notifications refusées dans le navigateur.";
               setPushDeviceStatus("Notifications refusées dans les réglages du navigateur.", "danger");
               return;
@@ -831,7 +856,9 @@
           if (!response.ok) throw new Error("push_subscribe_rejected");
           activeTopics.add(topic);
           pushDeviceReady = true;
-          setPushButtonState(button, status, topic, true);
+          buttons
+            .filter((candidate) => candidate.dataset.pushToggle === topic)
+            .forEach((candidate) => setPushButtonState(candidate, document.querySelector(`[data-push-status="${topic}"]`), topic, true));
           setPushDeviceStatus("Alertes mobiles actives sur cet appareil.", "ready");
           renderDashboardOnboarding(dashboardRuntimeStatus);
         } catch (error) {

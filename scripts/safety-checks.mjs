@@ -1352,6 +1352,16 @@ check(
     && dashboardHybridSource.includes('data-push-test'),
 );
 check(
+  'mobile push activation keeps the permission request in the direct tap path',
+  authClientSource.includes('function isAppleMobileOutsideInstalledApp()')
+    && authClientSource.includes('data-push-enable')
+    && authClientSource.includes('const requestedPermission = !activeTopics.has(topic) && Notification.permission === "default"')
+    && authClientSource.includes('await Notification.requestPermission()')
+    && dashboardHybridSource.includes('data-push-enable')
+    && dashboardHybridSource.includes('icon-192.png')
+    && notificationStylesSource.includes('.dashboard-page .oracle-links > a'),
+);
+check(
   'trade history exposes execution details and a quiet-bot diagnosis',
   authClientSource.includes('data-dashboard-empty-refresh')
     && authClientSource.includes('Entrée exécutée')
