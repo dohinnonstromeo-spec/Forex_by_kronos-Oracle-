@@ -20,13 +20,15 @@
 //
 // Run with: node scripts/backtest-small-account-swing.mjs [yahooRange]
 
+import { computeTrailingStopPrice, SWING_TRAILING_PARAMS_BY_PAIR } from "../trading-exit-rules.mjs";
+
 const SYMBOLS = [
   // Only the 3 pairs SWING_TRAILING_PARAMS_BY_PAIR already validated for the
   // trailing stop -- no point asking "is this small-account-safe" for a pair
   // that isn't even shipping the exit mechanism being tested here.
-  { pair: "EUR/USD", yahooSymbol: "EURUSD=X", spec: { tickSize: 0.00001, lossTickValue: 1 }, trailParams: { activationR: 0.2, trailR: 0.3, bufferR: 0.15 } },
-  { pair: "USD/CHF", yahooSymbol: "USDCHF=X", spec: { tickSize: 0.00001, lossTickValue: 1.2502813132954915 }, trailParams: { activationR: 0.2, trailR: 0.3, bufferR: 0.15 } },
-  { pair: "XAU/USD", yahooSymbol: "GC=F", spec: { tickSize: 0.01, lossTickValue: 1 }, trailParams: { activationR: 1, trailR: 0.5, bufferR: 0.15 } },
+  { pair: "EUR/USD", yahooSymbol: "EURUSD=X", spec: { tickSize: 0.00001, lossTickValue: 1 }, trailParams: SWING_TRAILING_PARAMS_BY_PAIR["EUR/USD"] },
+  { pair: "USD/CHF", yahooSymbol: "USDCHF=X", spec: { tickSize: 0.00001, lossTickValue: 1.2502813132954915 }, trailParams: SWING_TRAILING_PARAMS_BY_PAIR["USD/CHF"] },
+  { pair: "XAU/USD", yahooSymbol: "GC=F", spec: { tickSize: 0.01, lossTickValue: 1 }, trailParams: SWING_TRAILING_PARAMS_BY_PAIR["XAU/USD"] },
 ];
 // spec values: real numbers fetched live from the connected MetaApi demo
 // account moments before this script was written (GET .../symbols/{sym}/
@@ -144,7 +146,7 @@ function simulateFixedTp(bars, signalIndex, signal) {
   return { result: "expired", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
 }
 
-function simulateTrailingStop(bars, signalIndex, signal, activationR, trailR, bufferR) {
+function simulateTrailingStop(bars, signalIndex, signal, trailParams) {
   const buy = signal.direction === "ACHAT";
   let stop = signal.sl;
   let bestFavR = -Infinity;
@@ -158,13 +160,14 @@ function simulateTrailingStop(bars, signalIndex, signal, activationR, trailR, bu
     const favExtreme = buy ? bar.high : bar.low;
     const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
     if (favR > bestFavR) bestFavR = favR;
-    if (bestFavR >= activationR) {
-      const breakevenStop = buy ? signal.entry + bufferR * signal.risk : signal.entry - bufferR * signal.risk;
-      const trailedStop = bestFavR >= activationR + trailR
-        ? (buy ? signal.entry + (bestFavR - trailR) * signal.risk : signal.entry - (bestFavR - trailR) * signal.risk)
-        : breakevenStop;
-      stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
-    }
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      trailParams,
+    );
+    if (candidateStop != null) stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
   }
   const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
   const expiryClose = bars[expiryIndex].close;
@@ -232,7 +235,7 @@ async function main() {
           const signals = generateSignals(p.bars, valuePerUnitPerLot).filter((s) => s.minVolumeRisk <= maxRisk);
           if (!signals.length) return { label: p.label, eligible: 0, baseline: null, trailing: null };
           const baselineTrades = signals.map((s) => ({ split: s.split, ...simulateFixedTp(p.bars, s.index, s.signal) }));
-          const trailingTrades = signals.map((s) => ({ split: s.split, ...simulateTrailingStop(p.bars, s.index, s.signal, symbolDef.trailParams.activationR, symbolDef.trailParams.trailR, symbolDef.trailParams.bufferR) }));
+          const trailingTrades = signals.map((s) => ({ split: s.split, ...simulateTrailingStop(p.bars, s.index, s.signal, symbolDef.trailParams) }));
           return {
             label: p.label,
             eligible: signals.length,

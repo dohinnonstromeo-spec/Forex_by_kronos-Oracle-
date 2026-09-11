@@ -16,7 +16,7 @@
 // BASELINE_PARAMS, copied verbatim, same as every other backtest script in
 // this repo) and the SAME exit mechanism each pair actually ships with today
 // (staged trailing stop for XAU/USD, USD/CHF, EUR/USD -- see
-// SWING_TRAILING_PARAMS_BY_PAIR in server.mjs; fixed TP1 1.6R/TP2 2.5R for
+// SWING_TRAILING_PARAMS_BY_PAIR in trading-exit-rules.mjs; fixed TP1 1.6R/TP2 2.5R for
 // the rest). GBP/JPY excluded -- it has no validated entry edge at all
 // (PAIRS_WITHOUT_VALIDATED_EDGE), so pyramiding a losing edge only tells you
 // it's still losing, with more risk.
@@ -32,10 +32,12 @@
 //
 // Run with: node scripts/backtest-swing-pyramiding.mjs [yahooRange]
 
+import { computeTrailingStopPrice, SWING_TRAILING_PARAMS_BY_PAIR } from "../trading-exit-rules.mjs";
+
 const SYMBOLS = [
-  { pair: "XAU/USD", yahooSymbol: "GC=F", exitType: "trailing", trailParams: { activationR: 1, trailR: 0.5, bufferR: 0.15 } },
-  { pair: "USD/CHF", yahooSymbol: "USDCHF=X", exitType: "trailing", trailParams: { activationR: 0.2, trailR: 0.3, bufferR: 0.15 } },
-  { pair: "EUR/USD", yahooSymbol: "EURUSD=X", exitType: "trailing", trailParams: { activationR: 0.2, trailR: 0.3, bufferR: 0.15 } },
+  { pair: "XAU/USD", yahooSymbol: "GC=F", exitType: "trailing", trailParams: SWING_TRAILING_PARAMS_BY_PAIR["XAU/USD"] },
+  { pair: "USD/CHF", yahooSymbol: "USDCHF=X", exitType: "trailing", trailParams: SWING_TRAILING_PARAMS_BY_PAIR["USD/CHF"] },
+  { pair: "EUR/USD", yahooSymbol: "EURUSD=X", exitType: "trailing", trailParams: SWING_TRAILING_PARAMS_BY_PAIR["EUR/USD"] },
   { pair: "US500", yahooSymbol: "^GSPC", exitType: "fixed" },
   { pair: "USD/JPY", yahooSymbol: "USDJPY=X", exitType: "fixed" },
   { pair: "BTC/USD", binanceSymbol: "BTCUSDT", exitType: "fixed" },
@@ -167,13 +169,14 @@ function simulateSingle(bars, signalIndex, signal, exitType, trailParams) {
       const favExtreme = buy ? bar.high : bar.low;
       const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
       if (favR > bestFavR) bestFavR = favR;
-      if (bestFavR >= trailParams.activationR) {
-        const breakevenStop = buy ? signal.entry + trailParams.bufferR * signal.risk : signal.entry - trailParams.bufferR * signal.risk;
-        const trailedStop = bestFavR >= trailParams.activationR + trailParams.trailR
-          ? (buy ? signal.entry + (bestFavR - trailParams.trailR) * signal.risk : signal.entry - (bestFavR - trailParams.trailR) * signal.risk)
-          : breakevenStop;
-        stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
-      }
+      const candidateStop = computeTrailingStopPrice(
+        signal.entry,
+        signal.direction,
+        signal.risk,
+        buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+        trailParams,
+      );
+      if (candidateStop != null) stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
     }
     const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
     const expiryClose = bars[expiryIndex].close;
@@ -226,13 +229,14 @@ function simulateWithPyramiding(bars, baseIndex, baseSignal, exitType, trailPara
         const favExtreme = buy ? bar.high : bar.low;
         const favR = buy ? (favExtreme - leg.entry) / leg.risk : (leg.entry - favExtreme) / leg.risk;
         if (favR > leg.bestFavR) leg.bestFavR = favR;
-        if (leg.bestFavR >= trailParams.activationR) {
-          const breakevenStop = buy ? leg.entry + trailParams.bufferR * leg.risk : leg.entry - trailParams.bufferR * leg.risk;
-          const trailedStop = leg.bestFavR >= trailParams.activationR + trailParams.trailR
-            ? (buy ? leg.entry + (leg.bestFavR - trailParams.trailR) * leg.risk : leg.entry - (leg.bestFavR - trailParams.trailR) * leg.risk)
-            : breakevenStop;
-          leg.stop = buy ? Math.max(leg.stop, breakevenStop, trailedStop) : Math.min(leg.stop, breakevenStop, trailedStop);
-        }
+        const candidateStop = computeTrailingStopPrice(
+          leg.entry,
+          baseSignal.direction,
+          leg.risk,
+          buy ? leg.entry + leg.bestFavR * leg.risk : leg.entry - leg.bestFavR * leg.risk,
+          trailParams,
+        );
+        if (candidateStop != null) leg.stop = buy ? Math.max(leg.stop, candidateStop) : Math.min(leg.stop, candidateStop);
       } else {
         const tp1 = buy ? leg.entry + leg.risk * 1.6 : leg.entry - leg.risk * 1.6;
         const tp2 = buy ? leg.entry + leg.risk * 2.5 : leg.entry - leg.risk * 2.5;

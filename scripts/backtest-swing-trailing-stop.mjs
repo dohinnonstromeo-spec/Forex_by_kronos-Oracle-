@@ -14,13 +14,16 @@
 // and its high/low/close is unknown, same conservative "stop-side-of-the-bar-
 // checked-first" assumption scripts/backtest.mjs already uses for SL/TP.
 //
-// Run with: node scripts/backtest-swing-trailing-stop.mjs [yahooRange]
+// Run with: node scripts/backtest-swing-trailing-stop.mjs [yahooRange] [pair]
 //   yahooRange: Yahoo history window, default "5y" -- pass "max" (or "10y" if
 //   Yahoo rejects max for a given symbol) to independently re-verify a finding
 //   against a second, non-overlapping period (see the periodLabel split below),
 //   same "two real windows must agree" bar the scalp backtest used.
+//   pair: optional production pair filter, for example "XAU/USD". It makes a
+//   focused review reproduce the exact same grid without silently sampling less
+//   history or changing any production rule.
 
-import { computeTrailingStopPrice } from "../trading-exit-rules.mjs";
+import { computeTrailingStopPrice, SWING_TRAILING_PARAMS_BY_PAIR } from "../trading-exit-rules.mjs";
 
 const SYMBOLS = [
   { pair: "EUR/USD", kind: "yahoo", yahooSymbol: "EURUSD=X" },
@@ -420,17 +423,20 @@ function generateSignals(bars) {
   return signals;
 }
 
-const ACTIVATION_RS = [0.2, 0.4, 0.6, 0.8, 1.0];
+const ACTIVATION_RS = [0.2, 0.4, 0.5, 0.6, 0.8, 1.0];
 const TRAIL_RS = [0.3, 0.5, 0.75, 1.0];
 const BUFFER_R = 0.15;
 
-// These are the exact trailing settings currently shipped for the three swing
-// pairs. Other pairs are intentionally not assigned a hybrid result here.
-const CURRENT_TRAILING_PARAMS = {
-  "EUR/USD": { activationR: 0.2, trailR: 0.3, bufferR: 0.15 },
-  "XAU/USD": { activationR: 1, trailR: 0.5, bufferR: 0.15 },
-  "USD/CHF": { activationR: 0.2, trailR: 0.3, bufferR: 0.15 },
-};
+// Project production parameters into the research shape. Do not duplicate
+// numeric thresholds here: changing production then re-running a backtest
+// must always evaluate the exact exit logic the robot will use.
+const CURRENT_TRAILING_PARAMS = Object.fromEntries(
+  Object.entries(SWING_TRAILING_PARAMS_BY_PAIR).map(([pair, params]) => [pair, {
+    activationR: params.trailActivationR,
+    trailR: params.trailR,
+    bufferR: params.trailBufferR,
+  }]),
+);
 
 // One pair, one already-fetched slice of bars (a whole history, OR one half of
 // it for the two-independent-periods check) -- returns the baseline, the full
@@ -493,9 +499,16 @@ function analyzePeriod(pair, bars) {
 
 async function main() {
   const yahooRange = process.argv[2] || "5y";
+  const requestedPair = String(process.argv[3] || "").trim().toUpperCase();
+  const symbols = requestedPair
+    ? SYMBOLS.filter((symbolDef) => symbolDef.pair === requestedPair)
+    : SYMBOLS;
+  if (requestedPair && !symbols.length) {
+    throw new Error(`unknown_pair_${requestedPair}`);
+  }
   console.log(`Fenetre Yahoo demandee: ${yahooRange} -- Binance reste toujours limite a ses 1000 dernieres bougies journalieres (~2.7 ans), non ajustable ici.\n`);
 
-  for (const symbolDef of SYMBOLS) {
+  for (const symbolDef of symbols) {
     let bars;
     try {
       bars = symbolDef.kind === "yahoo" ? await fetchYahooDaily(symbolDef.yahooSymbol, yahooRange) : await fetchBinanceDaily(symbolDef.binanceSymbol);

@@ -15,7 +15,7 @@ import {
   isExperimentalAutoAnalysisStyle,
   normalizeAutoAnalysisStyle,
 } from "../strategy-engines.mjs";
-import { computeTrailingStopPrice } from "../trading-exit-rules.mjs";
+import { computeTrailingStopPrice, SWING_TRAILING_PARAMS_BY_PAIR } from "../trading-exit-rules.mjs";
 
 // Standalone on purpose, same reason as scripts/backtest.mjs: importing server.mjs
 // starts a real HTTP server as a side effect. The functions below are copied from
@@ -806,6 +806,8 @@ console.log("=== hybrid trailing: opt-in, bounded pairs, future orders only ==="
 const dashboardHybridSource = await readFile(new URL("../dashboard.html", import.meta.url), "utf8");
 const scalpBacktestSource = await readFile(new URL("../scripts/backtest-scalp-trailing-stop.mjs", import.meta.url), "utf8");
 const swingBacktestSource = await readFile(new URL("../scripts/backtest-swing-trailing-stop.mjs", import.meta.url), "utf8");
+const smallAccountBacktestSource = await readFile(new URL("../scripts/backtest-small-account-swing.mjs", import.meta.url), "utf8");
+const pyramidingBacktestSource = await readFile(new URL("../scripts/backtest-swing-pyramiding.mjs", import.meta.url), "utf8");
 const microPriceActionBacktestSource = await readFile(new URL("../scripts/backtest-scalp-price-action-smc.mjs", import.meta.url), "utf8");
 const meanReversionValidationSource = await readFile(new URL("../scripts/backtest-scalp-fx-drawdown.mjs", import.meta.url), "utf8");
 const trailingTestParams = { trailActivationR: 1, trailR: 0.5, trailBufferR: 0.15 };
@@ -821,6 +823,23 @@ check(
 check(
   "trailing stop keeps its positive buffer when the peak is too close",
   computeTrailingStopPrice(100, "ACHAT", 10, 102, { trailActivationR: 0.2, trailR: 0.5, trailBufferR: 0.15 }) === 101.5,
+);
+const xauSwingTrailingParams = SWING_TRAILING_PARAMS_BY_PAIR["XAU/USD"];
+check(
+  "XAU swing trailing activates at 0.6R and locks a positive floor",
+  xauSwingTrailingParams?.trailActivationR === 0.6
+    && xauSwingTrailingParams.trailR === 0.5
+    && computeTrailingStopPrice(100, "ACHAT", 10, 105.9, xauSwingTrailingParams) === null
+    && computeTrailingStopPrice(100, "ACHAT", 10, 106, xauSwingTrailingParams) === 101.5
+    && computeTrailingStopPrice(100, "VENTE", 10, 94, xauSwingTrailingParams) === 98.5,
+);
+check(
+  "swing research reuses the shared production trailing rule",
+  swingBacktestSource.includes("SWING_TRAILING_PARAMS_BY_PAIR")
+    && smallAccountBacktestSource.includes("SWING_TRAILING_PARAMS_BY_PAIR")
+    && smallAccountBacktestSource.includes("computeTrailingStopPrice(")
+    && pyramidingBacktestSource.includes("SWING_TRAILING_PARAMS_BY_PAIR")
+    && pyramidingBacktestSource.includes("computeTrailingStopPrice("),
 );
 check(
   "hybrid preference is durable and OFF by default",
@@ -909,7 +928,7 @@ check(
     && scalpBacktestSource.includes("JOURS actifs")
     && scalpBacktestSource.includes('["month", "year"]')
     && swingBacktestSource.includes("function simulateHybridTpTrailingStop")
-    && swingBacktestSource.includes('import { computeTrailingStopPrice }')
+    && swingBacktestSource.includes("SWING_TRAILING_PARAMS_BY_PAIR")
     && swingBacktestSource.includes("HYBRIDE TP1 1.6R + trailing actuel")
     && swingBacktestSource.includes("function printTemporalBreakdown")
     && swingBacktestSource.includes("JOURS actifs")
