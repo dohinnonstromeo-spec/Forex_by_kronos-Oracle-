@@ -26,10 +26,10 @@
         <a href="/tester-gratuitement" data-cta-trial data-cms="global.cta.trial">Tester gratuitement</a>
         <a href="/paiement" data-payment-form>S'abonner</a>
         <div class="auth-notif" data-notif-wrap hidden>
-          <button class="auth-notif-bell" type="button" data-notif-bell aria-label="Notifications">
+          <button class="auth-notif-bell" type="button" data-notif-bell aria-label="Notifications" aria-controls="notification-center" aria-expanded="false">
             <span data-icon="bell" aria-hidden="true"></span><span class="auth-notif-badge" data-notif-badge hidden>0</span>
           </button>
-          <div class="auth-notif-panel" data-notif-panel role="dialog" aria-label="Centre de notifications" aria-modal="false" hidden>
+          <div id="notification-center" class="auth-notif-panel" data-notif-panel role="dialog" aria-label="Centre de notifications" aria-modal="false" hidden>
             <div class="auth-notif-heading">
               <div>
                 <p class="auth-notif-eyebrow">Centre de contrôle</p>
@@ -331,6 +331,16 @@
             </div>
             <p class="dashboard-history-note">Avec cette option, les nouvelles positions automatiques armées avec TP1 et TP2 conservent TP1 comme seuil interne : à son atteinte, le robot clôture une moitié compatible avec le volume minimum du broker, puis place le reliquat au breakeven avant de poursuivre le trailing-stop. Le TP broker reste TP2 sur les stratégies à objectif fixe. Si le volume minimum empêche une moitié, aucune clôture forcée n'est envoyée. Les positions déjà ouvertes ne sont pas converties à ce nouveau scénario ; les anciennes positions à TP fixe peuvent seulement recevoir le resserrement historique de leur objectif.</p>
             <p class="dashboard-history-note dashboard-prepare-error" data-secure-half-priority-message hidden></p>
+          </div>
+
+          <div class="dashboard-autotrade-section" data-autotrade-preferences-section-quick-partial-tp hidden>
+            <div class="dashboard-slot-head">
+              <h3>TP rapide &agrave; 50 % + protection</h3>
+              <label class="dashboard-slot-switch"><input type="checkbox" data-quick-partial-tp-toggle autocomplete="off"> Actif</label>
+            </div>
+            <p class="dashboard-history-note">Pour les nouvelles positions, le robot cl&ocirc;ture 50 % au premier objectif utilisable, le plus proche entre le TP analytique et 1,25R. Il couvre ensuite les co&ucirc;ts au breakeven, puis laisse le reste au stop suiveur. Les positions d&eacute;j&agrave; ouvertes ne changent jamais.</p>
+            <p class="dashboard-history-note">Mode de s&eacute;curit&eacute; optionnel : il cherche &agrave; s&eacute;curiser plus t&ocirc;t, mais peut diminuer le gain moyen face au trailing seul. Active-le d'abord en mode d&eacute;mo. Sur les rares paires admises au test TP fixe + SL suiveur, le mode hybride garde la priorit&eacute;.</p>
+            <p class="dashboard-history-note dashboard-prepare-error" data-quick-partial-tp-message hidden></p>
           </div>
 
           <div class="dashboard-autotrade-section" data-autotrade-preferences-section-hybrid-trailing hidden>

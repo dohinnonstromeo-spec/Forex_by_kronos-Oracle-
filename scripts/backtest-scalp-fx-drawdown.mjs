@@ -18,6 +18,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, "..", "data-backtest");
 const TRAIN_RATIO = 0.7;
+const SMALL_ACCOUNT_MIN_TEST_TRADES = 100;
+const SMALL_ACCOUNT_MIN_PROFIT_FACTOR = 1.2;
+const SMALL_ACCOUNT_MAX_DRAWDOWN_R = 10;
+const SMALL_ACCOUNT_MAX_LOSS_STREAK = 5;
 
 function loadCsv(pair, suffix) {
   const path = join(DATA_DIR, `${pair}_M1${suffix}.csv`);
@@ -164,14 +168,37 @@ function analyzeDrawdown(testTrades, riskPercentOfBalance, startingBalance) {
   };
 }
 
+function summarizeTestTrades(testTrades) {
+  if (!testTrades.length) {
+    return { winRate: 0, avgR: 0, profitFactor: 0, averageHoldMinutes: 0 };
+  }
+  let grossWin = 0;
+  let grossLoss = 0;
+  let totalR = 0;
+  let heldMinutes = 0;
+  for (const trade of testTrades) {
+    totalR += trade.rMultiple;
+    heldMinutes += trade.barsHeld;
+    if (trade.rMultiple > 0) grossWin += trade.rMultiple;
+    if (trade.rMultiple < 0) grossLoss += Math.abs(trade.rMultiple);
+  }
+  const wins = testTrades.filter((trade) => trade.rMultiple > 0).length;
+  return {
+    winRate: Math.round((wins / testTrades.length) * 1000) / 10,
+    avgR: Math.round((totalR / testTrades.length) * 1000) / 1000,
+    profitFactor: Math.round((grossLoss > 0 ? grossWin / grossLoss : grossWin) * 1000) / 1000,
+    averageHoldMinutes: Math.round((heldMinutes / testTrades.length) * 10) / 10,
+  };
+}
+
 const CANDIDATES = [
   {
-    label: "GBPUSD -- meilleur candidat (ma20 rsi20/80 stretch0.1% atr1 tp4R hold30)",
+    label: "GBPUSD -- candidat de recherche (ma20 rsi20/80 stretch0.1% atr1 tp4R hold60)",
     pair: "GBPUSD", spreadPct: 0.0037,
     params: { maPeriod: 20, oversold: 20, overbought: 80, minStretchPct: 0.1, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1, tpR: 4, maxHoldBars: 60 },
   },
   {
-    label: "XAUUSD -- meilleur candidat (ma55 rsi20/80 stretch0.03% atr1.3 tp4R hold30)",
+    label: "XAUUSD -- candidat de recherche (ma55 rsi20/80 stretch0.03% atr1.3 tp4R hold60)",
     pair: "XAUUSD", spreadPct: 0.0039,
     params: { maPeriod: 55, oversold: 20, overbought: 80, minStretchPct: 0.03, volatilityMinPct: 0.006, volatilityMaxPct: 0.3, riskAtrMultiplier: 1.3, tpR: 4, maxHoldBars: 60 },
   },
@@ -183,8 +210,16 @@ async function main() {
     if (!bars) { console.log(`[${c.pair}] CSV 365d introuvable.`); continue; }
     const trades = runTrades(bars, c.params, c.spreadPct);
     const testTrades = trades.filter((t) => t.split === "test");
+    const summary = summarizeTestTrades(testTrades);
+    const baselineDrawdown = analyzeDrawdown(testTrades, 1, 100);
+    const smallAccountReady = testTrades.length >= SMALL_ACCOUNT_MIN_TEST_TRADES
+      && summary.profitFactor >= SMALL_ACCOUNT_MIN_PROFIT_FACTOR
+      && baselineDrawdown.maxDrawdownR <= SMALL_ACCOUNT_MAX_DRAWDOWN_R
+      && baselineDrawdown.maxLossStreak <= SMALL_ACCOUNT_MAX_LOSS_STREAK;
     console.log(`\n=== ${c.label} ===`);
     console.log(`${testTrades.length} trades sur le TEST (hors-echantillon, jamais vus par la selection de parametres).`);
+    console.log(`Taux de reussite: ${summary.winRate}% | avgR: ${summary.avgR} | profit factor: ${summary.profitFactor} | duree moyenne: ${summary.averageHoldMinutes} min`);
+    console.log(`Verdict petit compte: ${smallAccountReady ? "VALIDE" : "REFUSE"} (minimum ${SMALL_ACCOUNT_MIN_TEST_TRADES} trades, PF ${SMALL_ACCOUNT_MIN_PROFIT_FACTOR}, drawdown <= ${SMALL_ACCOUNT_MAX_DRAWDOWN_R}R, serie <= ${SMALL_ACCOUNT_MAX_LOSS_STREAK}).`);
 
     for (const riskPercent of [0.5, 1, 2]) {
       const startingBalance = 100; // un "petit compte" comme demande -- $100 de depart

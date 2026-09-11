@@ -1,5 +1,6 @@
 (() => {
   const CLIENT_REQUEST_TIMEOUT_MS = 30_000;
+  let notificationsPanelStarted = false;
 
   function fetchWithTimeout(url, options = {}) {
     if (options.signal) return fetch(url, options);
@@ -174,6 +175,8 @@
   }
 
   if (document.querySelector(".dashboard-main")) {
+    // The in-app centre must stay usable even when dashboard data is delayed.
+    startNotificationPanel();
     // Let the rest of this deferred script initialize its state variables before
     // the dashboard starts. This keeps the early notification/status boot safe.
     setTimeout(() => loadDashboard(), 0);
@@ -577,47 +580,58 @@
   // it can never show something push wouldn't have also said.
   let notificationsFallbackStarted = false;
   let pushTestBound = false;
-  function startNotificationsFallback() {
-    if (notificationsFallbackStarted) return;
+  function startNotificationPanel() {
+    if (notificationsPanelStarted) return true;
     const wrap = document.querySelector("[data-notif-wrap]");
-    if (!wrap) return;
-    notificationsFallbackStarted = true;
+    const bell = wrap?.querySelector("[data-notif-bell]");
+    const panel = wrap?.querySelector("[data-notif-panel]");
+    if (!wrap || !bell || !panel) return false;
+
+    notificationsPanelStarted = true;
     wrap.hidden = false;
-    const bell = wrap.querySelector("[data-notif-bell]");
-    const panel = wrap.querySelector("[data-notif-panel]");
     const close = wrap.querySelector("[data-notif-close]");
+    const closePanel = () => {
+      panel.hidden = true;
+      bell.setAttribute("aria-expanded", "false");
+    };
     const openPanel = () => {
       const opening = panel.hidden;
       panel.hidden = !panel.hidden;
       bell.setAttribute("aria-expanded", String(!panel.hidden));
-      if (opening) markNotificationsSeen();
+      if (opening) {
+        void markNotificationsSeen();
+        void refreshNotifications();
+      }
     };
     bell.setAttribute("aria-expanded", "false");
     bell.addEventListener("click", openPanel);
     close?.addEventListener("click", () => {
-      panel.hidden = true;
-      bell.setAttribute("aria-expanded", "false");
+      closePanel();
       bell.focus();
     });
     wrap.querySelector("[data-notif-go-trading]")?.addEventListener("click", () => {
-      panel.hidden = true;
-      bell.setAttribute("aria-expanded", "false");
+      closePanel();
       document.querySelector('[data-tab-btn="trading"]')?.click();
     });
     document.addEventListener("click", (event) => {
       if (!panel.hidden && !wrap.contains(event.target)) {
-        panel.hidden = true;
-        bell.setAttribute("aria-expanded", "false");
+        closePanel();
       }
     });
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && !panel.hidden) {
-        panel.hidden = true;
-        bell.setAttribute("aria-expanded", "false");
+        closePanel();
         bell.focus();
       }
     });
+    return true;
+  }
+
+  function startNotificationsFallback() {
+    if (!startNotificationPanel() || notificationsFallbackStarted) return;
+    notificationsFallbackStarted = true;
     bindPushTest();
+    void refreshNotifications();
     scheduleVisiblePoll(refreshNotifications, 60000);
   }
 
@@ -1416,6 +1430,44 @@
       }
     });
 
+    document.querySelector("[data-quick-partial-tp-toggle]")?.addEventListener("change", async (event) => {
+      const checkbox = event.currentTarget;
+      const enabled = checkbox.checked;
+      const messageEl = document.querySelector("[data-quick-partial-tp-message]");
+      if (messageEl) messageEl.hidden = true;
+      if (enabled && !window.confirm("Le TP rapide ferme 50 % plus t\u00f4t, puis prot\u00e8ge le reliquat au breakeven et avec le stop suiveur. Il peut r\u00e9duire le gain moyen face au trailing seul. Teste d'abord en mode d\u00e9mo. Continuer ?")) {
+        checkbox.checked = false;
+        return;
+      }
+      checkbox.disabled = true;
+      try {
+        const response = await fetchWithTimeout("/api/auto-trade/toggle-quick-partial-tp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await response.json();
+        if (!result.ok) {
+          checkbox.checked = !enabled;
+          if (messageEl) {
+            messageEl.textContent = result.message || "\u00c9chec (" + (result.error || "erreur inconnue") + ").";
+            messageEl.hidden = false;
+          }
+        } else if (messageEl) {
+          messageEl.textContent = enabled
+            ? "TP rapide activ\u00e9 pour les prochaines positions : 50 % au premier objectif atteignable, breakeven couvrant les co\u00fbts, puis stop suiveur sur le reliquat. Les positions d\u00e9j\u00e0 ouvertes restent inchang\u00e9es."
+            : "TP rapide d\u00e9sactiv\u00e9 : les positions d\u00e9j\u00e0 ouvertes conservent leur plan de sortie initial.";
+          messageEl.classList.remove("dashboard-prepare-error");
+          messageEl.hidden = false;
+        }
+      } catch {
+        checkbox.checked = !enabled;
+      } finally {
+        checkbox.disabled = false;
+        await refreshAutoTradeStatus();
+      }
+    });
+
     document.querySelector("[data-hybrid-trailing-toggle]")?.addEventListener("change", async (event) => {
       const checkbox = event.currentTarget;
       const enabled = checkbox.checked;
@@ -1663,6 +1715,13 @@
       if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.secureHalfPriorityEnabled);
     }
 
+    const quickPartialTpSection = document.querySelector("[data-autotrade-preferences-section-quick-partial-tp]");
+    if (quickPartialTpSection) {
+      quickPartialTpSection.hidden = !anyBrokerConnected;
+      const toggle = document.querySelector("[data-quick-partial-tp-toggle]");
+      if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.quickPartialTpEnabled);
+    }
+
     const hybridTrailingSection = document.querySelector("[data-autotrade-preferences-section-hybrid-trailing]");
     if (hybridTrailingSection) {
       hybridTrailingSection.hidden = !anyBrokerConnected;
@@ -1880,21 +1939,22 @@
 
   function partialProtectionLabel(item) {
     if (!item.partialCloseEnabled) return "Protection standard : TP et SL broker.";
+    const target = item.partialCloseTarget != null ? "le seuil " + item.partialCloseTarget : "TP1";
     if (item.partialCloseStatus === "uncertain") {
-      return "TP1 atteint : ex\u00e9cution partielle incertaine, aucune nouvelle action envoy\u00e9e.";
+      return target + " atteint : ex\u00e9cution partielle incertaine, aucune nouvelle action envoy\u00e9e.";
     }
     if (item.partialCloseStatus === "skipped_min_volume") {
       return item.breakevenApplied
-        ? "TP1 atteint : volume minimum broker incompatible avec une moiti\u00e9, reliquat prot\u00e9g\u00e9 au breakeven."
-        : "TP1 atteint : volume minimum broker incompatible avec une moiti\u00e9, breakeven en attente.";
+        ? target + " atteint : volume minimum broker incompatible avec une moiti\u00e9, reliquat prot\u00e9g\u00e9 au breakeven."
+        : target + " atteint : volume minimum broker incompatible avec une moiti\u00e9, breakeven en attente.";
     }
     if (item.partialCloseStatus === "done") {
       return item.breakevenApplied
-        ? "TP1 atteint : moiti\u00e9 cl\u00f4tur\u00e9e, reliquat prot\u00e9g\u00e9 au breakeven."
-        : "TP1 atteint : moiti\u00e9 cl\u00f4tur\u00e9e, breakeven en attente.";
+        ? target + " atteint : moiti\u00e9 cl\u00f4tur\u00e9e, reliquat prot\u00e9g\u00e9 au breakeven."
+        : target + " atteint : moiti\u00e9 cl\u00f4tur\u00e9e, breakeven en attente.";
     }
-    if (item.partialCloseError) return `Protection TP1 en attente : ${item.partialCloseError}`;
-    return "Protection arm\u00e9e : moiti\u00e9 \u00e0 TP1 puis breakeven.";
+    if (item.partialCloseError) return "Protection " + target + " en attente : " + item.partialCloseError;
+    return "Protection arm\u00e9e : moiti\u00e9 \u00e0 " + target + " puis breakeven.";
   }
 
   function formatTradeRiskAmount(value) {

@@ -20,6 +20,8 @@
 //   against a second, non-overlapping period (see the periodLabel split below),
 //   same "two real windows must agree" bar the scalp backtest used.
 
+import { computeTrailingStopPrice } from "../trading-exit-rules.mjs";
+
 const SYMBOLS = [
   { pair: "EUR/USD", kind: "yahoo", yahooSymbol: "EURUSD=X" },
   { pair: "XAU/USD", kind: "yahoo", yahooSymbol: "GC=F" },
@@ -170,6 +172,25 @@ function simulateFixedTp(bars, signalIndex, signal) {
   return { result: "expired", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
 }
 
+// Full short exits are tested independently from the production TP1/TP2
+// baseline. The requested target may only tighten the analytical TP1 (1.6R).
+function simulateFixedQuickTp(bars, signalIndex, signal, requestedTargetR) {
+  const buy = signal.direction === "ACHAT";
+  const targetR = Math.min(1.6, requestedTargetR);
+  const target = buy ? signal.entry + signal.risk * targetR : signal.entry - signal.risk * targetR;
+  for (let j = signalIndex + 1; j <= Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1); j++) {
+    const bar = bars[j];
+    const hitStop = buy ? bar.low <= signal.sl : bar.high >= signal.sl;
+    const hitTarget = buy ? bar.high >= target : bar.low <= target;
+    if (hitStop) return { result: "loss", rMultiple: -1 - COST_DRAG_R, barsHeld: j - signalIndex };
+    if (hitTarget) return { result: "win", rMultiple: targetR - COST_DRAG_R, barsHeld: j - signalIndex };
+  }
+  const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
+  const expiryClose = bars[expiryIndex].close;
+  const markToMarketR = buy ? (expiryClose - signal.entry) / signal.risk : (signal.entry - expiryClose) / signal.risk;
+  return { result: "expired", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
+}
+
 // Same staged mechanism as the scalp version: untouched below activationR,
 // entry+buffer at activationR, trails bestFavR-trailR beyond activationR+trailR.
 function simulateTrailingStop(bars, signalIndex, signal, activationR, trailR, bufferR) {
@@ -186,12 +207,15 @@ function simulateTrailingStop(bars, signalIndex, signal, activationR, trailR, bu
     const favExtreme = buy ? bar.high : bar.low;
     const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
     if (favR > bestFavR) bestFavR = favR;
-    if (bestFavR >= activationR) {
-      const breakevenStop = buy ? signal.entry + bufferR * signal.risk : signal.entry - bufferR * signal.risk;
-      const trailedStop = bestFavR >= activationR + trailR
-        ? (buy ? signal.entry + (bestFavR - trailR) * signal.risk : signal.entry - (bestFavR - trailR) * signal.risk)
-        : breakevenStop;
-      stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      { trailActivationR: activationR, trailR, trailBufferR: bufferR },
+    );
+    if (candidateStop != null) {
+      stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
     }
   }
   const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
@@ -222,12 +246,15 @@ function simulateHybridTpTrailingStop(bars, signalIndex, signal, activationR, tr
     const favExtreme = buy ? bar.high : bar.low;
     const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
     if (favR > bestFavR) bestFavR = favR;
-    if (bestFavR >= activationR) {
-      const breakevenStop = buy ? signal.entry + bufferR * signal.risk : signal.entry - bufferR * signal.risk;
-      const trailedStop = bestFavR >= activationR + trailR
-        ? (buy ? signal.entry + (bestFavR - trailR) * signal.risk : signal.entry - (bestFavR - trailR) * signal.risk)
-        : breakevenStop;
-      stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      { trailActivationR: activationR, trailR, trailBufferR: bufferR },
+    );
+    if (candidateStop != null) {
+      stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
     }
   }
   const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
@@ -235,6 +262,73 @@ function simulateHybridTpTrailingStop(bars, signalIndex, signal, activationR, tr
   const markToMarketR = buy ? (expiryClose - signal.entry) / signal.risk : (signal.entry - expiryClose) / signal.risk;
   return { result: "timeout", rMultiple: markToMarketR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
 }
+
+// Research-only representation of secure half on a trailing swing position:
+// half closes at TP1, the remainder receives the cost-aware breakeven used in
+// production, and the shared trailing-stop rule manages the final exit.
+function simulatePartialTpTrailingStop(bars, signalIndex, signal, activationR, trailR, bufferR, breakevenPriceBuffer, requestedTargetR = null) {
+  const buy = signal.direction === "ACHAT";
+  // A fast target can tighten the analytical TP1 (1.6R) but never extend it.
+  const targetR = requestedTargetR == null ? 1.6 : Math.min(1.6, requestedTargetR);
+  const target = buy ? signal.entry + signal.risk * targetR : signal.entry - signal.risk * targetR;
+  const costBufferR = breakevenPriceBuffer / signal.risk;
+  let stop = signal.sl;
+  let bestFavR = -Infinity;
+  let partialTaken = false;
+  const combinedResult = (remainingR, barsHeld) => {
+    const rMultiple = (targetR + remainingR) / 2 - COST_DRAG_R;
+    return { result: rMultiple > 0 ? "win" : "loss", rMultiple, barsHeld };
+  };
+  for (let j = signalIndex + 1; j <= Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1); j++) {
+    const bar = bars[j];
+    const hitStop = buy ? bar.low <= stop : bar.high >= stop;
+    if (hitStop) {
+      const rAtStop = buy ? (stop - signal.entry) / signal.risk : (signal.entry - stop) / signal.risk;
+      return partialTaken
+        ? combinedResult(rAtStop, j - signalIndex)
+        : { result: rAtStop > 0 ? "win" : "loss", rMultiple: rAtStop - COST_DRAG_R, barsHeld: j - signalIndex };
+    }
+    if (!partialTaken) {
+      const hitTarget = buy ? bar.high >= target : bar.low <= target;
+      if (hitTarget) {
+        partialTaken = true;
+        const protectedR = Math.min(costBufferR, targetR - costBufferR);
+        if (protectedR > 0) {
+          const breakevenStop = buy
+            ? signal.entry + protectedR * signal.risk
+            : signal.entry - protectedR * signal.risk;
+          stop = buy ? Math.max(stop, breakevenStop) : Math.min(stop, breakevenStop);
+        }
+        continue;
+      }
+    }
+    const favExtreme = buy ? bar.high : bar.low;
+    const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
+    if (favR > bestFavR) bestFavR = favR;
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      { trailActivationR: activationR, trailR, trailBufferR: bufferR },
+    );
+    if (candidateStop != null) {
+      stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
+    }
+  }
+  const expiryIndex = Math.min(signalIndex + LOOKAHEAD_BARS, bars.length - 1);
+  const expiryClose = bars[expiryIndex].close;
+  const remainingR = buy ? (expiryClose - signal.entry) / signal.risk : (signal.entry - expiryClose) / signal.risk;
+  return partialTaken
+    ? combinedResult(remainingR, expiryIndex - signalIndex)
+    : { result: remainingR > 0 ? "win" : "loss", rMultiple: remainingR - COST_DRAG_R, barsHeld: expiryIndex - signalIndex };
+}
+
+function swingBreakevenPriceBuffer(pair) {
+  return pair === "XAU/USD" ? 0.8 : 0.00016;
+}
+
+const QUICK_PARTIAL_TARGET_RS = [0.5, 0.75, 1, 1.25];
 
 function summarize(trades) {
   if (!trades.length) return { count: 0, winRate: null, avgR: null };
@@ -348,11 +442,43 @@ function analyzePeriod(pair, bars) {
   const baselineTrain = summarize(baselineTrades.filter((t) => t.split === "train"));
   const baselineTest = summarize(baselineTrades.filter((t) => t.split === "test"));
   const currentTrailing = CURRENT_TRAILING_PARAMS[pair];
+  const currentTrailingTrades = currentTrailing
+    ? signals.map((s) => ({ split: s.split, ...simulateTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }))
+    : [];
+  const currentTrailingTrain = summarize(currentTrailingTrades.filter((t) => t.split === "train"));
+  const currentTrailingTest = summarize(currentTrailingTrades.filter((t) => t.split === "test"));
   const hybridTrades = currentTrailing
     ? signals.map((s) => ({ split: s.split, ...simulateHybridTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }))
     : [];
   const hybridTrain = summarize(hybridTrades.filter((t) => t.split === "train"));
   const hybridTest = summarize(hybridTrades.filter((t) => t.split === "test"));
+  const partialTrailingTrades = currentTrailing
+    ? signals.map((s) => ({ split: s.split, ...simulatePartialTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR, swingBreakevenPriceBuffer(pair)) }))
+    : [];
+  const partialTrailingTrain = summarize(partialTrailingTrades.filter((t) => t.split === "train"));
+  const partialTrailingTest = summarize(partialTrailingTrades.filter((t) => t.split === "test"));
+  const quickPartialResults = currentTrailing
+    ? QUICK_PARTIAL_TARGET_RS.map((targetR) => {
+      const trades = signals.map((s) => ({ split: s.split, ...simulatePartialTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR, swingBreakevenPriceBuffer(pair), targetR) }));
+      return {
+        targetR,
+        train: summarize(trades.filter((t) => t.split === "train")),
+        test: summarize(trades.filter((t) => t.split === "test")),
+      };
+    })
+    : [];
+  const quickPartialBest = [...quickPartialResults].sort((a, b) => (b.train.avgR ?? -99) - (a.train.avgR ?? -99))[0] || null;
+  const quickFullTargetResults = currentTrailing
+    ? QUICK_PARTIAL_TARGET_RS.map((targetR) => {
+      const trades = signals.map((s) => ({ split: s.split, ...simulateFixedQuickTp(bars, s.index, s.signal, targetR) }));
+      return {
+        targetR,
+        train: summarize(trades.filter((t) => t.split === "train")),
+        test: summarize(trades.filter((t) => t.split === "test")),
+      };
+    })
+    : [];
+  const quickFullTargetBest = [...quickFullTargetResults].sort((a, b) => (b.train.avgR ?? -99) - (a.train.avgR ?? -99))[0] || null;
   const results = [];
   for (const activationR of ACTIVATION_RS) {
     for (const trailR of TRAIL_RS) {
@@ -362,7 +488,7 @@ function analyzePeriod(pair, bars) {
       results.push({ activationR, trailR, train, test, beatsBaseline: train.avgR > baselineTrain.avgR && test.avgR > baselineTest.avgR });
     }
   }
-  return { barCount: bars.length, signalCount: signals.length, baselineTrain, baselineTest, hybridTrain, hybridTest, results };
+  return { barCount: bars.length, signalCount: signals.length, baselineTrain, baselineTest, currentTrailingTrain, currentTrailingTest, hybridTrain, hybridTest, partialTrailingTrain, partialTrailingTest, quickPartialResults, quickPartialBest, quickFullTargetResults, quickFullTargetBest, results };
 }
 
 async function main() {
@@ -386,10 +512,12 @@ async function main() {
       const fullBaselineTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulateFixedTp(bars, s.index, s.signal) }));
       const fullTrailingTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulateTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }));
       const fullHybridTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulateHybridTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR) }));
+      const fullPartialTrailingTrades = allSignals.map((s) => ({ signalIndex: s.index, signalTimestamp: bars[s.index]?.date, ...simulatePartialTpTrailingStop(bars, s.index, s.signal, currentTrailing.activationR, currentTrailing.trailR, currentTrailing.bufferR, swingBreakevenPriceBuffer(symbolDef.pair)) }));
       printTemporalBreakdown(symbolDef.pair, bars, [
         { name: "TP_FIXE", trades: fullBaselineTrades },
         { name: "TRAILING", trades: fullTrailingTrades },
         { name: "HYBRIDE", trades: fullHybridTrades },
+        { name: "TP1_50_TRAILING", trades: fullPartialTrailingTrades },
       ]);
     }
 
@@ -416,6 +544,20 @@ async function main() {
         const hybridBeatsBaseline = analysis.hybridTrain.avgR > analysis.baselineTrain.avgR && analysis.hybridTest.avgR > analysis.baselineTest.avgR;
         const p = CURRENT_TRAILING_PARAMS[symbolDef.pair];
         console.log(`    HYBRIDE TP1 1.6R + trailing actuel (activation=${p.activationR}R trail=${p.trailR}R): train avgR=${analysis.hybridTrain.avgR} | test avgR=${analysis.hybridTest.avgR} ${hybridBeatsBaseline ? "(bat la baseline sur les deux splits)" : "(ne bat pas la baseline sur les deux splits)"}`);
+        const partialBeatsBaseline = analysis.partialTrailingTrain.avgR > analysis.baselineTrain.avgR && analysis.partialTrailingTest.avgR > analysis.baselineTest.avgR;
+        console.log(`    TP1 50% + breakeven + trailing (demi-volume executable): train avgR=${analysis.partialTrailingTrain.avgR} | test avgR=${analysis.partialTrailingTest.avgR} ${partialBeatsBaseline ? "(bat la baseline sur les deux splits)" : "(ne bat pas la baseline sur les deux splits)"}`);
+        console.log("    TP1 RAPIDE 50% + breakeven + trailing (choix sur train):");
+        for (const result of analysis.quickPartialResults) {
+          console.log(`      cible=${result.targetR}R: train avgR=${result.train.avgR} | test avgR=${result.test.avgR}`);
+        }
+        const quickBeatsTrailing = analysis.quickPartialBest.train.avgR > analysis.currentTrailingTrain.avgR && analysis.quickPartialBest.test.avgR > analysis.currentTrailingTest.avgR;
+        console.log(`      choix train=${analysis.quickPartialBest.targetR}R -> test avgR=${analysis.quickPartialBest.test.avgR} ${quickBeatsTrailing ? "(bat le trailing seul sur les deux splits)" : "(ne bat pas le trailing seul sur les deux splits)"}`);
+        console.log("    TP RAPIDE 100% (choix sur train):");
+        for (const result of analysis.quickFullTargetResults) {
+          console.log(`      cible=${result.targetR}R: train avgR=${result.train.avgR} | test avgR=${result.test.avgR}`);
+        }
+        const quickFullBeatsTrailing = analysis.quickFullTargetBest.train.avgR > analysis.currentTrailingTrain.avgR && analysis.quickFullTargetBest.test.avgR > analysis.currentTrailingTest.avgR;
+        console.log(`      choix train=${analysis.quickFullTargetBest.targetR}R -> test avgR=${analysis.quickFullTargetBest.test.avgR} ${quickFullBeatsTrailing ? "(bat le trailing seul sur les deux splits)" : "(ne bat pas le trailing seul sur les deux splits)"}`);
       }
     }
 

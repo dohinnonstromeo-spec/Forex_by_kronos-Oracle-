@@ -15,6 +15,7 @@ import {
   isExperimentalAutoAnalysisStyle,
   normalizeAutoAnalysisStyle,
 } from "../strategy-engines.mjs";
+import { computeTrailingStopPrice } from "../trading-exit-rules.mjs";
 
 // Standalone on purpose, same reason as scripts/backtest.mjs: importing server.mjs
 // starts a real HTTP server as a side effect. The functions below are copied from
@@ -554,6 +555,40 @@ check("disabled preference leaves the original fixed broker TP unchanged", !disa
 const scalpPlan = scalpPartialPlanForTest({ enabled: true, tp: 4405 });
 check("scalp arms TP1 partial protection without a full broker TP", scalpPlan.partialCloseEnabled && scalpPlan.partialCloseTarget === 4405 && scalpPlan.brokerTakeProfit === null);
 
+console.log("=== quick partial TP: target stays directional, capped, and order-specific ===");
+
+const QUICK_PARTIAL_TARGET_R_FOR_TEST = 1.25;
+function quickPartialTargetForTest(direction, entry, sl, analyticalTarget, enabled) {
+  if (!enabled || (direction !== "ACHAT" && direction !== "VENTE")) return null;
+  const entryPrice = Number(entry);
+  const stopPrice = Number(sl);
+  const targetPrice = Number(analyticalTarget);
+  const risk = Math.abs(entryPrice - stopPrice);
+  if (!(entryPrice > 0) || !(risk > 0) || !(targetPrice > 0)) return null;
+  const buy = direction === "ACHAT";
+  const analyticalTargetR = buy
+    ? (targetPrice - entryPrice) / risk
+    : (entryPrice - targetPrice) / risk;
+  if (!(analyticalTargetR > 0)) return null;
+  const selectedTargetR = Math.min(analyticalTargetR, QUICK_PARTIAL_TARGET_R_FOR_TEST);
+  return buy
+    ? entryPrice + selectedTargetR * risk
+    : entryPrice - selectedTargetR * risk;
+}
+
+check(
+  "quick partial target caps a buy and a sell at 1.25R without changing a closer analytical TP",
+  quickPartialTargetForTest("ACHAT", 100, 98, 110, true) === 102.5
+    && quickPartialTargetForTest("VENTE", 100, 102, 90, true) === 97.5
+    && quickPartialTargetForTest("ACHAT", 100, 98, 101, true) === 101,
+);
+check(
+  "quick partial target rejects a disabled, invalid, or backwards plan",
+  quickPartialTargetForTest("ACHAT", 100, 98, 110, false) === null
+    && quickPartialTargetForTest("ACHAT", 100, 100, 110, true) === null
+    && quickPartialTargetForTest("VENTE", 100, 102, 110, true) === null,
+);
+
 console.log("=== distributed scheduler lease: autonomous execution stays single-flight across replicas ===");
 const serverSource = await readFile(new URL("../server.mjs", import.meta.url), "utf8");
 const ciSource = await readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
@@ -656,6 +691,7 @@ check("static files stay confined and internal paths are denied", serverSource.i
 check("session deletion preserves Secure", serverSource.includes("clearSessionCookie(res, req = null)") && serverSource.includes("Max-Age=0\" + secure"));
 check("news requests are normalized and bounded", serverSource.includes("normalizedSymbol = normalizePair") && serverSource.includes("const newsInFlight = new Map()") && serverSource.includes("memoryCache.news.size > 32"));
 const authClientSource = await readFile(new URL("../assets/auth.js", import.meta.url), "utf8");
+const notificationStylesSource = await readFile(new URL("../assets/oracle-extras.css", import.meta.url), "utf8");
 check("authenticated frontend requests have bounded timeouts", authClientSource.includes("function fetchWithTimeout(url, options = {})") && authClientSource.includes("AbortSignal.timeout(CLIENT_REQUEST_TIMEOUT_MS)") && !/await fetch\(/.test(authClientSource));
 check("user UI separates last evaluation from current lease", authClientSource.includes("another_execution_instance_running") && authClientSource.includes("function autoTradeLeaseSummary") && authClientSource.includes("slotStatus.executionLease"));
 check("external alert and email calls have bounded timeouts", serverSource.includes("signal: AbortSignal.timeout(3500)") && serverSource.includes("signal: AbortSignal.timeout(10000)"));
@@ -770,6 +806,22 @@ console.log("=== hybrid trailing: opt-in, bounded pairs, future orders only ==="
 const dashboardHybridSource = await readFile(new URL("../dashboard.html", import.meta.url), "utf8");
 const scalpBacktestSource = await readFile(new URL("../scripts/backtest-scalp-trailing-stop.mjs", import.meta.url), "utf8");
 const swingBacktestSource = await readFile(new URL("../scripts/backtest-swing-trailing-stop.mjs", import.meta.url), "utf8");
+const microPriceActionBacktestSource = await readFile(new URL("../scripts/backtest-scalp-price-action-smc.mjs", import.meta.url), "utf8");
+const meanReversionValidationSource = await readFile(new URL("../scripts/backtest-scalp-fx-drawdown.mjs", import.meta.url), "utf8");
+const trailingTestParams = { trailActivationR: 1, trailR: 0.5, trailBufferR: 0.15 };
+check(
+  "trailing stop leaves the original stop untouched before activation",
+  computeTrailingStopPrice(100, "ACHAT", 10, 109.9, trailingTestParams) === null,
+);
+check(
+  "trailing stop locks a meaningful gain immediately at activation",
+  computeTrailingStopPrice(100, "ACHAT", 10, 110, trailingTestParams) === 105
+    && computeTrailingStopPrice(100, "VENTE", 10, 90, trailingTestParams) === 95,
+);
+check(
+  "trailing stop keeps its positive buffer when the peak is too close",
+  computeTrailingStopPrice(100, "ACHAT", 10, 102, { trailActivationR: 0.2, trailR: 0.5, trailBufferR: 0.15 }) === 101.5,
+);
 check(
   "hybrid preference is durable and OFF by default",
   serverSource.includes('ensureColumn("auto_trading_accounts", "hybrid_trailing_enabled integer NOT NULL DEFAULT 0")')
@@ -801,6 +853,37 @@ check(
     return block.length > 0 && !block.includes("UPDATE trade_orders") && block.includes("future-only");
   })(),
 );
+check(
+  "quick partial preference is durable, defaults OFF, and exposes its state",
+  serverSource.includes('ensureColumn("auto_trading_accounts", "quick_partial_tp_enabled integer NOT NULL DEFAULT 0")')
+    && serverSource.includes("quick_partial_tp_enabled = excluded.quick_partial_tp_enabled")
+    && serverSource.includes("quickPartialTpEnabled: Boolean(Number(row?.quick_partial_tp_enabled))"),
+);
+check(
+  "quick partial uses a named R cap and the analytical target for each new order",
+  serverSource.includes("const QUICK_PARTIAL_TARGET_R = 1.25")
+    && serverSource.includes("Math.min(analyticalTargetR, QUICK_PARTIAL_TARGET_R)")
+    && serverSource.includes("const partialCloseTarget = quickPartialTarget ?? secureHalfTarget"),
+);
+check(
+  "quick partial endpoint accepts only real booleans and never rewrites open orders",
+  (() => {
+    const start = serverSource.indexOf('url.pathname === "/api/auto-trade/toggle-quick-partial-tp"');
+    const end = serverSource.indexOf('url.pathname === "/api/auto-trade/toggle-secure-half"', start);
+    const block = start >= 0 && end > start ? serverSource.slice(start, end) : "";
+    return block.length > 0
+      && block.includes("body?.enabled !== true && body?.enabled !== false")
+      && block.includes("future-only")
+      && !block.includes("UPDATE trade_orders");
+  })(),
+);
+check(
+  "quick partial preference stays client-visible but independent from broker secrets",
+  dashboardHybridSource.includes("data-quick-partial-tp-toggle")
+    && authClientSource.includes("/api/auto-trade/toggle-quick-partial-tp")
+    && authClientSource.includes("status.quickPartialTpEnabled")
+    && !/quickPartialTpEnabled[\s\S]{0,240}broker_(?:demo|live)_token/.test(serverSource),
+);
 
 // Small pure copy of the server allowlist rule: disabled or non-validated pairs
 // must never receive a broker TP just because the account-level toggle is on.
@@ -820,15 +903,50 @@ check("hybrid gives validated scalp XAU/USD its fixed TP", hybridTargetForTest("
 check(
   "backtests compare the hybrid exit instead of only printing a label",
   scalpBacktestSource.includes("function simulateHybridTpTrailingStop")
+    && scalpBacktestSource.includes('import { computeTrailingStopPrice }')
     && scalpBacktestSource.includes("HYBRIDE (TP fixe + trailing")
     && scalpBacktestSource.includes("function printTemporalBreakdown")
     && scalpBacktestSource.includes("JOURS actifs")
     && scalpBacktestSource.includes('["month", "year"]')
     && swingBacktestSource.includes("function simulateHybridTpTrailingStop")
+    && swingBacktestSource.includes('import { computeTrailingStopPrice }')
     && swingBacktestSource.includes("HYBRIDE TP1 1.6R + trailing actuel")
     && swingBacktestSource.includes("function printTemporalBreakdown")
     && swingBacktestSource.includes("JOURS actifs")
     && swingBacktestSource.includes('["month", "year"]'),
+);
+check(
+  "partial-TP research keeps the production-style breakeven and shared trailing rule",
+  scalpBacktestSource.includes("function simulatePartialTpTrailingStop")
+    && scalpBacktestSource.includes("scalpBreakevenPriceBuffer")
+    && scalpBacktestSource.includes("demi-volume executable")
+    && scalpBacktestSource.includes("computeTrailingStopPrice(")
+    && swingBacktestSource.includes("function simulatePartialTpTrailingStop")
+    && swingBacktestSource.includes("swingBreakevenPriceBuffer")
+    && swingBacktestSource.includes("demi-volume executable")
+    && swingBacktestSource.includes("computeTrailingStopPrice("),
+);
+check(
+  "quick-TP research caps targets and selects them on training data only",
+  scalpBacktestSource.includes("const QUICK_PARTIAL_TARGET_RS = [0.5, 0.75, 1, 1.25]")
+    && scalpBacktestSource.includes("Math.min(analyticalTargetR, requestedTargetR)")
+    && scalpBacktestSource.includes("sort((a, b) => (b.train.avgR ?? -99) - (a.train.avgR ?? -99))")
+    && scalpBacktestSource.includes("quickBeatsTrailing")
+    && swingBacktestSource.includes("const QUICK_PARTIAL_TARGET_RS = [0.5, 0.75, 1, 1.25]")
+    && swingBacktestSource.includes("Math.min(1.6, requestedTargetR)")
+    && swingBacktestSource.includes("analysis.currentTrailingTrain")
+    && swingBacktestSource.includes("analysis.currentTrailingTest"),
+);
+check(
+  "full quick-TP research remains separate from partial exits and trailing",
+  scalpBacktestSource.includes("TP RAPIDE 100%")
+    && scalpBacktestSource.includes("function simulateFixedTp(bars, signalIndex, signal, p, spreadPct, requestedTargetR = null)")
+    && scalpBacktestSource.includes("const quickFullTargetResults")
+    && scalpBacktestSource.includes("quickFullBeatsTrailing")
+    && swingBacktestSource.includes("function simulateFixedQuickTp")
+    && swingBacktestSource.includes("TP RAPIDE 100%")
+    && swingBacktestSource.includes("const quickFullTargetResults")
+    && swingBacktestSource.includes("quickFullBeatsTrailing"),
 );
 check(
   "dashboard labels the experiment and future-only behavior clearly",
@@ -842,6 +960,33 @@ check(
   authClientSource.includes("/api/auto-trade/toggle-hybrid-trailing")
     && authClientSource.includes("data-hybrid-trailing-toggle")
     && authClientSource.includes("status.hybridTrailingEnabled"),
+);
+check(
+  "quick partial dashboard explains its 50 percent exit and its future-only scope",
+  dashboardHybridSource.includes("TP rapide")
+    && dashboardHybridSource.includes("50 %")
+    && dashboardHybridSource.includes("nouvelles positions")
+    && authClientSource.includes("partialCloseTarget"),
+);
+check(
+  "micro price-action research stays offline, cost-aware, and chronologically validated",
+  microPriceActionBacktestSource.includes("local Dukascopy M1 CSV files")
+    && microPriceActionBacktestSource.includes("H1/M15 trend alignment")
+    && microPriceActionBacktestSource.includes("MAX_COST_R")
+    && microPriceActionBacktestSource.includes("VALIDATION_FOLDS")
+    && microPriceActionBacktestSource.includes("stop-first rule")
+    && !microPriceActionBacktestSource.includes("fetch(")
+    && !microPriceActionBacktestSource.includes("server.mjs"),
+);
+check(
+  "mean-reversion validation reports its real duration and rejects unsafe small-account drawdowns",
+  meanReversionValidationSource.includes("maxHoldBars: 60")
+    && meanReversionValidationSource.includes("hold60")
+    && meanReversionValidationSource.includes("function summarizeTestTrades")
+    && meanReversionValidationSource.includes("Verdict petit compte")
+    && meanReversionValidationSource.includes("SMALL_ACCOUNT_MAX_DRAWDOWN_R = 10")
+    && !meanReversionValidationSource.includes("fetch(")
+    && !meanReversionValidationSource.includes("server.mjs"),
 );
 
 console.log("=== audit trail: snapshots, news fail-safe, and broker execution price ===");
@@ -1043,15 +1188,16 @@ check(
 );
 check(
   'the total account cap remains explicit and tighter user limits still win',
-  serverSource.includes('account.max_concurrent_positions || 3')
+  serverSource.includes('DEFAULT_MAX_CONCURRENT_POSITIONS = 10')
+    && serverSource.includes('account.max_concurrent_positions || DEFAULT_MAX_CONCURRENT_POSITIONS')
     && serverSource.includes('account.user_max_concurrent_positions')
     && serverSource.includes('effectiveMaxConcurrentPositions: combineTightened')
     && serverSource.includes('max_concurrent_positions_reached'),
 );
 check(
-  'new admin approvals default to three positions without changing existing explicit limits',
-  adminPremiumSource.includes('maxConcurrentPositions ?? 3')
-    && serverSource.includes('Number(body?.maxConcurrentPositions) || 3'),
+  'new admin approvals default to ten positions without changing existing explicit limits',
+  adminPremiumSource.includes('maxConcurrentPositions ?? DEFAULT_MAX_CONCURRENT_POSITIONS')
+    && serverSource.includes('Number(body?.maxConcurrentPositions) || DEFAULT_MAX_CONCURRENT_POSITIONS'),
 );
 check(
   'autonomous sizing requires fresh broker balance, equity, free margin, and permission',
@@ -1149,6 +1295,15 @@ check(
     && authClientSource.includes('scheduleVisiblePoll(refreshDashboardRuntimeStatus, 5 * 60 * 1000)')
     && authClientSource.includes('startNotificationsFallback();')
     && authClientSource.indexOf('startNotificationsFallback();') < authClientSource.indexOf('const performance = await fetchJson'),
+);
+check(
+  'notification centre opens before dashboard requests and remains mobile-safe',
+  authClientSource.includes('startNotificationPanel();\n    // Let the rest of this deferred script initialize')
+    && authClientSource.includes('function startNotificationPanel()')
+    && authClientSource.includes('void refreshNotifications();')
+    && dashboardHybridSource.includes('aria-controls="notification-center"')
+    && dashboardHybridSource.includes('id="notification-center"')
+    && notificationStylesSource.includes('.auth-notif-panel { position: fixed;'),
 );
 check(
   'dashboard runtime distinguishes approval blockers from an active scheduler',

@@ -10,6 +10,7 @@
   let lastMemberTrigger = null;
   const memberSearch = document.querySelector("[data-member-search]");
   const memberPlanFilter = document.querySelector("[data-member-plan-filter]");
+  const DEFAULT_MAX_CONCURRENT_POSITIONS = 10;
   let memberItems = [];
 
   // The token used to have to be retyped on every page load/navigation -- painful
@@ -538,7 +539,7 @@
             <input type="number" min="1" max="10" step="0.5" value="${request.dailyLossLimitPercent ?? 3}" data-field="dailyLossLimitPercent">
           </label>
           <label class="dashboard-autotrade-field">Positions ouvertes max
-            <input type="number" min="1" max="20" step="1" value="${request.maxConcurrentPositions ?? 3}" data-field="maxConcurrentPositions">
+            <input type="number" min="1" max="20" step="1" value="${request.maxConcurrentPositions ?? DEFAULT_MAX_CONCURRENT_POSITIONS}" data-field="maxConcurrentPositions">
           </label>
           <label class="dashboard-autotrade-field">Confiance min (%)
             <input type="number" min="60" max="95" step="1" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">

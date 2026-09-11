@@ -18,6 +18,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { computeTrailingStopPrice } from "../trading-exit-rules.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, "..", "data-backtest");
@@ -97,14 +98,17 @@ function evaluateMeanReversionAt(bars, closes, i, p) {
 }
 
 // Baseline: exact production exit logic (fixed SL, fixed TP).
-function simulateFixedTp(bars, signalIndex, signal, p, spreadPct) {
+function simulateFixedTp(bars, signalIndex, signal, p, spreadPct, requestedTargetR = null) {
   const buy = signal.direction === "ACHAT";
-  const tpR = Math.abs(signal.tp - signal.entry) / signal.risk;
+  const analyticalTargetR = Math.abs(signal.tp - signal.entry) / signal.risk;
+  // A fast target can tighten the analytical target but never extend it.
+  const tpR = requestedTargetR == null ? analyticalTargetR : Math.min(analyticalTargetR, requestedTargetR);
+  const target = buy ? signal.entry + tpR * signal.risk : signal.entry - tpR * signal.risk;
   const costInR = (signal.entry * (spreadPct / 100)) / signal.risk;
   for (let j = signalIndex + 1; j <= Math.min(signalIndex + p.maxHoldBars, bars.length - 1); j++) {
     const bar = bars[j];
     const hitSl = buy ? bar.low <= signal.sl : bar.high >= signal.sl;
-    const hitTp = buy ? bar.high >= signal.tp : bar.low <= signal.tp;
+    const hitTp = buy ? bar.high >= target : bar.low <= target;
     if (hitSl) return { result: "loss", rMultiple: -1 - costInR, barsHeld: j - signalIndex };
     if (hitTp) return { result: "win", rMultiple: tpR - costInR, barsHeld: j - signalIndex };
   }
@@ -137,12 +141,15 @@ function simulateTrailingStop(bars, signalIndex, signal, p, spreadPct, activatio
     const favExtreme = buy ? bar.high : bar.low;
     const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
     if (favR > bestFavR) bestFavR = favR;
-    if (bestFavR >= activationR) {
-      const breakevenStop = buy ? signal.entry + bufferR * signal.risk : signal.entry - bufferR * signal.risk;
-      const trailedStop = bestFavR >= activationR + trailR
-        ? (buy ? signal.entry + (bestFavR - trailR) * signal.risk : signal.entry - (bestFavR - trailR) * signal.risk)
-        : breakevenStop;
-      stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      { trailActivationR: activationR, trailR, trailBufferR: bufferR },
+    );
+    if (candidateStop != null) {
+      stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
     }
   }
   const expiryIndex = Math.min(signalIndex + p.maxHoldBars, bars.length - 1);
@@ -174,12 +181,15 @@ function simulateHybridTpTrailingStop(bars, signalIndex, signal, p, spreadPct, a
     const favExtreme = buy ? bar.high : bar.low;
     const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
     if (favR > bestFavR) bestFavR = favR;
-    if (bestFavR >= activationR) {
-      const breakevenStop = buy ? signal.entry + bufferR * signal.risk : signal.entry - bufferR * signal.risk;
-      const trailedStop = bestFavR >= activationR + trailR
-        ? (buy ? signal.entry + (bestFavR - trailR) * signal.risk : signal.entry - (bestFavR - trailR) * signal.risk)
-        : breakevenStop;
-      stop = buy ? Math.max(stop, breakevenStop, trailedStop) : Math.min(stop, breakevenStop, trailedStop);
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      { trailActivationR: activationR, trailR, trailBufferR: bufferR },
+    );
+    if (candidateStop != null) {
+      stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
     }
   }
   const expiryIndex = Math.min(signalIndex + p.maxHoldBars, bars.length - 1);
@@ -187,6 +197,82 @@ function simulateHybridTpTrailingStop(bars, signalIndex, signal, p, spreadPct, a
   const markToMarketR = buy ? (expiryClose - signal.entry) / signal.risk : (signal.entry - expiryClose) / signal.risk;
   return { result: "timeout", rMultiple: markToMarketR - costInR, barsHeld: expiryIndex - signalIndex };
 }
+
+// Research-only representation of the production secure-half path: close half
+// at the analytical TP, move the remainder to the same cost-aware breakeven
+// used live, then keep the normal trailing curve. It assumes a broker volume
+// step allows an exact half-close; live code correctly skips this if it cannot.
+function simulatePartialTpTrailingStop(bars, signalIndex, signal, p, spreadPct, activationR, trailR, bufferR, breakevenPriceBuffer, requestedTargetR = null) {
+  const buy = signal.direction === "ACHAT";
+  const analyticalTargetR = Math.abs(signal.tp - signal.entry) / signal.risk;
+  // A fast target can tighten the analytical target but never extend it.
+  const targetR = requestedTargetR == null ? analyticalTargetR : Math.min(analyticalTargetR, requestedTargetR);
+  const target = buy ? signal.entry + targetR * signal.risk : signal.entry - targetR * signal.risk;
+  const costInR = (signal.entry * (spreadPct / 100)) / signal.risk;
+  const costBufferR = breakevenPriceBuffer / signal.risk;
+  let stop = signal.sl;
+  let bestFavR = -Infinity;
+  let partialTaken = false;
+  const combinedResult = (remainingR, barsHeld) => {
+    const rMultiple = (targetR + remainingR) / 2 - costInR;
+    return { result: rMultiple > 0 ? "win" : "loss", rMultiple, barsHeld };
+  };
+  for (let j = signalIndex + 1; j <= Math.min(signalIndex + p.maxHoldBars, bars.length - 1); j++) {
+    const bar = bars[j];
+    const hitStop = buy ? bar.low <= stop : bar.high >= stop;
+    if (hitStop) {
+      const rAtStop = buy ? (stop - signal.entry) / signal.risk : (signal.entry - stop) / signal.risk;
+      return partialTaken
+        ? combinedResult(rAtStop, j - signalIndex)
+        : { result: rAtStop > 0 ? "win" : "loss", rMultiple: rAtStop - costInR, barsHeld: j - signalIndex };
+    }
+    if (!partialTaken) {
+      const hitTarget = buy ? bar.high >= target : bar.low <= target;
+      if (hitTarget) {
+        partialTaken = true;
+        // Mirrors breakevenStopForPosition at the TP price: never place a
+        // positive stop beyond the price that just triggered the partial exit.
+        const protectedR = Math.min(costBufferR, targetR - costBufferR);
+        if (protectedR > 0) {
+          const breakevenStop = buy
+            ? signal.entry + protectedR * signal.risk
+            : signal.entry - protectedR * signal.risk;
+          stop = buy ? Math.max(stop, breakevenStop) : Math.min(stop, breakevenStop);
+        }
+        // Production deliberately waits for the next scheduler tick before
+        // sending a second broker modification after a partial close.
+        continue;
+      }
+    }
+    const favExtreme = buy ? bar.high : bar.low;
+    const favR = buy ? (favExtreme - signal.entry) / signal.risk : (signal.entry - favExtreme) / signal.risk;
+    if (favR > bestFavR) bestFavR = favR;
+    const candidateStop = computeTrailingStopPrice(
+      signal.entry,
+      signal.direction,
+      signal.risk,
+      buy ? signal.entry + bestFavR * signal.risk : signal.entry - bestFavR * signal.risk,
+      { trailActivationR: activationR, trailR, trailBufferR: bufferR },
+    );
+    if (candidateStop != null) {
+      stop = buy ? Math.max(stop, candidateStop) : Math.min(stop, candidateStop);
+    }
+  }
+  const expiryIndex = Math.min(signalIndex + p.maxHoldBars, bars.length - 1);
+  const expiryClose = bars[expiryIndex].close;
+  const remainingR = buy ? (expiryClose - signal.entry) / signal.risk : (signal.entry - expiryClose) / signal.risk;
+  return partialTaken
+    ? combinedResult(remainingR, expiryIndex - signalIndex)
+    : { result: remainingR > 0 ? "win" : "loss", rMultiple: remainingR - costInR, barsHeld: expiryIndex - signalIndex };
+}
+
+function scalpBreakevenPriceBuffer(pair) {
+  return pair === "XAUUSD" ? 0.35 : 0.00008;
+}
+
+// These are intentionally modest, cost-aware partial targets. The target is
+// selected on the training split only, then reported on the held-out split.
+const QUICK_PARTIAL_TARGET_RS = [0.5, 0.75, 1, 1.25];
 
 function summarize(trades) {
   if (!trades.length) return { count: 0, winRate: null, avgR: null };
@@ -352,10 +438,83 @@ async function main() {
     const hybridTest = summarize(hybridTrades.filter((t) => t.split === "test"));
     const hybridBeatsBaseline = hybridTrain.avgR > baselineTrain.avgR && hybridTest.avgR > baselineTest.avgR;
     console.log(`HYBRIDE (TP fixe + trailing, reglages trailing actuels activation=${p.trailActivationR}R trail=${p.trailR}R): train avgR=${hybridTrain.avgR} (n=${hybridTrain.count}, wr=${hybridTrain.winRate}%) | test avgR=${hybridTest.avgR} (n=${hybridTest.count}, wr=${hybridTest.winRate}%) ${hybridBeatsBaseline ? "<<< BAT LA BASELINE SUR LES DEUX SPLITS" : "(ne bat pas la baseline sur les deux splits)"}`);
+
+    const partialTrailingTrades = signals.map((s) => ({
+      signalIndex: s.index,
+      signalTimestamp: bars[s.index]?.timestamp,
+      split: s.split,
+      ...simulatePartialTpTrailingStop(
+        bars,
+        s.index,
+        s.signal,
+        p,
+        p.spreadPct,
+        p.trailActivationR,
+        p.trailR,
+        p.trailBufferR,
+        scalpBreakevenPriceBuffer(pair),
+      ),
+    }));
+    const partialTrailingTrain = summarize(partialTrailingTrades.filter((t) => t.split === "train"));
+    const partialTrailingTest = summarize(partialTrailingTrades.filter((t) => t.split === "test"));
+    const partialTrailingBeatsBaseline = partialTrailingTrain.avgR > baselineTrain.avgR && partialTrailingTest.avgR > baselineTest.avgR;
+    console.log(`TP1 50% + BREAKEVEN + TRAILING (demi-volume executable): train avgR=${partialTrailingTrain.avgR} (n=${partialTrailingTrain.count}, wr=${partialTrailingTrain.winRate}%) | test avgR=${partialTrailingTest.avgR} (n=${partialTrailingTest.count}, wr=${partialTrailingTest.winRate}%) ${partialTrailingBeatsBaseline ? "<<< BAT LA BASELINE SUR LES DEUX SPLITS" : "(ne bat pas la baseline sur les deux splits)"}`);
+
+    const quickPartialResults = QUICK_PARTIAL_TARGET_RS.map((targetR) => {
+      const trades = signals.map((s) => ({
+        signalIndex: s.index,
+        signalTimestamp: bars[s.index]?.timestamp,
+        split: s.split,
+        ...simulatePartialTpTrailingStop(
+          bars,
+          s.index,
+          s.signal,
+          p,
+          p.spreadPct,
+          p.trailActivationR,
+          p.trailR,
+          p.trailBufferR,
+          scalpBreakevenPriceBuffer(pair),
+          targetR,
+        ),
+      }));
+      return {
+        targetR,
+        train: summarize(trades.filter((t) => t.split === "train")),
+        test: summarize(trades.filter((t) => t.split === "test")),
+      };
+    });
+    const quickPartialBest = [...quickPartialResults].sort((a, b) => (b.train.avgR ?? -99) - (a.train.avgR ?? -99))[0];
+    console.log("TP1 RAPIDE 50% + BREAKEVEN + TRAILING (TP plafonne par l'analyse, choix sur train):");
+    for (const result of quickPartialResults) {
+      console.log(`  cible=${result.targetR}R: train avgR=${result.train.avgR} (wr=${result.train.winRate}%) | test avgR=${result.test.avgR} (wr=${result.test.winRate}%)`);
+    }
+    const quickBeatsTrailing = quickPartialBest.train.avgR > currentTrailingTrain.avgR && quickPartialBest.test.avgR > currentTrailingTest.avgR;
+    console.log(`  choix train=${quickPartialBest.targetR}R -> test avgR=${quickPartialBest.test.avgR} ${quickBeatsTrailing ? "<<< BAT LE TRAILING SEUL SUR LES DEUX SPLITS" : "(ne bat pas le trailing seul sur les deux splits)"}`);
+
+    const quickFullTargetResults = QUICK_PARTIAL_TARGET_RS.map((targetR) => {
+      const trades = signals.map((s) => ({
+        split: s.split,
+        ...simulateFixedTp(bars, s.index, s.signal, p, p.spreadPct, targetR),
+      }));
+      return {
+        targetR,
+        train: summarize(trades.filter((t) => t.split === "train")),
+        test: summarize(trades.filter((t) => t.split === "test")),
+      };
+    });
+    const quickFullTargetBest = [...quickFullTargetResults].sort((a, b) => (b.train.avgR ?? -99) - (a.train.avgR ?? -99))[0];
+    console.log("TP RAPIDE 100% (TP plafonne par l'analyse, choix sur train):");
+    for (const result of quickFullTargetResults) {
+      console.log(`  cible=${result.targetR}R: train avgR=${result.train.avgR} (wr=${result.train.winRate}%) | test avgR=${result.test.avgR} (wr=${result.test.winRate}%)`);
+    }
+    const quickFullBeatsTrailing = quickFullTargetBest.train.avgR > currentTrailingTrain.avgR && quickFullTargetBest.test.avgR > currentTrailingTest.avgR;
+    console.log(`  choix train=${quickFullTargetBest.targetR}R -> test avgR=${quickFullTargetBest.test.avgR} ${quickFullBeatsTrailing ? "<<< BAT LE TRAILING SEUL SUR LES DEUX SPLITS" : "(ne bat pas le trailing seul sur les deux splits)"}`);
     printTemporalBreakdown(pair, bars, [
       { name: "TP_FIXE", trades: baselineTrades },
       { name: "TRAILING", trades: currentTrailingTrades },
       { name: "HYBRIDE", trades: hybridTrades },
+      { name: "TP1_50_TRAILING", trades: partialTrailingTrades },
     ]);
   }
 }

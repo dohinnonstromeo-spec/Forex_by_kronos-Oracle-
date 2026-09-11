@@ -617,6 +617,10 @@ async function ensureRelationalTablesImpl() {
   // into this new scenario; the legacy immediate TP-tightening action remains
   // deliberately isolated to eligible pre-existing fixed-TP positions.
   await ensureColumn("auto_trading_accounts", "secure_half_priority_enabled integer NOT NULL DEFAULT 0");
+  // Conservative exit preference. It is deliberately OFF by default and is
+  // stored independently from secure-half: it applies only to future orders
+  // and freezes the selected target on each order at creation time.
+  await ensureColumn("auto_trading_accounts", "quick_partial_tp_enabled integer NOT NULL DEFAULT 0");
   // Experimental hybrid exit: keep the fixed reference TP on top of the
   // validated trailing stop, only for pairs that clear the two-split hybrid
   // backtest. Durable user preference, OFF by default; existing orders are
@@ -1754,6 +1758,7 @@ function startNewSignalAlertScheduler() {
 // plan this implements.
 const AUTO_TRADE_INTERVAL_MS = boundedEnvNumber(env.AUTO_TRADE_INTERVAL_SECONDS, 60, 10, 3600) * 1000;
 const AUTO_TRADE_LEASE_MS = boundedEnvNumber(env.AUTO_TRADE_LEASE_SECONDS, 300, 120, 86400) * 1000;
+const DEFAULT_MAX_CONCURRENT_POSITIONS = 10;
 // The account-level max_concurrent_positions remains the total bot cap. This
 // second cap permits diversification while preventing repeated entries from
 // turning one pair into an unbounded concentration. The environment may only
@@ -2521,7 +2526,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   if (monthlyLossLimitAmount > 0 && (await monthlyRealizedPnlAmount(userId, slot)) <= -monthlyLossLimitAmount)
     return recordAutoTradeStatus(userId, slot, "monthly_loss_limit_amount_reached", { monthlyLossLimitAmount });
 
-  const maxConcurrent = combineTightened(account.max_concurrent_positions || 3, account.user_max_concurrent_positions, "lower");
+  const maxConcurrent = combineTightened(account.max_concurrent_positions || DEFAULT_MAX_CONCURRENT_POSITIONS, account.user_max_concurrent_positions, "lower");
   let openCount = await countOpenAutoPositions(userId, slot);
   if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, slot, "max_concurrent_positions_reached", { maxConcurrent, openCount });
   const openPositionsByPair = await countOpenAutoPositionsByPair(userId, slot);
@@ -2640,24 +2645,36 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       brokerSlot: slot,
     });
     const orderId = `ord_${Date.now()}_${randomBytes(4).toString("hex")}`;
-    // secure_half_priority_enabled applies to any order with a broker TP,
-    // including a hybrid order. It can only make this new target smaller.
+    // The fast partial preference comes first: it caps the first exit at the
+    // closest valid analytical target or the validated 1.25R threshold. It
+    // never combines with the hybrid experiment, which owns the broker TP.
     const baseOrderTp1 = hybridTrailingTarget ?? (swingTrailingParams ? null : signal.tp1);
-    const partialCloseEnabled = Number(account.secure_half_priority_enabled) === 1
+    const quickPartialTarget = quickPartialTargetFor(
+      signal.direction,
+      signal.entree,
+      signal.sl,
+      signal.tp1,
+      Number(account.quick_partial_tp_enabled) === 1 && hybridTrailingTarget == null,
+    );
+    const secureHalfTarget = quickPartialTarget == null && Number(account.secure_half_priority_enabled) === 1
       && hybridTrailingTarget == null
       && Number.isFinite(Number(signal.tp1))
-      && Number.isFinite(Number(signal.tp2));
+      && Number.isFinite(Number(signal.tp2))
+      ? Number(signal.tp1)
+      : null;
+    const partialCloseTarget = quickPartialTarget ?? secureHalfTarget;
+    const partialCloseEnabled = partialCloseTarget != null;
     const orderTp1 = baseOrderTp1;
-    // TP1 stays in our database as the partial-close trigger. Fixed-TP orders
-    // use TP2 at the broker so MetaApi cannot close the whole position before
-    // the scheduler has a chance to close the first half.
+    // The partial-close target stays in our database. Fixed-TP orders use TP2
+    // at the broker so MetaApi cannot close the whole position before the
+    // scheduler has a chance to close the first half.
     const brokerTakeProfit = partialCloseEnabled && !swingTrailingParams ? signal.tp2 : baseOrderTp1;
     const orderTrailingStopPrice = swingTrailingParams ? signal.sl : null;
     const orderBestFavorablePrice = swingTrailingParams ? signal.entree : null;
     await sqlRun(
       `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, broker_take_profit, partial_close_enabled, partial_close_target, partial_close_status, status, created_at, risk_percent_at_trade, broker_slot, trailing_stop_price, best_favorable_price, half_target_secured)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?, 0)`,
-      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, brokerTakeProfit, partialCloseEnabled ? 1 : 0, partialCloseEnabled ? signal.tp1 : null, partialCloseEnabled ? "armed" : "disabled", new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice],
+      [orderId, userId, analysisId, signal.paire, signal.direction, signal.entree, signal.sl, orderTp1, signal.tp2, brokerTakeProfit, partialCloseEnabled ? 1 : 0, partialCloseTarget, partialCloseEnabled ? "armed" : "disabled", new Date().toISOString(), effectiveRiskPercent, slot, orderTrailingStopPrice, orderBestFavorablePrice],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
@@ -2725,7 +2742,7 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
   // Scalp shares the account total cap with swing and allows up to the same
   // bounded number per pair. One opening attempt per tick is retained so an
   // enabled pair cannot burst several orders in one scheduler pass.
-  const maxConcurrent = combineTightened(account.max_concurrent_positions || 3, account.user_max_concurrent_positions, "lower");
+  const maxConcurrent = combineTightened(account.max_concurrent_positions || DEFAULT_MAX_CONCURRENT_POSITIONS, account.user_max_concurrent_positions, "lower");
   const openCount = await countOpenAutoPositions(userId, slot);
   if (openCount >= maxConcurrent) return recordAutoTradeStatus(userId, slot, "max_concurrent_positions_reached", { maxConcurrent, openCount });
   const openPositionsByPair = await countOpenAutoPositionsByPair(userId, slot);
@@ -2913,15 +2930,26 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
       signal,
       Number(account.hybrid_trailing_enabled) === 1,
     );
-    const partialCloseEnabled = Number(account.secure_half_priority_enabled) === 1
+    const quickPartialTarget = quickPartialTargetFor(
+      signal.direction,
+      signal.entry,
+      signal.sl,
+      signal.tp,
+      Number(account.quick_partial_tp_enabled) === 1 && hybridTrailingTarget == null,
+    );
+    const secureHalfTarget = quickPartialTarget == null && Number(account.secure_half_priority_enabled) === 1
       && hybridTrailingTarget == null
-      && Number.isFinite(Number(signal.tp));
+      && Number.isFinite(Number(signal.tp))
+      ? Number(signal.tp)
+      : null;
+    const partialCloseTarget = quickPartialTarget ?? secureHalfTarget;
+    const partialCloseEnabled = partialCloseTarget != null;
     const orderTp1 = hybridTrailingTarget ?? null;
     const brokerTakeProfit = hybridTrailingTarget ?? null;
     await sqlRun(
       `INSERT INTO trade_orders (id, user_id, analysis_id, pair, direction, entry, sl, tp1, tp2, broker_take_profit, partial_close_enabled, partial_close_target, partial_close_status, status, created_at, scalp_max_hold_seconds, broker_slot, trailing_stop_price, best_favorable_price, risk_percent_at_trade, signal_timeframe, entry_timeframe, setup_timeframe, sl_distance, estimated_max_loss_amount, sizing_balance_at_trade)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CONFIRMATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, orderTp1, signal.tp, brokerTakeProfit, partialCloseEnabled ? 1 : 0, partialCloseEnabled ? signal.tp : null, partialCloseEnabled ? "armed" : "disabled", new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry, effectiveRiskPercent, signal.signalTimeframe, signal.entryTimeframe, signal.setupTimeframe, signal.risk, estimatedMaxLossAmount, sizingBalance],
+      [orderId, userId, analysisId, pair, signal.direction, signal.entry, signal.sl, orderTp1, signal.tp, brokerTakeProfit, partialCloseEnabled ? 1 : 0, partialCloseTarget, partialCloseEnabled ? "armed" : "disabled", new Date().toISOString(), holdSeconds, slot, signal.sl, signal.entry, effectiveRiskPercent, signal.signalTimeframe, signal.entryTimeframe, signal.setupTimeframe, signal.risk, estimatedMaxLossAmount, sizingBalance],
     );
 
     const result = await confirmAndSendOrder({ orderId, userId, volume, credentials, brokerSlot: slot });
@@ -3324,7 +3352,7 @@ async function handleApi(req, res, url) {
     // a fat-fingered value, not a meaningful trading-risk decision) -- requested
     // directly: the actual portfolio-risk ceiling is the admin's call to make,
     // not something baked into the code past what they can even type.
-    const maxConcurrentPositions = Math.max(1, Math.min(20, Math.round(Number(body?.maxConcurrentPositions) || 3)));
+    const maxConcurrentPositions = Math.max(1, Math.min(20, Math.round(Number(body?.maxConcurrentPositions) || DEFAULT_MAX_CONCURRENT_POSITIONS)));
     const minConfidenceFloor = Math.max(60, Math.min(95, Number(body?.minConfidenceFloor) || NEW_SIGNAL_ALERT_MIN_CONFIDENCE));
     // All four below are optional -- 0/absent means "no restriction on this axis",
     // same as before this feature existed, so approving an account without
@@ -4071,6 +4099,30 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/auto-trade/toggle-quick-partial-tp") {
+    if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const session = await currentSession(req);
+    if (!session) return sendJson(res, 401, { ok: false, error: "auth_required" });
+    const body = await readBody(req);
+    // Do not coerce strings: a malformed client must not activate a broker
+    // behavior just because Boolean("false") would be truthy.
+    if (body?.enabled !== true && body?.enabled !== false) {
+      return sendJson(res, 400, { ok: false, error: "invalid_boolean" });
+    }
+    await ensureRelationalTables();
+    const enabled = body.enabled;
+    const now = new Date().toISOString();
+    await sqlRun(
+      `INSERT INTO auto_trading_accounts (user_id, quick_partial_tp_enabled, created_at, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET quick_partial_tp_enabled = excluded.quick_partial_tp_enabled, updated_at = excluded.updated_at`,
+      [session.user.id, enabled ? 1 : 0, now, now],
+    );
+    // This preference is intentionally future-only. Open orders keep their
+    // persisted exit plan and are never modified by a setting change.
+    sendJson(res, 200, { ok: true, enabled });
+    return;
+  }
+
   if (url.pathname === "/api/auto-trade/toggle-secure-half") {
     if (req.method !== "POST") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
     const session = await currentSession(req);
@@ -4351,7 +4403,7 @@ async function handleApi(req, res, url) {
       userRiskPercent: row?.user_risk_percent ?? null,
       userCapitalCap: row?.user_capital_cap ?? null,
       userMaxConcurrentPositions: row?.user_max_concurrent_positions ?? null,
-      effectiveMaxConcurrentPositions: combineTightened(row?.max_concurrent_positions || 3, row?.user_max_concurrent_positions, "lower"),
+      effectiveMaxConcurrentPositions: combineTightened(row?.max_concurrent_positions || DEFAULT_MAX_CONCURRENT_POSITIONS, row?.user_max_concurrent_positions, "lower"),
       userMaxTradesPerDay: row?.user_max_trades_per_day ?? null,
       userDailyLossLimitPercent: row?.user_daily_loss_limit_percent ?? null,
       userDailyLossLimitAmount: row?.user_daily_loss_limit_amount ?? null,
@@ -4370,6 +4422,7 @@ async function handleApi(req, res, url) {
       scalpEnabled: Boolean(Number(row?.scalp_enabled)),
       scalpUserEnabled: Boolean(Number(row?.user_scalp_enabled)),
       secureHalfPriorityEnabled: Boolean(Number(row?.secure_half_priority_enabled)),
+      quickPartialTpEnabled: Boolean(Number(row?.quick_partial_tp_enabled)),
       hybridTrailingEnabled: Boolean(Number(row?.hybrid_trailing_enabled)),
       scalpPairs: row?.scalp_pairs ? row.scalp_pairs.split(",").filter(Boolean) : [],
       scalpLotMode: row?.scalp_lot_mode || "auto",
@@ -6572,6 +6625,30 @@ const HYBRID_TRAILING_PAIRS_BY_SOURCE = {
   auto_scalp: new Set(["XAU/USD"]),
   auto_signal: new Set(["EUR/USD"]),
 };
+
+// The 1.25R cap is a named, reviewed exit parameter from the offline
+// quick-TP comparisons. It is not a price target: each order computes its own
+// price from the actual entry and structural stop supplied by its analysis.
+const QUICK_PARTIAL_TARGET_R = 1.25;
+
+function quickPartialTargetFor(direction, entry, sl, analyticalTarget, enabled) {
+  if (!enabled || (direction !== "ACHAT" && direction !== "VENTE")) return null;
+  const entryPrice = Number(entry);
+  const stopPrice = Number(sl);
+  const targetPrice = Number(analyticalTarget);
+  const risk = Math.abs(entryPrice - stopPrice);
+  if (!(entryPrice > 0) || !(risk > 0) || !(targetPrice > 0)) return null;
+  const buy = direction === "ACHAT";
+  const analyticalTargetR = buy
+    ? (targetPrice - entryPrice) / risk
+    : (entryPrice - targetPrice) / risk;
+  if (!(analyticalTargetR > 0)) return null;
+  const selectedTargetR = Math.min(analyticalTargetR, QUICK_PARTIAL_TARGET_R);
+  const selectedTarget = buy
+    ? entryPrice + selectedTargetR * risk
+    : entryPrice - selectedTargetR * risk;
+  return Number.isFinite(selectedTarget) && selectedTarget > 0 ? selectedTarget : null;
+}
 
 function hybridTrailingTargetFor(source, pair, signal, enabled) {
   if (!enabled || !HYBRID_TRAILING_PAIRS_BY_SOURCE[source]?.has(pair)) return null;

@@ -15,7 +15,9 @@ export function computeTrailingStopPrice(entry, direction, risk, bestFavorablePr
   const breakevenStop = buy
     ? entry + params.trailBufferR * risk
     : entry - params.trailBufferR * risk;
-  if (bestFavR < params.trailActivationR + params.trailR) return breakevenStop;
+  // Start following the recorded peak immediately at activation. The positive
+  // buffer remains a floor, but there is no unprotected activation-to-trail
+  // gap where a winner can give back most of its floating profit.
   const trailedStop = buy
     ? entry + (bestFavR - params.trailR) * risk
     : entry - (bestFavR - params.trailR) * risk;

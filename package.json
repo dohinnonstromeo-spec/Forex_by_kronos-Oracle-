@@ -9,6 +9,8 @@
     "start": "node server.mjs",
     "test": "node --test --test-concurrency=1 scripts/api-tests.mjs && node scripts/safety-checks.mjs",
     "backtest:styles": "node scripts/backtest-analysis-styles-realistic.mjs",
+    "backtest:micro:price-action": "node scripts/backtest-scalp-price-action-smc.mjs",
+    "backtest:mean-reversion:validate": "node scripts/backtest-scalp-fx-drawdown.mjs",
     "backtest:styles:legacy": "node scripts/backtest-analysis-styles.mjs"
   },
   "dependencies": {
