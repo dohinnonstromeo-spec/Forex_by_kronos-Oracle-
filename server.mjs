@@ -456,6 +456,7 @@ async function ensureRelationalTablesImpl() {
       max_concurrent_positions integer,
       min_confidence_floor real,
       user_min_confidence real,
+      user_precision_entry_only integer NOT NULL DEFAULT 0,
       user_paused integer NOT NULL DEFAULT 0,
       created_at text NOT NULL,
       updated_at text NOT NULL
@@ -641,6 +642,10 @@ async function ensureRelationalTablesImpl() {
   // $X" (see sizingBalanceForAccount). NULL/0 means the conservative broker
   // funds basis (minimum of balance, equity, and free margin) is used.
   await ensureColumn("auto_trading_accounts", "user_capital_cap real");
+  // Optional small-capital profile: it only filters out positions whose natural
+  // structural stop cannot fit the selected capital and the broker's minimum lot.
+  // It never alters the analysis entry or stop-loss level.
+  await ensureColumn("auto_trading_accounts", "user_precision_entry_only integer NOT NULL DEFAULT 0");
   await ensureColumn("auto_trading_accounts", "user_max_concurrent_positions integer");
   await ensureColumn("auto_trading_accounts", "user_max_trades_per_day integer");
   await ensureColumn("auto_trading_accounts", "user_daily_loss_limit_percent real");
@@ -2541,6 +2546,10 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
   if (accountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
   let sizingBalance = sizingBalanceForAccount(account, accountInfo);
   if (!(sizingBalance > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
+  const precisionEntryOnly = Number(account.user_precision_entry_only) === 1;
+  if (precisionEntryOnly && !(Number(account.user_capital_cap) > 0)) {
+    return recordAutoTradeStatus(userId, slot, "precision_entry_requires_capital_cap");
+  }
 
   // user_capital_cap: "trade this real account, but size every position as if
   // it only held $X" -- requested directly so someone with e.g. a real $45,000
@@ -2565,7 +2574,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     direction: signal.direction,
   }));
   const openedPairs = [];
-  const skipped = { alreadyOpen: 0, pyramidingDisabled: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, rejected: 0 };
+  const skipped = { alreadyOpen: 0, pyramidingDisabled: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, precisionRiskIncompatible: 0, rejected: 0 };
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
     if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
@@ -2599,12 +2608,26 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
 
     const specification = await getBrokerSymbolSpecification(credentials, signal.paire).catch(() => null);
     if (!specification) { skipped.noSpec += 1; continue; }
+    const precisionRiskBudget = sizingBalance * (effectiveRiskPercent / 100);
+    const minimumLotRisk = estimateStopLossAmount({
+      entry: signal.entree,
+      sl: signal.sl,
+      volume: specification.minVolume,
+      specification,
+    });
+    // A precision profile does not pull a stop closer to the entry. It waits for
+    // a setup whose original structural stop is affordable at the broker's real
+    // minimum lot, otherwise it records the skip and leaves the setup untouched.
+    if (precisionEntryOnly && (!(minimumLotRisk > 0) || minimumLotRisk > precisionRiskBudget * 1.000001)) {
+      skipped.precisionRiskIncompatible += 1;
+      continue;
+    }
     // Only these two pairs, only when a capital cap is actually active -- see
     // computeAutoTradeVolume's comment and scripts/backtest-small-account-swing.mjs
     // for why XAU/USD is deliberately excluded (no proven edge at any small-account
     // size) and why 15% is the ceiling (the highest of the tested ceilings that
     // still held a positive edge on BOTH independent periods, train and test).
-    const smallAccountFloorEligible = account.user_capital_cap > 0 && SMALL_ACCOUNT_MIN_LOT_PAIRS.has(signal.paire);
+    const smallAccountFloorEligible = !precisionEntryOnly && account.user_capital_cap > 0 && SMALL_ACCOUNT_MIN_LOT_PAIRS.has(signal.paire);
     const volume = computeAutoTradeVolume({
       balance: sizingBalance, riskPercent: effectiveRiskPercent, entry: signal.entree, sl: signal.sl, specification,
       allowMinVolumeFloor: smallAccountFloorEligible,
@@ -2706,6 +2729,7 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     analysisStyle,
     maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR,
     pyramidingEnabled: AUTO_ALLOW_PYRAMIDING,
+    precisionEntryOnly,
     newsCalendarFallback: newsFallback,
     ...skipped,
   });
@@ -2750,6 +2774,10 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
   if (accountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
   const sizingBalance = sizingBalanceForAccount(account, accountInfo);
   if (!(sizingBalance > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
+  const precisionEntryOnly = Number(account.user_precision_entry_only) === 1;
+  if (precisionEntryOnly && !(Number(account.user_capital_cap) > 0)) {
+    return recordAutoTradeStatus(userId, slot, "precision_entry_requires_capital_cap");
+  }
 
   // Scalp shares the account total cap with swing and allows up to the same
   // bounded number per pair. One opening attempt per tick is retained so an
@@ -2820,6 +2848,16 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
     );
     if (!(riskBudgetAmount > 0) || !(minimumLotRiskCeiling > 0)) continue;
 
+    const minimumLotRisk = estimateStopLossAmount({ entry: signal.entry, sl: signal.sl, volume: specification.minVolume, specification });
+    if (precisionEntryOnly && (!(minimumLotRisk > 0) || minimumLotRisk > riskBudgetAmount * 1.000001)) {
+      recordAutoTradeStatus(userId, slot, "precision_entry_minimum_lot_risk_exceeds_budget", {
+        pair,
+        minimumLotRisk,
+        riskBudgetAmount,
+      });
+      continue;
+    }
+
     let volume;
     const fixedLot = account.scalp_lot_mode === "fixed" && Number(account.scalp_fixed_lot) > 0;
     if (fixedLot) {
@@ -2830,8 +2868,8 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
         entry: signal.entry,
         sl: signal.sl,
         specification,
-        allowMinVolumeFloor: true,
-        maxRiskAmount: minimumLotRiskCeiling,
+        allowMinVolumeFloor: !precisionEntryOnly,
+        maxRiskAmount: precisionEntryOnly ? null : minimumLotRiskCeiling,
       });
     }
     if (!volume) {
@@ -2840,7 +2878,7 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
     }
     const estimatedMaxLossAmount = estimateStopLossAmount({ entry: signal.entry, sl: signal.sl, volume, specification });
     const isMinimumLot = Math.abs(volume - specification.minVolume) < Math.max(0.0000001, specification.volumeStep / 100);
-    const maximumAllowedLoss = !fixedLot && isMinimumLot ? minimumLotRiskCeiling : riskBudgetAmount;
+    const maximumAllowedLoss = !fixedLot && isMinimumLot && !precisionEntryOnly ? minimumLotRiskCeiling : riskBudgetAmount;
     if (!(estimatedMaxLossAmount > 0) || estimatedMaxLossAmount > maximumAllowedLoss * 1.000001) {
       recordAutoTradeStatus(userId, slot, "scalp_volume_risk_exceeds_limit", {
         pair,
@@ -4209,6 +4247,11 @@ async function handleApi(req, res, url) {
     const userMinConfidence = clamp(body?.userMinConfidence, 60, 99);
     const userRiskPercent = clamp(body?.userRiskPercent, 0.1, 3);
     const userCapitalCap = clamp(body?.userCapitalCap, 1, 10000000);
+    const hasPrecisionEntryOnly = Object.prototype.hasOwnProperty.call(body, "userPrecisionEntryOnly");
+    const userPrecisionEntryOnly = body?.userPrecisionEntryOnly === true ? 1 : body?.userPrecisionEntryOnly === false ? 0 : null;
+    if (hasPrecisionEntryOnly && userPrecisionEntryOnly === null) {
+      return sendJson(res, 400, { ok: false, error: "invalid_preference_value", fields: ["userPrecisionEntryOnly"] });
+    }
     const userMaxConcurrentPositions = clampInt(body?.userMaxConcurrentPositions, 1, 20);
     const userMaxTradesPerDay = clampInt(body?.userMaxTradesPerDay, 1, 100);
     const userDailyLossLimitPercent = clamp(body?.userDailyLossLimitPercent, 1, 10);
@@ -4228,6 +4271,7 @@ async function handleApi(req, res, url) {
       ["user_min_confidence", "userMinConfidence", userMinConfidence],
       ["user_risk_percent", "userRiskPercent", userRiskPercent],
       ["user_capital_cap", "userCapitalCap", userCapitalCap],
+      ["user_precision_entry_only", "userPrecisionEntryOnly", userPrecisionEntryOnly],
       ["user_max_concurrent_positions", "userMaxConcurrentPositions", userMaxConcurrentPositions],
       ["user_max_trades_per_day", "userMaxTradesPerDay", userMaxTradesPerDay],
       ["user_daily_loss_limit_percent", "userDailyLossLimitPercent", userDailyLossLimitPercent],
@@ -4414,6 +4458,7 @@ async function handleApi(req, res, url) {
       userMinConfidence: row?.user_min_confidence ?? null,
       userRiskPercent: row?.user_risk_percent ?? null,
       userCapitalCap: row?.user_capital_cap ?? null,
+      userPrecisionEntryOnly: Boolean(Number(row?.user_precision_entry_only)),
       userMaxConcurrentPositions: row?.user_max_concurrent_positions ?? null,
       effectiveMaxConcurrentPositions: combineTightened(row?.max_concurrent_positions || DEFAULT_MAX_CONCURRENT_POSITIONS, row?.user_max_concurrent_positions, "lower"),
       userMaxTradesPerDay: row?.user_max_trades_per_day ?? null,

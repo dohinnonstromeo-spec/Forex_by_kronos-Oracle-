@@ -379,6 +379,11 @@
                   <label class="dashboard-autotrade-field">Capital alloué ($) <span class="dashboard-autotrade-hint">laisse vide pour utiliser les fonds broker disponibles (solde, equity, marge libre)</span>
                     <input type="number" min="1" step="1" data-pref="userCapitalCap" placeholder="fonds broker disponibles" autocomplete="off">
                   </label>
+                  <label class="dashboard-slot-switch dashboard-autotrade-preference-toggle">
+                    <input type="checkbox" data-pref-toggle="userPrecisionEntryOnly" autocomplete="off">
+                    <span>Mode petit capital / entr&#xE9;e de pr&#xE9;cision</span>
+                    <span class="dashboard-autotrade-hint">N&#xE9;cessite un capital allou&#xE9;. Le robot garde uniquement les setups dont le SL structurel et le lot minimal respectent ton budget; il ne rapproche jamais le SL.</span>
+                  </label>
                   <label class="dashboard-autotrade-field">Confiance min (%) <span class="dashboard-autotrade-hint" data-pref-hint="minConfidenceFloor"></span>
                     <input type="number" min="60" max="99" step="1" data-pref="userMinConfidence" placeholder="réglage admin" autocomplete="off">
                   </label>

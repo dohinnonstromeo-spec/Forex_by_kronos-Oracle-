@@ -303,6 +303,39 @@ test("admin: auto-trade approval persists and validates the analysis style", { s
   assert.equal(invalid.data.error, "invalid_analysis_style");
 });
 
+test("auto-trade preferences: precision small-capital profile persists and remains opt-in", async () => {
+  const email = uniqueEmail("apitest_precision_capital");
+  const signup = await fetch(BASE + "/api/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "ApiTest", email, password: "CorrectPass123!" }),
+  });
+  const cookie = signup.headers.get("set-cookie");
+  const saved = await postJson(
+    "/api/auto-trade/preferences",
+    { userCapitalCap: 200, userRiskPercent: 0.25, userPrecisionEntryOnly: true },
+    { Cookie: cookie },
+  );
+  assert.equal(saved.status, 200);
+  assert.equal(saved.data.ok, true);
+
+  const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA busy_timeout = 30000; PRAGMA query_only = ON");
+  const row = db.prepare("SELECT user_capital_cap, user_risk_percent, user_precision_entry_only FROM auto_trading_accounts WHERE user_id IN (SELECT id FROM users WHERE email = ?)").get(email);
+  db.close();
+  assert.equal(row?.user_capital_cap, 200);
+  assert.equal(row?.user_risk_percent, 0.25);
+  assert.equal(row?.user_precision_entry_only, 1);
+
+  const invalid = await postJson(
+    "/api/auto-trade/preferences",
+    { userPrecisionEntryOnly: "yes" },
+    { Cookie: cookie },
+  );
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.data.error, "invalid_preference_value");
+});
+
 test("admin: member detail returns safe account telemetry", { skip: !hasSecrets && "needs secret.dev" }, async () => {
   resetRateLimits();
   const email = uniqueEmail("apitest_member_detail");

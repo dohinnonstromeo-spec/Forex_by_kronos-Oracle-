@@ -398,6 +398,10 @@ check(
   "small-account floor ON but the target already sizes above min lot on its own -- returns the normally-computed volume, not forced down to minVolume",
   computeAutoTradeVolume({ balance: 43230.85, riskPercent: 0.1, entry: 4400.13601, sl: 4385.13601, specification: xauSpec, allowMinVolumeFloor: true, maxRiskAmount: 1000000 }) === 0.02,
 );
+check(
+  "precision small-capital profile rejects an XAU minimum lot when its natural SL exceeds the real budget",
+  computeAutoTradeVolume({ balance: 200, riskPercent: 0.25, entry: 4400, sl: 4390, specification: xauSpec, allowMinVolumeFloor: false }) === null,
+);
 
 function estimatedStopLossAmountForTest({ entry, sl, volume, specification }) {
   const distance = Math.abs(Number(entry) - Number(sl));
@@ -804,6 +808,16 @@ check('admin pages stay airy and responsive', adminContentPageSource.includes('a
 
 console.log("=== hybrid trailing: opt-in, bounded pairs, future orders only ===");
 const dashboardHybridSource = await readFile(new URL("../dashboard.html", import.meta.url), "utf8");
+check(
+  "small-capital precision mode never narrows a stop and rejects incompatible minimum lots",
+  serverSource.includes("user_precision_entry_only")
+    && serverSource.includes("precision_entry_requires_capital_cap")
+    && serverSource.includes("precision_entry_minimum_lot_risk_exceeds_budget")
+    && serverSource.includes("allowMinVolumeFloor: !precisionEntryOnly")
+    && dashboardHybridSource.includes('data-pref-toggle="userPrecisionEntryOnly"')
+    && authClientSource.includes("userPrecisionEntryOnly"),
+);
+
 const scalpBacktestSource = await readFile(new URL("../scripts/backtest-scalp-trailing-stop.mjs", import.meta.url), "utf8");
 const swingBacktestSource = await readFile(new URL("../scripts/backtest-swing-trailing-stop.mjs", import.meta.url), "utf8");
 const smallAccountBacktestSource = await readFile(new URL("../scripts/backtest-small-account-swing.mjs", import.meta.url), "utf8");

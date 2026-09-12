@@ -1609,6 +1609,8 @@
     broker_unreachable: "Broker injoignable au dernier passage (solde non confirmé)",
     broker_trading_not_allowed: "Trading refusé par le broker",
     broker_funds_unavailable: "Solde, equity ou marge libre insuffisants ou indisponibles",
+    precision_entry_requires_capital_cap: "Mode petit capital bloqu\u00e9 : renseigne un capital allou\u00e9",
+    precision_entry_minimum_lot_risk_exceeds_budget: "Mode petit capital bloqu\u00e9 : le lot minimum d\u00e9passe ton budget",
     opened_trade: "Position ouverte lors de la dernière évaluation",
     no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
@@ -1659,6 +1661,8 @@
       if (detail.noSpec) parts.push(String(detail.noSpec) + " specs broker indisponibles");
       if (detail.noVolume) parts.push(String(detail.noVolume) + " taille de position trop petite");
       if (detail.noFunds) parts.push(String(detail.noFunds) + " \u00e9tat des fonds broker indisponible");
+      if (detail.precisionEntryOnly) parts.push("profil petit capital actif");
+      if (detail.precisionRiskIncompatible) parts.push(String(detail.precisionRiskIncompatible) + " setup(s) refus\u00e9(s) : lot minimal incompatible avec le budget");
       if (detail.rejected) parts.push(String(detail.rejected) + " rejet\u00e9(s) par le broker");
       if (detail.pyramidingDisabled) parts.push(String(detail.pyramidingDisabled) + " entr\u00e9e(s) ignor\u00e9e(s) : paire d\u00e9j\u00e0 ouverte");
     } else if (reason === "no_signal_meets_confidence_or_rr") {
@@ -1682,8 +1686,12 @@
    } else if (reason === "monthly_loss_limit_amount_reached") {
      parts.push(`limite ${detail.monthlyLossLimitAmount}`);
     } else if (reason === "consecutive_auto_losses_circuit_breaker") {
-      if (detail.consecutiveLosses != null) parts.push(`${detail.consecutiveLosses}/${detail.lossLimit} pertes consécutives`);
-      if (detail.cooldownUntil) parts.push(`reprise prévue ${formatDate(detail.cooldownUntil)}`);
+      if (detail.consecutiveLosses != null) parts.push(String(detail.consecutiveLosses) + "/" + String(detail.lossLimit) + " pertes cons\u00e9cutives");
+      if (detail.cooldownUntil) parts.push("reprise pr\u00e9vue " + formatDate(detail.cooldownUntil));
+    } else if (reason === "precision_entry_minimum_lot_risk_exceeds_budget") {
+      if (detail.pair) parts.push("paire : " + detail.pair);
+      if (Number.isFinite(Number(detail.minimumLotRisk))) parts.push("lot min : " + formatTradeRiskAmount(detail.minimumLotRisk));
+      if (Number.isFinite(Number(detail.riskBudgetAmount))) parts.push("budget : " + formatTradeRiskAmount(detail.riskBudgetAmount));
     } else if (String(reason || "").startsWith("scalp_")) {
       if (detail.pair) parts.push(`paire : ${detail.pair}`);
       if (detail.missingTimeframes?.length) parts.push(`unit\u00e9s manquantes : ${detail.missingTimeframes.join(", ")}`);
@@ -1903,6 +1911,8 @@
     // balance (see sizingBalance in processAutoTradeForUser).
     const capitalCap = section.querySelector('[data-pref="userCapitalCap"]');
     if (capitalCap && document.activeElement !== capitalCap) capitalCap.value = status.userCapitalCap ?? "";
+    const precisionEntryOnly = section.querySelector('[data-pref-toggle="userPrecisionEntryOnly"]');
+    if (precisionEntryOnly && document.activeElement !== precisionEntryOnly) precisionEntryOnly.checked = Boolean(status.userPrecisionEntryOnly);
     const hoursStart = section.querySelector('[data-pref="userTradingHoursStart"]');
     const hoursEnd = section.querySelector('[data-pref="userTradingHoursEnd"]');
     if (hoursStart && document.activeElement !== hoursStart) hoursStart.value = status.userTradingHoursStart || "";
@@ -1921,7 +1931,8 @@
         ? `capital plafonné à ${status.userCapitalCap}`
         : "fonds broker réels";
       const positions = status.userMaxConcurrentPositions ?? status.maxConcurrentPositions;
-      summary.textContent = `${riskLabel} · ${capitalLabel} · ${positions ?? "—"} positions max`;
+      const precisionLabel = status.userPrecisionEntryOnly ? "entr\u00e9es de pr\u00e9cision" : "profil standard";
+      summary.textContent = riskLabel + " \u00b7 " + capitalLabel + " \u00b7 " + precisionLabel + " \u00b7 " + (positions ?? "-") + " positions max";
     }
   }
 
@@ -1933,7 +1944,16 @@
     button.addEventListener("click", async () => {
       const section = document.querySelector("[data-autotrade-preferences-section]");
       const field = (name) => section.querySelector(`[data-pref="${name}"]`)?.value || null;
+      const precisionEntryOnly = Boolean(section.querySelector('[data-pref-toggle="userPrecisionEntryOnly"]')?.checked);
       const userTradingDays = [...section.querySelectorAll("[data-pref-trading-days] input:checked")].map((input) => Number(input.value));
+      if (precisionEntryOnly && !(Number(field("userCapitalCap")) > 0)) {
+        if (message) {
+          message.textContent = "Indique d'abord un capital allou\u00e9 avant d'activer le mode petit capital.";
+          message.classList.add("dashboard-prepare-error");
+          message.hidden = false;
+        }
+        return;
+      }
       button.disabled = true;
       if (message) message.hidden = true;
       try {
@@ -1941,7 +1961,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            userRiskPercent: field("userRiskPercent"), userCapitalCap: field("userCapitalCap"), userMinConfidence: field("userMinConfidence"),
+            userRiskPercent: field("userRiskPercent"), userCapitalCap: field("userCapitalCap"), userPrecisionEntryOnly, userMinConfidence: field("userMinConfidence"),
             userMinRiskReward: field("userMinRiskReward"), userMaxConcurrentPositions: field("userMaxConcurrentPositions"),
             userMaxTradesPerDay: field("userMaxTradesPerDay"), userDailyLossLimitPercent: field("userDailyLossLimitPercent"),
             userDailyLossLimitAmount: field("userDailyLossLimitAmount"),
