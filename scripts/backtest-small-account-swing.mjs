@@ -35,8 +35,11 @@ const SYMBOLS = [
 // specification + current-price), not typical/guessed FX conventions.
 const MIN_VOLUME = 0.01; // confirmed identical (0.01) on all three pairs live
 
-const CAPITAL_LEVELS = [30, 50, 100];
-const RISK_CEILING_PCTS = [10, 15, 20]; // % of capital, worst case, at min lot
+// $20 at 0.25% is included deliberately: it makes a broker's minimum-lot
+// constraint visible instead of suggesting that every small balance can trade
+// every instrument safely.
+const CAPITAL_LEVELS = [20, 30, 50, 100];
+const RISK_CEILING_PCTS = [0.25, 0.5, 1, 2, 10, 15, 20]; // % of capital, worst case, at min lot
 
 const LOOKAHEAD_BARS = 20;
 const COST_DRAG_R = 0.05;

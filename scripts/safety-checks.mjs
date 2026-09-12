@@ -403,6 +403,14 @@ check(
   computeAutoTradeVolume({ balance: 200, riskPercent: 0.25, entry: 4400, sl: 4390, specification: xauSpec, allowMinVolumeFloor: false }) === null,
 );
 
+function microTargetCostViableForTest(targetAmount, roundTripCost, minRatio = 3) {
+  return targetAmount > 0 && roundTripCost > 0 && targetAmount >= roundTripCost * minRatio;
+}
+check(
+  "strict micro-account target must cover at least three times its observed spread cost",
+  microTargetCostViableForTest(0.12, 0.04) && !microTargetCostViableForTest(0.119, 0.04),
+);
+
 function estimatedStopLossAmountForTest({ entry, sl, volume, specification }) {
   const distance = Math.abs(Number(entry) - Number(sl));
   const valuePerUnitPerLot = specification.lossTickValue / specification.tickSize;
@@ -818,6 +826,16 @@ check(
     && authClientSource.includes("userPrecisionEntryOnly"),
 );
 
+check(
+  "small-capital precision mode rejects unaffordable spread costs and same-pair pyramiding",
+  serverSource.includes("precision_entry_target_cost_not_viable")
+    && serverSource.includes("estimateRoundTripSpreadCost")
+    && serverSource.includes("isTargetCostViable")
+    && serverSource.includes("precisionEntryOnly || !AUTO_ALLOW_PYRAMIDING")
+    && serverSource.includes("precision_entry_pair_already_open")
+    && authClientSource.includes("precisionCostIncompatible")
+    && authClientSource.includes("precisionPyramiding"),
+);
 const scalpBacktestSource = await readFile(new URL("../scripts/backtest-scalp-trailing-stop.mjs", import.meta.url), "utf8");
 const swingBacktestSource = await readFile(new URL("../scripts/backtest-swing-trailing-stop.mjs", import.meta.url), "utf8");
 const smallAccountBacktestSource = await readFile(new URL("../scripts/backtest-small-account-swing.mjs", import.meta.url), "utf8");
@@ -1058,7 +1076,7 @@ check(
 check(
   "automatic repetition and losing streaks are fail-closed by default",
   serverSource.includes('env.AUTO_ALLOW_PYRAMIDING === "true"')
-    && serverSource.includes('pairOpenCount > 0 && !AUTO_ALLOW_PYRAMIDING')
+    && serverSource.includes('pairOpenCount > 0 && (precisionEntryOnly || !AUTO_ALLOW_PYRAMIDING)')
     && serverSource.includes("recentAutoLossStreak")
     && serverSource.includes("consecutive_auto_losses_circuit_breaker")
     && serverSource.includes("AUTO_CONSECUTIVE_LOSS_LIMIT"),

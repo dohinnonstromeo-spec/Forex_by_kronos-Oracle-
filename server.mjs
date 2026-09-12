@@ -2574,7 +2574,20 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     direction: signal.direction,
   }));
   const openedPairs = [];
-  const skipped = { alreadyOpen: 0, pyramidingDisabled: 0, correlation: 0, noSpec: 0, noVolume: 0, noFunds: 0, precisionRiskIncompatible: 0, rejected: 0 };
+  const skipped = {
+    alreadyOpen: 0,
+    pyramidingDisabled: 0,
+    correlation: 0,
+    noSpec: 0,
+    noVolume: 0,
+    noFunds: 0,
+    precisionRiskIncompatible: 0,
+    precisionCostIncompatible: 0,
+    precisionPyramiding: 0,
+    rejected: 0,
+  };
+  const precisionRiskExamples = [];
+  const precisionCostExamples = [];
   for (const signal of candidates) {
     if (openCount >= maxConcurrent) break;
     if (maxTradesPerDay > 0 && tradesOpenedToday >= maxTradesPerDay) break;
@@ -2583,7 +2596,14 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     // per-slot lease prevents two scheduler instances from exceeding this map.
     const pairOpenCount = openPositionsByPair.get(signal.paire) || 0;
     if (pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR) { skipped.alreadyOpen += 1; continue; }
-    if (pairOpenCount > 0 && !AUTO_ALLOW_PYRAMIDING) { skipped.pyramidingDisabled += 1; continue; }
+    // Small-capital mode deliberately does not average into one pair. A second
+    // entry would add the same directional exposure without creating a new,
+    // independent opportunity for the limited capital budget.
+    if (pairOpenCount > 0 && (precisionEntryOnly || !AUTO_ALLOW_PYRAMIDING)) {
+      if (precisionEntryOnly) skipped.precisionPyramiding += 1;
+      else skipped.pyramidingDisabled += 1;
+      continue;
+    }
     // Hard block here (unlike the manual flow, where this is only advisory) --
     // there's no human to read a correlation warning in an unattended path.
     // Scoped to this slot: a demo position isn't real exposure, so it can't
@@ -2620,6 +2640,13 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     // minimum lot, otherwise it records the skip and leaves the setup untouched.
     if (precisionEntryOnly && (!(minimumLotRisk > 0) || minimumLotRisk > precisionRiskBudget * 1.000001)) {
       skipped.precisionRiskIncompatible += 1;
+      if (precisionRiskExamples.length < 3) {
+        precisionRiskExamples.push({
+          pair: signal.paire,
+          minimumLotRisk,
+          riskBudgetAmount: precisionRiskBudget,
+        });
+      }
       continue;
     }
     // Only these two pairs, only when a capital cap is actually active -- see
@@ -2634,6 +2661,28 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       maxRiskAmount: smallAccountFloorEligible ? sizingBalance * (SMALL_ACCOUNT_MIN_LOT_RISK_PCT / 100) : null,
     });
     if (!volume) { skipped.noVolume += 1; continue; }
+
+    // The broker supplies the current bid/ask alongside the symbol
+    // specification. In small-capital mode, fail closed when the first
+    // analytical target does not leave adequate room after the known spread.
+    // Broker commissions are not exposed by this endpoint, so this is a
+    // minimum cost check, not a claim that execution is free.
+    if (precisionEntryOnly) {
+      const targetAmount = Math.abs(Number(signal.tp1) - Number(signal.entree))
+        / specification.tickSize * specification.lossTickValue * volume;
+      const roundTripCost = estimateRoundTripSpreadCost(specification, volume);
+      if (!isTargetCostViable(targetAmount, roundTripCost)) {
+        skipped.precisionCostIncompatible += 1;
+        if (precisionCostExamples.length < 3) {
+          precisionCostExamples.push({
+            pair: signal.paire,
+            targetAmount,
+            roundTripCost,
+          });
+        }
+        continue;
+      }
+    }
 
     // SWING_TRAILING_PARAMS_BY_PAIR pairs skip the broker-side TP1 by default:
     // the backtested production exit for these three is the trailing stop alone.
@@ -2719,7 +2768,18 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
       await sqlRun(`UPDATE analyses SET status = 'BLOCKED', active = 0, block_reason = ? WHERE id = ?`, [result.body?.error || "auto_trade_rejected", analysisId]);
     }
   }
-  recordAutoTradeStatus(userId, slot, openedThisTick ? "opened_trade" : "no_valid_setup_this_tick", {
+  const firstPrecisionRiskExample = precisionRiskExamples[0] || {};
+  const firstPrecisionCostExample = precisionCostExamples[0] || {};
+  const onlyPrecisionRiskBlocked = candidates.length > 0 && skipped.precisionRiskIncompatible === candidates.length;
+  const onlyPrecisionCostBlocked = candidates.length > 0 && skipped.precisionCostIncompatible === candidates.length;
+  const finalStatus = openedThisTick
+    ? "opened_trade"
+    : onlyPrecisionRiskBlocked
+      ? "precision_entry_minimum_lot_risk_exceeds_budget"
+      : onlyPrecisionCostBlocked
+        ? "precision_entry_target_cost_not_viable"
+        : "no_valid_setup_this_tick";
+  recordAutoTradeStatus(userId, slot, finalStatus, {
     openedThisTick,
     candidateCount: candidates.length,
     candidatePairs,
@@ -2730,7 +2790,11 @@ async function processAutoTradeForUser(account, signals, slot, newsRisk = null) 
     maxPerPair: MAX_AUTO_POSITIONS_PER_PAIR,
     pyramidingEnabled: AUTO_ALLOW_PYRAMIDING,
     precisionEntryOnly,
+    precisionRiskExamples,
+    precisionCostExamples,
     newsCalendarFallback: newsFallback,
+    ...firstPrecisionRiskExample,
+    ...firstPrecisionCostExample,
     ...skipped,
   });
 }
@@ -2790,6 +2854,12 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
   for (const pair of scalpPairs) {
     const pairOpenCount = openPositionsByPair.get(pair) || 0;
     if (pairOpenCount >= MAX_AUTO_POSITIONS_PER_PAIR) continue;
+    // The strict small-capital profile never adds another scalp position on an
+    // already-open instrument. It keeps scarce risk budget independent per pair.
+    if (precisionEntryOnly && pairOpenCount > 0) {
+      recordAutoTradeStatus(userId, slot, "precision_entry_pair_already_open", { pair, pairOpenCount });
+      continue;
+    }
     const price = await getAnalysisPrice(pair).catch(() => null);
     if (!price || !isUsableLivePrice(price)) continue;
     const historyEntries = await Promise.all(SCALP_TIMEFRAMES.map(async (timeframe) => [
@@ -12108,29 +12178,30 @@ async function getBrokerSymbolSpecification(credentials, pair) {
   };
 }
 
-// Approximate round-trip transaction cost (spread only -- commission isn't
-// consistently exposed by this API, same "not a precise cost model" honesty
-// scripts/backtest.mjs already applies to its own cost haircut) for one scalp
-// trade at a given volume: buying at ask and immediately selling at bid (or the
-// reverse) loses exactly the spread, which is the dominant cost at the tiny
-// profit targets scalp mode is built around -- a fixed cost that eats a much
-// bigger share of a $0.30-3 target than it would of a normal swing trade's
-// target, which is exactly why "sans risque" isn't real for this style and this
-// guard exists at all.
-function estimateScalpRoundTripCost(specification, volume) {
+// Approximate round-trip transaction cost (spread only -- commission is not
+// consistently exposed by this API). It applies to every style: buying at ask
+// and closing at bid, or the reverse, loses exactly the current spread.
+function estimateRoundTripSpreadCost(specification, volume) {
   const { bid, ask, tickSize, lossTickValue } = specification;
   if (!(bid > 0) || !(ask > 0) || !(tickSize > 0) || !(lossTickValue > 0) || !(volume > 0)) return null;
   const spread = ask - bid;
   return (spread / tickSize) * lossTickValue * volume;
 }
 
-// A scalp trade only makes sense if its profit target meaningfully exceeds what
-// it costs just to get in and out -- minRatio defaults to 3x so a target isn't
-// approved right at the break-even edge, where normal price noise around the
-// spread could make a "winning" trade a net loss once cost is counted.
-function isScalpTargetCostViable(targetAmount, roundTripCost, minRatio = 3) {
+// A target only makes sense when it meaningfully exceeds its known spread cost.
+// This remains conservative rather than pretending that unknown commissions or
+// slippage do not exist.
+function isTargetCostViable(targetAmount, roundTripCost, minRatio = 3) {
   if (!(targetAmount > 0) || !(roundTripCost > 0)) return false;
   return targetAmount >= roundTripCost * minRatio;
+}
+
+function estimateScalpRoundTripCost(specification, volume) {
+  return estimateRoundTripSpreadCost(specification, volume);
+}
+
+function isScalpTargetCostViable(targetAmount, roundTripCost, minRatio = 3) {
+  return isTargetCostViable(targetAmount, roundTripCost, minRatio);
 }
 
 // Ground truth for a broker-executed position, confirmed live against a real

@@ -1611,6 +1611,8 @@
     broker_funds_unavailable: "Solde, equity ou marge libre insuffisants ou indisponibles",
     precision_entry_requires_capital_cap: "Mode petit capital bloqu\u00e9 : renseigne un capital allou\u00e9",
     precision_entry_minimum_lot_risk_exceeds_budget: "Mode petit capital bloqu\u00e9 : le lot minimum d\u00e9passe ton budget",
+    precision_entry_target_cost_not_viable: "Mode petit capital bloqu\u00e9 : l'objectif ne couvre pas suffisamment le spread",
+    precision_entry_pair_already_open: "Mode petit capital : une position est d\u00e9j\u00e0 ouverte sur cette paire",
     opened_trade: "Position ouverte lors de la dernière évaluation",
     no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
@@ -1663,6 +1665,8 @@
       if (detail.noFunds) parts.push(String(detail.noFunds) + " \u00e9tat des fonds broker indisponible");
       if (detail.precisionEntryOnly) parts.push("profil petit capital actif");
       if (detail.precisionRiskIncompatible) parts.push(String(detail.precisionRiskIncompatible) + " setup(s) refus\u00e9(s) : lot minimal incompatible avec le budget");
+      if (detail.precisionCostIncompatible) parts.push(String(detail.precisionCostIncompatible) + " setup(s) refus\u00e9(s) : objectif insuffisant face au spread");
+      if (detail.precisionPyramiding) parts.push(String(detail.precisionPyramiding) + " entr\u00e9e(s) ignor\u00e9e(s) : une position existe d\u00e9j\u00e0 sur cette paire");
       if (detail.rejected) parts.push(String(detail.rejected) + " rejet\u00e9(s) par le broker");
       if (detail.pyramidingDisabled) parts.push(String(detail.pyramidingDisabled) + " entr\u00e9e(s) ignor\u00e9e(s) : paire d\u00e9j\u00e0 ouverte");
     } else if (reason === "no_signal_meets_confidence_or_rr") {
@@ -1692,6 +1696,13 @@
       if (detail.pair) parts.push("paire : " + detail.pair);
       if (Number.isFinite(Number(detail.minimumLotRisk))) parts.push("lot min : " + formatTradeRiskAmount(detail.minimumLotRisk));
       if (Number.isFinite(Number(detail.riskBudgetAmount))) parts.push("budget : " + formatTradeRiskAmount(detail.riskBudgetAmount));
+    } else if (reason === "precision_entry_target_cost_not_viable") {
+      if (detail.pair) parts.push("paire : " + detail.pair);
+      if (Number.isFinite(Number(detail.targetAmount))) parts.push("objectif : " + formatTradeRiskAmount(detail.targetAmount));
+      if (Number.isFinite(Number(detail.roundTripCost))) parts.push("spread aller-retour estim\u00e9 : " + formatTradeRiskAmount(detail.roundTripCost));
+    } else if (reason === "precision_entry_pair_already_open") {
+      if (detail.pair) parts.push("paire : " + detail.pair);
+      if (detail.pairOpenCount != null) parts.push(String(detail.pairOpenCount) + " position ouverte");
     } else if (String(reason || "").startsWith("scalp_")) {
       if (detail.pair) parts.push(`paire : ${detail.pair}`);
       if (detail.missingTimeframes?.length) parts.push(`unit\u00e9s manquantes : ${detail.missingTimeframes.join(", ")}`);
@@ -1931,7 +1942,7 @@
         ? `capital plafonné à ${status.userCapitalCap}`
         : "fonds broker réels";
       const positions = status.userMaxConcurrentPositions ?? status.maxConcurrentPositions;
-      const precisionLabel = status.userPrecisionEntryOnly ? "entr\u00e9es de pr\u00e9cision" : "profil standard";
+      const precisionLabel = status.userPrecisionEntryOnly ? "profil petit capital strict" : "profil standard";
       summary.textContent = riskLabel + " \u00b7 " + capitalLabel + " \u00b7 " + precisionLabel + " \u00b7 " + (positions ?? "-") + " positions max";
     }
   }
