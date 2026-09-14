@@ -1613,6 +1613,7 @@
     precision_entry_minimum_lot_risk_exceeds_budget: "Mode petit capital bloqu\u00e9 : le lot minimum d\u00e9passe ton budget",
     precision_entry_target_cost_not_viable: "Mode petit capital bloqu\u00e9 : l'objectif ne couvre pas suffisamment le spread",
     precision_entry_pair_already_open: "Mode petit capital : une position est d\u00e9j\u00e0 ouverte sur cette paire",
+    precision_entry_scalp_research_rejected: "Mode petit capital : scalp d\u00e9sactiv\u00e9, m\u00e9thode non valid\u00e9e pour ce profil",
     opened_trade: "Position ouverte lors de la dernière évaluation",
     no_valid_setup_this_tick: "Signal(s) repéré(s) mais aucun n'a passé les vérifications finales",
     globally_paused_by_admin: "Trading suspendu globalement par l'administrateur",
@@ -1703,6 +1704,9 @@
     } else if (reason === "precision_entry_pair_already_open") {
       if (detail.pair) parts.push("paire : " + detail.pair);
       if (detail.pairOpenCount != null) parts.push(String(detail.pairOpenCount) + " position ouverte");
+    } else if (reason === "precision_entry_scalp_research_rejected") {
+      if (detail.analysisStyle) parts.push("style : " + String(detail.analysisStyle).replaceAll("_", " "));
+      parts.push("validation petit compte requise avant activation");
     } else if (String(reason || "").startsWith("scalp_")) {
       if (detail.pair) parts.push(`paire : ${detail.pair}`);
       if (detail.missingTimeframes?.length) parts.push(`unit\u00e9s manquantes : ${detail.missingTimeframes.join(", ")}`);
@@ -1869,10 +1873,13 @@
   // scalpUserEnabled is the owner's own switch.
   function renderScalpSection(status) {
     const toggle = document.querySelector("[data-scalp-toggle]");
-    if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.scalpUserEnabled);
-    if (toggle) toggle.disabled = !status.scalpEnabled;
+    const precisionBlocked = Boolean(status.userPrecisionEntryOnly);
+    if (toggle && document.activeElement !== toggle) toggle.checked = Boolean(status.scalpUserEnabled) && !precisionBlocked;
+    if (toggle) toggle.disabled = !status.scalpEnabled || precisionBlocked;
     const lockedNote = document.querySelector("[data-scalp-locked-note]");
     if (lockedNote) lockedNote.hidden = Boolean(status.scalpEnabled);
+    const precisionNote = document.querySelector("[data-scalp-precision-note]");
+    if (precisionNote) precisionNote.hidden = !precisionBlocked;
     const metrics = document.querySelector("[data-scalp-metrics]");
     if (!metrics) return;
     if (!status.scalpEnabled) {

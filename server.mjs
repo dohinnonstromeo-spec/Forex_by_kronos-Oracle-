@@ -2822,6 +2822,17 @@ function clampVolumeToSpec(rawVolume, specification) {
 // imposes.
 async function processScalpForUser(account, credentials, slot, newsRisk = null) {
   if (!Number(account.scalp_enabled) || !Number(account.user_scalp_enabled)) return;
+  const userId = account.user_id;
+  const precisionEntryOnly = Number(account.user_precision_entry_only) === 1;
+  // The current mean-reversion scalp remains available to normal accounts, but
+  // its own out-of-sample drawdown validation rejects it for the strict
+  // small-capital profile. Do not turn a research finding into live exposure.
+  if (precisionEntryOnly) {
+    return recordAutoTradeStatus(userId, slot, "precision_entry_scalp_research_rejected", {
+      analysisStyle: "mean_reversion_multi_timeframe",
+      validation: "small_account_research_rejected",
+    });
+  }
   if (!newsRisk || newsRisk.status !== "ok") {
     return recordAutoTradeStatus(account.user_id, slot, "economic_calendar_unavailable", {
       reason: "Calendrier économique indisponible : aucune nouvelle position scalp autorisée.",
@@ -2829,7 +2840,6 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
   }
   const scalpPairs = String(account.scalp_pairs || "").split(",").filter((p) => SCALP_PARAMS_BY_PAIR[p]);
   if (!scalpPairs.length) return;
-  const userId = account.user_id;
 
   // Scalp may use a fixed lot or a fixed dollar loss target, but it still must
   // verify that the real broker account has usable funds before opening.
@@ -2838,11 +2848,6 @@ async function processScalpForUser(account, credentials, slot, newsRisk = null) 
   if (accountInfo.tradeAllowed === false) return recordAutoTradeStatus(userId, slot, "broker_trading_not_allowed");
   const sizingBalance = sizingBalanceForAccount(account, accountInfo);
   if (!(sizingBalance > 0)) return recordAutoTradeStatus(userId, slot, "broker_funds_unavailable");
-  const precisionEntryOnly = Number(account.user_precision_entry_only) === 1;
-  if (precisionEntryOnly && !(Number(account.user_capital_cap) > 0)) {
-    return recordAutoTradeStatus(userId, slot, "precision_entry_requires_capital_cap");
-  }
-
   // Scalp shares the account total cap with swing and allows up to the same
   // bounded number per pair. One opening attempt per tick is retained so an
   // enabled pair cannot burst several orders in one scheduler pass.
@@ -4284,8 +4289,11 @@ async function handleApi(req, res, url) {
     const enabled = Boolean(body?.enabled);
     await ensureRelationalTables();
     if (enabled) {
-      const row = await sqlGet(`SELECT scalp_enabled FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
+      const row = await sqlGet(`SELECT scalp_enabled, user_precision_entry_only FROM auto_trading_accounts WHERE user_id = ?`, [session.user.id]);
       if (!Number(row?.scalp_enabled)) return sendJson(res, 403, { ok: false, error: "scalp_not_authorized" });
+      if (Number(row?.user_precision_entry_only) === 1) {
+        return sendJson(res, 409, { ok: false, error: "precision_entry_scalp_research_rejected" });
+      }
     }
     await sqlRun(
       `INSERT INTO auto_trading_accounts (user_id, user_scalp_enabled, created_at, updated_at) VALUES (?, ?, ?, ?)

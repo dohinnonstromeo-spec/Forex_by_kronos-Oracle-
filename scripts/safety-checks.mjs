@@ -833,8 +833,10 @@ check(
     && serverSource.includes("isTargetCostViable")
     && serverSource.includes("precisionEntryOnly || !AUTO_ALLOW_PYRAMIDING")
     && serverSource.includes("precision_entry_pair_already_open")
+    && serverSource.includes("precision_entry_scalp_research_rejected")
     && authClientSource.includes("precisionCostIncompatible")
-    && authClientSource.includes("precisionPyramiding"),
+    && authClientSource.includes("precisionPyramiding")
+    && dashboardHybridSource.includes("data-scalp-precision-note"),
 );
 const scalpBacktestSource = await readFile(new URL("../scripts/backtest-scalp-trailing-stop.mjs", import.meta.url), "utf8");
 const swingBacktestSource = await readFile(new URL("../scripts/backtest-swing-trailing-stop.mjs", import.meta.url), "utf8");

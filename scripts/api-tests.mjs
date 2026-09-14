@@ -334,6 +334,14 @@ test("auto-trade preferences: precision small-capital profile persists and remai
   );
   assert.equal(invalid.status, 400);
   assert.equal(invalid.data.error, "invalid_preference_value");
+
+  const scalpDb = new DatabaseSync(dbPath);
+  scalpDb.exec("PRAGMA busy_timeout = 30000");
+  scalpDb.prepare("UPDATE auto_trading_accounts SET scalp_enabled = 1 WHERE user_id IN (SELECT id FROM users WHERE email = ?)").run(email);
+  scalpDb.close();
+  const scalp = await postJson("/api/auto-trade/toggle-scalp", { enabled: true }, { Cookie: cookie });
+  assert.equal(scalp.status, 409);
+  assert.equal(scalp.data.error, "precision_entry_scalp_research_rejected");
 });
 
 test("admin: member detail returns safe account telemetry", { skip: !hasSecrets && "needs secret.dev" }, async () => {
