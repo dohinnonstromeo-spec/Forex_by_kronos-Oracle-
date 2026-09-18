@@ -24,6 +24,7 @@ jobs:
       - name: Syntax check server and scripts
         run: |
           node --check server.mjs
+          node --check assets/kronos-pulse.js
           for f in scripts/*.mjs; do
             echo "checking $f"
             node --check "$f"
@@ -72,6 +73,7 @@ jobs:
             echo "$name OK"
           }
           check "Homepage" "http://127.0.0.1:4174/"
+          check "Kronos Pulse asset" "http://127.0.0.1:4174/assets/kronos-pulse.js"
           check "/api/ready" "http://127.0.0.1:4174/api/ready"
           check "/api/signals" "http://127.0.0.1:4174/api/signals"
           check "/api/analyze-chart" "http://127.0.0.1:4174/api/analyze-chart" \
@@ -95,3 +97,6 @@ jobs:
 
       - name: Trading safety regression checks
         run: node scripts/safety-checks.mjs
+
+      - name: Front-end regression contract
+        run: node scripts/frontend-regression.mjs

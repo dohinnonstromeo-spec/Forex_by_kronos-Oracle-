@@ -149,6 +149,54 @@
         </div>
       </section>
 
+      <section id="kronos-pulse" class="kronos-pulse" aria-labelledby="kronos-pulse-title">
+        <div class="kronos-pulse__intro">
+          <div>
+            <p class="kronos-pulse__eyebrow"><span aria-hidden="true"></span> KRONOS ORACLE PULSE</p>
+            <h2 id="kronos-pulse-title">Le contexte du marche,<br><em>avant la decision.</em></h2>
+          </div>
+          <p class="kronos-pulse__lede">Une lecture synthetique des instruments surveilles par Kronos. L'indice mesure la clarte du contexte disponible ; il ne constitue ni un conseil, ni un signal d'execution.</p>
+        </div>
+
+        <div class="kronos-pulse__terminal" data-kronos-pulse aria-busy="true">
+          <div class="kronos-pulse__terminal-head">
+            <div class="kronos-pulse__terminal-label"><span class="kronos-pulse__live-dot" aria-hidden="true"></span> MARKET INTELLIGENCE / LIVE CONTEXT</div>
+            <p class="kronos-pulse__timestamp" data-pulse-generated aria-live="polite">Connexion aux donnees marche...</p>
+          </div>
+          <div class="kronos-pulse__layout">
+            <div class="kronos-pulse__score-card">
+              <div class="kronos-pulse__score-ring" data-pulse-ring style="--pulse-score: 0"><div><strong data-pulse-score>--</strong><span>CLARTE</span></div></div>
+              <p class="kronos-pulse__score-label">Indice de contexte</p>
+              <p class="kronos-pulse__score-caption" data-pulse-confidence>En attente de donnees verifiables</p>
+            </div>
+            <div class="kronos-pulse__reading">
+              <span class="kronos-pulse__reading-label">Lecture Kronos</span>
+              <strong data-pulse-state aria-live="polite">Synchronisation en cours</strong>
+              <p data-pulse-summary>Nous n'affichons aucune conclusion tant que plusieurs sources de marche ne sont pas disponibles.</p>
+              <div class="kronos-pulse__facts">
+                <div><span>Sources fraiches</span><strong data-pulse-sources>-- / 4</strong></div>
+                <div><span>Consensus</span><strong data-pulse-consensus>--</strong></div>
+                <div><span>Variation moyenne</span><strong data-pulse-volatility>--</strong></div>
+              </div>
+            </div>
+            <div class="kronos-pulse__actions">
+              <a class="kronos-pulse__primary-action" href="/dashboard">Ouvrir le cockpit <span aria-hidden="true">-&gt;</span></a>
+              <button class="kronos-pulse__details-toggle" type="button" data-pulse-details-toggle aria-expanded="false" aria-controls="pulse-method">Comment est calcule l'indice ?</button>
+              <button class="kronos-pulse__refresh" type="button" data-pulse-refresh>Actualiser les donnees</button>
+            </div>
+          </div>
+          <div class="kronos-pulse__instrument-grid" data-pulse-instruments aria-live="polite">
+            <article class="kronos-pulse__instrument" data-pulse-instrument="EUR/USD"><span>EUR/USD</span><strong>--</strong><em>En attente</em></article>
+            <article class="kronos-pulse__instrument" data-pulse-instrument="XAU/USD"><span>XAU/USD</span><strong>--</strong><em>En attente</em></article>
+            <article class="kronos-pulse__instrument" data-pulse-instrument="GBP/JPY"><span>GBP/JPY</span><strong>--</strong><em>En attente</em></article>
+            <article class="kronos-pulse__instrument" data-pulse-instrument="BTC/USD"><span>BTC/USD</span><strong>--</strong><em>En attente</em></article>
+          </div>
+          <div id="pulse-method" class="kronos-pulse__method" data-pulse-details hidden>
+            <p><strong>Clarte du contexte :</strong> combinaison de la fraicheur des donnees, de l'alignement des variations et de leur amplitude sur les instruments visibles. Une donnee fermee, obsolete ou incomplete ne compte pas.</p>
+            <p>Ce module aide a contextualiser une analyse. Verifie toujours ton plan, ton risque et les annonces economiques avant toute decision.</p>
+          </div>
+        </div>
+      </section>
       <section class="home-market-board">
         <div class="home-section-head">
           <p data-cms="home.market.kicker">Marchés en direct</p>
@@ -328,6 +376,7 @@
   <script src="/assets/oracle-chatbot.js" defer></script>
   <script src="/assets/home-performance.js" defer></script>
   <script src="/assets/home-market-effects.js" defer></script>
+  <script src="/assets/kronos-pulse.js" defer></script>
   <script src="/assets/nav-active.js" defer></script>
 </body>
 </html>

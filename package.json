@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test --test-concurrency=1 scripts/api-tests.mjs && node scripts/safety-checks.mjs",
+    "test": "node --test --test-concurrency=1 scripts/api-tests.mjs && node scripts/safety-checks.mjs && node scripts/frontend-regression.mjs",
     "backtest:styles": "node scripts/backtest-analysis-styles-realistic.mjs",
     "backtest:micro:price-action": "node scripts/backtest-scalp-price-action-smc.mjs",
     "backtest:mean-reversion:validate": "node scripts/backtest-scalp-fx-drawdown.mjs",
