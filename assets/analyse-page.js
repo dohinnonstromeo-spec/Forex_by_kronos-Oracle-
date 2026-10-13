@@ -657,6 +657,17 @@
     ));
     const hasTechnicalRead = Boolean(technical.priceActionRead?.summary || technical.text || facts.length);
     if (!narrative && !hasTechnicalRead) return "";
+    const historyDiagnostics = technical.historyDiagnostics;
+    const providerAttempts = Array.isArray(historyDiagnostics?.attempts) ? historyDiagnostics.attempts : [];
+    const providerErrors = Array.isArray(historyDiagnostics?.errors) ? historyDiagnostics.errors : [];
+    const dataTroubleshooting = Number(technical.bars || 0) < 30 && historyDiagnostics
+      ? `<details class="no-signal-data-status"><summary>Pourquoi l'historique OHLC manque</summary>
+          <p>${escapeHtml(`${historyDiagnostics.status || "données insuffisantes"} · timeframe demandé ${historyDiagnostics.timeframe || timeframe || "n/a"} · ${historyDiagnostics.elapsedMs ?? "?"} ms · budget ${historyDiagnostics.budgetMs ?? "?"} ms`)}</p>
+          ${providerAttempts.length ? `<ul>${providerAttempts.map((attempt) => `<li>${escapeHtml(`${attempt.provider || "source"}${attempt.interval ? `/${attempt.interval}` : ""} : ${attempt.result || "réponse inconnue"}${attempt.bars ? ` (${attempt.bars} bougies)` : ""}`)}</li>`).join("")}</ul>` : ""}
+          ${providerErrors.length ? `<p>Détails : ${escapeHtml(providerErrors.join(" · "))}</p>` : ""}
+          <p>Kronos suspend le biais confirmé et les niveaux d'ordre tant qu'il n'a pas 30 bougies clôturées sur l'unité demandée.</p>
+        </details>`
+      : "";
     const formatValue = (value) => {
       if (value == null || value === "") return "—";
       if (!Number.isFinite(Number(value))) return String(value);
@@ -674,6 +685,7 @@
         </div>
         ${factMarkup ? `<div class="no-signal-analysis-facts">${factMarkup}</div>` : ""}
         ${reading ? `<p class="no-signal-analysis-reading"><strong>Structure lue :</strong> ${escapeHtml(reading)}</p>` : ""}
+        ${dataTroubleshooting}
         ${narrative ? `<details class="no-signal-analysis-details" open><summary>Raisonnement et données utilisées</summary><p>${escapeHtml(narrative)}</p></details>` : ""}
       </section>
     `;

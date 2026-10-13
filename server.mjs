@@ -5991,23 +5991,38 @@ async function runKronosAnalysis({ body, images, req, user }) {
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
     const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "M5";
-    let livePrice = await getAnalysisPrice(selectedPair);
+    const independentOhlcMode = !images.length && !smcMode && !priceActionResearchMode;
+    const livePricePromise = getAnalysisPrice(selectedPair).catch((error) => {
+      logOnce("analysis-live-price", `${selectedPair}: ${error.message}`);
+      return null;
+    });
+    let livePrice = independentOhlcMode ? null : await livePricePromise;
     // Fired alongside the main history fetch below (independent data, different
     // granularity -- the deterministic engine wasn't backtested per user-chosen
     // timeframe/strategy), awaited together with `answer` further down so this costs
     // an extra fetch, not extra latency.
-    const crossCheckPromise = smcMode || priceActionResearchMode
+    const crossCheckPromise = smcMode || priceActionResearchMode || independentOhlcMode
       ? Promise.resolve(null) : deterministicCrossCheck(selectedPair, livePrice);
-    const history = await getHistoryForSymbol(selectedPair, livePrice, {
+    const historyOptions = {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Scalping",
-      preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
+      preferDeriv: !independentOhlcMode && isScalpingStrategy(body.strategy || "Scalping"),
       allowHistoricalWithoutLive: !images.length,
       requireExactTimeframe: smcMode || priceActionResearchMode
         || (/^price\s*action$/i.test(String(body.style || "Price Action")) && isScalpingStrategy(body.strategy || "Scalping")),
       requireOpen: smcMode,
       historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 6500,
-    });
+    };
+    let history;
+    if (independentOhlcMode) {
+      const historyPromise = getHistoryForSymbol(selectedPair, null, historyOptions);
+      [history, livePrice] = await Promise.all([
+        historyPromise,
+        promiseWithTimeout(livePricePromise, 1800, null),
+      ]);
+    } else {
+      history = await getHistoryForSymbol(selectedPair, livePrice, historyOptions);
+    }
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Scalping",
@@ -6030,6 +6045,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
         includeHistory: smcMode,
         requireExactTimeframe: smcMode,
         requireOpen: smcMode,
+        allowHistoricalWithoutLive: independentOhlcMode,
         preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
         historyBudgetMs: images.length ? 7000 : 9000,
       })
@@ -6072,7 +6088,15 @@ async function runKronosAnalysis({ body, images, req, user }) {
         events: [],
         headlines: [],
       };
-    const calibration = calibrationFor({ outcomes: await loadCalibrationOutcomes() }, body);
+    const calibrationOutcomes = await promiseWithTimeout(
+      loadCalibrationOutcomes().catch((error) => {
+        logOnce("analysis-calibration", error.message);
+        return [];
+      }),
+      1200,
+      [],
+    );
+    const calibration = calibrationFor({ outcomes: calibrationOutcomes }, body);
     const quickApiSetup = !deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice);
     const deepAssistedSetup = deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice)
       && newsContext?.calendarStatus === "ok" && !newsContext?.activeRisk && technicalSnapshot?.valid;
@@ -6226,7 +6250,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
     // matters -- falls back to the original price if the refetch itself fails, rather
     // than losing an otherwise-valid analysis to a transient provider hiccup on this
     // last step.
-    const shouldRefreshPrice = !priceActionResearchMode && (images.length > 0 || deepAnalysis);
+    const shouldRefreshPrice = !independentOhlcMode && !priceActionResearchMode && (images.length > 0 || deepAnalysis);
     const refreshedPrice = shouldRefreshPrice ? await getAnalysisPrice(selectedPair).catch(() => null) : null;
     if (refreshedPrice && Number.isFinite(Number(refreshedPrice.price))) livePrice = refreshedPrice;
     if (priceActionResearchMode) {
@@ -6249,7 +6273,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
       priceActionAnalysis,
     });
     if (!result.educationalOnly) {
-      await recordLearningAnalysis(result, body, {
+      await promiseWithTimeout(recordLearningAnalysis(result, body, {
         livePrice,
         imageQuality,
         calibration,
@@ -6260,7 +6284,10 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         analysisDepth,
         user,
         isTest: isTestRequest(req),
-      });
+      }).catch((error) => {
+        logOnce("analysis-learning-write", error.message);
+        return null;
+      }), 1200, null);
     }
     return result;
 }
@@ -6947,31 +6974,83 @@ async function loadHistories(prices, usableKey, options = {}) {
   return histories;
 }
 
+const HISTORY_CANDLE_LIMIT = 240;
+const HISTORY_CACHE_MAX_BARS = 240;
+
+function safeHistoryError(error) {
+  return String(error?.message || error || "provider_error")
+    .replace(/https?:\/\/\S+/gi, "provider_url")
+    .replace(/([?&](?:apikey|api_key|token|key)=)[^&\s]+/gi, "$1[redacted]")
+    .slice(0, 100);
+}
+
 async function getHistoryForSymbol(symbol, price = null, options = {}) {
-  const cache = await loadMarketCache();
+  const startedAt = Date.now();
+  const budget = Number.isFinite(Number(options.historyBudgetMs)) ? Number(options.historyBudgetMs) : 12000;
+  const diagnostics = {
+    timeframe: normalizeTimeframe(options.timeframe) || null,
+    exactTimeframe: options.requireExactTimeframe === true,
+    budgetMs: Math.max(2500, Math.min(12000, budget)),
+    cache: false,
+    attempts: [],
+    errors: [],
+  };
+  const finish = (history, status = null) => {
+    const bars = Array.isArray(history) ? history : [];
+    if (!bars._meta) tagHistory(bars, bars.length ? "historique" : "aucun historique", true, null, options.timeframe || null);
+    bars._meta.diagnostics = {
+      ...diagnostics,
+      status: status || (bars.length >= 30 ? "ok" : bars.length ? "historique_insuffisant" : "aucune_bougie_reçue"),
+      elapsedMs: Date.now() - startedAt,
+      bars: bars.length,
+    };
+    return bars;
+  };
+  const cacheFallback = memoryCache.marketDocument || { prices: {}, histories: {}, historyVariants: {} };
+  let cache;
+  try {
+    cache = await promiseWithTimeout(loadMarketCache(), 700, null);
+    if (!cache) {
+      diagnostics.errors.push("cache_lecture_trop_lente_utilisation_cache_memoire");
+      cache = cacheFallback;
+    }
+  } catch (error) {
+    diagnostics.errors.push(`cache:${safeHistoryError(error)}`);
+    cache = cacheFallback;
+  }
   const cached = cachedHistory(symbol, cache, options);
   const cachedHasOpen = !options.requireOpen || cached.every((bar) => Number.isFinite(Number(bar.open)));
   const preferredIntervals = historyIntervals(symbol, options);
-  const budget = Number.isFinite(Number(options.historyBudgetMs)) ? Number(options.historyBudgetMs) : 12000;
-  const deadline = Date.now() + Math.max(2500, Math.min(12000, budget));
+  const deadline = Date.now() + diagnostics.budgetMs;
   if (options.preferDeriv && price?.source === "deriv_ws" && price.open && isUsableLivePrice(price)) {
     try {
-      const derivBars = await fetchDerivAnalysisHistory(symbol, options.timeframe, Math.max(2500, Math.min(10000, budget)));
+      const derivBars = await fetchDerivAnalysisHistory(symbol, options.timeframe, Math.max(2500, Math.min(10000, diagnostics.budgetMs)));
       if (derivBars.length >= 30 && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
         && !derivBars._meta?.stale && isHistoryCompatible(derivBars, options)) {
-        await saveMarketCache(historyCacheUpdate(cache, { [symbol]: derivBars }, options));
+        try {
+          await saveMarketCache(historyCacheUpdate(cache, { [symbol]: derivBars }, options));
+        } catch (error) {
+          logOnce("history-cache-write", safeHistoryError(error));
+        }
         recordProviderHealth("deriv_ws_history", true);
-        return derivBars;
+        return finish(derivBars, "deriv_live");
       }
+      diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: derivBars.length >= 30 ? "incompatible" : "insufficient_bars" });
     } catch (error) {
-      recordProviderHealth("deriv_ws_history", false, error.message);
+      const reason = safeHistoryError(error);
+      diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "error" });
+      diagnostics.errors.push(`deriv_ws:${reason}`);
+      recordProviderHealth("deriv_ws_history", false, reason);
     }
   }
-  if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
-  if ((!price?.open || !isUsableLivePrice(price)) && options.allowHistoricalWithoutLive !== true) {
-    return cachedHasOpen ? cached : [];
+  if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) {
+    diagnostics.cache = true;
+    return finish(cached, "cache_frais");
   }
-  const errors = [];
+  if ((!price?.open || !isUsableLivePrice(price)) && options.allowHistoricalWithoutLive !== true) {
+    diagnostics.errors.push("prix_live_requis_pour_demander_l_historique");
+    return finish(cachedHasOpen ? cached : [], "prix_live_requis");
+  }
   let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
   const attempts = [
     ["binance", fetchBinanceHistory],
@@ -6983,32 +7062,37 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   for (const [source, loader] of attempts) {
     for (const interval of preferredIntervals) {
       if (Date.now() > deadline) {
-        errors.push("history_budget_exceeded");
-        return fallbackHistory;
+        diagnostics.errors.push("budget_historique_atteint");
+        return finish(fallbackHistory, "budget_atteint");
       }
       try {
         const bars = await loader(symbol, interval);
         if (bars.length >= 30) {
           if (options.requireOpen && !bars.every((bar) => Number.isFinite(Number(bar.open)))) {
-            errors.push(`${source}_${interval}:open_missing`);
+            diagnostics.attempts.push({ provider: source, interval, result: "open_missing" });
             continue;
           }
           tagHistory(bars, `${source}:${interval}`, false, null, options.timeframe || null);
           if (isHistoryCompatible(bars, options)) {
-            // Keep the fresh timeframe in memory immediately, but let the normal
-            // persistence throttle batch writes to Neon. A scalp evaluates six
-            // horizons and must never turn a cache refresh into six database writes.
-            await saveMarketCache(historyCacheUpdate(cache, { [symbol]: bars }, options));
+            diagnostics.attempts.push({ provider: source, interval, result: "ok", bars: bars.length });
+            // The OHLC result remains usable even if persistence is unavailable.
+            try {
+              await saveMarketCache(historyCacheUpdate(cache, { [symbol]: bars }, options));
+            } catch (error) {
+              logOnce("history-cache-write", safeHistoryError(error));
+            }
             recordProviderHealth(`${source}_history_single`, true);
-            return bars;
+            return finish(bars, "frais");
           }
           if (!fallbackHistory.length || fallbackHistory._meta?.stale) fallbackHistory = bars;
-          errors.push(`${source}_${interval}:not_timeframe_compatible`);
+          diagnostics.attempts.push({ provider: source, interval, result: "timeframe_incompatible", bars: bars.length });
           continue;
         }
-        if (bars.length) errors.push(`${source}_${interval}:insufficient_bars`);
+        diagnostics.attempts.push({ provider: source, interval, result: bars.length ? "insufficient_bars" : "no_bars" });
       } catch (error) {
-        errors.push(`${source}_${interval}:${error.message}`);
+        const reason = safeHistoryError(error);
+        diagnostics.attempts.push({ provider: source, interval, result: "error" });
+        diagnostics.errors.push(`${source}:${interval}:${reason}`);
       }
     }
   }
@@ -7017,16 +7101,18 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       const bars = await fetchDukascopyHistory(symbol);
       if (bars.length >= 30) {
         tagHistory(bars, "dukascopy:daily", true, null, options.timeframe || null);
+        diagnostics.attempts.push({ provider: "dukascopy", interval: "1day", result: "indicative_daily_fallback", bars: bars.length });
         recordProviderHealth("dukascopy_history_single", true);
-        return bars;
+        return finish(bars, "historique_quotidien_indicatif");
       }
-      errors.push("dukascopy:insufficient_bars");
+      diagnostics.attempts.push({ provider: "dukascopy", interval: "1day", result: "insufficient_bars" });
     } catch (error) {
-      errors.push(`dukascopy:${error.message}`);
+      diagnostics.errors.push(`dukascopy:${safeHistoryError(error)}`);
     }
   }
-  recordProviderHealth("history_single", false, errors.join(" | ") || "no_history");
-  return fallbackHistory;
+  const errorSummary = diagnostics.errors.join(" | ") || "no_history";
+  recordProviderHealth("history_single", false, errorSummary);
+  return finish(fallbackHistory, fallbackHistory.length ? "cache_perime" : "aucune_source_disponible");
 }
 
 async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
@@ -7038,6 +7124,7 @@ async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
       preferDeriv: options.preferDeriv === true,
       requireExactTimeframe: options.requireExactTimeframe === true,
       requireOpen: options.requireOpen === true,
+      allowHistoricalWithoutLive: options.allowHistoricalWithoutLive === true,
       historyBudgetMs: options.historyBudgetMs || 4500,
     });
     const snapshot = buildTechnicalSnapshot(symbol, history, livePrice, {
@@ -7156,7 +7243,7 @@ async function fetchTwelveDataHistory(symbol, interval) {
     const api = new URL("https://api.twelvedata.com/time_series");
     api.searchParams.set("symbol", symbol);
     api.searchParams.set("interval", interval);
-    api.searchParams.set("outputsize", "80");
+    api.searchParams.set("outputsize", String(HISTORY_CANDLE_LIMIT));
     api.searchParams.set("apikey", key);
     const data = await fetchJson(api);
     if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
@@ -7188,7 +7275,7 @@ async function fetchBinanceHistory(symbol, interval) {
   const api = new URL("https://api.binance.com/api/v3/klines");
   api.searchParams.set("symbol", binanceSymbol);
   api.searchParams.set("interval", binanceInterval);
-  api.searchParams.set("limit", "80");
+  api.searchParams.set("limit", String(HISTORY_CANDLE_LIMIT));
   const data = await fetchJson(api);
   if (!Array.isArray(data)) throw new Error("invalid_history");
   return data.map((bar) => ({
@@ -7223,7 +7310,7 @@ async function fetchMassiveHistory(symbol, interval) {
       low: Number(bar.l),
       volume: Number(bar.v),
       datetime: bar.t ? new Date(bar.t).toISOString() : null,
-    })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low)).slice(-80);
+    })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low)).slice(-HISTORY_CANDLE_LIMIT);
   });
 }
 
@@ -7244,7 +7331,7 @@ async function fetchStooqHistory(symbol, interval) {
     datetime: `${row.Date || row.date || ""} ${row.Time || row.time || ""}`.trim(),
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
   if (!bars.length) throw new Error("invalid_history");
-  return bars.slice(-80);
+  return bars.slice(-HISTORY_CANDLE_LIMIT);
 }
 
 async function fetchYahooHistory(symbol, interval) {
@@ -7263,7 +7350,7 @@ async function fetchYahooHistory(symbol, interval) {
     datetime: new Date(ts * 1000).toISOString(),
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
   if (!bars.length) throw new Error("invalid_history");
-  return bars.slice(-80);
+  return bars.slice(-HISTORY_CANDLE_LIMIT);
 }
 
 async function fetchDukascopyHistory(symbol) {
@@ -7282,7 +7369,7 @@ async function fetchDukascopyHistory(symbol) {
     datetime: row.Date || row.date,
   })).filter((bar) => Number.isFinite(bar.close) && Number.isFinite(bar.high) && Number.isFinite(bar.low));
   if (!bars.length) throw new Error("invalid_history");
-  return bars.slice(-80);
+  return bars.slice(-HISTORY_CANDLE_LIMIT);
 }
 
 function historyIntervals(symbol, options = {}) {
@@ -9669,6 +9756,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       source: meta.source || livePrice?.source || "aucun historique",
       stale: Boolean(meta.stale || livePrice?.stale),
       historyFresh: false,
+      historyDiagnostics: meta.diagnostics || null,
       livePriceUsable,
       valid: false,
       marketRegime: "unknown",
@@ -9723,6 +9811,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     stale: Boolean(meta.stale || livePrice?.stale || !compatible),
     historyFresh,
     historyAgeMinutes: Number.isFinite(lastClosedAgeMs) ? Number((lastClosedAgeMs / 60_000).toFixed(1)) : null,
+    historyDiagnostics: meta.diagnostics || null,
     livePriceUsable,
     timeframeCompatible: compatible,
     timeframe,
@@ -11481,7 +11570,7 @@ async function saveMarketCache(cache, { force = false } = {}) {
       source: history.source,
       timeframe: history.timeframe || null,
       asOf: history.asOf,
-      bars: Array.isArray(history.bars) ? history.bars.slice(-80) : [],
+      bars: Array.isArray(history.bars) ? history.bars.slice(-HISTORY_CACHE_MAX_BARS) : [],
     }])),
     historyVariants: Object.fromEntries(Object.entries(mergedHistoryVariants).map(([variant, histories]) => [
       variant,
@@ -11489,14 +11578,14 @@ async function saveMarketCache(cache, { force = false } = {}) {
         source: history.source,
         timeframe: history.timeframe || null,
         asOf: history.asOf,
-        bars: Array.isArray(history.bars) ? history.bars.slice(-80) : [],
+        bars: Array.isArray(history.bars) ? history.bars.slice(-HISTORY_CACHE_MAX_BARS) : [],
       }])),
     ])),
     updatedAt: new Date().toISOString(),
   };
   memoryCache.marketDocument = trimmed;
   if (!force && Date.now() - memoryCache.marketCachePersistedAt < MARKET_CACHE_PERSIST_INTERVAL_MS) return trimmed;
-  if (await saveStateDocument("market-cache", trimmed)) {
+  if (await promiseWithTimeout(saveStateDocument("market-cache", trimmed).catch(() => false), 700, false)) {
     memoryCache.marketCachePersistedAt = Date.now();
     return trimmed;
   }
@@ -11561,7 +11650,7 @@ function mergeCachedHistories(existing, histories, options = {}) {
         // indicator derived from it (SMA/RSI/support-resistance) kept reporting as
         // current. Preserve the bars' own asOf when they carry one.
         asOf: bars._meta?.asOf || new Date().toISOString(),
-        bars: bars.slice(-80),
+        bars: bars.slice(-HISTORY_CACHE_MAX_BARS),
       };
     }
   }
