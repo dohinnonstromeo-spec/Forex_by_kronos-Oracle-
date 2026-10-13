@@ -10465,6 +10465,7 @@ function buildNoSignalDiagnostic(details = {}) {
   const validation = details.validation || {};
   const quality = meta.imageQuality || {};
   const technical = meta.technicalSnapshot || {};
+  const marketOutlook = meta.marketOutlook || null;
   const levelCheck = meta.levelCheck || {};
   const explanation = `${details.explanation || ""} ${validation.reason || ""} ${levelCheck.reason || ""}`.toLowerCase();
 
@@ -10548,7 +10549,29 @@ function buildNoSignalDiagnostic(details = {}) {
     };
   }
 
-  if (technical.valid === false || /historique insuffisant|donnée non fiable|fallback|indisponible/.test(explanation)) {
+  // A completed OHLC read is still useful when the market is neutral or the
+  // current candle has not confirmed an entry. `technical.valid` also includes
+  // trend/confluence checks, so treating every false value as bad data hid a
+  // valid market read behind the misleading "Données marché faibles" label.
+  if (marketOutlook?.status === "context_only" && !quality.images) {
+    const bars = Math.max(0, Number(marketOutlook.bars) || Number(technical.bars) || 0);
+    return {
+      status: "OHLC_CONTEXT_READY",
+      statusLabel: "Lecture OHLC réalisée · entrée non confirmée",
+      userMessage: `Kronos a lu ${bars} bougies ${marketOutlook.timeframe || meta.timeframe || ""} (${technical.source || meta.historySource || "source inconnue"}). ${marketOutlook.bias || "Le biais reste indéterminé."} Aucun déclencheur de scalping n'est validé maintenant; aucun niveau d'ordre n'est publié.`,
+      nextActions: [
+        marketOutlook.trigger || "Attendre une clôture confirmée puis un retest/rejet.",
+        marketOutlook.invalidation || "Réévaluer le scénario après une clôture qui invalide la structure.",
+        "Relancer l'analyse après la clôture d'une nouvelle bougie sur le même timeframe.",
+      ],
+    };
+  }
+
+  const historyInsufficient = Number(technical.bars || 0) < 30
+    || technical.stale === true
+    || technical.historyFresh === false
+    || technical.timeframeCompatible === false;
+  if (historyInsufficient || /historique insuffisant|donnée non fiable|historique non aligné/.test(explanation)) {
     return {
       status: "DONNEES_FAIBLES",
       statusLabel: "Données marché faibles",
@@ -10570,6 +10593,23 @@ function buildNoSignalDiagnostic(details = {}) {
         "Attendre une cassure, un retest ou un rejet clair.",
         "Surveiller les zones support/résistance indiquées dans l'analyse.",
         "Relancer après une nouvelle bougie ou sur un timeframe supérieur.",
+      ],
+    };
+  }
+
+  // A healthy, fresh OHLC series with no confirmed direction is a setup
+  // decision, not a data outage. Keep chartless reads useful for other styles too.
+  if (!quality.images && Number(technical.bars || 0) >= 30
+    && technical.stale !== true && technical.historyFresh !== false
+    && technical.timeframeCompatible !== false) {
+    return {
+      status: "SETUP_NON_CONFIRME",
+      statusLabel: "Données lues · setup non confirmé",
+      userMessage: `Les ${technical.bars} bougies ${meta.timeframe || ""} sont disponibles, mais elles ne valident pas encore une entrée selon le style ${meta.style || "sélectionné"}. Aucun SL/TP n'est inventé.`,
+      nextActions: [
+        "Attendre la clôture d'une bougie qui confirme le scénario, puis son retest si nécessaire.",
+        "Consulter la tendance, les niveaux calculés et la structure OHLC affichés dans cette analyse.",
+        "Relancer l'analyse après une nouvelle clôture, sans changer de paire ni de timeframe.",
       ],
     };
   }
