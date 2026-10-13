@@ -578,6 +578,7 @@
           </div>
         </div>
         <p class="no-signal-message">${escapeHtml(message)}</p>
+        ${renderNoSignalAnalysis(result)}
         ${renderTargetProfileSummary(result)}
         ${renderPriceFreshness(result)}
         ${renderPriceActionResearch(result)}
@@ -617,6 +618,48 @@
         ${renderAdvancedDisclosure(result)}
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>
+    `;
+  }
+
+  function renderNoSignalAnalysis(result) {
+    const meta = result.meta || {};
+    const technical = meta.technicalSnapshot || {};
+    const narrative = String(result.explanation || "").trim();
+    const pair = String(meta.pair || "Marché");
+    const timeframe = String(meta.timeframe || "");
+    const hasImages = Number(meta.imageQuality?.images || 0) > 0;
+    const facts = [
+      ["Prix observé", meta.livePrice],
+      ["Tendance", technical.trend],
+      ["RSI", technical.rsi],
+      ["ATR", technical.atr],
+      ["Support calculé", technical.support],
+      ["Résistance calculée", technical.resistance],
+    ].filter(([, value]) => (
+      (value != null && value !== "" && Number.isFinite(Number(value)))
+      || (typeof value === "string" && Boolean(value.trim()))
+    ));
+    const hasTechnicalRead = Boolean(technical.priceActionRead?.summary || technical.text || facts.length);
+    if (!narrative && !hasTechnicalRead) return "";
+    const formatValue = (value) => {
+      if (value == null || value === "") return "—";
+      if (!Number.isFinite(Number(value))) return String(value);
+      return Number(value).toFixed(levelPrecision(pair, Number(value)));
+    };
+    const factMarkup = facts.map(([label, value]) => `
+      <div><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatValue(value))}</strong></div>
+    `).join("");
+    const reading = technical.priceActionRead?.summary || technical.text || "";
+    return `
+      <section class="no-signal-analysis" aria-label="Analyse du marché sans capture">
+        <div class="no-signal-analysis-head">
+          <strong>${hasImages ? "Lecture Kronos" : "Lecture OHLC sans capture"} · ${escapeHtml(pair)}${timeframe ? ` · ${escapeHtml(timeframe)}` : ""}</strong>
+          <small>${Number(technical.bars || 0)} bougies · ${escapeHtml(technical.source || meta.historySource || "source indisponible")}</small>
+        </div>
+        ${factMarkup ? `<div class="no-signal-analysis-facts">${factMarkup}</div>` : ""}
+        ${reading ? `<p class="no-signal-analysis-reading"><strong>Structure lue :</strong> ${escapeHtml(reading)}</p>` : ""}
+        ${narrative ? `<details class="no-signal-analysis-details" open><summary>Raisonnement et données utilisées</summary><p>${escapeHtml(narrative)}</p></details>` : ""}
+      </section>
     `;
   }
 
