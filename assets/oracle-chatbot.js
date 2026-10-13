@@ -160,7 +160,7 @@
     return `<div class="oracle-meta">
       <span class="oracle-tech">${escapeHtml(meta.technique || "Price Action")}</span>
       <div class="oracle-score"><span class="score-fill ${color}" style="width:${Math.max(0, Math.min(100, score))}%"></span></div>
-      <small>Score confiance: ${score || "—"}/100</small>
+      <small>Indice interne de cohérence: ${score || "—"}/100 · pas une probabilité de gain</small>
     </div>`;
   }
 

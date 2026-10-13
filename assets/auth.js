@@ -1596,7 +1596,7 @@
     outside_user_trading_hours: "Hors de tes horaires de trading personnalisés",
     outside_user_trading_days: "Aujourd'hui n'est pas un de tes jours de trading personnalisés",
     no_approved_pairs: "Aucune paire approuvée sur ce compte",
-    no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil de confiance ou de R:R requis",
+    no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le score Kronos minimal ou le R:R requis",
     daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte -- reprend demain",
     daily_loss_limit_amount_reached: "Limite de perte quotidienne ($) atteinte -- reprend demain",
     weekly_loss_limit_percent_reached: "Limite de perte hebdomadaire (%) atteinte -- reprend lundi",
@@ -1671,7 +1671,7 @@
       if (detail.rejected) parts.push(String(detail.rejected) + " rejet\u00e9(s) par le broker");
       if (detail.pyramidingDisabled) parts.push(String(detail.pyramidingDisabled) + " entr\u00e9e(s) ignor\u00e9e(s) : paire d\u00e9j\u00e0 ouverte");
     } else if (reason === "no_signal_meets_confidence_or_rr") {
-      if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
+      if (detail.minConfidence != null) parts.push(`score Kronos minimal ${detail.minConfidence}/100`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
       if (detail.approvedPairs?.length) parts.push(`paires : ${detail.approvedPairs.join(", ")}`);
     } else if (reason === "max_concurrent_positions_reached") {
@@ -1861,7 +1861,7 @@
       // des pertes et des profits"), not the R×risk% estimate alone anymore.
       ["Gains du jour", `${slotStatus.dailyPnlAmount >= 0 ? "+" : ""}${slotStatus.dailyPnlAmount.toFixed(2)} (${slotStatus.dailyPnlPercent >= 0 ? "+" : ""}${slotStatus.dailyPnlPercent}%)`],
       ["Limite de perte/jour", `${status.dailyLossLimitPercent ?? "—"}%`],
-      ["Seuil de confiance", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}%`],
+      ["Score Kronos minimal", `${Math.max(status.minConfidenceFloor || 0, status.userMinConfidence || 0)}/100`],
       ["Dernière évaluation", autoTradeTickSummary(slotStatus.lastTick)],
       ["État actuel", autoTradeLeaseSummary(slotStatus.executionLease)],
     ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");

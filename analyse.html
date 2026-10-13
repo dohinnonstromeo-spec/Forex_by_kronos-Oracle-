@@ -12,7 +12,7 @@
   <meta name="description" content="Console Kronos pour analyser jusqu'à 2 screenshots de charts Forex avec Groq Vision, Gemini en secours et les données marché." data-cms="analyse.seo.description">
   <link rel="canonical" href="https://forex-by-kronos-oracle.onrender.com/analyse.html">
   <meta property="og:title" content="Analyse IA · Oracle Forex" data-cms="analyse.seo.og_title">
-  <meta property="og:description" content="Analysez vos graphes Forex avec Kronos : score de confiance, plan de risque et niveaux d'entrée/sortie." data-cms="analyse.seo.description">
+  <meta property="og:description" content="Analysez vos graphes Forex avec Kronos : indice de qualité interne, plan de risque et niveaux d'entrée/sortie." data-cms="analyse.seo.description">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://forex-by-kronos-oracle.onrender.com/analyse.html">
   <meta property="og:image" content="https://forex-by-kronos-oracle.onrender.com/assets/og-image.png">
@@ -20,7 +20,7 @@
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Analyse IA · Oracle Forex" data-cms="analyse.seo.og_title">
-  <meta name="twitter:description" content="Analysez vos graphes Forex avec Kronos : score de confiance, plan de risque et niveaux d'entrée/sortie." data-cms="analyse.seo.description">
+  <meta name="twitter:description" content="Analysez vos graphes Forex avec Kronos : indice de qualité interne, plan de risque et niveaux d'entrée/sortie." data-cms="analyse.seo.description">
   <meta name="twitter:image" content="https://forex-by-kronos-oracle.onrender.com/assets/og-image.png">
   <link rel="stylesheet" href="/assets/styles-nTlncI0E.css">
   <link rel="stylesheet" href="/assets/oracle-extras.css">
@@ -57,7 +57,7 @@
         <div><strong>2</strong><span>graphes max</span></div>
         <div><strong>8</strong><span>styles IA</span></div>
         <div><strong>5</strong><span>stratégies</span></div>
-        <div><strong>Live</strong><span>TradingView + APIs</span></div>
+        <div><strong>OHLC</strong><span>Flux de données API</span></div>
       </div>
       <div class="analysis-hero-rail" aria-label="Étapes d'une analyse Kronos">
         <div>
@@ -106,9 +106,9 @@
               id="tradingViewFrame"
               title="Graphique TradingView"
               loading="lazy"
-              src="https://s.tradingview.com/widgetembed/?symbol=FX%3AEURUSD&interval=60&theme=dark&style=1&locale=fr&timezone=Africa%2FPorto-Novo&withdateranges=1&hide_side_toolbar=0&allow_symbol_change=1&save_image=0&studies=%5B%5D"
+              src="https://s.tradingview.com/widgetembed/?symbol=FX%3AEURUSD&interval=60&theme=dark&style=1&locale=fr&timezone=Africa%2FPorto-Novo&withdateranges=1&hide_side_toolbar=0&allow_symbol_change=0&save_image=0&studies=%5B%5D"
             ></iframe>
-            <p class="tv-chart-note" data-cms="analyse.tvchart.note">TradingView sert à visualiser le chart. Les signaux restent basés sur les APIs de données et l'analyse IA.</p>
+            <p class="tv-chart-note" data-cms="analyse.tvchart.note">TradingView sert à visualiser le chart et suit la paire choisie dans le formulaire. Son fournisseur peut différer du flux OHLC analysé par Kronos; l'iframe n'est pas lue par le moteur.</p>
           </section>
 
           <div class="analysis-form-grid">
@@ -169,9 +169,10 @@
             <div class="analysis-field">
               <label for="style">Style d'analyse</label>
               <select id="style" name="style">
-                <option selected>Mixte</option><option>Hybride SMC+Chartiste</option><option>ICT</option><option>SMC</option><option>Wyckoff</option>
-                <option>Elliott</option><option>Price Action</option><option>Ichimoku</option>
+                <option selected>Price Action</option><option>Mixte</option><option>Hybride SMC+Chartiste</option><option>ICT</option><option>SMC</option><option>Wyckoff</option>
+                <option>Elliott</option><option>Ichimoku</option>
               </select>
+              <p id="styleModeHint" class="mt-1 text-xs text-muted-foreground" aria-live="polite">Price Action reste le choix par defaut. SMC est un diagnostic experimental calcule sur les bougies OHLC cloturees.</p>
             </div>
             <div class="analysis-field">
               <label for="strategy">Stratégie</label>
@@ -192,6 +193,14 @@
                 <option>Agressif 3%</option>
               </select>
             </div>
+            <div class="analysis-field analysis-field-wide">
+              <label for="targetProfile">Profil de sortie SL/TP</label>
+              <select id="targetProfile" name="targetProfile">
+                <option value="prudent" selected>Prudent (actuel) — TP1 proche, TP2 modéré</option>
+                <option value="mdt_extended">Objectifs étendus — profil inspiré des captures (expérimental)</option>
+              </select>
+              <p class="mt-1 text-xs text-muted-foreground">Le mode prudent reste le défaut. Le profil étendu conserve le SL structurel; il vise TP1 à 0,67R puis TP2 à 2R (achat) ou 2,67R (vente), avec 50 % pris à TP1 et le reste protégé à BE. Ces ratios ne garantissent pas que la cible sera atteinte.</p>
+            </div>
             <div class="analysis-field">
               <label for="capital">Capital disponible</label>
               <input id="capital" name="capital" type="number" min="0" step="1" placeholder="Ex: 50">
@@ -211,8 +220,9 @@
           </label>
           <label class="kronos-engine-badge mt-3 analysis-live-toggle">
             <input id="includeNewsContext" name="includeNewsContext" type="checkbox" checked>
-            <span data-cms="analyse.checkbox.news">Croiser l'analyse avec prix live, calendrier économique et news API</span>
+            <span data-cms="analyse.checkbox.news">Inclure le calendrier économique et les news API (mode Profonde)</span>
           </label>
+          <p id="newsDepthHint" class="mt-1 text-xs text-muted-foreground" aria-live="polite"></p>
           <div id="chartDetectionPanel" class="market-notice"></div>
 
           <button class="analysis-submit mt-6 icon-prefix" type="submit"><span data-icon="zap"></span><span data-cms="analyse.submit_button">Lancer l'analyse Kronos</span></button>

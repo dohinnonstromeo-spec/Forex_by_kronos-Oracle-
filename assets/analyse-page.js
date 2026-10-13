@@ -4,16 +4,22 @@
   let images = [];
   let activeFilter = "Tous";
   let detectedContext = null;
+  let pendingDetectedContext = null;
+  let chartDetectionVersion = 0;
 
   document.addEventListener("DOMContentLoaded", () => {
     setupUpload();
     setupAnalyzeForm();
+    setupAnalysisDepthHints();
+    setupAnalysisStyleHints();
     setupTradingView();
     setupQuickPairControls();
     setupTimeframeControls();
     setupTabs();
     document.querySelector("#autoDetectChart")?.addEventListener("change", () => {
+      chartDetectionVersion += 1;
       detectedContext = null;
+      pendingDetectedContext = null;
       const panel = document.querySelector("#chartDetectionPanel");
       if (panel) panel.textContent = "";
       if (isAutoDetectEnabled()) detectChartContext();
@@ -87,7 +93,9 @@
       const remove = event.target.closest("[data-remove-image]");
       if (!remove) return;
       images.splice(Number(remove.dataset.removeImage), 1);
+      chartDetectionVersion += 1;
       detectedContext = null;
+      pendingDetectedContext = null;
       renderPreviews(previews);
       maybeDetectChartContext();
     });
@@ -115,8 +123,12 @@
       const deep = body.analysisDepth !== "Rapide";
       setSubmitLabel(submit, deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...");
       body.images = images;
-      body.autoDetect = isAutoDetectEnabled();
-      body.detectedContext = isAutoDetectEnabled() ? detectedContext : null;
+      body.autoDetect = isAutoDetectEnabled() && Boolean(detectedContext);
+      body.detectedContext = body.autoDetect ? detectedContext : null;
+      if (isAutoDetectEnabled() && images.length && !detectedContext) {
+        const panel = document.querySelector("#chartDetectionPanel");
+        if (panel) panel.innerHTML = `<span class="oracle-chat-dot closed"></span> Détection non confirmée : la paire et l'unité de temps du formulaire seront utilisées.`;
+      }
       const response = await postJson("/api/analyze-chart", body, deep ? 120000 : 45000);
       finishAnalysisProgress(progress, Boolean(response));
       renderAnalysisResult(result, response);
@@ -149,6 +161,38 @@
     const update = () => updateTradingViewFrame(pair?.value, timeframe?.value);
     pair?.addEventListener("change", update);
     timeframe?.addEventListener("change", update);
+    update();
+  }
+
+  function setupAnalysisDepthHints() {
+    const depth = document.querySelector("#analysisDepth");
+    const news = document.querySelector("#includeNewsContext");
+    const hint = document.querySelector("#newsDepthHint");
+    if (!hint) return;
+    const update = () => {
+      if (depth?.value === "Rapide") {
+        hint.textContent = "Mode rapide : l'analyse SMC/Price Action utilise les bougies disponibles; news et calendrier ne sont croises qu'en mode Profonde.";
+      } else if (news?.checked) {
+        hint.textContent = "Mode Profonde : Kronos ajoute le calendrier et les actualites au contexte de marche.";
+      } else {
+        hint.textContent = "Mode Profonde actif; le croisement news/calendrier est desactive.";
+      }
+    };
+    depth?.addEventListener("change", update);
+    news?.addEventListener("change", update);
+    update();
+  }
+
+  function setupAnalysisStyleHints() {
+    const style = document.querySelector("#style");
+    const hint = document.querySelector("#styleModeHint");
+    if (!style || !hint) return;
+    const update = () => {
+      hint.textContent = style.value === "SMC"
+        ? "SMC experimental : sweep, biais MTF, cassure, FVG/OB puis retest sur bougies cloturees. Diagnostic uniquement, aucun signal copiable."
+        : "Price Action reste le choix par defaut. SMC est un diagnostic experimental calcule sur les bougies OHLC cloturees.";
+    };
+    style.addEventListener("change", update);
     update();
   }
 
@@ -207,7 +251,7 @@
       timezone: "Africa/Porto-Novo",
       withdateranges: "1",
       hide_side_toolbar: "0",
-      allow_symbol_change: "1",
+      allow_symbol_change: "0",
       save_image: "0",
       studies: "[]",
     });
@@ -251,12 +295,13 @@
     const label = node.querySelector("[data-progress-label]");
     const fill = node.querySelector("[data-progress-fill]");
     const step = node.querySelector("[data-progress-step]");
+    const deep = form.querySelector("#analysisDepth")?.value !== "Rapide";
     const steps = [
       "Lecture des images et paramètres...",
       "Vérification paire, timeframe et prix live...",
-      "Croisement news/API et contexte macro...",
-      "Comparaison ICT, SMC, Wyckoff, Elliott, Price Action et Ichimoku...",
-      "Calcul SL/TP et score d'efficacité...",
+      deep ? "Croisement news, calendrier et données de marché..." : "Contrôle du flux prix/bougies...",
+      "Application du style choisi, vérification des niveaux et du risque...",
+      "Vérification des niveaux et calcul de l'indice interne...",
       "Relecture de cohérence avant affichage...",
     ];
     let value = 1;
@@ -289,7 +334,9 @@
   }
 
   async function detectChartContext() {
+    const requestVersion = ++chartDetectionVersion;
     detectedContext = null;
+    pendingDetectedContext = null;
     const panel = document.querySelector("#chartDetectionPanel");
     if (!isAutoDetectEnabled() || !images.length || !panel) {
       if (panel) panel.textContent = "";
@@ -297,23 +344,25 @@
     }
     panel.innerHTML = `<span class="oracle-chat-dot"></span> Lecture paire/timeframes par IA vision...`;
     const data = await postJson("/api/detect-chart-context", { images });
+    if (requestVersion !== chartDetectionVersion) return;
     if (!data?.ok) {
       panel.innerHTML = `<span class="oracle-chat-dot closed"></span> Détection indisponible. Sélection manuelle conservée.`;
       return;
     }
-    detectedContext = data;
+    pendingDetectedContext = data;
     const pair = data.primaryPair;
     const timeframe = data.executionTimeframe || data.timeframes?.[0];
-    if (pair) setSelectValue("pair", pair);
-    if (timeframe) setSelectValue("timeframe", timeframe);
     panel.innerHTML = `
       <span class="oracle-chat-dot"></span>
-      Détection proposée: <strong>${escapeHtml(pair || "paire inconnue")}</strong> ·
+      Contexte détecté — vérifie avant utilisation : <strong>${escapeHtml(pair || "paire inconnue")}</strong> ·
       timeframes ${escapeHtml((data.timeframes || []).join(" / ") || "inconnus")} ·
       exécution ${escapeHtml(timeframe || "à confirmer")}
-      <button class="ml-2 rounded border border-amber-neon/40 px-2 py-1 text-[10px] uppercase text-amber-neon" type="button" data-confirm-detection>Confirmer</button>
+      <button class="ml-2 rounded border border-amber-neon/40 px-2 py-1 text-[10px] uppercase text-amber-neon" type="button" data-confirm-detection>Utiliser ce contexte</button>
     `;
     panel.querySelector("[data-confirm-detection]")?.addEventListener("click", () => {
+      detectedContext = pendingDetectedContext;
+      if (pair) setSelectValue("pair", pair);
+      if (timeframe) setSelectValue("timeframe", timeframe);
       panel.innerHTML = `<span class="oracle-chat-dot"></span> Contexte confirmé: ${escapeHtml(pair || "manuel")} · ${escapeHtml(timeframe || "manuel")}`;
     });
   }
@@ -456,21 +505,26 @@
             <div class="direction-label ${buy ? "buy" : "sell"}">${result.direction} ${icon(buy ? "arrowUp" : "arrowDown")}</div>
           </div>
           <div class="result-confidence">
-            <strong>${result.score}%</strong>
-            <span>Score d'efficacité</span>
+            <strong>${result.score}/100</strong>
+            <span>Indice de qualité interne</span>
           </div>
         </div>
+        ${renderTargetProfileSummary(result)}
         <div class="levels-table result-level-grid">
-          ${renderCopyValue("Entrée", result.entry, "entry")}
+          ${renderCopyValue("Zone d'entrée indicative", getEntryZone(result)?.range || result.entry, "entry", getEntryZoneNote(result))}
           ${renderCopyValue("Stop Loss", result.sl, "sl")}
           ${renderCopyValue("Take Profit 1", result.tp1, "tp")}
           ${renderCopyValue("Take Profit 2", result.tp2, "tp")}
-          ${renderCopyValue("R/R ratio", result.rr, "rr")}
+          ${renderCopyValue(result.meta?.targetProfile === "mdt_extended" ? "R/R TP1 · TP2" : "R/R ratio",
+            result.meta?.targetProfile === "mdt_extended" && Number.isFinite(Number(result.meta?.tp2R))
+              ? `${result.rr} / 1:${Number(result.meta.tp2R).toFixed(2)}` : result.rr, "rr")}
           <div class="level-card tech"><span>Technique</span><strong>${escapeHtml(result.technique)}</strong></div>
         </div>
         ${renderPriceFreshness(result)}
+        ${renderSmcAnalysis(result)}
+        ${renderMarketChart(result)}
         <div class="score-line">
-          <div class="signal-bottom"><span>Score d'efficacité</span><strong>${result.score}%</strong></div>
+          <div class="signal-bottom"><span>Qualité interne · pas un taux de réussite</span><strong>${result.score}/100</strong></div>
           <div class="oracle-score"><span class="score-fill ${scoreColor(result.score)}" style="width:${result.score}%"></span></div>
         </div>
         ${renderDangerScore(result)}
@@ -507,24 +561,31 @@
   function renderNoSignalResult(result) {
     const score = Math.max(0, Math.min(100, Number(result.score || 0)));
     const diagnostic = result.diagnostic || {};
+    const smc = result.meta?.smcAnalysis || null;
     const label = result.statusLabel || diagnostic.statusLabel || "Setup non confirmé";
     const message = result.userMessage || diagnostic.userMessage || "Kronos bloque le trade pour éviter un signal forcé.";
     const actions = Array.isArray(result.nextActions) ? result.nextActions : diagnostic.nextActions || [];
     return `
-      <div class="analysis-card no-signal-card">
+        <div class="analysis-card no-signal-card${smc ? " smc-no-signal-card" : ""}">
         <div class="no-signal-hero">
           <div>
             <p class="analysis-kicker">Diagnostic Kronos</p>
             <div class="direction-label no-signal-title">⏸ ${escapeHtml(label)}</div>
           </div>
           <div class="result-confidence no-signal-confidence">
-            <strong>${score}%</strong>
-            <span>Validité</span>
+            <strong>${score}/100</strong>
+            <span>Qualité du filtre</span>
           </div>
         </div>
         <p class="no-signal-message">${escapeHtml(message)}</p>
+        ${renderTargetProfileSummary(result)}
+        ${renderPriceFreshness(result)}
+        ${renderPriceActionResearch(result)}
+        ${renderSmcAnalysis(result)}
+        ${smc ? `<div class="smc-readiness-mini">Ce mode ne donne pas de probabilite de reussite. Les etapes sont un diagnostic, pas une probabilite.</div>` : ""}
+        ${renderMarketChart(result)}
         <div class="score-line">
-          <div class="signal-bottom"><span>Confiance exploitable</span><strong>${score}%</strong></div>
+          <div class="signal-bottom"><span>Indice interne · pas une probabilité</span><strong>${score}/100</strong></div>
           <div class="oracle-score"><span class="score-fill ${scoreColor(score)}" style="width:${score}%"></span></div>
         </div>
         ${renderDangerScore(result)}
@@ -556,6 +617,111 @@
         ${renderAdvancedDisclosure(result)}
         <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
       </div>
+    `;
+  }
+
+  function renderTargetProfileSummary(result) {
+    const extended = result.meta?.targetProfile === "mdt_extended";
+    const label = result.meta?.targetProfileLabel || (extended ? "Objectifs étendus (expérimental)" : "Prudent (profil actuel)");
+    const tp1R = Number(result.meta?.tp1R);
+    const tp2R = Number(result.meta?.tp2R);
+    const details = extended
+      ? `TP1 ${Number.isFinite(tp1R) ? tp1R.toFixed(2) : "0.67"}R · TP2 ${Number.isFinite(tp2R) ? `${tp2R.toFixed(2)}R` : "2.00R achat / 2.67R vente"} · 50 % à TP1 puis BE`
+      : "Le profil prudent existant reste actif par défaut.";
+    return `<div class="target-profile-summary${extended ? " extended" : ""}"><span>Profil de sortie</span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(details)}</small></div>`;
+  }
+
+  function renderSmcAnalysis(result) {
+    const smc = result.meta?.smcAnalysis;
+    if (!smc) return "";
+    const pair = String(result.meta?.pair || "");
+    const formatPrice = (value) => {
+      if (value == null || value === "") return "indisponible";
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(levelPrecision(pair, number)) : "indisponible";
+    };
+    const statusClass = (status) => status === "confirme" ? "confirmed" : status === "attente" ? "waiting" : "blocked";
+    const stages = Array.isArray(smc.stages) ? smc.stages.map((stage) => `
+      <li class="smc-stage ${statusClass(stage.status)}">
+        <span class="smc-stage-state">${stage.status === "confirme" ? "OK" : stage.status === "attente" ? "..." : "--"}</span>
+        <span><strong>${escapeHtml(stage.label || "Etape")}</strong><small>${escapeHtml(stage.detail || "")}</small></span>
+      </li>
+    `).join("") : "";
+    const zones = Array.isArray(smc.zones) ? smc.zones : [];
+    const zoneMarkup = zones.length ? zones.map((zone) => `
+      <div class="smc-zone-card ${String(zone.type || "").toLowerCase()}">
+        <strong>${escapeHtml(zone.type || "Zone")} - ${zone.direction === 1 ? "ACHAT" : zone.direction === -1 ? "VENTE" : escapeHtml(zone.direction || "")}</strong>
+        <span>${formatPrice(zone.low)} - ${formatPrice(zone.high)} - ${escapeHtml(zone.timeframe || smc.setupTimeframe || "")}</span>
+        <small>${escapeHtml(zone.lifecycle || "repere de contexte")}</small>
+      </div>
+    `).join("") : `<p class="smc-empty">Aucune zone FVG, OB ou OTE exploitable dans les bougies confirmees.</p>`;
+    const liquidity = smc.liquidity
+      ? `<div class="smc-fact"><span>Liquidite observee</span><strong>Haut ${formatPrice(smc.liquidity.high)} - Bas ${formatPrice(smc.liquidity.low)}</strong><small>${escapeHtml(smc.liquidity.source || "extremes OHLC")}</small></div>`
+      : "";
+    const candidate = smc.candidateLevels ? `
+      <div class="smc-candidate-levels">
+        <strong>Niveaux indicatifs - aucun signal copiable</strong>
+        <span>${escapeHtml(smc.candidateLevels.direction)} - entree ${formatPrice(smc.candidateLevels.entry)} - invalidation ${formatPrice(smc.candidateLevels.sl)} - cible 1.5R ${formatPrice(smc.candidateLevels.tp)}</span>
+        <small>${escapeHtml(smc.candidateLevels.label || "Aucun ordre ne sera emis depuis cette simulation.")}</small>
+      </div>
+    ` : "";
+    const benchmark = smc.benchmark || {};
+    const benchmarkText = benchmark.strictTrades != null
+      ? `Backtest recherche ${escapeHtml(benchmark.market || "XAU/USD")} (${escapeHtml(benchmark.timeframe || "M5/M15")}, ${escapeHtml(benchmark.sample || "période disponible")}): ${benchmark.strictTrades} trades, ${benchmark.strictWinRatePct}% gagnants, ${Number(benchmark.strictAverageR).toFixed(3)}R/trade, PF ${Number(benchmark.strictProfitFactor).toFixed(3)}, ${benchmark.positiveFolds}/${benchmark.folds} plis positifs.${benchmark.xauTrades != null ? ` XAU/USD seul: ${benchmark.xauTrades} trades, ${Number(benchmark.xauAverageR).toFixed(3)}R/trade, PF ${Number(benchmark.xauProfitFactor).toFixed(3)}.` : ""} ${escapeHtml(benchmark.note || "Résultat de recherche; ce n'est pas une probabilité de réussite.")}`
+      : "Aucun resultat de recherche SMC disponible.";
+    const bars = smc.inputs?.setupBars || 0;
+    const contextBars = smc.inputs?.contextBars || 0;
+    const stale = smc.inputs?.setupStale || smc.inputs?.contextStale;
+    const mismatch = smc.inputs?.sourceAligned === false;
+    return `
+      <section class="smc-analysis-panel" aria-label="Diagnostic SMC Kronos">
+        <div class="smc-panel-heading">
+          <div><span>SMC KRONOS - ${escapeHtml(smc.version || "research")}</span><strong>${escapeHtml(smc.statusLabel || "Diagnostic indisponible")}</strong></div>
+          <b>RECHERCHE</b>
+        </div>
+        <p class="smc-summary">${escapeHtml(smc.summary || "Analyse OHLC indisponible.")}</p>
+        <div class="smc-facts-grid">
+          <div class="smc-fact"><span>Contexte / setup</span><strong>${escapeHtml(smc.contextTimeframe || "-")} / ${escapeHtml(smc.setupTimeframe || "-")}</strong><small>${contextBars} / ${bars} bougies cloturees</small></div>
+          <div class="smc-fact"><span>Biais MTF</span><strong>${escapeHtml(smc.bias?.label || "indisponible")}</strong><small>${escapeHtml(smc.structure?.label || "structure indisponible")}</small></div>
+          ${liquidity}
+          ${smc.activeZone ? `<div class="smc-fact"><span>Zone active</span><strong>${escapeHtml(smc.activeZone.type)} ${formatPrice(smc.activeZone.low)} - ${formatPrice(smc.activeZone.high)}</strong><small>expire dans ${Number(smc.activeZone.expiresInBars || 0)} bougies</small></div>` : ""}
+        </div>
+        ${stages ? `<ol class="smc-stage-list">${stages}</ol>` : ""}
+        <div class="smc-zones-heading">Zones detectees - informationnelles</div>
+        <div class="smc-zone-list">${zoneMarkup}</div>
+        ${candidate}
+        <div class="smc-benchmark">${benchmarkText}</div>
+        <p class="smc-source-note">Sources: ${escapeHtml(smc.inputs?.setupSource || "inconnue")} / ${escapeHtml(smc.inputs?.contextSource || "inconnue")} - ${stale ? "historique differe" : "historique recent"} - ${mismatch ? "fournisseurs differents" : "sources alignees"}. Les bougies non cloturees sont exclues. Les zones ne garantissent pas un rejet et OHLC ne montre pas les ordres institutionnels.</p>
+      </section>
+    `;
+  }
+
+  function renderPriceActionResearch(result) {
+    const research = result.meta?.priceActionAnalysis;
+    if (!research) return "";
+    const pair = String(result.meta?.pair || research.pair || "");
+    const formatPrice = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number.toFixed(levelPrecision(pair, number)) : "indisponible";
+    };
+    const candidates = Array.isArray(research.candidates) ? research.candidates : [];
+    const candidateMarkup = candidates.length ? candidates.map((candidate) => `
+      <div class="pa-research-candidate">
+        <strong>${candidate.setup === "break_retest" ? "Cassure + retest" : "Rejet confirmé"} · ${escapeHtml(candidate.directionLabel || (candidate.direction === 1 ? "ACHAT" : "VENTE"))}</strong>
+        <span>Clôture candidate : ${formatPrice(candidate.entry)}</span>
+        <span>Invalidation théorique : ${formatPrice(candidate.stop)}</span>
+        <span>TP théoriques : ${formatPrice(candidate.tp1)} / ${formatPrice(candidate.tp2)}</span>
+        <small>Coût estimé ${Number(candidate.costR || 0).toFixed(3)}R · niveaux non copiables</small>
+      </div>
+    `).join("") : `<p class="pa-research-empty">Aucun déclencheur sur la dernière bougie clôturée. ${escapeHtml(research.statusLabel || "Attendre le setup complet.")}</p>`;
+    return `
+      <section class="pa-research-panel" aria-label="Diagnostic Price Action OHLC expérimental">
+        <div class="pa-research-heading"><div><span>PRICE ACTION OHLC · ${escapeHtml(research.version || "recherche")}</span><strong>${escapeHtml(research.statusLabel || "Diagnostic")}</strong></div><b>NON EXÉCUTABLE</b></div>
+        <p>${escapeHtml(research.summary || "Le moteur attend des bougies Deriv alignées.")}</p>
+        <small>${escapeHtml(research.timeframe || result.meta?.timeframe || "UT")} · ${Number(research.bars || 0)} bougies clôturées · ${escapeHtml(research.source || "source inconnue")}</small>
+        <div class="pa-research-candidates">${candidateMarkup}</div>
+        <small>${escapeHtml(research.rule || "Cassure clôturée puis retest confirmé.")} Coût testé sans commission connue, avec un tick de slippage par côté. Ces résultats ne valident pas l'exécution.</small>
+      </section>
     `;
   }
 
@@ -600,7 +766,7 @@
     if (!quality) return "";
     const ok = quality.valid;
     const grade = quality.grade ? ` · grade ${quality.grade}` : "";
-    const dataScore = Number.isFinite(Number(quality.dataScore)) ? ` · score data ${quality.dataScore}%` : "";
+    const dataScore = Number.isFinite(Number(quality.dataScore)) ? ` · score data ${quality.dataScore}/100` : "";
     const blockers = Array.isArray(quality.blockers) && quality.blockers.length ? ` · ${quality.blockers.slice(0, 2).join(" · ")}` : "";
     return `<div class="mt-2 text-[10px] uppercase tracking-widest ${ok ? "text-neon-green" : "text-neon-orange"}">
       Qualité: ${ok ? "validée" : "bloquée"}${grade}${dataScore} · ${quality.source || "n/a"} · fiabilité ${quality.reliability || 0}% · ${quality.bars || 0} barres${blockers}
@@ -628,6 +794,94 @@
     `;
   }
 
+  function renderMarketChart(result) {
+    const chart = result.meta?.marketChart;
+    const candles = Array.isArray(chart?.candles) ? chart.candles.filter((bar) =>
+      [bar?.o, bar?.h, bar?.l, bar?.c].every((value) => Number.isFinite(Number(value)))
+    ) : [];
+    if (candles.length < 10) return "";
+
+    const width = 760;
+    const height = 230;
+    const left = 12;
+    const right = 64;
+    const top = 12;
+    const bottom = 18;
+    const plotWidth = width - left - right;
+    const plotHeight = height - top - bottom;
+    const rawMin = Math.min(...candles.map((bar) => Number(bar.l)));
+    const rawMax = Math.max(...candles.map((bar) => Number(bar.h)));
+    const pad = Math.max((rawMax - rawMin) * 0.06, Math.abs(rawMax) * 0.00001, 1e-8);
+    const min = rawMin - pad;
+    const max = rawMax + pad;
+    const span = max - min || 1;
+    const y = (price) => top + ((max - price) / span) * plotHeight;
+    const step = plotWidth / candles.length;
+    const bodyWidth = Math.max(2, Math.min(9, step * 0.66));
+    const guides = [
+      { name: "Résistance", value: chart.resistance, color: "#ff6978", dash: "4 4" },
+      { name: "Support", value: chart.support, color: "#41d99a", dash: "4 4" },
+      { name: "Centre entrée", value: result.entry, color: "#f6c85f", dash: "" },
+      { name: "SL", value: result.sl, color: "#ff5964", dash: "" },
+      { name: "TP1", value: result.tp1, color: "#49d8a0", dash: "" },
+      { name: "TP2", value: result.tp2, color: "#4bb7ff", dash: "" },
+    ].map((item) => ({ ...item, value: Number(item.value) }))
+      .filter((item) => Number.isFinite(item.value) && item.value >= min && item.value <= max);
+    const grid = [0.25, 0.5, 0.75].map((fraction) => {
+      const yy = top + plotHeight * fraction;
+      const value = max - span * fraction;
+      return `<line x1="${left}" y1="${yy.toFixed(2)}" x2="${(width - right).toFixed(2)}" y2="${yy.toFixed(2)}" class="market-chart-grid"/><text x="${width - right + 5}" y="${(yy + 3).toFixed(2)}" class="market-chart-axis">${escapeHtml(value.toPrecision(5))}</text>`;
+    }).join("");
+    const guideSvg = guides.map((item) => {
+      const yy = y(item.value);
+      const dash = item.dash ? ` stroke-dasharray="${item.dash}"` : "";
+      return `<line x1="${left}" y1="${yy.toFixed(2)}" x2="${(width - right).toFixed(2)}" y2="${yy.toFixed(2)}" stroke="${item.color}" stroke-width="1.2"${dash}/><text x="${width - right + 5}" y="${(yy + 3).toFixed(2)}" fill="${item.color}" class="market-chart-axis">${item.name}</text>`;
+    }).join("");
+    const smc = result.meta?.smcAnalysis;
+    const smcZones = smc?.setupTimeframe === chart.timeframe && Array.isArray(smc.zones)
+      ? smc.zones.filter((zone) => Number.isFinite(Number(zone.low)) && Number.isFinite(Number(zone.high))
+        && Number(zone.low) >= min && Number(zone.high) <= max)
+      : [];
+    const smcZoneSvg = smcZones.map((zone) => {
+      const color = zone.type === "FVG" ? "#f6c85f" : zone.type === "OB" ? "#c27aff" : "#49b7ff";
+      const yTop = y(Number(zone.high));
+      const yBottom = y(Number(zone.low));
+      return `<rect x="${left}" y="${yTop.toFixed(2)}" width="${plotWidth.toFixed(2)}" height="${Math.max(2, yBottom - yTop).toFixed(2)}" fill="${color}" fill-opacity=".14" stroke="${color}" stroke-opacity=".7" stroke-dasharray="3 3"><title>${escapeHtml(zone.type)} ${escapeHtml(zone.lifecycle || "zone")}: ${escapeHtml(Number(zone.low).toPrecision(7))} - ${escapeHtml(Number(zone.high).toPrecision(7))}</title></rect>`;
+    }).join("");
+    const smcLiquiditySvg = smc?.setupTimeframe === chart.timeframe && smc.liquidity
+      ? [
+        { label: "Liquidite haute", value: Number(smc.liquidity.high) },
+        { label: "Liquidite basse", value: Number(smc.liquidity.low) },
+      ].filter((item) => Number.isFinite(item.value) && item.value >= min && item.value <= max)
+        .map((item) => `<line x1="${left}" y1="${y(item.value).toFixed(2)}" x2="${(width - right).toFixed(2)}" y2="${y(item.value).toFixed(2)}" stroke="#49b7ff" stroke-width="1" stroke-dasharray="2 4"><title>${item.label}: ${item.value.toPrecision(7)}</title></line>`).join("")
+      : "";
+    const entryZone = getEntryZone(result);
+    const entryZoneSvg = entryZone && entryZone.low >= min && entryZone.high <= max
+      ? `<rect x="${left}" y="${y(entryZone.high).toFixed(2)}" width="${plotWidth.toFixed(2)}" height="${Math.max(2, y(entryZone.low) - y(entryZone.high)).toFixed(2)}" fill="#f6c85f" fill-opacity=".16" stroke="#f6c85f" stroke-opacity=".55" stroke-dasharray="3 3"><title>Zone d'entrée indicative ${escapeHtml(entryZone.range)} · centre ${escapeHtml(entryZone.centerText)}</title></rect>`
+      : "";
+    const barsSvg = candles.map((bar, index) => {
+      const x = left + step * index + step / 2;
+      const open = Number(bar.o);
+      const close = Number(bar.c);
+      const color = close >= open ? "#42d99b" : "#f36b79";
+      const bodyTop = Math.min(y(open), y(close));
+      const bodyHeight = Math.max(1.4, Math.abs(y(close) - y(open)));
+      return `<line x1="${x.toFixed(2)}" y1="${y(Number(bar.h)).toFixed(2)}" x2="${x.toFixed(2)}" y2="${y(Number(bar.l)).toFixed(2)}" stroke="${color}" stroke-width="1"/><rect x="${(x - bodyWidth / 2).toFixed(2)}" y="${bodyTop.toFixed(2)}" width="${bodyWidth.toFixed(2)}" height="${bodyHeight.toFixed(2)}" rx="0.6" fill="${color}"/>`;
+    }).join("");
+    const stale = Boolean(chart.stale);
+    const source = chart.source || "API";
+    const structure = chart.structureLookbackBars ? ` · structure ${chart.structureLookbackBars} bougies` : "";
+    const priceActionSummary = result.meta?.technicalSnapshot?.priceActionRead?.summary;
+    return `<section class="result-market-chart${stale ? " stale" : ""}" aria-label="Mini graphique interne issu des bougies API">
+      <div class="result-market-chart-head"><div><span>GRAPHIQUE KRONOS · OHLC API</span><strong>${escapeHtml(chart.pair || result.meta?.pair || "Paire")} · ${escapeHtml(chart.timeframe || result.meta?.timeframe || "UT")}</strong></div><small>${candles.length} dernières bougies · ${escapeHtml(source)}${stale ? " · historique différé" : ""}</small></div>
+      <div class="result-market-chart-scroll"><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${candles.length} chandeliers OHLC avec niveaux calculés">
+        ${grid}${smcZoneSvg}${smcLiquiditySvg}${entryZoneSvg}${guideSvg}${barsSvg}
+      </svg></div>
+      ${priceActionSummary ? `<p class="result-market-chart-reading"><strong>Lecture OHLC :</strong> ${escapeHtml(priceActionSummary)}</p>` : ""}
+      <p>Ce mini-graphe reprend les bougies OHLC reçues par Kronos; il ne lit pas les pixels de l’iframe TradingView. Les niveaux hors de la fenêtre visible restent dans le plan ci-dessus.${escapeHtml(structure)}</p>
+    </section>`;
+  }
+
   function renderConfluence(result) {
     const text = result.meta?.sections?.confluence;
     if (!text) return "";
@@ -650,10 +904,8 @@
     `;
   }
 
-  // Second, independent opinion from the one part of Kronos with a real, backtested
-  // statistical edge (scripts/backtest.mjs) -- shown so the user can manually weigh
-  // it, never used to auto-override the LLM's read (see server.mjs normalizeAnalysis:
-  // deterministicCrossCheck only ever adds an `agreement` field, it doesn't touch score).
+  // Separate deterministic research signal with historical test stats. It is shown
+  // for comparison and never overrides the image analysis or changes its score.
   function renderDeterministicCrossCheck(result) {
     const check = result.meta?.deterministicCrossCheck;
     if (!check) return "";
@@ -664,21 +916,22 @@
     let cls = "cross-check-neutral";
     let verdict;
     if (!check.active) {
-      verdict = `Pas de signal validé actuellement sur cette paire côté moteur backtesté (${escapeHtml(check.reason || "confluence insuffisante")}).`;
+      verdict = `Pas de signal validé actuellement sur cette paire côté second moteur (${escapeHtml(check.reason || "confluence insuffisante")}).`;
     } else if (check.agreement === "accord") {
       cls = "cross-check-agree";
-      verdict = `D'accord avec Kronos : ${escapeHtml(check.direction)} (confiance moteur ${check.confidence}%).`;
+      verdict = `D'accord avec Kronos : ${escapeHtml(check.direction)} (indice interne du moteur ${check.confidence}/100).`;
     } else if (check.agreement === "desaccord") {
       cls = "cross-check-disagree";
-      verdict = `En désaccord avec Kronos : le moteur backtesté penche pour ${escapeHtml(check.direction)} (confiance ${check.confidence}%).`;
+      verdict = `En désaccord avec Kronos : le moteur de recherche penche pour ${escapeHtml(check.direction)} (indice interne ${check.confidence}/100).`;
     } else {
-      verdict = `Signal actif côté moteur backtesté : ${escapeHtml(check.direction)} (confiance ${check.confidence}%).`;
+      verdict = `Signal actif côté moteur de recherche : ${escapeHtml(check.direction)} (indice interne ${check.confidence}/100).`;
     }
     return `
       <div class="result-cross-check ${cls}">
-        <span>${icon("activity")} Moteur backtesté (edge prouvé)</span>
+        <span>${icon("activity")} Second moteur · validation historique indicative</span>
         <p>${verdict}</p>
         ${statsLine ? `<small>${escapeHtml(statsLine)}</small>` : ""}
+        <small>Ce contrôle est distinct de l'analyse affichée. Une simulation historique ne garantit pas le résultat du prochain trade.</small>
       </div>
     `;
   }
@@ -706,11 +959,20 @@
   // minute and a half ago. Shown inline, next to the levels, not hidden.
   function renderPriceFreshness(result) {
     const asOf = result.meta?.livePriceAsOf;
-    if (!asOf) return "";
-    const seconds = Math.max(0, Math.round((Date.now() - new Date(asOf).getTime()) / 1000));
+    const source = result.meta?.livePriceSource || "source non précisée";
+    const timestamp = asOf ? new Date(asOf).getTime() : NaN;
+    const seconds = Number.isFinite(timestamp) ? Math.max(0, Math.round((Date.now() - timestamp) / 1000)) : null;
+    if (seconds == null) return `<p class="result-price-freshness stale">Source prix : ${escapeHtml(source)} · horodatage indisponible; vérifie la cotation du courtier.</p>`;
     const label = seconds < 20 ? "à l'instant" : seconds < 60 ? `il y a ${seconds}s` : `il y a ${Math.round(seconds / 60)} min`;
     const stale = seconds >= 90;
-    return `<p class="result-price-freshness${stale ? " stale" : ""}">Prix vérifié ${label}${stale ? " — vérifie le marché avant d'agir." : "."}</p>`;
+    const brokerNote = /deriv/i.test(source) ? "flux public Deriv; compare au prix de ton compte" : "flux fournisseur, non certifié comme le flux Deriv";
+    const historySource = result.meta?.historySource || "historique non précisé";
+    const alignment = result.meta?.derivFeedConfirmed ? "prix/bougies Deriv alignés" : "prix et bougies non confirmés sur le même flux Deriv";
+    const spread = result.meta?.livePriceBid != null && result.meta?.livePriceAsk != null
+      && Number.isFinite(Number(result.meta.livePriceBid)) && Number.isFinite(Number(result.meta.livePriceAsk))
+      ? `Bid ${result.meta.livePriceBid} / Ask ${result.meta.livePriceAsk} · spread ${result.meta.livePriceSpread}`
+      : "bid/ask et spread d'exécution non fournis";
+    return `<p class="result-price-freshness${stale ? " stale" : ""}">Prix ${label} · source ${escapeHtml(source)} · bougies ${escapeHtml(historySource)} · ${alignment} · ${brokerNote} · ${spread} · commissions/slippage non intégrés au R/R${stale ? "; prix à recontrôler avant toute entrée." : "."}</p>`;
   }
 
   function renderAnalysisMeta(result) {
@@ -726,17 +988,18 @@
     const id = result.learningId;
     if (!quality && !calibration && !live && !id && !chartContext && !technical && !news) return "";
     return `<div class="mt-3 text-[10px] uppercase tracking-widest text-muted-foreground">
-      ${quality ? `<div>Image: ${quality.score}% · ${escapeHtml(quality.reason || "")}</div>` : ""}
-      ${live ? `<div>Prix live vérifié: ${escapeHtml(live)}</div>` : ""}
+      ${quality ? `<div>Qualité fichier image: ${quality.score}% · dimensions uniquement, ne confirme pas la lecture des prix · ${escapeHtml(quality.reason || "")}</div>` : ""}
+      ${live ? `<div>Prix d'analyse: ${escapeHtml(live)} · source ${escapeHtml(meta.livePriceSource || "n/a")}</div>` : ""}
+      ${meta.historySource ? `<div>Historique bougies: ${escapeHtml(meta.historySource)} · ${meta.derivFeedConfirmed ? "prix et bougies issus de Deriv" : "source potentiellement différente de Deriv"}</div>` : ""}
       ${technical ? `<div>Technique API: ${escapeHtml(technical.trend || "n/a")} · RSI ${escapeHtml(technical.rsi ?? "n/a")} · ${escapeHtml(technical.bars || 0)} bougies · ${escapeHtml(technical.source || "source n/a")}</div>` : ""}
-      ${dataReliability ? `<div>Fiabilité données: ${Number(dataReliability.score || 0)}% · grade ${escapeHtml(dataReliability.grade || "n/a")}${Array.isArray(dataReliability.blockers) && dataReliability.blockers.length ? ` · ${escapeHtml(dataReliability.blockers.slice(0, 2).join(" · "))}` : ""}</div>` : ""}
+      ${dataReliability ? `<div>Indice de fiabilité des données: ${Number(dataReliability.score || 0)}/100 · grade ${escapeHtml(dataReliability.grade || "n/a")}${Array.isArray(dataReliability.blockers) && dataReliability.blockers.length ? ` · ${escapeHtml(dataReliability.blockers.slice(0, 2).join(" · "))}` : ""}</div>` : ""}
       ${meta.analysisDepth ? `<div>Mode analyse: ${escapeHtml(meta.analysisDepth)}</div>` : ""}
       ${mtfConsensus ? `<div>Consensus MTF: ${escapeHtml(mtfConsensus.summary || "n/a")}${mtfConsensus.conflict ? " · conflit détecté" : ""}</div>` : ""}
       ${Array.isArray(meta.multiTimeframe) && meta.multiTimeframe.length ? `<div>Multi-timeframe: ${escapeHtml(meta.multiTimeframe.map((tf) => `${tf.timeframe}:${tf.trend || "n/a"}`).join(" · "))}</div>` : ""}
       ${news ? `<div>News/API: ${news.enabled ? (news.activeRisk ? "risque macro actif" : "contexte consulté") : "désactivé"} · ${escapeHtml(news.headlines?.[0]?.title || news.summary || "aucun titre")}</div>` : ""}
       ${meta.strategy ? `<div>Stratégie: ${escapeHtml(meta.strategy)}</div>` : ""}
       ${chartContext?.primaryPair || chartContext?.executionTimeframe ? `<div>Contexte chart: ${escapeHtml(chartContext.primaryPair || "paire manuelle")} · ${escapeHtml(chartContext.executionTimeframe || "timeframe manuel")}</div>` : ""}
-      ${meta.styleComparison ? `<div>Style retenu: ${escapeHtml(meta.styleComparison.bestStyle || result.technique || "n/a")} · efficacité ${Number(meta.styleComparison.bestScore || result.score || 0)}%</div>` : ""}
+      ${meta.styleComparison ? `<div>Style retenu: ${escapeHtml(meta.styleComparison.bestStyle || result.technique || "n/a")} · indice interne ${Number(meta.styleComparison.bestScore || result.score || 0)}/100</div>` : ""}
       ${meta.assistedLevels ? `<div>Plan: ${escapeHtml(meta.assistedLevels)}</div>` : ""}
       ${meta.targetConstraint ? `<div>Objectifs: ${escapeHtml(meta.targetConstraint)}</div>` : ""}
       ${calibration ? `<div>Apprentissage: ${escapeHtml(calibration.message || "")}</div>` : ""}
@@ -750,7 +1013,7 @@
       <span>TP1 ${signal.tp1}</span><span>TP2 ${signal.tp2}</span>
     </div>
     <div class="score-line">
-      <div class="signal-bottom"><span>R/R ${signal.rr} · ${signal.age}</span><strong>${signal.score}%</strong></div>
+      <div class="signal-bottom"><span>R/R ${signal.rr} · ${signal.age} · indice interne</span><strong>${signal.score}/100</strong></div>
       <div class="oracle-score"><span class="score-fill ${scoreColor(signal.score)}" style="width:${signal.score}%"></span></div>
     </div>`;
   }
@@ -850,20 +1113,28 @@
   }
 
   function renderTradePlan(result) {
+    const synthetic = Boolean(result.meta?.levelsAreSynthetic);
+    const entryZone = getEntryZone(result);
     const plan = [
+      `PAIRE: ${result.meta?.pair || "—"}`,
+      `DIRECTION: ${result.direction || "—"}`,
+      `TIMEFRAME: ${result.meta?.timeframe || "—"}`,
+      `ZONE D'ENTRÉE: ${entryZone?.range || result.entry}`,
+      entryZone ? `CENTRE DE CALCUL: ${entryZone.centerText}` : "",
       `STOP LOSS: ${result.sl}`,
+      `PROFIL DE SORTIE: ${result.meta?.targetProfileLabel || "Prudent (profil actuel)"}`,
       `TAKE PROFIT 1: ${result.tp1}`,
       `TAKE PROFIT 2: ${result.tp2}`,
+      `R/R TP1: ${result.rr || "—"}`,
+      result.meta?.targetProfile === "mdt_extended" && Number.isFinite(Number(result.meta?.tp2R))
+        ? `R/R TP2: 1:${Number(result.meta.tp2R).toFixed(2)}` : "",
+      "Note: la zone d'entrée est indicative; SL, TP et R/R sont calculés depuis le centre.",
     ].filter((line) => !/:\s*$/.test(line)).join("\n");
     return `
       <div class="trade-plan">
-        <div class="signal-bottom"><span>SL / TP prêts à copier</span><button type="button" data-copy-plan>Copier SL/TP</button></div>
-        <div class="copy-level-grid">
-          ${renderCopyValue("SL", result.sl)}
-          ${renderCopyValue("TP1", result.tp1)}
-          ${renderCopyValue("TP2", result.tp2)}
-        </div>
+        <div class="signal-bottom"><span>${synthetic ? "Niveaux calculés · à vérifier" : "Niveaux proposés · à vérifier sur Deriv"}</span><button type="button" data-copy-plan>Copier le plan complet</button></div>
         <pre class="trade-plan-copy">${escapeHtml(plan)}</pre>
+        <p class="entry-zone-disclaimer">La zone est une marge indicative autour du point central. SL, TP et R/R restent calculés depuis ce point central; attends une confirmation du prix dans la zone.</p>
       </div>
     `;
   }
@@ -882,6 +1153,7 @@
           <div><span>Après TP1</span><strong>SL breakeven</strong></div>
         </div>
         <p>${escapeHtml(risk.instruction || risk.warning || "Ajuster le lot avant toute entrée.")}</p>
+        <p>Le volume exact du contrat Deriv n'est pas calculé ici. Vérifie dans MT5 que la perte estimée au SL reste sous la limite choisie.</p>
       </div>
     `;
   }
@@ -893,7 +1165,7 @@
     const reasons = Array.isArray(danger.reasons) ? danger.reasons.slice(0, 3).join(" · ") : "risque standard";
     return `
       <div class="danger-panel ${score >= 70 ? "high" : score >= 40 ? "medium" : "low"}">
-        <div class="signal-bottom"><span>Score danger</span><strong>${score}% · ${escapeHtml(label)}</strong></div>
+      <div class="signal-bottom"><span>Indice de risque interne</span><strong>${score}/100 · ${escapeHtml(label)}</strong></div>
         <div class="oracle-score"><span class="score-fill ${score >= 70 ? "red" : score >= 40 ? "orange" : "green"}" style="width:${score}%"></span></div>
         <p>${escapeHtml(reasons)}</p>
       </div>
@@ -927,9 +1199,48 @@
     `;
   }
 
-  function renderCopyValue(label, value, className = "") {
+  function renderCopyValue(label, value, className = "", note = "") {
     if (!value || value === "—") return "";
-    return `<button class="level-card ${escapeHtml(className)}" type="button" data-copy-value="${escapeHtml(value)}" title="Copier ${escapeHtml(label)}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></button>`;
+    return `<div class="level-card ${escapeHtml(className)}"><div class="level-card-content"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong>${note ? `<small>${escapeHtml(note)}</small>` : ""}</div><button class="level-copy-button" type="button" data-copy-value="${escapeHtml(value)}" aria-label="Copier ${escapeHtml(label)}" title="Copier ${escapeHtml(label)}"><span data-copy-label>Copier</span></button></div>`;
+  }
+
+  function getEntryZone(result) {
+    const center = Number(String(result?.entry ?? "").replace(/\s/g, "").replace(",", "."));
+    if (!Number.isFinite(center)) return null;
+    const pair = String(result.meta?.pair || "");
+    const precision = levelPrecision(pair, center);
+    const tick = 10 ** -precision;
+    const atr = Number(result.meta?.technicalSnapshot?.atr);
+    const halfWidth = Number.isFinite(atr) && atr > 0 ? Math.max(tick, atr * 0.08) : tick;
+    const low = Math.floor((center - halfWidth) / tick + 1e-8) * tick;
+    const high = Math.ceil((center + halfWidth) / tick - 1e-8) * tick;
+    const safeLow = low < center ? low : center - tick;
+    const safeHigh = high > center ? high : center + tick;
+    const format = (value) => value.toFixed(precision);
+    return {
+      low: safeLow,
+      high: safeHigh,
+      center,
+      centerText: format(center),
+      range: `${format(safeLow)} – ${format(safeHigh)}`,
+    };
+  }
+
+  function levelPrecision(pair, value) {
+    const symbol = String(pair).toUpperCase();
+    if (/BTC|ETH|US500|NAS|SPX/i.test(symbol)) return Math.abs(value) >= 1000 ? 1 : 2;
+    if (/XAU|XAG|XPT|XPD/i.test(symbol)) return 2;
+    if (/JPY/i.test(symbol)) return 3;
+    if (/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol) || Math.abs(value) < 10) return 5;
+    return Math.abs(value) >= 100 ? 2 : 5;
+  }
+
+  function getEntryZoneNote(result) {
+    const entryZone = getEntryZone(result);
+    if (!entryZone) return "";
+    const atr = Number(result.meta?.technicalSnapshot?.atr);
+    const basis = Number.isFinite(atr) && atr > 0 ? "marge de 8 % de l'ATR" : "marge minimale d'un tick";
+    return `Centre de calcul : ${entryZone.centerText} · ${basis}.`;
   }
 
   async function copyTradePlan(container) {
@@ -939,8 +1250,8 @@
       await navigator.clipboard.writeText(plan);
       const button = container.querySelector("[data-copy-plan]");
       if (button) {
-        button.textContent = "Copié";
-        setTimeout(() => { button.textContent = "Copier SL/TP"; }, 1400);
+        button.textContent = "Plan copié";
+        setTimeout(() => { button.textContent = "Copier le plan complet"; }, 1400);
       }
     } catch {
       window.prompt("Copiez le plan", plan);
@@ -952,9 +1263,14 @@
     if (!value) return;
     try {
       await navigator.clipboard.writeText(value);
-      const previous = button.querySelector("strong")?.textContent || value;
-      button.querySelector("strong").textContent = "Copié";
-      setTimeout(() => { button.querySelector("strong").textContent = previous; }, 1200);
+      const label = button.querySelector("[data-copy-label]");
+      const previous = label?.textContent || button.textContent;
+      if (label) label.textContent = "Copié";
+      else button.textContent = "Copié";
+      setTimeout(() => {
+        if (label?.isConnected) label.textContent = previous;
+        else if (button.isConnected) button.textContent = previous;
+      }, 1200);
     } catch {
       window.prompt("Copiez ce niveau", value);
     }

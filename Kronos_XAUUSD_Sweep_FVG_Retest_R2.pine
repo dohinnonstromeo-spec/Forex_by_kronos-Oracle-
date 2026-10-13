@@ -1,0 +1,292 @@
+//@version=6
+strategy("KRONOS XAUUSD — Sweep + Displacement + FVG Retest R2", shorttitle="KRONOS XAU R2", overlay=true, pyramiding=0, initial_capital=1000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=0, slippage=1, process_orders_on_close=false, max_labels_count=200, max_boxes_count=50, max_lines_count=50)
+
+// R2: même scénario de recherche que R1, avec tableau mobile, deux objectifs partiels et statistiques descriptives.
+// Le pourcentage historique est un taux de sorties positives Strategy Tester, pas une probabilité du prochain trade.
+// Le script ne garantit pas de rentabilité et n'envoie pas d'ordres à Deriv.
+
+string TZ = "Etc/UTC"
+string G_LEVELS = "01 · Liquidité"
+string G_CONFIRM = "02 · Confirmation PA / FVG"
+string G_COSTS = "03 · Coûts et risque"
+string G_VIEW = "04 · Affichage téléphone"
+
+int sweepLookback = input.int(20, "Fenêtre du haut/bas à balayer (M5)", minval=5, maxval=100, group=G_LEVELS)
+int sweepWaitBars = input.int(5, "Délai sweep → displacement (bougies M5)", minval=1, maxval=20, group=G_LEVELS)
+string tradeSession = input.session("0700-1700:23456", "Fenêtre d'entrée UTC", group=G_LEVELS)
+bool useSession = input.bool(true, "Limiter à la fenêtre UTC", group=G_LEVELS)
+
+int atrLength = input.int(14, "ATR M5", minval=2, maxval=100, group=G_CONFIRM)
+int bosLookback = input.int(5, "Cassure structurelle (M5)", minval=2, maxval=20, group=G_CONFIRM)
+float displacementAtr = input.float(0.60, "Corps displacement minimum (x ATR)", minval=0.1, maxval=3.0, step=0.05, group=G_CONFIRM)
+int fvgRetestBars = input.int(12, "Expiration du retest FVG (bougies M5)", minval=1, maxval=48, group=G_CONFIRM)
+bool useM15Filter = input.bool(false, "Exiger l'alignement M15", group=G_CONFIRM, tooltip="Désactivé par défaut. L'activer change la stratégie et exige un nouveau test.")
+float tp1R = input.float(1.0, "TP1 (R) · fermer 50 %", minval=0.2, maxval=5.0, step=0.1, group=G_CONFIRM)
+float tp2R = input.float(1.5, "TP2 (R) · fermer le reste", minval=0.3, maxval=8.0, step=0.1, group=G_CONFIRM)
+int maxHoldBars = input.int(12, "Durée maximale (bougies M5)", minval=1, maxval=100, group=G_CONFIRM)
+
+float spreadEstimateUsd = input.float(0.15, "Spread estimé XAUUSD ($)", minval=0.0, maxval=10.0, step=0.01, group=G_COSTS, tooltip="Vérifie le spread de ton compte Deriv dans MT5.")
+int slippageTicks = input.int(1, "Slippage estimé (ticks par côté)", minval=0, maxval=100, group=G_COSTS)
+float roundTripCommissionUsd = input.float(0.0, "Commission totale estimée ($)", minval=0.0, maxval=100.0, step=0.01, group=G_COSTS)
+float maxCostR = input.float(0.15, "Coût estimé maximal (R)", minval=0.0, maxval=1.0, step=0.01, group=G_COSTS)
+float stopAtrBuffer = input.float(0.10, "Marge du stop derrière le sweep (x ATR)", minval=0.01, maxval=1.0, step=0.01, group=G_COSTS)
+float maxStopAtr = input.float(3.0, "Stop maximal (x ATR)", minval=0.5, maxval=10.0, step=0.25, group=G_COSTS)
+float simulatedQty = input.float(1.0, "Quantité Strategy Tester", minval=0.001, step=0.01, group=G_COSTS, tooltip="Quantité de simulation TradingView. Ce n'est pas automatiquement le lot Deriv.")
+
+bool showLiquidity = input.bool(true, "Afficher les niveaux balayables", group=G_VIEW)
+bool showFvg = input.bool(true, "Afficher la FVG active", group=G_VIEW)
+bool showOrders = input.bool(true, "Afficher Entrée / SL / TP1 / TP2", group=G_VIEW)
+bool showSignals = input.bool(true, "Afficher les étapes du scénario", group=G_VIEW)
+string panelMode = input.string("Mobile", "Panneau", options=["Mobile", "Détaillé"], group=G_VIEW)
+
+bool isM5 = timeframe.isminutes and timeframe.multiplier == 5
+if barstate.isfirst and not isM5
+    runtime.error("KRONOS XAUUSD R2 fonctionne sur un graphique 5 minutes (M5).")
+if barstate.isfirst and tp2R <= tp1R
+    runtime.error("TP2 (R) doit être supérieur à TP1 (R).")
+
+bool isXau = str.contains(str.upper(syminfo.ticker), "XAU")
+float atr = ta.atr(atrLength)
+float priorHigh = ta.highest(high[1], sweepLookback)
+float priorLow = ta.lowest(low[1], sweepLookback)
+float swingHigh = ta.highest(high[1], bosLookback)
+float swingLow = ta.lowest(low[1], bosLookback)
+float candleRange = math.max(high - low, syminfo.mintick)
+float candleBody = math.abs(close - open)
+
+// Contexte M15 issu de chandelles clôturées uniquement.
+[m15Close, m15Ema20, m15Ema50, m15Ema20TwoBarsAgo] = request.security(syminfo.tickerid, "15", [close[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 20)[3]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+bool m15Bull = m15Close > m15Ema20 and m15Ema20 > m15Ema50 and m15Ema20 > m15Ema20TwoBarsAgo
+bool m15Bear = m15Close < m15Ema20 and m15Ema20 < m15Ema50 and m15Ema20 < m15Ema20TwoBarsAgo
+
+bool inTradeHours = not useSession or not na(time(timeframe.period, tradeSession, TZ))
+bool m15AllowsLong = not useM15Filter or m15Bull
+bool m15AllowsShort = not useM15Filter or m15Bear
+
+// État du scénario : sweep/reprise → displacement + FVG → retest confirmé du milieu.
+var int sweepDirection = 0
+var int sweepBar = na
+var float sweepExtreme = na
+var float sweptLevel = na
+var int fvgDirection = 0
+var int fvgBar = na
+var float fvgLower = na
+var float fvgUpper = na
+var float fvgMid = na
+var float plannedStop = na
+var float plannedEntry = na
+var float plannedTp1 = na
+var float plannedTp2 = na
+var int positionEntryBar = na
+var int pendingDirection = 0
+var box activeFvgBox = na
+var string lastEvent = "AUCUN SETUP"
+
+bool bullSweep = barstate.isconfirmed and inTradeHours and not na(priorLow) and low < priorLow and close > priorLow and m15AllowsLong
+bool bearSweep = barstate.isconfirmed and inTradeHours and not na(priorHigh) and high > priorHigh and close < priorHigh and m15AllowsShort
+
+if barstate.isconfirmed
+    if sweepDirection != 0 and (bar_index - sweepBar > sweepWaitBars or (sweepDirection == 1 and low <= sweepExtreme) or (sweepDirection == -1 and high >= sweepExtreme))
+        sweepDirection := 0
+        sweepBar := na
+        sweepExtreme := na
+        sweptLevel := na
+
+    if fvgDirection != 0 and (bar_index - fvgBar > fvgRetestBars or (fvgDirection == 1 and low <= plannedStop) or (fvgDirection == -1 and high >= plannedStop))
+        fvgDirection := 0
+        fvgBar := na
+        fvgLower := na
+        fvgUpper := na
+        fvgMid := na
+        plannedStop := na
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+            activeFvgBox := na
+        lastEvent := "FVG ANNULÉE / EXPIRÉE"
+
+    bool bullDisplacement = close > open and candleBody >= atr * displacementAtr and close > swingHigh and low > high[2] and close >= low + candleRange * 0.75
+    bool bearDisplacement = close < open and candleBody >= atr * displacementAtr and close < swingLow and high < low[2] and close <= high - candleRange * 0.75
+
+    if fvgDirection == 0 and sweepDirection == 1 and bar_index > sweepBar and m15AllowsLong and bullDisplacement
+        fvgDirection := 1
+        fvgBar := bar_index
+        fvgLower := high[2]
+        fvgUpper := low
+        fvgMid := (fvgLower + fvgUpper) / 2.0
+        plannedStop := sweepExtreme - math.max(atr * stopAtrBuffer, 2 * syminfo.mintick)
+        sweepDirection := 0
+        sweepBar := na
+        lastEvent := "DISPLACEMENT HAUSSIER + FVG"
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+        if showFvg
+            activeFvgBox := box.new(bar_index - 2, fvgUpper, bar_index + 1, fvgLower, border_color=color.lime, bgcolor=color.new(color.lime, 84), extend=extend.right, text="FVG LONG · attendre retest", text_color=color.lime, text_size=size.small)
+        if showSignals
+            label.new(bar_index, low, "BOS + FVG\nattendre retest", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+        alert("KRONOS XAU | displacement haussier + FVG | attendre retest | " + syminfo.ticker, alert.freq_once_per_bar_close)
+    else if fvgDirection == 0 and sweepDirection == -1 and bar_index > sweepBar and m15AllowsShort and bearDisplacement
+        fvgDirection := -1
+        fvgBar := bar_index
+        fvgLower := high
+        fvgUpper := low[2]
+        fvgMid := (fvgLower + fvgUpper) / 2.0
+        plannedStop := sweepExtreme + math.max(atr * stopAtrBuffer, 2 * syminfo.mintick)
+        sweepDirection := 0
+        sweepBar := na
+        lastEvent := "DISPLACEMENT BAISSIER + FVG"
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+        if showFvg
+            activeFvgBox := box.new(bar_index - 2, fvgUpper, bar_index + 1, fvgLower, border_color=color.red, bgcolor=color.new(color.red, 84), extend=extend.right, text="FVG SHORT · attendre retest", text_color=color.red, text_size=size.small)
+        if showSignals
+            label.new(bar_index, high, "BOS + FVG\nattendre retest", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+        alert("KRONOS XAU | displacement baissier + FVG | attendre retest | " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+bool longSignal = false
+bool shortSignal = false
+float costEstimate = spreadEstimateUsd + 2.0 * slippageTicks * syminfo.mintick + roundTripCommissionUsd
+if barstate.isconfirmed and fvgDirection != 0 and bar_index > fvgBar and inTradeHours and strategy.position_size == 0
+    bool midpointTouched = low <= fvgMid and high >= fvgMid
+    bool bullRetest = fvgDirection == 1 and midpointTouched and close > fvgMid and close > open
+    bool bearRetest = fvgDirection == -1 and midpointTouched and close < fvgMid and close < open
+    float longRisk = close - plannedStop
+    float shortRisk = plannedStop - close
+    bool longRiskOk = longRisk > 0 and longRisk <= atr * maxStopAtr and costEstimate / longRisk <= maxCostR
+    bool shortRiskOk = shortRisk > 0 and shortRisk <= atr * maxStopAtr and costEstimate / shortRisk <= maxCostR
+    longSignal := bullRetest and longRiskOk and m15AllowsLong and isXau
+    shortSignal := bearRetest and shortRiskOk and m15AllowsShort and isXau
+    if longSignal
+        pendingDirection := 1
+        plannedEntry := close
+        plannedTp1 := plannedEntry + longRisk * tp1R
+        plannedTp2 := plannedEntry + longRisk * tp2R
+        strategy.entry("K-XAU-L", strategy.long, qty=simulatedQty, comment="Retest FVG long")
+        strategy.exit("K-XAU-L-TP1", from_entry="K-XAU-L", stop=plannedStop, limit=plannedTp1, qty_percent=50)
+        strategy.exit("K-XAU-L-TP2", from_entry="K-XAU-L", stop=plannedStop, limit=plannedTp2, qty_percent=50)
+        lastEvent := "ACHAT · retest FVG confirmé"
+        fvgDirection := 0
+        fvgBar := na
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+            activeFvgBox := na
+        alert("KRONOS XAU | ACHAT | entrée≈" + str.tostring(plannedEntry, format.mintick) + " | SL=" + str.tostring(plannedStop, format.mintick) + " | TP1=" + str.tostring(plannedTp1, format.mintick) + " | TP2=" + str.tostring(plannedTp2, format.mintick), alert.freq_once_per_bar_close)
+    else if shortSignal
+        pendingDirection := -1
+        plannedEntry := close
+        plannedTp1 := plannedEntry - shortRisk * tp1R
+        plannedTp2 := plannedEntry - shortRisk * tp2R
+        strategy.entry("K-XAU-S", strategy.short, qty=simulatedQty, comment="Retest FVG short")
+        strategy.exit("K-XAU-S-TP1", from_entry="K-XAU-S", stop=plannedStop, limit=plannedTp1, qty_percent=50)
+        strategy.exit("K-XAU-S-TP2", from_entry="K-XAU-S", stop=plannedStop, limit=plannedTp2, qty_percent=50)
+        lastEvent := "VENTE · retest FVG confirmé"
+        fvgDirection := 0
+        fvgBar := na
+        if not na(activeFvgBox)
+            box.delete(activeFvgBox)
+            activeFvgBox := na
+        alert("KRONOS XAU | VENTE | entrée≈" + str.tostring(plannedEntry, format.mintick) + " | SL=" + str.tostring(plannedStop, format.mintick) + " | TP1=" + str.tostring(plannedTp1, format.mintick) + " | TP2=" + str.tostring(plannedTp2, format.mintick), alert.freq_once_per_bar_close)
+
+// Actualise les niveaux avec le prix d'exécution simulé par TradingView.
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    positionEntryBar := bar_index
+    pendingDirection := 0
+    lastEvent := strategy.position_size > 0 ? "POSITION LONG ACTIVE" : "POSITION SHORT ACTIVE"
+    plannedEntry := strategy.position_avg_price
+    float filledRisk = math.abs(plannedEntry - plannedStop)
+    if strategy.position_size > 0 and filledRisk > 0
+        plannedTp1 := plannedEntry + filledRisk * tp1R
+        plannedTp2 := plannedEntry + filledRisk * tp2R
+        strategy.exit("K-XAU-L-TP1", from_entry="K-XAU-L", stop=plannedStop, limit=plannedTp1, qty_percent=50)
+        strategy.exit("K-XAU-L-TP2", from_entry="K-XAU-L", stop=plannedStop, limit=plannedTp2, qty_percent=50)
+    else if strategy.position_size < 0 and filledRisk > 0
+        plannedTp1 := plannedEntry - filledRisk * tp1R
+        plannedTp2 := plannedEntry - filledRisk * tp2R
+        strategy.exit("K-XAU-S-TP1", from_entry="K-XAU-S", stop=plannedStop, limit=plannedTp1, qty_percent=50)
+        strategy.exit("K-XAU-S-TP2", from_entry="K-XAU-S", stop=plannedStop, limit=plannedTp2, qty_percent=50)
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    positionEntryBar := na
+    pendingDirection := 0
+    plannedEntry := na
+    plannedTp1 := na
+    plannedTp2 := na
+    plannedStop := na
+    lastEvent := "TRADE CLOS · ATTENDRE NOUVEAU SWEEP"
+
+if strategy.position_size != 0 and not na(positionEntryBar) and bar_index - positionEntryBar >= maxHoldBars - 1
+    if strategy.position_size > 0
+        strategy.close("K-XAU-L", comment="Sortie temps")
+    else
+        strategy.close("K-XAU-S", comment="Sortie temps")
+
+// Lance un nouveau scénario uniquement lorsque le précédent est terminé.
+if barstate.isconfirmed and strategy.position_size == 0 and fvgDirection == 0 and sweepDirection == 0 and not longSignal and not shortSignal and inTradeHours and isXau
+    if bullSweep
+        sweepDirection := 1
+        sweepBar := bar_index
+        sweepExtreme := low
+        sweptLevel := priorLow
+        lastEvent := "SWEEP BAS · attendre BOS + FVG"
+        if showSignals
+            label.new(bar_index, low, "SWEEP LOW\nattendre displacement", style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.small)
+        alert("KRONOS XAU | sweep du bas confirmé | attendre displacement + FVG | " + syminfo.ticker, alert.freq_once_per_bar_close)
+    else if bearSweep
+        sweepDirection := -1
+        sweepBar := bar_index
+        sweepExtreme := high
+        sweptLevel := priorHigh
+        lastEvent := "SWEEP HAUT · attendre BOS + FVG"
+        if showSignals
+            label.new(bar_index, high, "SWEEP HIGH\nattendre displacement", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+        alert("KRONOS XAU | sweep du haut confirmé | attendre displacement + FVG | " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if fvgDirection != 0 and not na(activeFvgBox)
+    box.set_right(activeFvgBox, bar_index + 1)
+
+float displayEntry = strategy.position_size != 0 or pendingDirection != 0 ? plannedEntry : na
+float displayStop = strategy.position_size != 0 or pendingDirection != 0 ? plannedStop : na
+float displayTp1 = strategy.position_size != 0 or pendingDirection != 0 ? plannedTp1 : na
+float displayTp2 = strategy.position_size != 0 or pendingDirection != 0 ? plannedTp2 : na
+plot(showLiquidity ? priorHigh : na, "Liquidité récente · haut", color=color.new(color.red, 35), linewidth=1, style=plot.style_linebr)
+plot(showLiquidity ? priorLow : na, "Liquidité récente · bas", color=color.new(color.aqua, 35), linewidth=1, style=plot.style_linebr)
+plot(showLiquidity and sweepDirection != 0 ? sweptLevel : na, "Niveau balayé", color=color.yellow, linewidth=2, style=plot.style_linebr)
+plot(showOrders ? displayEntry : na, "Entrée prévue / moyenne", color=color.blue, linewidth=2, style=plot.style_linebr)
+plot(showOrders ? displayStop : na, "SL · invalidation", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(showOrders ? displayTp1 : na, "TP1 · 50 %", color=color.new(color.lime, 25), linewidth=1, style=plot.style_linebr)
+plot(showOrders ? displayTp2 : na, "TP2 · 50 %", color=color.lime, linewidth=2, style=plot.style_linebr)
+plotshape(showSignals and longSignal, title="Achat après retest FVG", style=shape.labelup, location=location.belowbar, color=color.lime, text="LONG\nFVG", textcolor=color.black, size=size.small)
+plotshape(showSignals and shortSignal, title="Vente après retest FVG", style=shape.labeldown, location=location.abovebar, color=color.red, text="SHORT\nFVG", textcolor=color.white, size=size.small)
+
+// Statistique descriptive : taux des sorties Strategy Tester avec profit positif.
+// Les deux sorties partielles TP1/TP2 peuvent compter séparément; ce n'est PAS la probabilité par setup.
+float historicalPositiveExitPct = strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : na
+string historicalRateText = na(historicalPositiveExitPct) ? "N/D · aucun trade clos" : str.tostring(historicalPositiveExitPct, "#.0") + "% · " + str.tostring(strategy.wintrades) + "/" + str.tostring(strategy.closedtrades) + " sorties +"
+string scenarioText = strategy.position_size > 0 ? "ACHAT EN COURS" : strategy.position_size < 0 ? "VENTE EN COURS" : pendingDirection == 1 ? "ACHAT · ordre simulé" : pendingDirection == -1 ? "VENTE · ordre simulé" : fvgDirection == 1 ? "ATTENDRE RETEST FVG LONG" : fvgDirection == -1 ? "ATTENDRE RETEST FVG SHORT" : sweepDirection == 1 ? "SURVEILLER BOS + FVG LONG" : sweepDirection == -1 ? "SURVEILLER BOS + FVG SHORT" : "ATTENDRE SWEEP"
+string logicText = strategy.position_size != 0 or pendingDirection != 0 ? "Sweep → BOS/FVG → retest confirmé; SL derrière le sweep." : fvgDirection != 0 ? "BOS + FVG validés; attendre le retest du milieu." : sweepDirection != 0 ? "Sweep repris; attendre BOS + FVG." : "Aucun sweep confirmé; patienter."
+string contextText = m15Bull ? "M15 haussier" : m15Bear ? "M15 baissier" : "M15 neutre"
+string levelEntryText = not na(displayEntry) ? str.tostring(displayEntry, format.mintick) : pendingDirection == 0 ? "En attente du retest" : "—"
+string levelStopText = not na(displayStop) ? str.tostring(displayStop, format.mintick) : not na(plannedStop) ? str.tostring(plannedStop, format.mintick) : "Après le sweep"
+string levelTp1Text = not na(displayTp1) ? str.tostring(displayTp1, format.mintick) : "Après l'entrée"
+string levelTp2Text = not na(displayTp2) ? str.tostring(displayTp2, format.mintick) : "Après l'entrée"
+color statusColor = strategy.position_size != 0 ? color.new(color.blue, 20) : fvgDirection != 0 ? color.new(color.green, 30) : sweepDirection != 0 ? color.new(color.orange, 25) : color.new(color.gray, 55)
+
+var table panel = table.new(position.top_right, 2, 9, frame_color=color.new(color.silver, 35), frame_width=1, border_color=color.new(color.silver, 70), border_width=1)
+if barstate.islast
+    table.cell(panel, 0, 0, "KRONOS XAU R2", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 0, isXau ? syminfo.ticker + " · M5" : "GRAPHIQUE NON-XAU", bgcolor=color.black, text_color=isXau ? color.white : color.orange)
+    table.cell(panel, 0, 1, "SCÉNARIO", text_color=color.white)
+    table.cell(panel, 1, 1, scenarioText, bgcolor=statusColor, text_color=color.white)
+    table.cell(panel, 0, 2, "ENTRÉE", text_color=color.silver)
+    table.cell(panel, 1, 2, levelEntryText, text_color=color.blue)
+    table.cell(panel, 0, 3, "SL", text_color=color.silver)
+    table.cell(panel, 1, 3, levelStopText, text_color=color.red)
+    table.cell(panel, 0, 4, "TP1 · 50 %", text_color=color.silver)
+    table.cell(panel, 1, 4, levelTp1Text + " · " + str.tostring(tp1R, "#.0") + "R", text_color=color.lime)
+    table.cell(panel, 0, 5, "TP2 · reste", text_color=color.silver)
+    table.cell(panel, 1, 5, levelTp2Text + " · " + str.tostring(tp2R, "#.0") + "R", text_color=color.lime)
+    table.cell(panel, 0, 6, "LOGIQUE", text_color=color.silver)
+    table.cell(panel, 1, 6, panelMode == "Mobile" ? logicText : logicText + " · " + contextText, text_color=color.white)
+    table.cell(panel, 0, 7, "SORTIES + HISTORIQUES", text_color=color.silver)
+    table.cell(panel, 1, 7, historicalRateText, text_color=na(historicalPositiveExitPct) ? color.orange : color.aqua)
+    table.cell(panel, 0, 8, "À SAVOIR", text_color=color.silver)
+    table.cell(panel, 1, 8, "Taux historique indicatif; pas une proba. Vérifier lot/coûts Deriv.", text_color=color.orange)

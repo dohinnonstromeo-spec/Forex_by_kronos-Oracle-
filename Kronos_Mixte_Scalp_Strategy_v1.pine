@@ -1,0 +1,638 @@
+//@version=6
+strategy("KRONOS — Price Action Scalping v1", shorttitle="KRONOS-S", overlay=true, pyramiding=0, initial_capital=1000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.0, slippage=1, margin_long=20, margin_short=20, process_orders_on_close=true, max_lines_count=30, max_labels_count=100, max_boxes_count=100)
+
+// ============================================================================
+// KRONOS — Analyse technique v1
+// Pine port of the deterministic evidence engines in strategy-engines.mjs.
+// The active chart supplies the symbol and main timeframe automatically.
+// Signals are confirmed only when the chart bar closes.
+// This indicator does not fetch AI, screenshot, calendar, or news data.
+// ============================================================================
+
+// ── User settings: similar controls to the Oracle Forex analysis form ────────
+string G_METHOD = "01 · Méthode Kronos"
+string G_PROFILE = "02 · Profil et objectifs"
+string G_RISK = "03 · Gestion du risque"
+string G_CONFIRM = "04 · Confirmation multi-timeframe"
+string G_ZONES = "05 · Zones SMC / ICT"
+string G_VISUALS = "06 · Affichage et alertes"
+
+string methodMode = input.string("Price Action", "Style d'analyse", options=["Mixte", "Price Action", "Ichimoku", "SMC", "Wyckoff"], group=G_METHOD, tooltip="Mixte exige au moins deux moteurs dans le même sens. ICT, Elliott et la lecture IA de captures ne font pas partie de ce moteur mécanique.")
+string analysisDepth = input.string("Rapide", "Mode d'analyse", options=["Rapide", "Profonde"], group=G_METHOD, tooltip="Rapide utilise les règles du graphique. Profonde ajoute un filtre de tendance sur une unité de temps supérieure confirmée ; ce n'est pas l'analyse IA/news du site.")
+
+string horizon = input.string("Scalping", "Profil de trading", options=["Scalping", "Swing Trading", "Position Trading", "Breakout", "Reversal"], group=G_PROFILE, tooltip="Scalping est le profil par défaut. Le profil règle les objectifs R ; les règles d'entrée de la méthode sélectionnée restent les mêmes.")
+bool useCustomTargets = input.bool(false, "Remplacer les objectifs du profil", group=G_PROFILE)
+float customTp1R = input.float(1.6, "Objectif TP1 (R)", minval=0.1, maxval=20.0, step=0.1, group=G_PROFILE)
+float customTp2R = input.float(2.5, "Objectif TP2 (R)", minval=0.2, maxval=30.0, step=0.1, group=G_PROFILE)
+int maxHoldMinutes = input.int(60, "Durée maximale d'un scalp (minutes)", minval=5, maxval=1440, group=G_PROFILE, tooltip="Clôture la position si aucun stop ou objectif n'a terminé le trade dans le délai.")
+
+string riskProfile = input.string("Protection maximale 0.5%", "Gestion du risque", options=["Protection maximale 0.5%", "Conservateur 1%", "Standard 2%", "Agressif 3%", "Personnalisé"], group=G_RISK)
+float customRiskPct = input.float(0.5, "Risque personnalisé (%)", minval=0.05, maxval=10.0, step=0.05, group=G_RISK)
+float minAtrRisk = input.float(1.15, "Distance minimale du stop (× range moyen)", minval=0.1, maxval=10.0, step=0.05, group=G_RISK)
+float minPriceRiskPct = input.float(0.12, "Distance minimale du stop (% du prix)", minval=0.01, maxval=5.0, step=0.01, group=G_RISK)
+float maxRiskPctPrice = input.float(2.5, "Risque maximal du stop (% du prix)", minval=0.1, maxval=20.0, step=0.1, group=G_RISK)
+
+string confirmationTf = input.timeframe("15", "Unité supérieure de confirmation", group=G_CONFIRM, tooltip="Utilisée en mode Profonde. Pour un graphique scalp M5, M15 est le filtre supérieur par défaut. La dernière bougie clôturée est utilisée.")
+int htfFastLength = input.int(20, "EMA rapide de confirmation", minval=2, maxval=200, group=G_CONFIRM)
+int htfSlowLength = input.int(50, "EMA lente de confirmation", minval=3, maxval=400, group=G_CONFIRM)
+
+int rangePeriod = input.int(14, "Période du range moyen", minval=2, maxval=200, group=G_METHOD, tooltip="La méthode du site moyenne high-low sur cette période (ce n'est pas l'ATR Wilder standard).")
+int paLookback = input.int(30, "Price Action · fenêtre support/résistance", minval=5, maxval=300, group=G_METHOD)
+int paTrendPeriod = input.int(10, "Price Action · structure HH/HL", minval=3, maxval=100, group=G_METHOD)
+int pivotSpan = input.int(2, "SMC · pivot gauche/droite", minval=1, maxval=10, group=G_METHOD, tooltip="Un pivot n'est confirmé qu'après le nombre de bougies indiqué à droite.")
+int smcLookback = input.int(90, "SMC · ancienneté maximale des pivots", minval=20, maxval=500, group=G_METHOD)
+
+bool showFvgZones = input.bool(true, "Tracer les FVG / imbalance 3 bougies", group=G_ZONES, tooltip="FVG haussier : le plus haut de la bougie 1 reste sous le plus bas de la bougie 3. La zone reste active jusqu'à remplissage complet.")
+bool showBodyImbalance = input.bool(true, "Tracer aussi les gaps de corps", group=G_ZONES, tooltip="Approximation mécanique d'un volume imbalance entre les corps de deux bougies consécutives ; peut afficher plus de zones que la définition ICT stricte.")
+bool showOteZone = input.bool(true, "Tracer la zone OTE 61,8–79%", group=G_ZONES, tooltip="Calculée sur le dernier swing confirmé : retracement d'une jambe haussière ou baissière. Zone d'intérêt, pas signal d'entrée à elle seule.")
+bool showOrderBlockZones = input.bool(true, "Tracer les Order Blocks après BOS", group=G_ZONES, tooltip="Dernière bougie opposée trouvée avant la cassure de structure, dans la fenêtre de recherche choisie.")
+bool useFullObWicks = input.bool(true, "Order Block : inclure les mèches", group=G_ZONES)
+int obSearchBars = input.int(12, "Order Block : recherche arrière (bougies)", minval=2, maxval=50, group=G_ZONES)
+bool showLiquidityLevels = input.bool(true, "Tracer les derniers swings / liquidités", group=G_ZONES)
+bool showBosLabels = input.bool(true, "Marquer BOS et CHoCH", group=G_ZONES)
+
+bool showPlanLines = input.bool(true, "Tracer entrée / SL / TP", group=G_VISUALS)
+bool showSignals = input.bool(true, "Afficher les marqueurs ACHAT/VENTE", group=G_VISUALS)
+bool showDashboard = input.bool(true, "Afficher le panneau Kronos", group=G_VISUALS)
+bool enableDynamicAlerts = input.bool(true, "Activer les alertes détaillées alert()", group=G_VISUALS, tooltip="À la création de l'alerte, choisir « Any alert() function call » et activer la notification dans l'application.")
+
+// ── Profile defaults ────────────────────────────────────────────────────────
+float profileTp1R = switch horizon
+    "Scalping" => 1.0
+    "Swing Trading" => 1.6
+    "Position Trading" => 2.0
+    "Breakout" => 1.5
+    "Reversal" => 1.3
+    => 1.6
+
+float profileTp2R = switch horizon
+    "Scalping" => 1.6
+    "Swing Trading" => 2.5
+    "Position Trading" => 3.0
+    "Breakout" => 2.5
+    "Reversal" => 2.0
+    => 2.5
+
+float tp1R = useCustomTargets ? customTp1R : profileTp1R
+float tp2R = useCustomTargets ? customTp2R : profileTp2R
+float riskPct = switch riskProfile
+    "Protection maximale 0.5%" => 0.5
+    "Conservateur 1%" => 1.0
+    "Standard 2%" => 2.0
+    "Agressif 3%" => 3.0
+    => customRiskPct
+
+// ── Common calculations ────────────────────────────────────────────────────
+float entry = close
+float avgRange = ta.sma(high - low, rangePeriod)
+bool enoughPriceActionBars = bar_index >= math.max(math.max(34, paLookback), paTrendPeriod * 2 - 1)
+bool scalpChartTimeframeOk = timeframe.isminutes and timeframe.multiplier <= 15
+
+f_stop(int direction, float reference, float rangeValue) =>
+    float minimumRisk = math.max(rangeValue * minAtrRisk, close * minPriceRiskPct / 100.0)
+    float structuralRisk = na(reference) ? 0.0 : math.abs(close - reference)
+    float acceptedStructuralRisk = structuralRisk <= close * maxRiskPctPrice / 100.0 ? structuralRisk : 0.0
+    float riskDistance = math.max(minimumRisk, acceptedStructuralRisk)
+    float stopPrice = direction == 1 ? close - riskDistance : close + riskDistance
+    [stopPrice, riskDistance]
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+f_direction(int direction) =>
+    direction == 1 ? "haussier" : direction == -1 ? "baissier" : "neutre"
+
+// ── Price Action engine ─────────────────────────────────────────────────────
+float paSupport = ta.lowest(low[1], paLookback)
+float paResistance = ta.highest(high[1], paLookback)
+float candleBody = math.abs(close - open)
+float candleRange = math.max(high - low, close * 0.00001)
+float lowerWick = math.min(open, close) - low
+float upperWick = high - math.max(open, close)
+bool paBullReject = close > open and lowerWick >= math.max(candleBody * 1.35, candleRange * 0.25) and close >= low + candleRange * 0.62
+bool paBearReject = close < open and upperWick >= math.max(candleBody * 1.35, candleRange * 0.25) and close <= high - candleRange * 0.62
+bool paBullEngulf = close[1] < open[1] and close > open and close >= open[1] and open <= close[1]
+bool paBearEngulf = close[1] > open[1] and close < open and close <= open[1] and open >= close[1]
+bool paBullBreak = close > paResistance * 1.0002
+bool paBearBreak = close < paSupport * 0.9998
+float paCurrentHigh = ta.highest(high, paTrendPeriod)
+float paPreviousHigh = ta.highest(high[paTrendPeriod], paTrendPeriod)
+float paCurrentLow = ta.lowest(low, paTrendPeriod)
+float paPreviousLow = ta.lowest(low[paTrendPeriod], paTrendPeriod)
+bool paTrendBull = paCurrentHigh > paPreviousHigh and paCurrentLow > paPreviousLow
+bool paTrendBear = paCurrentHigh < paPreviousHigh and paCurrentLow < paPreviousLow
+int paBullEvidence = (paBullBreak ? 1 : 0) + (paBullEngulf ? 1 : 0) + (paBullReject ? 1 : 0) + (paTrendBull ? 1 : 0)
+int paBearEvidence = (paBearBreak ? 1 : 0) + (paBearEngulf ? 1 : 0) + (paBearReject ? 1 : 0) + (paTrendBear ? 1 : 0)
+bool paBullPattern = paBullBreak or paBullEngulf or paBullReject
+bool paBearPattern = paBearBreak or paBearEngulf or paBearReject
+bool paLong = enoughPriceActionBars and paBullPattern and paBullEvidence >= 2 and paBullEvidence >= paBearEvidence
+bool paShort = enoughPriceActionBars and paBearPattern and paBearEvidence >= 2 and paBearEvidence > paBullEvidence
+int paDirection = paLong ? 1 : paShort ? -1 : 0
+
+// ── Ichimoku engine ────────────────────────────────────────────────────────
+float tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2.0
+float kijun = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2.0
+float spanA = (tenkan + kijun) / 2.0
+float spanB = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2.0
+float cloudTop = math.max(spanA, spanB)
+float cloudBottom = math.min(spanA, spanB)
+bool ichiLong = bar_index >= 77 and close > cloudTop and tenkan > kijun and close > close[26]
+bool ichiShort = bar_index >= 77 and close < cloudBottom and tenkan < kijun and close < close[26]
+int ichiDirection = ichiLong ? 1 : ichiShort ? -1 : 0
+float ichiLongReference = math.min(kijun, cloudBottom)
+float ichiShortReference = math.max(kijun, cloudTop)
+
+// ── SMC engine ──────────────────────────────────────────────────────────────
+float pivotHigh = ta.pivothigh(high, pivotSpan, pivotSpan)
+float pivotLow = ta.pivotlow(low, pivotSpan, pivotSpan)
+float lastSwingHigh = ta.valuewhen(not na(pivotHigh), pivotHigh, 0)
+float previousSwingHigh = ta.valuewhen(not na(pivotHigh), pivotHigh, 1)
+float lastSwingLow = ta.valuewhen(not na(pivotLow), pivotLow, 0)
+float previousSwingLow = ta.valuewhen(not na(pivotLow), pivotLow, 1)
+int lastSwingHighBar = ta.valuewhen(not na(pivotHigh), bar_index - pivotSpan, 0)
+int previousSwingHighBar = ta.valuewhen(not na(pivotHigh), bar_index - pivotSpan, 1)
+int lastSwingLowBar = ta.valuewhen(not na(pivotLow), bar_index - pivotSpan, 0)
+int previousSwingLowBar = ta.valuewhen(not na(pivotLow), bar_index - pivotSpan, 1)
+bool smcPivotsRecent = not na(lastSwingHighBar) and not na(previousSwingHighBar) and not na(lastSwingLowBar) and not na(previousSwingLowBar) and bar_index - lastSwingHighBar <= smcLookback and bar_index - previousSwingHighBar <= smcLookback and bar_index - lastSwingLowBar <= smcLookback and bar_index - previousSwingLowBar <= smcLookback
+bool smcBullStructure = smcPivotsRecent and lastSwingHigh > previousSwingHigh and lastSwingLow > previousSwingLow
+bool smcBearStructure = smcPivotsRecent and lastSwingHigh < previousSwingHigh and lastSwingLow < previousSwingLow
+bool smcBullBos = smcPivotsRecent and close > lastSwingHigh * 1.0002
+bool smcBearBos = smcPivotsRecent and close < lastSwingLow * 0.9998
+bool smcBullSweep = smcPivotsRecent and low < lastSwingLow * 0.9998 and close > lastSwingLow
+bool smcBearSweep = smcPivotsRecent and high > lastSwingHigh * 1.0002 and close < lastSwingHigh
+bool smcBullFvg = bar_index >= 2 and high[2] < low
+bool smcBearFvg = bar_index >= 2 and low[2] > high
+bool smcBullChoch = smcBullBos and smcBearStructure
+bool smcBearChoch = smcBearBos and smcBullStructure
+bool smcBullBosEvent = barstate.isconfirmed and smcBullBos and not smcBullBos[1]
+bool smcBearBosEvent = barstate.isconfirmed and smcBearBos and not smcBearBos[1]
+// A separate two-candle body gap approximation. The three-candle wick FVG
+// above remains the primary imbalance definition used by the site's SMC rules.
+float currentBodyTop = math.max(open, close)
+float currentBodyBottom = math.min(open, close)
+float previousBodyTop = math.max(open[1], close[1])
+float previousBodyBottom = math.min(open[1], close[1])
+bool bullBodyGap = bar_index >= 1 and currentBodyBottom > previousBodyTop
+bool bearBodyGap = bar_index >= 1 and currentBodyTop < previousBodyBottom
+int smcBullEvidence = (smcBullBos ? 1 : 0) + (smcBullStructure ? 1 : 0) + (smcBullSweep ? 1 : 0) + (smcBullFvg ? 1 : 0)
+int smcBearEvidence = (smcBearBos ? 1 : 0) + (smcBearStructure ? 1 : 0) + (smcBearSweep ? 1 : 0) + (smcBearFvg ? 1 : 0)
+bool smcLong = smcPivotsRecent and ((smcBullBos and (smcBullStructure or smcBullFvg)) or (smcBullSweep and smcBullFvg)) and smcBullEvidence >= smcBearEvidence
+bool smcShort = smcPivotsRecent and ((smcBearBos and (smcBearStructure or smcBearFvg)) or (smcBearSweep and smcBearFvg)) and smcBearEvidence > smcBullEvidence
+int smcDirection = smcLong ? 1 : smcShort ? -1 : 0
+
+// ── Wyckoff engine ─────────────────────────────────────────────────────────
+// Mirrors the site rules: 40-bar range context, five-bar test window,
+// current volume at least 1.15x the preceding 29-bar average.
+float wyckoffSupport = ta.lowest(low[5], 40)
+float wyckoffResistance = ta.highest(high[5], 40)
+float priorAverageVolume = ta.sma(volume[1], 29)
+float volumeRatio = not na(priorAverageVolume) and priorAverageVolume > 0 ? volume / priorAverageVolume : na
+bool wyckoffVolumeReady = bar_index >= 49 and not na(volume) and ta.lowest(volume, 30) > 0 and not na(volumeRatio)
+bool wyckoffSpring = wyckoffVolumeReady and ta.lowest(low, 5) < wyckoffSupport * 0.9995 and close > wyckoffSupport and volumeRatio >= 1.15
+bool wyckoffUpthrust = wyckoffVolumeReady and ta.highest(high, 5) > wyckoffResistance * 1.0005 and close < wyckoffResistance and volumeRatio >= 1.15
+bool wyckoffLong = wyckoffSpring
+bool wyckoffShort = wyckoffUpthrust and not wyckoffSpring
+int wyckoffDirection = wyckoffLong ? 1 : wyckoffShort ? -1 : 0
+
+// ── Consensus and structural stop references ────────────────────────────────
+int longVotes = (paDirection == 1 ? 1 : 0) + (ichiDirection == 1 ? 1 : 0) + (smcDirection == 1 ? 1 : 0) + (wyckoffDirection == 1 ? 1 : 0)
+int shortVotes = (paDirection == -1 ? 1 : 0) + (ichiDirection == -1 ? 1 : 0) + (smcDirection == -1 ? 1 : 0) + (wyckoffDirection == -1 ? 1 : 0)
+int mixDirection = longVotes >= 2 and longVotes > shortVotes ? 1 : shortVotes >= 2 and shortVotes > longVotes ? -1 : 0
+
+[paLongStop, paLongRisk] = f_stop(1, paSupport, avgRange)
+[paShortStop, paShortRisk] = f_stop(-1, paResistance, avgRange)
+[ichiLongStop, ichiLongRisk] = f_stop(1, ichiLongReference, avgRange)
+[ichiShortStop, ichiShortRisk] = f_stop(-1, ichiShortReference, avgRange)
+[smcLongStop, smcLongRisk] = f_stop(1, lastSwingLow, avgRange)
+[smcShortStop, smcShortRisk] = f_stop(-1, lastSwingHigh, avgRange)
+[wyckoffLongStop, wyckoffLongRisk] = f_stop(1, wyckoffSupport, avgRange)
+[wyckoffShortStop, wyckoffShortRisk] = f_stop(-1, wyckoffResistance, avgRange)
+
+float mixLongStopReference = na
+if paDirection == 1
+    mixLongStopReference := paLongStop
+if ichiDirection == 1
+    mixLongStopReference := na(mixLongStopReference) ? ichiLongStop : math.min(mixLongStopReference, ichiLongStop)
+if smcDirection == 1
+    mixLongStopReference := na(mixLongStopReference) ? smcLongStop : math.min(mixLongStopReference, smcLongStop)
+if wyckoffDirection == 1
+    mixLongStopReference := na(mixLongStopReference) ? wyckoffLongStop : math.min(mixLongStopReference, wyckoffLongStop)
+
+float mixShortStopReference = na
+if paDirection == -1
+    mixShortStopReference := paShortStop
+if ichiDirection == -1
+    mixShortStopReference := na(mixShortStopReference) ? ichiShortStop : math.max(mixShortStopReference, ichiShortStop)
+if smcDirection == -1
+    mixShortStopReference := na(mixShortStopReference) ? smcShortStop : math.max(mixShortStopReference, smcShortStop)
+if wyckoffDirection == -1
+    mixShortStopReference := na(mixShortStopReference) ? wyckoffShortStop : math.max(mixShortStopReference, wyckoffShortStop)
+
+int rawDirection = switch methodMode
+    "Price Action" => paDirection
+    "Ichimoku" => ichiDirection
+    "SMC" => smcDirection
+    "Wyckoff" => wyckoffDirection
+    => mixDirection
+
+float structuralReference = switch methodMode
+    "Price Action" => rawDirection == 1 ? paSupport : paResistance
+    "Ichimoku" => rawDirection == 1 ? ichiLongReference : ichiShortReference
+    "SMC" => rawDirection == 1 ? lastSwingLow : lastSwingHigh
+    "Wyckoff" => rawDirection == 1 ? wyckoffSupport : wyckoffResistance
+    => rawDirection == 1 ? mixLongStopReference : mixShortStopReference
+
+// Use the last CLOSED higher-timeframe values, so the confirmation filter does
+// not change while its higher-timeframe candle is still forming.
+[higherFast, higherSlow] = request.security(syminfo.tickerid, confirmationTf, [ta.ema(close, htfFastLength)[1], ta.ema(close, htfSlowLength)[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+bool confirmationIsHigher = timeframe.in_seconds(confirmationTf) > timeframe.in_seconds(timeframe.period)
+bool higherBull = confirmationIsHigher and not na(higherFast) and higherFast > higherSlow
+bool higherBear = confirmationIsHigher and not na(higherFast) and higherFast < higherSlow
+int finalDirection = rawDirection == 1 and (analysisDepth == "Rapide" or higherBull) ? 1 : rawDirection == -1 and (analysisDepth == "Rapide" or higherBear) ? -1 : 0
+
+// ── OTE: retracement zone of the latest confirmed swing leg ─────────────────
+bool bullishSwingLeg = smcPivotsRecent and lastSwingLowBar < lastSwingHighBar and lastSwingHigh > lastSwingLow
+bool bearishSwingLeg = smcPivotsRecent and lastSwingHighBar < lastSwingLowBar and lastSwingHigh > lastSwingLow
+int oteDirection = bullishSwingLeg ? 1 : bearishSwingLeg ? -1 : 0
+int oteStartBar = bullishSwingLeg ? lastSwingLowBar : bearishSwingLeg ? lastSwingHighBar : na
+int oteEndBar = bullishSwingLeg ? lastSwingHighBar : bearishSwingLeg ? lastSwingLowBar : na
+float swingLegRange = smcPivotsRecent ? lastSwingHigh - lastSwingLow : na
+float oteTop = bullishSwingLeg ? lastSwingHigh - swingLegRange * 0.618 : bearishSwingLeg ? lastSwingLow + swingLegRange * 0.79 : na
+float oteBottom = bullishSwingLeg ? lastSwingHigh - swingLegRange * 0.79 : bearishSwingLeg ? lastSwingLow + swingLegRange * 0.618 : na
+var box oteBox = na
+var int drawnOteStartBar = na
+var int drawnOteEndBar = na
+var int drawnOteDirection = 0
+if showOteZone and oteDirection != 0 and (na(drawnOteStartBar) or oteStartBar != drawnOteStartBar or oteEndBar != drawnOteEndBar or oteDirection != drawnOteDirection)
+    if not na(oteBox)
+        box.delete(oteBox)
+    oteBox := box.new(left=oteStartBar, top=oteTop, right=bar_index, bottom=oteBottom, extend=extend.right, bgcolor=color.new(color.purple, 85), border_color=color.new(color.purple, 20), text=oteDirection == 1 ? "OTE haussier 61,8–79%" : "OTE baissier 61,8–79%", text_color=color.white, text_size=size.tiny)
+    drawnOteStartBar := oteStartBar
+    drawnOteEndBar := oteEndBar
+    drawnOteDirection := oteDirection
+if showOteZone and not na(oteBox)
+    box.set_right(oteBox, bar_index)
+    bool priceInsideOte = high >= oteBottom and low <= oteTop
+    box.set_bgcolor(oteBox, priceInsideOte ? color.new(color.orange, 78) : color.new(color.purple, 85))
+if not showOteZone and not na(oteBox)
+    box.delete(oteBox)
+    oteBox := na
+    drawnOteStartBar := na
+    drawnOteEndBar := na
+    drawnOteDirection := 0
+
+// ── FVG / three-candle wick imbalance zones ─────────────────────────────────
+var box bullFvgBox = na
+var box bearFvgBox = na
+var float bullFvgTop = na
+var float bullFvgBottom = na
+var float bearFvgTop = na
+var float bearFvgBottom = na
+var int bullFvgCreatedBar = na
+var int bearFvgCreatedBar = na
+var bool bullFvgActive = false
+var bool bearFvgActive = false
+var bool bullFvgTouched = false
+var bool bearFvgTouched = false
+if showFvgZones and barstate.isconfirmed and smcBullFvg
+    if not na(bullFvgBox)
+        box.delete(bullFvgBox)
+    bullFvgBottom := high[2]
+    bullFvgTop := low
+    bullFvgCreatedBar := bar_index
+    bullFvgActive := true
+    bullFvgTouched := false
+    bullFvgBox := box.new(left=bar_index - 2, top=bullFvgTop, right=bar_index, bottom=bullFvgBottom, extend=extend.right, bgcolor=color.new(color.lime, 85), border_color=color.new(color.lime, 25), text="FVG / IMBALANCE ↑", text_color=color.white, text_size=size.tiny)
+if showFvgZones and barstate.isconfirmed and smcBearFvg
+    if not na(bearFvgBox)
+        box.delete(bearFvgBox)
+    bearFvgBottom := high
+    bearFvgTop := low[2]
+    bearFvgCreatedBar := bar_index
+    bearFvgActive := true
+    bearFvgTouched := false
+    bearFvgBox := box.new(left=bar_index - 2, top=bearFvgTop, right=bar_index, bottom=bearFvgBottom, extend=extend.right, bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 25), text="FVG / IMBALANCE ↓", text_color=color.white, text_size=size.tiny)
+if showFvgZones and bullFvgActive and not na(bullFvgBox)
+    box.set_right(bullFvgBox, bar_index)
+    if bar_index > bullFvgCreatedBar and low <= bullFvgTop
+        bullFvgTouched := true
+    if bullFvgTouched
+        box.set_bgcolor(bullFvgBox, color.new(color.orange, 82))
+    if bar_index > bullFvgCreatedBar and low <= bullFvgBottom
+        bullFvgActive := false
+        box.set_extend(bullFvgBox, extend.none)
+        box.set_bgcolor(bullFvgBox, color.new(color.gray, 88))
+        box.set_border_color(bullFvgBox, color.new(color.gray, 55))
+        box.set_text(bullFvgBox, "FVG haussier rempli")
+if showFvgZones and bearFvgActive and not na(bearFvgBox)
+    box.set_right(bearFvgBox, bar_index)
+    if bar_index > bearFvgCreatedBar and high >= bearFvgBottom
+        bearFvgTouched := true
+    if bearFvgTouched
+        box.set_bgcolor(bearFvgBox, color.new(color.orange, 82))
+    if bar_index > bearFvgCreatedBar and high >= bearFvgTop
+        bearFvgActive := false
+        box.set_extend(bearFvgBox, extend.none)
+        box.set_bgcolor(bearFvgBox, color.new(color.gray, 88))
+        box.set_border_color(bearFvgBox, color.new(color.gray, 55))
+        box.set_text(bearFvgBox, "FVG baissier rempli")
+
+// ── Two-candle body imbalance approximation (separate from wick FVG) ────────
+var box bullBodyGapBox = na
+var box bearBodyGapBox = na
+var float bullBodyGapTop = na
+var float bullBodyGapBottom = na
+var float bearBodyGapTop = na
+var float bearBodyGapBottom = na
+var int bullBodyGapCreatedBar = na
+var int bearBodyGapCreatedBar = na
+var bool bullBodyGapActive = false
+var bool bearBodyGapActive = false
+if showBodyImbalance and barstate.isconfirmed and bullBodyGap
+    if not na(bullBodyGapBox)
+        box.delete(bullBodyGapBox)
+    bullBodyGapBottom := previousBodyTop
+    bullBodyGapTop := currentBodyBottom
+    bullBodyGapCreatedBar := bar_index
+    bullBodyGapActive := true
+    bullBodyGapBox := box.new(left=bar_index - 1, top=bullBodyGapTop, right=bar_index, bottom=bullBodyGapBottom, extend=extend.right, bgcolor=color.new(color.aqua, 88), border_color=color.new(color.aqua, 35), text="IMBALANCE corps ↑", text_color=color.white, text_size=size.tiny)
+if showBodyImbalance and barstate.isconfirmed and bearBodyGap
+    if not na(bearBodyGapBox)
+        box.delete(bearBodyGapBox)
+    bearBodyGapBottom := currentBodyTop
+    bearBodyGapTop := previousBodyBottom
+    bearBodyGapCreatedBar := bar_index
+    bearBodyGapActive := true
+    bearBodyGapBox := box.new(left=bar_index - 1, top=bearBodyGapTop, right=bar_index, bottom=bearBodyGapBottom, extend=extend.right, bgcolor=color.new(color.fuchsia, 88), border_color=color.new(color.fuchsia, 35), text="IMBALANCE corps ↓", text_color=color.white, text_size=size.tiny)
+if showBodyImbalance and bullBodyGapActive and not na(bullBodyGapBox)
+    box.set_right(bullBodyGapBox, bar_index)
+    if bar_index > bullBodyGapCreatedBar and low <= bullBodyGapTop
+        box.set_bgcolor(bullBodyGapBox, color.new(color.orange, 82))
+    if bar_index > bullBodyGapCreatedBar and low <= bullBodyGapBottom
+        bullBodyGapActive := false
+        box.set_extend(bullBodyGapBox, extend.none)
+        box.set_bgcolor(bullBodyGapBox, color.new(color.gray, 90))
+        box.set_text(bullBodyGapBox, "Imbalance corps rempli")
+if showBodyImbalance and bearBodyGapActive and not na(bearBodyGapBox)
+    box.set_right(bearBodyGapBox, bar_index)
+    if bar_index > bearBodyGapCreatedBar and high >= bearBodyGapBottom
+        box.set_bgcolor(bearBodyGapBox, color.new(color.orange, 82))
+    if bar_index > bearBodyGapCreatedBar and high >= bearBodyGapTop
+        bearBodyGapActive := false
+        box.set_extend(bearBodyGapBox, extend.none)
+        box.set_bgcolor(bearBodyGapBox, color.new(color.gray, 90))
+        box.set_text(bearBodyGapBox, "Imbalance corps rempli")
+
+// ── Order Blocks: last opposite candle before a confirmed structure break ───
+var box bullObBox = na
+var box bearObBox = na
+var float bullObMidBody = na
+var float bearObMidBody = na
+var int bullObCreatedBar = na
+var int bearObCreatedBar = na
+var bool bullObActive = false
+var bool bearObActive = false
+var bool bullObTouched = false
+var bool bearObTouched = false
+if showOrderBlockZones and smcBullBosEvent
+    float foundBullObTop = na
+    float foundBullObBottom = na
+    float foundBullObMid = na
+    int foundBullObBar = na
+    for i = 1 to obSearchBars
+        if na(foundBullObTop) and close[i] < open[i]
+            foundBullObTop := useFullObWicks ? high[i] : open[i]
+            foundBullObBottom := useFullObWicks ? low[i] : close[i]
+            foundBullObMid := (open[i] + close[i]) / 2.0
+            foundBullObBar := bar_index - i
+    if not na(foundBullObTop)
+        if not na(bullObBox)
+            box.delete(bullObBox)
+        bullObMidBody := foundBullObMid
+        bullObCreatedBar := bar_index
+        bullObActive := true
+        bullObTouched := false
+        bullObBox := box.new(left=foundBullObBar, top=foundBullObTop, right=bar_index, bottom=foundBullObBottom, extend=extend.right, bgcolor=color.new(color.green, 83), border_color=color.new(color.green, 20), text=smcBullChoch ? "OB · CHoCH ↑" : "OB · BOS ↑", text_color=color.white, text_size=size.tiny)
+if showOrderBlockZones and smcBearBosEvent
+    float foundBearObTop = na
+    float foundBearObBottom = na
+    float foundBearObMid = na
+    int foundBearObBar = na
+    for i = 1 to obSearchBars
+        if na(foundBearObTop) and close[i] > open[i]
+            foundBearObTop := useFullObWicks ? high[i] : close[i]
+            foundBearObBottom := useFullObWicks ? low[i] : open[i]
+            foundBearObMid := (open[i] + close[i]) / 2.0
+            foundBearObBar := bar_index - i
+    if not na(foundBearObTop)
+        if not na(bearObBox)
+            box.delete(bearObBox)
+        bearObMidBody := foundBearObMid
+        bearObCreatedBar := bar_index
+        bearObActive := true
+        bearObTouched := false
+        bearObBox := box.new(left=foundBearObBar, top=foundBearObTop, right=bar_index, bottom=foundBearObBottom, extend=extend.right, bgcolor=color.new(color.maroon, 82), border_color=color.new(color.red, 20), text=smcBearChoch ? "OB · CHoCH ↓" : "OB · BOS ↓", text_color=color.white, text_size=size.tiny)
+if showOrderBlockZones and bullObActive and not na(bullObBox)
+    box.set_right(bullObBox, bar_index)
+    if bar_index > bullObCreatedBar and low <= box.get_top(bullObBox)
+        bullObTouched := true
+    if bullObTouched
+        box.set_bgcolor(bullObBox, color.new(color.orange, 80))
+    if bar_index > bullObCreatedBar and close < bullObMidBody
+        bullObActive := false
+        box.set_extend(bullObBox, extend.none)
+        box.set_bgcolor(bullObBox, color.new(color.gray, 88))
+        box.set_text(bullObBox, "OB haussier invalidé (>50% corps)")
+if showOrderBlockZones and bearObActive and not na(bearObBox)
+    box.set_right(bearObBox, bar_index)
+    if bar_index > bearObCreatedBar and high >= box.get_bottom(bearObBox)
+        bearObTouched := true
+    if bearObTouched
+        box.set_bgcolor(bearObBox, color.new(color.orange, 80))
+    if bar_index > bearObCreatedBar and close > bearObMidBody
+        bearObActive := false
+        box.set_extend(bearObBox, extend.none)
+        box.set_bgcolor(bearObBox, color.new(color.gray, 88))
+        box.set_text(bearObBox, "OB baissier invalidé (>50% corps)")
+
+// ── Most recent swing liquidity references and BOS / CHoCH labels ───────────
+var line swingHighLine = na
+var line swingLowLine = na
+var int drawnSwingHighBar = na
+var int drawnSwingLowBar = na
+if showLiquidityLevels and not na(lastSwingHighBar) and (na(drawnSwingHighBar) or lastSwingHighBar != drawnSwingHighBar)
+    if not na(swingHighLine)
+        line.delete(swingHighLine)
+    swingHighLine := line.new(x1=lastSwingHighBar, y1=lastSwingHigh, x2=bar_index, y2=lastSwingHigh, extend=extend.right, color=color.new(color.red, 20), style=line.style_dotted, width=1)
+    drawnSwingHighBar := lastSwingHighBar
+if showLiquidityLevels and not na(lastSwingLowBar) and (na(drawnSwingLowBar) or lastSwingLowBar != drawnSwingLowBar)
+    if not na(swingLowLine)
+        line.delete(swingLowLine)
+    swingLowLine := line.new(x1=lastSwingLowBar, y1=lastSwingLow, x2=bar_index, y2=lastSwingLow, extend=extend.right, color=color.new(color.lime, 20), style=line.style_dotted, width=1)
+    drawnSwingLowBar := lastSwingLowBar
+if not showLiquidityLevels
+    if not na(swingHighLine)
+        line.delete(swingHighLine)
+        swingHighLine := na
+    if not na(swingLowLine)
+        line.delete(swingLowLine)
+        swingLowLine := na
+    drawnSwingHighBar := na
+    drawnSwingLowBar := na
+
+plotshape(showBosLabels and smcBullBosEvent and smcBullChoch, title="CHoCH haussier", style=shape.labelup, location=location.belowbar, color=color.new(color.aqua, 0), text="CHoCH ↑", textcolor=color.black, size=size.tiny)
+plotshape(showBosLabels and smcBearBosEvent and smcBearChoch, title="CHoCH baissier", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), text="CHoCH ↓", textcolor=color.black, size=size.tiny)
+plotshape(showBosLabels and smcBullBosEvent and not smcBullChoch, title="BOS haussier", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BOS ↑", textcolor=color.white, size=size.tiny)
+plotshape(showBosLabels and smcBearBosEvent and not smcBearChoch, title="BOS baissier", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="BOS ↓", textcolor=color.white, size=size.tiny)
+
+[longStop, longRisk] = f_stop(1, mixDirection == 1 and methodMode == "Mixte" ? mixLongStopReference : structuralReference, avgRange)
+[shortStop, shortRisk] = f_stop(-1, mixDirection == -1 and methodMode == "Mixte" ? mixShortStopReference : structuralReference, avgRange)
+float activeStop = finalDirection == 1 ? longStop : shortStop
+float activeRisk = finalDirection == 1 ? longRisk : shortRisk
+float activeTp1 = finalDirection == 1 ? entry + activeRisk * tp1R : entry - activeRisk * tp1R
+float activeTp2 = finalDirection == 1 ? entry + activeRisk * tp2R : entry - activeRisk * tp2R
+bool planValid = finalDirection != 0 and not na(avgRange) and avgRange > 0 and entry > 0 and activeRisk > 0 and activeRisk <= entry * maxRiskPctPrice / 100.0
+
+int selectedVotes = methodMode == "Mixte" ? (finalDirection == 1 ? longVotes : shortVotes) : (finalDirection == 1 ? 1 : 0)
+string confluenceText = methodMode == "Mixte" ? str.tostring(selectedVotes) + "/4 méthodes" : methodMode == "Price Action" ? str.tostring(finalDirection == 1 ? paBullEvidence : paBearEvidence) + " critères" : methodMode == "SMC" ? str.tostring(finalDirection == 1 ? smcBullEvidence : smcBearEvidence) + " critères" : methodMode == "Wyckoff" ? (finalDirection == 1 ? "Spring" : "UTAD") + (wyckoffVolumeReady ? " · vol " + str.tostring(volumeRatio, "#.##") + "x" : " · volume absent") : "3 confirmations Ichimoku"
+string paDetails = (paBullBreak ? "cassure haussière · " : "") + (paBearBreak ? "cassure baissière · " : "") + (paBullEngulf ? "engulfing haussier · " : "") + (paBearEngulf ? "engulfing baissier · " : "") + (paBullReject ? "rejet bas · " : "") + (paBearReject ? "rejet haut · " : "") + (paTrendBull ? "HH/HL structure" : paTrendBear ? "LH/LL structure" : "Structure neutre")
+string ichiDetails = "Prix " + (close > cloudTop ? "au-dessus du Kumo" : close < cloudBottom ? "sous le Kumo" : "dans le Kumo") + " · Tenkan/Kijun " + (tenkan > kijun ? "haussier" : "baissier") + " · Chikou " + (close > close[26] ? "haussier" : "baissier")
+string smcDetails = (smcBullBos ? "BOS haussier · " : "") + (smcBearBos ? "BOS baissier · " : "") + (smcBullStructure ? "HH/HL · " : "") + (smcBearStructure ? "LH/LL · " : "") + (smcBullSweep ? "sweep bas · " : "") + (smcBearSweep ? "sweep haut · " : "") + (smcBullFvg ? "FVG haussier · " : "") + (smcBearFvg ? "FVG baissier · " : "")
+string wyckoffDetails = wyckoffSpring ? "Spring confirmé · volume " + str.tostring(volumeRatio, "#.##") + "x" : wyckoffUpthrust ? "UTAD confirmé · volume " + str.tostring(volumeRatio, "#.##") + "x" : wyckoffVolumeReady ? "Pas de Spring/UTAD confirmé" : "Volume historique absent ou insuffisant"
+string methodDetails = switch methodMode
+    "Price Action" => paDetails
+    "Ichimoku" => ichiDetails
+    "SMC" => str.length(smcDetails) > 0 ? smcDetails : "Pas de BOS, sweep ou FVG confirmé"
+    "Wyckoff" => wyckoffDetails
+    => "PA " + f_direction(paDirection) + " · Ichimoku " + f_direction(ichiDirection) + " · SMC " + f_direction(smcDirection) + " · Wyckoff " + f_direction(wyckoffDirection)
+string stateText = planValid and not barstate.isconfirmed ? (finalDirection == 1 ? "POTENTIEL ACHAT · bougie en formation" : "POTENTIEL VENTE · bougie en formation") : planValid ? (finalDirection == 1 ? "ACHAT confirmé à la clôture" : "VENTE confirmée à la clôture") : analysisDepth == "Profonde" and not confirmationIsHigher ? "Attente · choisir un TF supérieur" : analysisDepth == "Profonde" and rawDirection != 0 and finalDirection == 0 ? "Attente · filtre TF supérieur" : "Aucun signal confirmé"
+
+// ── Signals, levels, and alerts ─────────────────────────────────────────────
+bool buySignal = barstate.isconfirmed and planValid and finalDirection == 1 and nz(finalDirection[1], 0) != 1
+bool sellSignal = barstate.isconfirmed and planValid and finalDirection == -1 and nz(finalDirection[1], 0) != -1
+// Strategy Tester execution: size each order from current equity and the stop distance.
+// Initial capital, commission, slippage, margin, and currency remain editable in Strategy Properties.
+float riskPerUnitAccount = strategy.convert_to_account(activeRisk * syminfo.pointvalue)
+float riskCash = strategy.equity * riskPct / 100.0
+float rawOrderQty = riskPerUnitAccount > 0 ? riskCash / riskPerUnitAccount : na
+float quantityStep = syminfo.mincontract
+float orderQty = quantityStep > 0 and not na(rawOrderQty) ? math.floor(rawOrderQty / quantityStep) * quantityStep : na
+bool orderQtyValid = not na(orderQty) and quantityStep > 0 and orderQty >= quantityStep * 2.0
+bool placeLong = buySignal and strategy.position_size == 0 and orderQtyValid
+bool placeShort = sellSignal and strategy.position_size == 0 and orderQtyValid
+var float strategyStop = na
+var float strategyTp1 = na
+var float strategyTp2 = na
+var int strategyEntryBar = na
+int chartMinutes = timeframe.isminutes ? timeframe.multiplier : 0
+int maxHoldBars = chartMinutes > 0 ? math.max(1, int(math.ceil(maxHoldMinutes / chartMinutes))) : 0
+
+if placeLong
+    strategyStop := activeStop
+    strategyTp1 := activeTp1
+    strategyTp2 := activeTp2
+    strategyEntryBar := bar_index
+    strategy.entry("Long", strategy.long, qty=orderQty, comment="Price Action scalp ACHAT")
+    strategy.exit("Long TP1", from_entry="Long", stop=strategyStop, limit=strategyTp1, qty_percent=50)
+    strategy.exit("Long TP2", from_entry="Long", stop=strategyStop, limit=strategyTp2, qty_percent=50)
+if placeShort
+    strategyStop := activeStop
+    strategyTp1 := activeTp1
+    strategyTp2 := activeTp2
+    strategyEntryBar := bar_index
+    strategy.entry("Short", strategy.short, qty=orderQty, comment="Price Action scalp VENTE")
+    strategy.exit("Short TP1", from_entry="Short", stop=strategyStop, limit=strategyTp1, qty_percent=50)
+    strategy.exit("Short TP2", from_entry="Short", stop=strategyStop, limit=strategyTp2, qty_percent=50)
+if strategy.position_size > 0
+    strategy.exit("Long TP1", from_entry="Long", stop=strategyStop, limit=strategyTp1, qty_percent=50)
+    strategy.exit("Long TP2", from_entry="Long", stop=strategyStop, limit=strategyTp2, qty_percent=50)
+if strategy.position_size < 0
+    strategy.exit("Short TP1", from_entry="Short", stop=strategyStop, limit=strategyTp1, qty_percent=50)
+    strategy.exit("Short TP2", from_entry="Short", stop=strategyStop, limit=strategyTp2, qty_percent=50)
+bool timedExit = maxHoldBars > 0 and strategy.position_size != 0 and not na(strategyEntryBar) and bar_index - strategyEntryBar >= maxHoldBars
+if timedExit
+    strategy.cancel("Long TP1")
+    strategy.cancel("Long TP2")
+    strategy.cancel("Short TP1")
+    strategy.cancel("Short TP2")
+    strategy.close_all(comment="Durée maximale atteinte")
+plotshape((buySignal or sellSignal) and not orderQtyValid, title="Taille inférieure au minimum", style=shape.labeldown, location=location.abovebar, color=color.new(color.orange, 0), text="TAILLE < MIN", textcolor=color.black, size=size.tiny)
+
+plotshape(showSignals and buySignal, title="Kronos ACHAT", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 0), text="KRONOS\nACHAT", textcolor=color.black, size=size.tiny)
+plotshape(showSignals and sellSignal, title="Kronos VENTE", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="KRONOS\nVENTE", textcolor=color.white, size=size.tiny)
+
+var line entryLine = na
+var line stopLine = na
+var line tp1Line = na
+var line tp2Line = na
+var label planLabel = na
+var string lastPlanText = "En attente d'une configuration"
+
+if buySignal or sellSignal
+    lastPlanText := (buySignal ? "ACHAT" : "VENTE") + " · " + methodMode + " · " + timeframe.period
+    if showPlanLines
+        if not na(entryLine)
+            line.delete(entryLine)
+        if not na(stopLine)
+            line.delete(stopLine)
+        if not na(tp1Line)
+            line.delete(tp1Line)
+        if not na(tp2Line)
+            line.delete(tp2Line)
+        if not na(planLabel)
+            label.delete(planLabel)
+        entryLine := line.new(bar_index, entry, bar_index + 1, entry, extend=extend.right, color=color.new(color.blue, 0), width=2)
+        stopLine := line.new(bar_index, activeStop, bar_index + 1, activeStop, extend=extend.right, color=color.new(color.red, 0), width=2)
+        tp1Line := line.new(bar_index, activeTp1, bar_index + 1, activeTp1, extend=extend.right, color=color.new(color.green, 15), width=1, style=line.style_dashed)
+        tp2Line := line.new(bar_index, activeTp2, bar_index + 1, activeTp2, extend=extend.right, color=color.new(color.green, 0), width=2)
+        string directionLabel = buySignal ? "ACHAT" : "VENTE"
+        planLabel := label.new(bar_index, buySignal ? low : high, directionLabel + " · " + methodMode + "\nEntrée " + f_price(entry) + " | SL " + f_price(activeStop) + "\nTP1 " + f_price(activeTp1) + " | TP2 " + f_price(activeTp2), style=buySignal ? label.style_label_up : label.style_label_down, color=buySignal ? color.new(color.green, 0) : color.new(color.red, 0), textcolor=color.white)
+    if enableDynamicAlerts and (placeLong or placeShort)
+        string actionText = buySignal ? "ACHAT" : "VENTE"
+        string alertMessage = "{\"system\":\"KRONOS\",\"action\":\"" + actionText + "\",\"symbol\":\"" + syminfo.tickerid + "\",\"timeframe\":\"" + timeframe.period + "\",\"method\":\"" + methodMode + "\",\"profile\":\"" + horizon + "\",\"entry\":" + str.tostring(entry, format.mintick) + ",\"stop\":" + str.tostring(activeStop, format.mintick) + ",\"tp1\":" + str.tostring(activeTp1, format.mintick) + ",\"tp2\":" + str.tostring(activeTp2, format.mintick) + ",\"risk_percent\":" + str.tostring(riskPct) + "}"
+        alert(alertMessage, alert.freq_once_per_bar_close)
+
+
+// ── Phone-friendly dashboard ────────────────────────────────────────────────
+var table dashboard = table.new(position.top_right, 2, 14, border_width=1, frame_color=color.new(color.gray, 55))
+if barstate.islast and showDashboard
+    color header = color.rgb(19, 26, 43)
+    color cell = color.rgb(29, 37, 56)
+    color stateColor = planValid ? (finalDirection == 1 ? color.new(color.green, 65) : color.new(color.red, 65)) : color.new(color.gray, 75)
+    string riskCashText = str.tostring(strategy.equity * riskPct / 100.0, "#.##") + " USD (equity test)"
+    string provisionalPrefix = not barstate.isconfirmed ? "Provisoire · " : ""
+    string entryStopText = planValid ? provisionalPrefix + f_price(entry) + " / " + f_price(activeStop) : "—"
+    string targetsText = planValid ? provisionalPrefix + f_price(activeTp1) + " / " + f_price(activeTp2) : "—"
+    string depthText = analysisDepth == "Rapide" ? "Rapide · bougie du graphique" : "Profonde · EMA " + str.tostring(htfFastLength) + "/" + str.tostring(htfSlowLength) + " sur " + confirmationTf
+    table.cell(dashboard, 0, 0, "KRONOS · ANALYSE", text_color=color.white, bgcolor=header)
+    table.cell(dashboard, 1, 0, "v1 · Strategy", text_color=color.white, bgcolor=header)
+    table.cell(dashboard, 0, 1, "Instrument", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 1, syminfo.tickerid, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 2, "Unité du graphique", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 2, timeframe.period, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 3, "Méthode", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 3, methodMode, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 4, "Profil", text_color=color.silver, bgcolor=cell)
+    string scalpTfHint = horizon == "Scalping" and not scalpChartTimeframeOk ? " · conseille M1–M15" : ""
+    table.cell(dashboard, 1, 4, horizon + " · TP " + str.tostring(tp1R) + "R/" + str.tostring(tp2R) + "R" + scalpTfHint, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 5, "Mode", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 5, depthText, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 6, "État", text_color=color.white, bgcolor=stateColor)
+    table.cell(dashboard, 1, 6, stateText, text_color=color.white, bgcolor=stateColor)
+    table.cell(dashboard, 0, 7, "Confluence", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 7, confluenceText, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 8, "Entrée / SL", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 8, entryStopText, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 9, "TP1 / TP2", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 9, targetsText, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 10, "Risque prévu", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 10, str.tostring(riskPct) + "% · " + riskCashText, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 11, "Dernier signal", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 11, lastPlanText, text_color=color.white, bgcolor=cell)
+    table.cell(dashboard, 0, 12, "Éléments lus", text_color=color.silver, bgcolor=cell, text_size=size.tiny)
+    table.cell(dashboard, 1, 12, methodDetails, text_color=color.white, bgcolor=cell, text_size=size.tiny)
+    table.cell(dashboard, 0, 13, "Taille estimée", text_color=color.silver, bgcolor=cell)
+    table.cell(dashboard, 1, 13, orderQtyValid ? str.tostring(orderQty, "#.####") + " unités approx." : "Signal ignoré · sous taille mini", text_color=color.white, bgcolor=orderQtyValid ? cell : color.new(color.orange, 55), text_size=size.tiny)
+
+if barstate.islast and not showDashboard
+    table.clear(dashboard, 0, 0, 1, 13)

@@ -20,10 +20,53 @@ import {
   SWING_TRAILING_PARAMS_BY_PAIR,
   computeTrailingStopPrice,
 } from "./trading-exit-rules.mjs";
+import { analyzeKronosSmc } from "./smc-engine.mjs";
+import {
+  analyzeLatestPriceActionScalp,
+  KRONOS_PRICE_ACTION_VERSION,
+  PRICE_ACTION_RULES,
+} from "./price-action-scalp-engine.mjs";
+import {
+  advancePaForwardPosition,
+  aggregateMinuteBidAskTicks,
+  buildPaForwardPosition,
+  isCompleteBidAskMinute,
+  PA_FORWARD_STRATEGY,
+  PA_FORWARD_STRATEGY_VERSION,
+  summarizePaForwardEvidence,
+  stepPaForwardBar,
+  warmPaForwardSetupState,
+} from "./price-action-forward-test.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
-const env = await loadEnv(join(root, "secret.dev"));
+const PA_FORWARD_STANDALONE_REQUESTED = String(process.env.KRONOS_PA_FORWARD_STANDALONE || "").trim().toLowerCase() === "true";
+const loadedEnv = PA_FORWARD_STANDALONE_REQUESTED
+  ? { ...process.env }
+  : await loadEnv(join(root, "secret.dev"));
+const env = PA_FORWARD_STANDALONE_REQUESTED
+  ? {
+    ...loadedEnv,
+    NODE_ENV: "development",
+    DATABASE_URL: "",
+    SUPABASE_URL: "",
+    SUPABASE_PROJECT_URL: "",
+    SUPABASE_SERVICE_ROLE_KEY: "",
+    SUPABASE_ANON_KEY: "",
+    DERIV_MARKET_DATA_WS_URL: "wss://api.derivws.com/trading/v1/options/ws/public",
+    METAAPI_TOKEN: "",
+    METAAPI_ACCOUNT_ID: "",
+    METAAPI_REGION: "",
+    BROKER_CREDENTIALS_ENCRYPTION_KEY: "",
+    BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS: "",
+    VAPID_PUBLIC_KEY: "",
+    VAPID_PRIVATE_KEY: "",
+    VAPID_SUBJECT: "",
+  }
+  : loadedEnv;
 const IS_PRODUCTION = String(env.NODE_ENV || "").toLowerCase() === "production";
+const PA_FORWARD_TEST_ENABLED = String(env.KRONOS_PA_FORWARD_TEST_ENABLED ?? "true").trim().toLowerCase() !== "false";
+const PA_FORWARD_STANDALONE = String(env.KRONOS_PA_FORWARD_STANDALONE ?? "false").trim().toLowerCase() === "true";
+const PA_FORWARD_SCAN_INTERVAL_MS = boundedEnvNumber(env.KRONOS_PA_FORWARD_SCAN_INTERVAL_SECONDS, 30, 15, 300) * 1000;
 const BROKER_CREDENTIALS_ENCRYPTION_REQUIRED = env.BROKER_CREDENTIALS_ENCRYPTION_REQUIRED === "true" || IS_PRODUCTION;
 const BROKER_CREDENTIALS_ENCRYPTION_KEY = deriveBrokerCredentialKey(env.BROKER_CREDENTIALS_ENCRYPTION_KEY || "");
 const BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS = deriveBrokerCredentialKey(env.BROKER_CREDENTIALS_ENCRYPTION_KEY_PREVIOUS || "");
@@ -113,7 +156,7 @@ function boundedEnvNumber(value, fallback, min, max) {
   return Math.min(max, Math.max(min, number));
 }
 const port = Math.trunc(boundedEnvNumber(env.PORT, 4174, 1, 65535));
-const dataDir = join(root, "data");
+const dataDir = env.KRONOS_DATA_DIR ? resolve(env.KRONOS_DATA_DIR) : join(root, "data");
 const learningPath = join(dataDir, "learning-log.json");
 const marketCachePath = join(dataDir, "market-cache.json");
 const authPath = join(dataDir, "auth-store.json");
@@ -256,7 +299,7 @@ async function ensureRelationalTablesImpl() {
       id text PRIMARY KEY,
       user_id text,
       created_at text NOT NULL,
-      pair text, timeframe text, style text, strategy text, risk text, capital text,
+      pair text, timeframe text, style text, strategy text, target_profile text, risk text, capital text,
       analysis_depth text,
       direction text, entry real, sl real, tp1 real, tp2 real, rr text,
       score real, active integer, status text, block_reason text,
@@ -401,6 +444,71 @@ async function ensureRelationalTablesImpl() {
       lease_until text NOT NULL,
       updated_at text NOT NULL
     )`,
+    // Dedicated, non-executable forward-test storage. This never enters
+    // `analyses`, user win-rate summaries, model calibration, or broker orders.
+    `CREATE TABLE IF NOT EXISTS pa_forward_quote_bars (
+      symbol text NOT NULL,
+      minute_epoch integer NOT NULL,
+      bid_open real NOT NULL,
+      bid_high real NOT NULL,
+      bid_low real NOT NULL,
+      bid_close real NOT NULL,
+      ask_open real NOT NULL,
+      ask_high real NOT NULL,
+      ask_low real NOT NULL,
+      ask_close real NOT NULL,
+      mean_spread real NOT NULL,
+      tick_count integer NOT NULL,
+      first_tick_epoch integer NOT NULL,
+      last_tick_epoch integer NOT NULL,
+      captured_at text NOT NULL,
+      PRIMARY KEY (symbol, minute_epoch)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_pa_forward_quote_minute ON pa_forward_quote_bars(minute_epoch)`,
+    `CREATE TABLE IF NOT EXISTS pa_forward_test_state (
+      strategy_version text PRIMARY KEY,
+      last_scanned_m5_epoch integer NOT NULL,
+      setup_direction integer NOT NULL DEFAULT 0,
+      setup_level real,
+      setup_index integer NOT NULL DEFAULT -1,
+      setup_initialized integer NOT NULL DEFAULT 0,
+      missed_bars integer NOT NULL DEFAULT 0,
+      started_at text NOT NULL,
+      updated_at text NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS pa_forward_test_trades (
+      id text PRIMARY KEY,
+      strategy_version text NOT NULL,
+      pair text NOT NULL,
+      setup text NOT NULL,
+      direction integer NOT NULL,
+      signal_bar_epoch integer NOT NULL,
+      signal_epoch integer NOT NULL,
+      entry_epoch integer NOT NULL,
+      signal_price real NOT NULL,
+      base_stop real NOT NULL,
+      average_range real NOT NULL,
+      entry real,
+      stop real,
+      tp1 real,
+      tp2 real,
+      risk real,
+      entry_spread real,
+      cost_r real,
+      remaining_fraction real NOT NULL DEFAULT 1,
+      tp1_taken integer NOT NULL DEFAULT 0,
+      realized_r real NOT NULL DEFAULT 0,
+      bars_held integer NOT NULL DEFAULT 0,
+      last_processed_minute integer,
+      status text NOT NULL,
+      outcome_reason text,
+      closed_at text,
+      data_quality text,
+      created_at text NOT NULL,
+      updated_at text NOT NULL,
+      UNIQUE (strategy_version, pair, signal_epoch)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_pa_forward_trade_status ON pa_forward_test_trades(strategy_version, status, entry_epoch)`,
     // Durable per-order mutex for broker-side position modifications. Unlike
     // withFileLock, this also coordinates separate server replicas.
     `CREATE TABLE IF NOT EXISTS trade_operation_leases (
@@ -490,6 +598,12 @@ async function ensureRelationalTablesImpl() {
   // Swallowing "already exists" makes this safe to call on every startup regardless
   // of whether the column is already there.
   await ensureColumn("analyses", "is_test integer NOT NULL DEFAULT 0");
+  await ensureColumn("pa_forward_test_state", "setup_direction integer NOT NULL DEFAULT 0");
+  await ensureColumn("pa_forward_test_state", "setup_level real");
+  await ensureColumn("pa_forward_test_state", "setup_index integer NOT NULL DEFAULT -1");
+  await ensureColumn("pa_forward_test_state", "setup_initialized integer NOT NULL DEFAULT 0");
+  await ensureColumn("pa_forward_test_state", "missed_bars integer NOT NULL DEFAULT 0");
+  await ensureColumn("analyses", "target_profile text NOT NULL DEFAULT 'prudent'");
   // Comma-separated topic list ("tp_sl", "new_signal") a subscription wants pushes
   // for -- one browser subscription can carry both, independently toggled (see
   // dashboard.html's two separate push buttons), so this can't just be a boolean.
@@ -1069,6 +1183,10 @@ const memoryCache = {
 let pricesInFlight = null;
 let historiesInFlight = null;
 const newsInFlight = new Map();
+let derivActiveSymbolsCache = { items: [], expiresAt: 0 };
+let derivActiveSymbolsInFlight = null;
+let derivActiveSymbolsRetryAt = 0;
+let derivRequestSequence = 0;
 const GROQ_MODEL = env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile";
 // Confirmed live (2026-08-11, both configured GROQ_KEY_* values): this Groq
@@ -1244,7 +1362,7 @@ Les sources à clés utilisent une rotation automatique multi-clés. Une clé é
 - Frankfurter/BCE: taux quotidiens de dernier recours; ne sert pas à produire un signal intraday.
 - Finnhub: calendrier économique quand disponible. Marketaux: actualités quand disponible.
 - Vision: Groq Vision LLaMA 4 Scout/Maverick en priorité, Gemini Vision en fallback.
-- Historique: jusqu'à 80 bougies; >=50 bougies = analyse technique complète, 30-49 = partielle, <30 = prudence/prix live seulement.
+- Historique: Deriv demande jusqu'à 500 bougies en M1, 360 en M5, puis une fenêtre adaptée aux UT plus longues; les fournisseurs de secours peuvent renvoyer moins. La profondeur réellement reçue et la fraîcheur priment sur la profondeur demandée.
 - Si la source live est absente, faible, différée ou incohérente, baisse le score et signale la limite. N'invente jamais une donnée manquante.`;
 
 const KRONOS_CHART_POLICY = `LECTURE DES GRAPHES
@@ -1253,13 +1371,13 @@ Plateformes possibles: TradingView, MT4, MT5, cTrader, Binance, Coinbase Advance
 Pour chaque image, identifie si visible: plateforme, instrument, timeframe, type de graphe, tendance, structure HH/HL ou LH/LL, supports/résistances, liquidité, patterns, indicateurs, dessins utilisateur.
 Le site accepte 2 graphes maximum. Avec 2 graphes: le timeframe le plus élevé donne le biais, le plus petit donne l'entrée. S'ils se contredisent, retourne AUCUN SIGNAL ou un score faible.
 Qualité image: >=70 analyse complète; 50-69 analyse partielle; 30-49 analyse prudente croisée avec API; <30 bloque l'analyse visuelle directe.
-Si aucun graphe n'est fourni, écris "Analyse sans screenshot", utilise seulement le prix live et le formulaire, et ne cite aucun élément visuel. Si un prix live fiable est disponible, tu peux proposer un plan éducatif prudent avec score plafonné à 60; sinon retourne AUCUN SIGNAL.`;
+Sans image uploadée, écris "Analyse sans screenshot" et ne prétends pas avoir effectué une lecture visuelle. Tu peux citer uniquement les métriques OHLC transmises dans la synthèse Kronos (bougie récente, swings confirmés, balayage 20 bougies et imbalance 3 bougies), avec leur paire, UT et source. N'invente pas d'OB, d'OTE ou de niveau absent des données; si l'historique est absent ou périmé, reviens au prix/formulaire et reste prudent.`;
 
 const KRONOS_METHOD_POLICY = `MÉTHODES D'ANALYSE SUPPORTÉES
 Techniques finales autorisées pour TECHNIQUE_UTILISEE: ICT, SMC, Wyckoff, Elliott, Price Action, Ichimoku, Hybride SMC+Chartiste.
 Confluences secondaires possibles dans l'explication: Supply/Demand, VSA, Harmonic, Fibonacci, chartisme classique, chandeliers japonais, volume, psychologie du marché. Elles ne doivent pas remplacer la technique finale autorisée.
 
-Price Action: structure HH/HL ou LH/LL, range, supports/résistances, cassure/retest, measured move, chandeliers de confirmation. Le contexte prime toujours sur une bougie isolée.
+Price Action: structure HH/HL ou LH/LL, supports/resistances, range, cassure/retest et chandeliers de confirmation. En scalping, seuls deux declencheurs sont recevables: (1) cloture au-dela d'un niveau puis retest/reprise confirmee; (2) rejet confirme sur un support/resistance identifiable. Un chandelier isolé n'est pas un signal. Si les donnees ne confirment pas le declencheur, retourne AUCUN SIGNAL. Les zones OTE, FVG, imbalance et OB restent du contexte visuel et ne valident pas une entree a elles seules.
 SMC: BOS = clôture au-delà d'un swing high/low existant dans le sens de la tendance en cours (continuation). CHOCH = clôture au-delà d'un swing dans le sens opposé à la tendance en cours (alerte de changement seulement, jamais une confirmation d'entrée à elle seule). Order block valide = dernière bougie opposée avant un déplacement impulsif, non mitigée au-delà de 50% de son corps. FVG = écart de prix entre la mèche de la bougie 1 et la mèche de la bougie 3 (3 bougies consécutives), non comblé par le prix depuis. Une zone déjà retestée et tenue plusieurs fois est plus fiable qu'une zone fraîche non testée.
 ICT: kill zones = Londres ~07h-10h GMT et New York ~12h-15h GMT (indicatif, pas une règle rigide hors info de session fournie); liquidity sweep = mèche qui dépasse un plus haut/bas évident puis rejette; OTE = zone de retracement Fibonacci 61.8%-79% d'un swing impulsif. Macros/Silver Bullet uniquement si l'heure/session est fournie dans le contexte, jamais suggérées à l'aveugle.
 Wyckoff: Spring = fausse cassure sous le support de la range suivie d'un retour rapide au-dessus, confirmée seulement à la clôture (pas sur la mèche seule); UTAD = symétrique au-dessus de la résistance. Effort/résultat: gros volume sans progression de prix = absorption, signal d'épuisement de la tendance en cours.
@@ -1491,6 +1609,11 @@ async function startSchedulersAfterReady() {
     return;
   }
   schedulersStarted = true;
+  if (PA_FORWARD_STANDALONE) {
+    startPriceActionForwardTest();
+    console.log("[pa-forward] standalone mode: only isolated public-quote research collector started");
+    return;
+  }
   startLearningOutcomesScheduler();
   startBrokerReconcileScheduler();
   startSendingRecoveryScheduler();
@@ -1500,20 +1623,24 @@ async function startSchedulersAfterReady() {
   startNewSignalAlertScheduler();
   startAutoTradeScheduler();
   startScalpTradingScheduler();
+  startPriceActionForwardTest();
   startHeartbeatScheduler();
   startRateLimitMapSweeper();
 }
 
-httpServer.listen(port, () => {
+const onHttpServerListen = () => {
   console.log(`Oracle Forex local: http://127.0.0.1:${port}/#signaux`);
   startSchedulersAfterReady();
-});
+};
+if (PA_FORWARD_STANDALONE) httpServer.listen(port, "127.0.0.1", onHttpServerListen);
+else httpServer.listen(port, onHttpServerListen);
 
 let shutdownPromise = null;
 async function gracefulShutdown(signal) {
   if (shutdownPromise) return shutdownPromise;
   shutdownPromise = (async () => {
     console.warn("[shutdown] " + signal + ": fermeture propre du serveur");
+    await stopPriceActionForwardQuoteStream();
     for (const client of signalStreamClients) client.destroy();
     httpServer.closeIdleConnections?.();
     await new Promise((resolve) => {
@@ -1639,6 +1766,586 @@ function startLearningOutcomesScheduler() {
   };
   tick();
   setInterval(tick, LEARNING_OUTCOMES_INTERVAL_MS);
+}
+
+const paForwardQuoteStatus = {
+  enabled: PA_FORWARD_TEST_ENABLED,
+  state: PA_FORWARD_TEST_ENABLED ? "starting" : "disabled",
+  symbol: null,
+  tickSize: null,
+  pipSize: null,
+  connectedAt: null,
+  lastTickAt: null,
+  lastCompleteMinuteAt: null,
+  lastScanAt: null,
+  lastScannedM5At: null,
+  lastHistoryBarCount: null,
+  lastHistorySource: null,
+  lastHistoryNewestBarAt: null,
+  lastError: null,
+  reconnects: 0,
+  missedBars: 0,
+  quoteMinutesIncomplete: 0,
+};
+let paForwardQuoteSocket = null;
+let paForwardQuoteLeaseToken = null;
+let paForwardQuoteLeaseTimer = null;
+let paForwardQuotePingTimer = null;
+let paForwardQuoteReconnectTimer = null;
+let paForwardQuoteConnectInFlight = false;
+let paForwardCurrentMinuteEpoch = null;
+let paForwardCurrentMinuteTicks = [];
+let paForwardQuoteWriteQueue = Promise.resolve();
+let paForwardScannerTimer = null;
+let paForwardScannerInFlight = false;
+
+function startPriceActionForwardTest() {
+  if (!PA_FORWARD_TEST_ENABLED) {
+    paForwardQuoteStatus.state = "disabled_by_environment";
+    return;
+  }
+  startPaForwardQuoteStream().catch((error) => {
+    paForwardQuoteStatus.state = "stream_error";
+    paForwardQuoteStatus.lastError = String(error?.message || error);
+    logOnce("pa-forward-stream", `flux de recherche indisponible (${error.message})`);
+  });
+  const tick = () => runPaForwardResearchScan().catch((error) => {
+    paForwardQuoteStatus.lastError = String(error?.message || error);
+    logOnce("pa-forward-scan", `scan de recherche XAUUSD échoué (${error.message})`);
+  });
+  tick();
+  paForwardScannerTimer = setInterval(tick, PA_FORWARD_SCAN_INTERVAL_MS);
+  paForwardScannerTimer.unref?.();
+}
+
+async function startPaForwardQuoteStream() {
+  if (!PA_FORWARD_TEST_ENABLED || paForwardQuoteSocket || paForwardQuoteConnectInFlight || paForwardQuoteReconnectTimer) return;
+  paForwardQuoteConnectInFlight = true;
+  try {
+    await ensureRelationalTables();
+    if (!paForwardQuoteLeaseToken) {
+      paForwardQuoteLeaseToken = await tryAcquireSchedulerLease("pa-forward-quote-stream");
+      if (!paForwardQuoteLeaseToken) {
+        paForwardQuoteStatus.state = "another_instance_collecting";
+        paForwardQuoteReconnectTimer = setTimeout(() => {
+          paForwardQuoteReconnectTimer = null;
+          startPaForwardQuoteStream().catch(() => {});
+        }, 30_000);
+        paForwardQuoteReconnectTimer.unref?.();
+        return;
+      }
+    }
+    if (!paForwardQuoteLeaseTimer) {
+      paForwardQuoteLeaseTimer = setInterval(async () => {
+        try {
+          const now = new Date();
+          const updated = await sqlRun(
+            `UPDATE scheduler_leases SET lease_until = ?, updated_at = ? WHERE lease_key = ? AND lease_token = ?`,
+            [new Date(now.getTime() + SCHEDULER_LEASE_MS).toISOString(), now.toISOString(), "pa-forward-quote-stream", paForwardQuoteLeaseToken],
+          );
+          if (Number(pgPool ? updated.rowCount : updated.changes) !== 1) {
+            paForwardQuoteStatus.state = "quote_stream_lease_lost";
+            try { paForwardQuoteSocket?.close(); } catch {}
+            paForwardQuoteSocket = null;
+            clearInterval(paForwardQuoteLeaseTimer);
+            paForwardQuoteLeaseTimer = null;
+            paForwardQuoteLeaseToken = null;
+            schedulePaForwardQuoteReconnect(5000);
+          }
+        } catch (error) {
+          paForwardQuoteStatus.lastError = String(error?.message || error);
+          logOnce("pa-forward-quote-lease", `renouvellement du verrou de cotations échoué (${error.message})`);
+        }
+      }, 30_000);
+      paForwardQuoteLeaseTimer.unref?.();
+    }
+
+    const records = PA_FORWARD_STANDALONE ? [] : await derivActiveSymbols();
+    const symbolRecord = derivSymbolRecordForPair(records, PA_FORWARD_STRATEGY.pair);
+    const symbol = symbolRecord?.underlying_symbol || symbolRecord?.symbol || null;
+    const pipSize = Number(symbolRecord?.pip_size ?? symbolRecord?.pip);
+    // Keep the same XAUUSD price increment used by the site's live Price Action
+    // engine and the Deriv MT5 backtest metadata. Deriv `pip_size` is a pip unit,
+    // not the execution tick increment used for stop buffers/slippage.
+    const tickSize = priceActionTickSize(PA_FORWARD_STRATEGY.pair);
+    if (!symbol || !(tickSize > 0)) throw new Error("deriv_xau_symbol_or_tick_size_unavailable");
+    paForwardQuoteStatus.symbol = symbol;
+    paForwardQuoteStatus.tickSize = tickSize;
+    paForwardQuoteStatus.pipSize = Number.isFinite(pipSize) ? pipSize : null;
+    paForwardQuoteStatus.state = "connecting";
+    const socket = new WebSocket(env.DERIV_MARKET_DATA_WS_URL || "wss://ws.binaryws.com/websockets/v3");
+    paForwardQuoteSocket = socket;
+    socket.addEventListener("open", () => {
+      if (paForwardQuoteSocket !== socket) return;
+      paForwardQuoteStatus.state = "connected_waiting_for_ticks";
+      paForwardQuoteStatus.connectedAt = new Date().toISOString();
+      paForwardQuoteStatus.lastError = null;
+      socket.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: ++derivRequestSequence }));
+      clearInterval(paForwardQuotePingTimer);
+      paForwardQuotePingTimer = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ ping: 1 }));
+      }, 30_000);
+      paForwardQuotePingTimer.unref?.();
+    }, { once: true });
+    socket.addEventListener("message", (event) => {
+      if (paForwardQuoteSocket !== socket) return;
+      let message;
+      try { message = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString()); } catch { return; }
+      if (message.error) {
+        paForwardQuoteStatus.lastError = String(message.error.message || message.error.code || "deriv_tick_stream_error");
+        paForwardQuoteStatus.state = "stream_error";
+        try { socket.close(); } catch {}
+        return;
+      }
+      if (message.msg_type !== "tick" || !message.tick) return;
+      const tick = {
+        epoch: Number(message.tick.epoch),
+        bid: Number(message.tick.bid),
+        ask: Number(message.tick.ask),
+      };
+      if (!Number.isFinite(tick.epoch) || !(tick.bid > 0) || !(tick.ask >= tick.bid)) return;
+      paForwardQuoteStatus.state = "streaming_bid_ask";
+      paForwardQuoteStatus.lastTickAt = new Date(tick.epoch * 1000).toISOString();
+      const minuteEpoch = Math.floor(tick.epoch / 60) * 60;
+      if (paForwardCurrentMinuteEpoch === null) {
+        paForwardCurrentMinuteEpoch = minuteEpoch;
+        paForwardCurrentMinuteTicks = [tick];
+        return;
+      }
+      if (minuteEpoch < paForwardCurrentMinuteEpoch) return;
+      if (minuteEpoch > paForwardCurrentMinuteEpoch) {
+        const completed = aggregateMinuteBidAskTicks(paForwardCurrentMinuteTicks);
+        if (completed) enqueuePaForwardQuoteBar(completed);
+        paForwardCurrentMinuteEpoch = minuteEpoch;
+        paForwardCurrentMinuteTicks = [tick];
+        return;
+      }
+      paForwardCurrentMinuteTicks.push(tick);
+    });
+    socket.addEventListener("error", () => {
+      paForwardQuoteStatus.lastError = "deriv_tick_stream_connection_error";
+      paForwardQuoteStatus.state = "stream_error";
+      try { socket.close(); } catch {}
+    }, { once: true });
+    socket.addEventListener("close", () => {
+      if (paForwardQuoteSocket !== socket) return;
+      paForwardQuoteSocket = null;
+      clearInterval(paForwardQuotePingTimer);
+      paForwardQuotePingTimer = null;
+      paForwardCurrentMinuteEpoch = null;
+      paForwardCurrentMinuteTicks = [];
+      paForwardQuoteStatus.state = "reconnecting";
+      paForwardQuoteStatus.reconnects += 1;
+      schedulePaForwardQuoteReconnect(5000);
+    }, { once: true });
+  } catch (error) {
+    paForwardQuoteStatus.state = "stream_error";
+    paForwardQuoteStatus.lastError = String(error?.message || error);
+    if (paForwardQuoteLeaseToken && !paForwardQuoteSocket) {
+      await releaseSchedulerLease("pa-forward-quote-stream", paForwardQuoteLeaseToken).catch(() => {});
+      paForwardQuoteLeaseToken = null;
+      clearInterval(paForwardQuoteLeaseTimer);
+      paForwardQuoteLeaseTimer = null;
+    }
+    schedulePaForwardQuoteReconnect(30_000);
+  } finally {
+    paForwardQuoteConnectInFlight = false;
+  }
+}
+
+function schedulePaForwardQuoteReconnect(delayMs) {
+  if (!PA_FORWARD_TEST_ENABLED || paForwardQuoteReconnectTimer) return;
+  paForwardQuoteReconnectTimer = setTimeout(() => {
+    paForwardQuoteReconnectTimer = null;
+    startPaForwardQuoteStream().catch(() => {});
+  }, delayMs);
+  paForwardQuoteReconnectTimer.unref?.();
+}
+
+function enqueuePaForwardQuoteBar(bar) {
+  paForwardQuoteWriteQueue = paForwardQuoteWriteQueue.then(async () => {
+    await ensureRelationalTables();
+    const now = new Date().toISOString();
+    await sqlRun(
+      `INSERT INTO pa_forward_quote_bars
+       (symbol, minute_epoch, bid_open, bid_high, bid_low, bid_close, ask_open, ask_high, ask_low, ask_close, mean_spread, tick_count, first_tick_epoch, last_tick_epoch, captured_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (symbol, minute_epoch) DO NOTHING`,
+      [PA_FORWARD_STRATEGY.pair, bar.minute_epoch, bar.bid_open, bar.bid_high, bar.bid_low, bar.bid_close,
+        bar.ask_open, bar.ask_high, bar.ask_low, bar.ask_close, bar.mean_spread, bar.tick_count,
+        bar.first_tick_epoch, bar.last_tick_epoch, now],
+    );
+    if (isCompleteBidAskMinute(bar)) {
+      paForwardQuoteStatus.lastCompleteMinuteAt = new Date((bar.minute_epoch + 60) * 1000).toISOString();
+    }
+  }).catch((error) => {
+    paForwardQuoteStatus.lastError = String(error?.message || error);
+    logOnce("pa-forward-quote-write", `enregistrement des cotations de recherche échoué (${error.message})`);
+  });
+}
+
+async function stopPriceActionForwardQuoteStream() {
+  clearInterval(paForwardScannerTimer);
+  paForwardScannerTimer = null;
+  clearInterval(paForwardQuoteLeaseTimer);
+  paForwardQuoteLeaseTimer = null;
+  clearInterval(paForwardQuotePingTimer);
+  paForwardQuotePingTimer = null;
+  clearTimeout(paForwardQuoteReconnectTimer);
+  paForwardQuoteReconnectTimer = null;
+  const socket = paForwardQuoteSocket;
+  paForwardQuoteSocket = null;
+  try { socket?.close(); } catch {}
+  paForwardCurrentMinuteEpoch = null;
+  paForwardCurrentMinuteTicks = [];
+  await paForwardQuoteWriteQueue.catch(() => {});
+  if (paForwardQuoteLeaseToken) {
+    await releaseSchedulerLease("pa-forward-quote-stream", paForwardQuoteLeaseToken).catch(() => {});
+    paForwardQuoteLeaseToken = null;
+  }
+}
+
+async function runPaForwardResearchScan() {
+  if (!PA_FORWARD_TEST_ENABLED || paForwardScannerInFlight) return;
+  paForwardScannerInFlight = true;
+  let leaseToken = null;
+  try {
+    await ensureRelationalTables();
+    leaseToken = await tryAcquireSchedulerLease("pa-forward-test-scan");
+    if (!leaseToken) return;
+    const latestTickEpoch = Math.floor(Date.parse(paForwardQuoteStatus.lastTickAt || "") / 1000);
+    const tickAgeSeconds = Math.floor(Date.now() / 1000) - latestTickEpoch;
+    if (!(Number(paForwardQuoteStatus.tickSize) > 0) || !Number.isFinite(latestTickEpoch) || tickAgeSeconds > 120) {
+      if (paForwardQuoteStatus.state !== "another_instance_collecting") {
+        paForwardQuoteStatus.state = Number.isFinite(latestTickEpoch) ? "bid_ask_stream_stale" : "waiting_for_bid_ask_quotes";
+      }
+      paForwardQuoteStatus.lastScanAt = new Date().toISOString();
+      return;
+    }
+    const bars = await fetchDerivAnalysisHistory(PA_FORWARD_STRATEGY.pair, PA_FORWARD_STRATEGY.timeframe, 10_000);
+    paForwardQuoteStatus.lastHistoryBarCount = Array.isArray(bars) ? bars.length : 0;
+    paForwardQuoteStatus.lastHistorySource = String(bars?._meta?.source || "");
+    paForwardQuoteStatus.lastHistoryNewestBarAt = bars?.length && Number.isFinite(Number(bars.at(-1)?.epoch))
+      ? new Date(Number(bars.at(-1).epoch) * 1000).toISOString()
+      : bars?.length ? bars.at(-1)?.datetime || null : null;
+    if (!Array.isArray(bars) || bars.length < PRICE_ACTION_RULES.lookbackBars + 3
+      || !String(bars?._meta?.source || "").startsWith("deriv_ws")) {
+      paForwardQuoteStatus.lastScanAt = new Date().toISOString();
+      paForwardQuoteStatus.state = paForwardQuoteStatus.lastTickAt ? "waiting_for_valid_m5_history" : paForwardQuoteStatus.state;
+      return;
+    }
+    await paForwardQuoteWriteQueue;
+    const latestBarEpoch = Math.floor(Date.parse(bars.at(-1).datetime) / 1000);
+    if (!Number.isFinite(latestBarEpoch)) return;
+    const nowIso = new Date().toISOString();
+    const quoteCutoff = Math.floor(Date.now() / 1000) - 48 * 60 * 60;
+    const quoteRows = await sqlAll(
+      `SELECT * FROM pa_forward_quote_bars WHERE symbol = ? AND minute_epoch >= ? ORDER BY minute_epoch ASC`,
+      [PA_FORWARD_STRATEGY.pair, quoteCutoff],
+    );
+    // A minute with ticks only near its middle/end is partial after a reconnect.
+    // Exclude it from entries, spread estimates and exits; otherwise its OHLC
+    // could falsely imply a complete path and hide an SL/TP touch.
+    const completeQuoteRows = quoteRows.filter(isCompleteBidAskMinute);
+    paForwardQuoteStatus.quoteMinutesIncomplete = quoteRows.length - completeQuoteRows.length;
+    const quoteByMinute = new Map(completeQuoteRows.map((row) => [Number(row.minute_epoch), row]));
+    const latestQuoteEpoch = completeQuoteRows.length ? Number(completeQuoteRows.at(-1).minute_epoch) : null;
+    if (latestQuoteEpoch && Date.now() / 1000 - latestQuoteEpoch > 120) {
+      paForwardQuoteStatus.state = "bid_ask_stream_stale";
+    }
+    await updatePaForwardOpenTrades(completeQuoteRows, latestQuoteEpoch);
+    const spreadGroups = new Map();
+    for (const row of completeQuoteRows) {
+      const minuteEpoch = Number(row.minute_epoch);
+      const groupEpoch = Math.floor(minuteEpoch / 300) * 300;
+      if (!spreadGroups.has(groupEpoch)) spreadGroups.set(groupEpoch, []);
+      spreadGroups.get(groupEpoch).push(row);
+    }
+    const spreadByM5Epoch = new Map();
+    for (const [groupEpoch, group] of spreadGroups) {
+      const ordered = group.slice().sort((a, b) => Number(a.minute_epoch) - Number(b.minute_epoch));
+      const complete = ordered.length === 5 && ordered.every((row, index) => Number(row.minute_epoch) === groupEpoch + index * 60);
+      if (!complete) continue;
+      const tickWeight = ordered.reduce((sum, row) => sum + Number(row.tick_count || 0), 0);
+      if (!(tickWeight > 0)) continue;
+      const meanSpread = ordered.reduce((sum, row) => sum + Number(row.mean_spread) * Number(row.tick_count || 0), 0) / tickWeight;
+      spreadByM5Epoch.set(groupEpoch, meanSpread);
+    }
+    await processPaForwardPendingEntries(quoteByMinute, latestQuoteEpoch);
+    await updatePaForwardOpenTrades(completeQuoteRows, latestQuoteEpoch);
+
+    let state = await sqlGet(
+      `SELECT last_scanned_m5_epoch, setup_direction, setup_level, setup_index, setup_initialized, missed_bars, started_at
+       FROM pa_forward_test_state WHERE strategy_version = ?`,
+      [PA_FORWARD_STRATEGY_VERSION],
+    );
+    const tickSize = Number(paForwardQuoteStatus.tickSize);
+    const latestIndex = bars.length - 1;
+    if (!state) {
+      const setup = warmPaForwardSetupState(bars, latestIndex, { tickSize, spreadByM5Epoch });
+      await sqlRun(
+        `INSERT INTO pa_forward_test_state
+         (strategy_version, last_scanned_m5_epoch, setup_direction, setup_level, setup_index, setup_initialized, missed_bars, started_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?) ON CONFLICT (strategy_version) DO NOTHING`,
+        [PA_FORWARD_STRATEGY_VERSION, latestBarEpoch, setup.direction, Number.isFinite(setup.level) ? setup.level : null,
+          setup.index, nowIso, nowIso],
+      );
+      paForwardQuoteStatus.lastScannedM5At = new Date(latestBarEpoch * 1000).toISOString();
+      state = { last_scanned_m5_epoch: latestBarEpoch, setup_direction: setup.direction,
+        setup_level: Number.isFinite(setup.level) ? setup.level : null, setup_index: setup.index,
+        setup_initialized: 1, missed_bars: 0, started_at: nowIso };
+    } else if (Number(state.setup_initialized) !== 1) {
+      const setup = warmPaForwardSetupState(bars, latestIndex, { tickSize, spreadByM5Epoch });
+      await savePaForwardSetupState(latestBarEpoch, setup, Number(state.missed_bars) || 0);
+      state.last_scanned_m5_epoch = latestBarEpoch;
+      state.setup_direction = setup.direction;
+      state.setup_level = Number.isFinite(setup.level) ? setup.level : null;
+      state.setup_index = setup.index;
+      state.setup_initialized = 1;
+    } else if (latestBarEpoch > Number(state.last_scanned_m5_epoch)) {
+      const deltaBars = Math.max(1, Math.floor((latestBarEpoch - Number(state.last_scanned_m5_epoch)) / 300));
+      let missedBars = Number(state.missed_bars) || 0;
+      let setup = {
+        direction: Number(state.setup_direction) || 0,
+        level: state.setup_level == null ? Number.NaN : Number(state.setup_level),
+        index: Number(state.setup_index),
+      };
+      if (deltaBars > 1) {
+        // If the process was down across one or more M5 closes, don't fabricate
+        // entries in the missing interval. Rebuild only the setup context, then
+        // resume prospectively on the newest bar with complete quote coverage.
+        setup = warmPaForwardSetupState(bars, latestIndex - 1, { tickSize, spreadByM5Epoch });
+        missedBars += deltaBars - 1;
+      }
+      const spread = spreadByM5Epoch.get(latestBarEpoch);
+      if (Number.isFinite(spread) && latestIndex >= PRICE_ACTION_RULES.lookbackBars + 2) {
+        const positionRows = await sqlAll(
+          `SELECT status, entry_epoch, closed_at FROM pa_forward_test_trades
+           WHERE strategy_version = ? AND status IN ('OPEN', 'CLOSED', 'DATA_GAP', 'PENDING_ENTRY') ORDER BY entry_epoch ASC`,
+          [PA_FORWARD_STRATEGY_VERSION],
+        );
+        const busyAtBarOpen = positionRows.some((position) => {
+          const entryEpoch = Number(position.entry_epoch);
+          if (entryEpoch > latestBarEpoch) return false;
+          if (position.status === "OPEN" || position.status === "PENDING_ENTRY") return true;
+          const closedEpoch = Math.floor(Date.parse(position.closed_at || "") / 1000);
+          const endEpoch = position.status === "DATA_GAP"
+            ? Math.max(Number.isFinite(closedEpoch) ? closedEpoch : 0, entryEpoch + PA_FORWARD_STRATEGY.maxHoldMinutes * 60)
+            : closedEpoch;
+          return endEpoch > latestBarEpoch;
+        });
+        if (!busyAtBarOpen) {
+          const result = stepPaForwardBar(bars, latestIndex, setup, { tickSize, spread });
+          setup = result.state;
+          const signal = result.signal;
+          if (signal?.setup === PA_FORWARD_STRATEGY.setup && signal.direction === PA_FORWARD_STRATEGY.direction) {
+            const signalEpoch = latestBarEpoch + 300;
+            const id = `${PA_FORWARD_STRATEGY_VERSION}:${PA_FORWARD_STRATEGY.pair}:${signalEpoch}`;
+            await sqlRun(
+              `INSERT INTO pa_forward_test_trades
+               (id, strategy_version, pair, setup, direction, signal_bar_epoch, signal_epoch, entry_epoch, signal_price, base_stop, average_range, status, data_quality, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', 'deriv_bid_ask_tick_stream', ?, ?)
+               ON CONFLICT (strategy_version, pair, signal_epoch) DO NOTHING`,
+              [id, PA_FORWARD_STRATEGY_VERSION, PA_FORWARD_STRATEGY.pair, signal.setup, signal.direction,
+                latestBarEpoch, signalEpoch, signalEpoch, signal.entry, signal.stop, signal.averageRange, nowIso, nowIso],
+            );
+          }
+        }
+        await savePaForwardSetupState(latestBarEpoch, setup, missedBars);
+        state.last_scanned_m5_epoch = latestBarEpoch;
+        state.setup_direction = setup.direction;
+        state.setup_level = Number.isFinite(setup.level) ? setup.level : null;
+        state.setup_index = setup.index;
+        state.missed_bars = missedBars;
+        paForwardQuoteStatus.lastScannedM5At = new Date(latestBarEpoch * 1000).toISOString();
+      } else if (deltaBars > 1) {
+        // Keep the newest close pending until its full five-minute bid/ask spread
+        // sample exists. The completed earlier interval is recorded as missed.
+        const previousEpoch = latestBarEpoch - 300;
+        await savePaForwardSetupState(previousEpoch, setup, missedBars);
+        state.last_scanned_m5_epoch = previousEpoch;
+        state.setup_direction = setup.direction;
+        state.setup_level = Number.isFinite(setup.level) ? setup.level : null;
+        state.setup_index = setup.index;
+        state.missed_bars = missedBars;
+      }
+    }
+    paForwardQuoteStatus.missedBars = Number(state.missed_bars) || 0;
+    if (!spreadByM5Epoch.has(latestBarEpoch) && latestBarEpoch > Number(state.last_scanned_m5_epoch)) {
+      paForwardQuoteStatus.state = "waiting_for_complete_bid_ask_m5";
+    }
+    await processPaForwardPendingEntries(quoteByMinute, latestQuoteEpoch);
+    await updatePaForwardOpenTrades(completeQuoteRows, latestQuoteEpoch);
+    await sqlRun(`DELETE FROM pa_forward_quote_bars WHERE symbol = ? AND minute_epoch < ?`, [PA_FORWARD_STRATEGY.pair, quoteCutoff]);
+    paForwardQuoteStatus.lastScanAt = new Date().toISOString();
+    if (paForwardQuoteStatus.state === "bid_ask_stream_stale" && latestQuoteEpoch && Date.now() / 1000 - latestQuoteEpoch <= 120) {
+      paForwardQuoteStatus.state = "streaming_bid_ask";
+    }
+  } finally {
+    if (leaseToken) await releaseSchedulerLease("pa-forward-test-scan", leaseToken).catch(() => {});
+    paForwardScannerInFlight = false;
+  }
+}
+
+async function savePaForwardSetupState(lastEpoch, setup, missedBars) {
+  const now = new Date().toISOString();
+  await sqlRun(
+    `UPDATE pa_forward_test_state SET last_scanned_m5_epoch = ?, setup_direction = ?, setup_level = ?,
+     setup_index = ?, setup_initialized = 1, missed_bars = ?, updated_at = ? WHERE strategy_version = ?`,
+    [lastEpoch, Number(setup?.direction) || 0, setup?.level != null && Number.isFinite(Number(setup.level)) ? Number(setup.level) : null,
+      Number.isFinite(Number(setup?.index)) ? Number(setup.index) : -1, Math.max(0, Number(missedBars) || 0),
+      now, PA_FORWARD_STRATEGY_VERSION],
+  );
+}
+
+async function updatePaForwardOpenTrades(quoteRows, latestQuoteEpoch) {
+  const openTrades = await sqlAll(
+    `SELECT * FROM pa_forward_test_trades WHERE strategy_version = ? AND status = 'OPEN' ORDER BY entry_epoch ASC`,
+    [PA_FORWARD_STRATEGY_VERSION],
+  );
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  for (const row of openTrades) {
+    const position = {
+      entry: Number(row.entry), stop: Number(row.stop), tp1: Number(row.tp1), tp2: Number(row.tp2), risk: Number(row.risk),
+      remaining_fraction: Number(row.remaining_fraction), tp1_taken: Number(row.tp1_taken), realized_r: Number(row.realized_r),
+      bars_held: Number(row.bars_held), last_processed_minute: Number(row.last_processed_minute), status: row.status,
+      outcome_reason: row.outcome_reason, closed_at: row.closed_at,
+    };
+    const quotes = quoteRows.filter((quote) => Number(quote.minute_epoch) > position.last_processed_minute);
+    const result = advancePaForwardPosition(position, quotes, Number(paForwardQuoteStatus.tickSize));
+    if (result.status === "OPEN" && nowEpoch > Number(row.entry_epoch) + PA_FORWARD_STRATEGY.maxHoldMinutes * 60 + 120
+      && (!latestQuoteEpoch || latestQuoteEpoch <= Number(row.last_processed_minute))) {
+      result.status = "DATA_GAP";
+      result.outcome_reason = "quote_stream_gap_past_time_stop";
+      result.closed_at = new Date((Number(row.entry_epoch) + PA_FORWARD_STRATEGY.maxHoldMinutes * 60) * 1000).toISOString();
+    }
+    if (result.status !== row.status || result.last_processed_minute !== Number(row.last_processed_minute)
+      || result.realized_r !== Number(row.realized_r) || result.bars_held !== Number(row.bars_held)) {
+      await persistPaForwardPosition(row.id, result);
+    }
+  }
+}
+
+async function processPaForwardPendingEntries(quoteByMinute, latestQuoteEpoch) {
+  const pending = await sqlAll(
+    `SELECT * FROM pa_forward_test_trades WHERE strategy_version = ? AND status = 'PENDING_ENTRY' ORDER BY entry_epoch ASC`,
+    [PA_FORWARD_STRATEGY_VERSION],
+  );
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  for (const signal of pending) {
+    const entryEpoch = Number(signal.entry_epoch);
+    const quote = quoteByMinute.get(entryEpoch);
+    if (!quote) {
+      if (nowEpoch > entryEpoch + 120) {
+        await sqlRun(
+          `UPDATE pa_forward_test_trades SET status = 'MISSED_NO_ENTRY_QUOTE', outcome_reason = 'entry_minute_not_captured', updated_at = ? WHERE id = ? AND status = 'PENDING_ENTRY'`,
+          [new Date().toISOString(), signal.id],
+        );
+      }
+      continue;
+    }
+    const prior = await sqlGet(
+      `SELECT status, entry_epoch, closed_at FROM pa_forward_test_trades
+       WHERE strategy_version = ? AND status IN ('OPEN', 'CLOSED', 'DATA_GAP') AND entry_epoch < ?
+       ORDER BY entry_epoch DESC LIMIT 1`,
+      [PA_FORWARD_STRATEGY_VERSION, entryEpoch],
+    );
+    if (prior) {
+      const priorEnd = prior.status === "OPEN"
+        ? Number.POSITIVE_INFINITY
+        : prior.status === "DATA_GAP"
+          ? Number(prior.entry_epoch) + PA_FORWARD_STRATEGY.maxHoldMinutes * 60
+          : Math.floor(Date.parse(prior.closed_at || "") / 1000);
+      // The backtest skips signal evaluation for every M5 candle that began
+      // while a position was open, even if that position exits before the next
+      // entry minute. Compare to the signal candle's open to preserve that rule.
+      if (priorEnd > Number(signal.signal_bar_epoch)) {
+        await sqlRun(
+          `UPDATE pa_forward_test_trades SET status = 'SKIPPED_OVERLAP', outcome_reason = 'one_position_at_a_time', updated_at = ? WHERE id = ? AND status = 'PENDING_ENTRY'`,
+          [new Date().toISOString(), signal.id],
+        );
+        continue;
+      }
+    }
+    const built = buildPaForwardPosition({ ...signal, entry_epoch: entryEpoch }, quote, Number(paForwardQuoteStatus.tickSize));
+    if (!built.ok) {
+      await sqlRun(
+        `UPDATE pa_forward_test_trades SET status = 'REJECTED', outcome_reason = ?, entry = ?, entry_spread = ?, cost_r = ?, updated_at = ? WHERE id = ? AND status = 'PENDING_ENTRY'`,
+        [built.reason, Number.isFinite(built.entry) ? built.entry : null, Number.isFinite(built.spread) ? built.spread : null,
+          Number.isFinite(built.costR) ? built.costR : null, new Date().toISOString(), signal.id],
+      );
+      continue;
+    }
+    const position = built.position;
+    await sqlRun(
+      `UPDATE pa_forward_test_trades SET entry = ?, stop = ?, tp1 = ?, tp2 = ?, risk = ?, entry_spread = ?, cost_r = ?,
+       remaining_fraction = ?, tp1_taken = ?, realized_r = ?, bars_held = ?, last_processed_minute = ?, status = 'OPEN', updated_at = ?
+       WHERE id = ? AND status = 'PENDING_ENTRY'`,
+      [position.entry, position.stop, position.tp1, position.tp2, position.risk, position.entry_spread, position.cost_r,
+        position.remaining_fraction, position.tp1_taken, position.realized_r, position.bars_held, position.last_processed_minute,
+        new Date().toISOString(), signal.id],
+    );
+  }
+}
+
+async function persistPaForwardPosition(id, position) {
+  await sqlRun(
+    `UPDATE pa_forward_test_trades SET remaining_fraction = ?, tp1_taken = ?, realized_r = ?, bars_held = ?,
+     last_processed_minute = ?, status = ?, outcome_reason = ?, closed_at = ?, updated_at = ? WHERE id = ?`,
+    [position.remaining_fraction, position.tp1_taken, position.realized_r, position.bars_held, position.last_processed_minute,
+      position.status, position.outcome_reason, position.closed_at || null, new Date().toISOString(), id],
+  );
+}
+
+async function paForwardResearchReport() {
+  await ensureRelationalTables();
+  const allRows = await sqlAll(
+    `SELECT * FROM pa_forward_test_trades WHERE strategy_version = ? ORDER BY signal_epoch ASC`,
+    [PA_FORWARD_STRATEGY_VERSION],
+  );
+  const rows = allRows.slice(-500).reverse();
+  const closed = allRows.filter((row) => row.status === "CLOSED").sort((a, b) => Number(a.entry_epoch) - Number(b.entry_epoch));
+  const evidence = summarizePaForwardEvidence(closed);
+  let cumulativeR = 0;
+  let peakR = 0;
+  let maxDrawdownR = 0;
+  for (const row of closed) {
+    cumulativeR += Number(row.realized_r) || 0;
+    peakR = Math.max(peakR, cumulativeR);
+    maxDrawdownR = Math.max(maxDrawdownR, peakR - cumulativeR);
+  }
+  const wins = closed.filter((row) => Number(row.realized_r) > 0);
+  const positiveR = closed.reduce((sum, row) => sum + Math.max(0, Number(row.realized_r) || 0), 0);
+  const negativeR = closed.reduce((sum, row) => sum + Math.min(0, Number(row.realized_r) || 0), 0);
+  const countStatuses = {};
+  for (const row of allRows) countStatuses[row.status] = (countStatuses[row.status] || 0) + 1;
+  const state = await sqlGet(`SELECT started_at, last_scanned_m5_epoch, missed_bars FROM pa_forward_test_state WHERE strategy_version = ?`, [PA_FORWARD_STRATEGY_VERSION]);
+  return {
+    ok: true,
+    researchOnly: true,
+    executable: false,
+    strategyVersion: PA_FORWARD_STRATEGY_VERSION,
+    strategy: PA_FORWARD_STRATEGY,
+    source: "Deriv public tick stream; aggregated bid/ask tick OHLC M1 + Deriv completed M5 candles",
+    stream: { ...paForwardQuoteStatus },
+    startedAt: state?.started_at || null,
+    lastScannedM5At: state?.last_scanned_m5_epoch ? new Date(Number(state.last_scanned_m5_epoch) * 1000).toISOString() : null,
+    summary: {
+      sampleClosed: closed.length,
+      sampleOpen: countStatuses.OPEN || 0,
+      statusCounts: countStatuses,
+      wins: wins.length,
+      winRatePct: closed.length ? wins.length / closed.length * 100 : null,
+      averageR: closed.length ? closed.reduce((sum, row) => sum + Number(row.realized_r || 0), 0) / closed.length : null,
+      profitFactor: negativeR < 0 ? positiveR / Math.abs(negativeR) : positiveR > 0 ? null : null,
+      netR: closed.reduce((sum, row) => sum + Number(row.realized_r || 0), 0),
+      maxDrawdownR,
+      missedBars: Number(state?.missed_bars) || 0,
+      evidence,
+      note: "Statistiques descriptives du forward test; pas une probabilité prédictive. Les cas DATA_GAP sont censurés et exclus des résultats fermés.",
+    },
+    trades: rows,
+  };
 }
 
 // Without dedup, every concurrent request that saw an expired cache fired its own
@@ -3213,6 +3920,14 @@ async function handleApi(req, res, url) {
     const admin = await requireAdmin(req);
     if (!admin.ok) return sendJson(res, admin.status, admin);
     sendJson(res, 200, { ok: true, lastAuthLoginError, lastAdminMembersError });
+    return;
+  }
+
+  if (url.pathname === "/api/admin/research/pa-forward") {
+    if (req.method !== "GET") return sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    const admin = await requireAdmin(req);
+    if (!admin.ok) return sendJson(res, admin.status, admin);
+    sendJson(res, 200, await paForwardResearchReport());
     return;
   }
 
@@ -5015,9 +5730,9 @@ Réponds uniquement avec cet objet JSON, sans aucun texte avant ou après, sans 
       const result = await runKronosAnalysis({
         body: {
           pair: chatPair,
-          timeframe: inferTimeframeFromText(question) || "H1",
-          style: "Mixte",
-          strategy: inferStrategyFromText(question) || "Swing Trading",
+          timeframe: inferTimeframeFromText(question) || "M5",
+          style: "Price Action",
+          strategy: inferStrategyFromText(question) || "Scalping",
           risk: defaultRiskMode(),
           capital: null,
           analysisDepth: "Rapide",
@@ -5173,12 +5888,22 @@ async function runKronosAnalysis({ body, images, req, user }) {
     if (body.style) body.style = sanitizeUserText(body.style, 40);
     if (body.strategy) body.strategy = sanitizeUserText(body.strategy, 40);
     if (body.risk) body.risk = sanitizeUserText(body.risk, 40);
+    body.targetProfile = normalizeTargetProfile(body.targetProfile);
+    const selectedTargetProfile = targetProfileDefinition(body.targetProfile, "ACHAT");
+    const targetProfileMeta = {
+      targetProfile: body.targetProfile,
+      targetProfileLabel: selectedTargetProfile.label,
+    };
     if (body.capital) {
       const capital = Number(body.capital);
       body.capital = Number.isFinite(capital) && capital > 0 ? Math.min(capital, 100_000_000) : null;
     }
+    const smcMode = /^smc$/i.test(String(body.style || ""));
+    const priceActionResearchMode = !images.length
+      && /^price\s*action$/i.test(String(body.style || "Price Action"))
+      && isScalpingStrategy(body.strategy || "Scalping");
     const imageQuality = assessImageQuality(images);
-    if (images.length && imageQuality.score < 20) {
+    if (images.length && imageQuality.score < 20 && !smcMode) {
       const result = {
         direction: "AUCUN SIGNAL",
         entry: "—",
@@ -5189,7 +5914,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
         score: imageQuality.score,
         technique: "Image non validée",
         explanation: `Qualité image trop faible (${imageQuality.reason}). Kronos bloque seulement les images quasi illisibles.`,
-        meta: { imageQuality, decisionReasons: ['DATA_TECHNICAL_WEAK', 'NO_ACTIONABLE_SIGNAL'] },
+        meta: { ...targetProfileMeta, imageQuality, decisionReasons: ['DATA_TECHNICAL_WEAK', 'NO_ACTIONABLE_SIGNAL'] },
         noSignal: true,
       };
       await recordLearningAnalysis(result, body, {
@@ -5215,7 +5940,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
       });
       return result;
     }
-    if (images.length && !hasVisionProvider()) {
+    if (images.length && !hasVisionProvider() && !smcMode) {
       const result = {
         direction: "AUCUN SIGNAL",
         entry: "—",
@@ -5226,6 +5951,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
         score: 0,
         technique: "Vision indisponible",
         explanation: "Aucune clé Groq Vision ou Gemini Vision n'est disponible pour analyser un screenshot. Kronos bloque le signal pour éviter une analyse inventée.",
+        meta: { ...targetProfileMeta, imageQuality, decisionReasons: ['VISION_UNAVAILABLE', 'NO_ACTIONABLE_SIGNAL'] },
         noSignal: true,
       };
       await recordLearningAnalysis(result, body, {
@@ -5254,32 +5980,76 @@ async function runKronosAnalysis({ body, images, req, user }) {
     const autoDetectEnabled = body.autoDetect === true || body.autoDetect === "on" || body.autoDetect === "true";
     const analysisDepth = normalizeAnalysisDepth(body.analysisDepth);
     const deepAnalysis = analysisDepth === "Profonde";
-    const includeNewsContext = deepAnalysis && (body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true");
+    const includeNewsContext = deepAnalysis && !priceActionResearchMode
+      && (body.includeNewsContext === true || body.includeNewsContext === "on" || body.includeNewsContext === "true");
     const chartContext = autoDetectEnabled ? normalizeChartDetection(body.detectedContext) : normalizeChartDetection(null);
     const selectedPair = chartContext.primaryPair || body.pair || "EUR/USD";
-    const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "H1";
+    const selectedTimeframe = chartContext.executionTimeframe || body.timeframe || "M5";
     let livePrice = await getAnalysisPrice(selectedPair);
     // Fired alongside the main history fetch below (independent data, different
     // granularity -- the deterministic engine wasn't backtested per user-chosen
     // timeframe/strategy), awaited together with `answer` further down so this costs
     // an extra fetch, not extra latency.
-    const crossCheckPromise = deterministicCrossCheck(selectedPair, livePrice);
+    const crossCheckPromise = smcMode || priceActionResearchMode
+      ? Promise.resolve(null) : deterministicCrossCheck(selectedPair, livePrice);
     const history = await getHistoryForSymbol(selectedPair, livePrice, {
       timeframe: selectedTimeframe,
-      strategy: body.strategy || "Swing Trading",
+      strategy: body.strategy || "Scalping",
+      preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
+      requireExactTimeframe: smcMode || priceActionResearchMode,
+      requireOpen: smcMode,
       historyBudgetMs: deepAnalysis ? 11000 : 3500,
     });
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
-      strategy: body.strategy || "Swing Trading",
+      strategy: body.strategy || "Scalping",
     });
-    const multiTimeframe = deepAnalysis
+    let priceActionAnalysis = priceActionResearchMode
+      ? buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice })
+      : null;
+    const smcPlan = smcMode ? smcTimeframePlan(selectedTimeframe, body.strategy || "Scalping") : null;
+    const requestedTimeframes = uniqueList([
+      ...(deepAnalysis && !priceActionResearchMode ? analysisTimeframes(selectedTimeframe, body.strategy || "Scalping") : []),
+      ...(smcPlan ? [smcPlan.setupTimeframe, smcPlan.contextTimeframe] : []),
+    ]);
+    const multiTimeframeRaw = requestedTimeframes.length
       ? await buildMultiTimeframeContext(selectedPair, livePrice, {
         timeframe: selectedTimeframe,
-        strategy: body.strategy || "Swing Trading",
+        strategy: body.strategy || "Scalping",
+        timeframes: requestedTimeframes,
+        includeHistory: smcMode,
+        requireExactTimeframe: smcMode,
+        requireOpen: smcMode,
+        preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
         historyBudgetMs: images.length ? 7000 : 9000,
       })
       : [];
+    const smcSetupHistory = smcMode
+      ? smcPlan.setupTimeframe === selectedTimeframe
+        ? history
+        : multiTimeframeRaw.find((item) => item.timeframe === smcPlan.setupTimeframe)?.history || []
+      : [];
+    const smcContextHistory = smcMode
+      ? smcPlan.contextTimeframe === selectedTimeframe
+        ? history
+        : multiTimeframeRaw.find((item) => item.timeframe === smcPlan.contextTimeframe)?.history || []
+      : [];
+    const smcSetupMeta = smcMode ? smcPlan.setupTimeframe === selectedTimeframe ? history?._meta : multiTimeframeRaw.find((item) => item.timeframe === smcPlan.setupTimeframe)?.history?._meta : null;
+    const smcContextMeta = smcMode ? smcPlan.contextTimeframe === selectedTimeframe ? history?._meta : multiTimeframeRaw.find((item) => item.timeframe === smcPlan.contextTimeframe)?.history?._meta : null;
+    const smcAnalysis = smcMode ? analyzeKronosSmc({
+      pair: selectedPair,
+      setupBars: isHistoryCompatible(smcSetupHistory, { timeframe: smcPlan.setupTimeframe, requireExactTimeframe: true }) ? smcSetupHistory : [],
+      contextBars: isHistoryCompatible(smcContextHistory, { timeframe: smcPlan.contextTimeframe, requireExactTimeframe: true }) ? smcContextHistory : [],
+      setupTimeframe: smcPlan.setupTimeframe,
+      contextTimeframe: smcPlan.contextTimeframe,
+      setupSource: smcSetupMeta?.source || "inconnue",
+      contextSource: smcContextMeta?.source || "inconnue",
+      setupStale: Boolean(smcSetupMeta?.stale),
+      contextStale: Boolean(smcContextMeta?.stale),
+      strategy: body.strategy || "Scalping",
+      spread: livePrice?.spread,
+    }) : null;
+    const multiTimeframe = multiTimeframeRaw.map(({ history: _history, ...item }) => item);
     const newsContext = includeNewsContext
       ? await analysisNewsContext(selectedPair)
       : {
@@ -5309,11 +6079,12 @@ async function runKronosAnalysis({ body, images, req, user }) {
 
 CONTEXTE:
 - Paire confirmée: ${selectedPair}
-- Timeframe formulaire: ${body.timeframe || "H1"}
+- Timeframe formulaire: ${body.timeframe || "M5"}
 - Timeframes détectés: ${(chartContext.timeframes || []).join(", ") || "non détectés"}
 - Timeframe final d'exécution: ${selectedTimeframe}
-- Style demandé: ${body.style || "Mixte"}
-- Stratégie demandée: ${body.strategy || "Swing Trading"}
+- Style demandé: ${body.style || "Price Action"}
+- Stratégie demandée: ${body.strategy || "Scalping"}
+- Profil de sortie: ${body.targetProfile === "mdt_extended" ? "Objectifs étendus inspirés des captures MDT" : "Prudent actuel"}
 - Gestion du risque: ${body.risk || defaultRiskMode()}
 - Capital indiqué: ${body.capital ? `${body.capital} unité(s) de compte` : "non indiqué"}
 - Mode d'analyse: ${analysisDepth}
@@ -5322,29 +6093,33 @@ CONTEXTE:
 - Synthèse technique interne: ${technicalSnapshot.text}
 - Lecture multi-timeframe: ${multiTimeframe.length ? multiTimeframe.map((item) => `${item.timeframe}: ${item.trend}, RSI ${item.rsi ?? "n/a"}, source ${item.source}`).join(" | ") : "mode rapide ou indisponible"}
 - Contexte news/API: ${newsContext.summary}
-- Qualité image estimée: ${images.length ? `${imageQuality.score}/100 (${imageQuality.reason})` : "aucun graphe uploadé: analyse texte/prix live"}
+- Qualité image estimée: ${images.length ? `${imageQuality.score}/100 (${imageQuality.reason})` : `aucun screenshot; synthèse sur ${technicalSnapshot.bars} bougies OHLC ${technicalSnapshot.source}`}
 - Calibration historique Kronos: ${calibration.message}
 
 RÈGLE STRICTE:
 Nombre de graphes fournis: ${images.length}.
 ${deepAnalysis
-  ? "Mode Profonde: réfléchis comme un analyste trading expérimenté. Tu dois lier explicitement paire, timeframe, capital, stratégie, style, risque, prix live, historique, MTF et news. Si une donnée contredit vraiment le setup, baisse le score ou rends le plan conditionnel. Ne retourne AUCUN SIGNAL que si prix live absent, news rouge active, niveaux incohérents ou risque structurel dangereux. Donne un raisonnement utile, pas seulement des niveaux."
+  ? "Mode Profonde: relie les donnees du contexte, mais ne produis un signal d'entree que si un setup concret est confirme et ses niveaux calculables. Retourne AUCUN SIGNAL si la confirmation manque, si les niveaux sont incoherents ou si le risque est dangereux. Donne les conditions a attendre."
   : "Mode Rapide: fais court, direct et exploitable. Reprends le comportement rapide classique: lecture du graphe ou du prix live, niveaux cohérents, validation prudente, sans analyse macro/MTF longue."}
-Si aucun graphe n'est fourni, ne prétends jamais voir des chandeliers, order blocks, FVG, nuage Ichimoku, vagues Elliott ou structures visibles. Dans ce cas, écris clairement "Analyse sans screenshot", utilise seulement prix live/contexte formulaire, et plafonne le score à 70.
+Sans image uploadée, écris "Analyse sans screenshot" et ne prétends pas avoir effectué une lecture visuelle. Tu peux exploiter uniquement les métriques OHLC explicitement fournies dans la synthèse technique (bougie récente, swings confirmés, balayage des 20 dernières bougies, imbalance 3 bougies), en précisant paire, timeframe et source API. N'invente pas d'OB, d'OTE ou de zones absentes des données; si l'historique est insuffisant ou périmé, retourne AUCUN SIGNAL ou indique les conditions à attendre. Le score reste plafonné à 70.
 Si un ou plusieurs graphes sont fournis, distingue ce qui est réellement visible sur les images de ce qui vient du prix live/API.
 Si le style demandé est "Mixte", compare ICT, SMC, Wyckoff, Elliott, Price Action et Ichimoku, puis retiens uniquement le style avec la meilleure efficacité visible.
-Si le style demandé n'est pas "Mixte" et que sa structure n'est pas clairement visible, baisse le score d'efficacité mais ne bloque pas si les niveaux sont cohérents.
+Pour tout style, cite uniquement des éléments réellement visibles. En Price Action scalping, si le déclencheur et les niveaux ne sont pas confirmés, retourne AUCUN SIGNAL; pour les autres styles, signale clairement toute limite de lecture.
 Tu dois citer les éléments techniques visibles qui justifient le style retenu.
 Adapte les niveaux à la stratégie demandée: Scalping = entrée proche du prix live, SL court, TP1 proche/prudent et TP2 moyen; Swing Trading = structure H1/H4/D1; Position Trading = niveaux majeurs; Breakout = attendre clôture/retest; Reversal = confirmer rejet/CHOCH/divergence avant entrée.
 En scalping, TP1 doit souvent être autour de 0.8R à 1.2R et TP2 autour de 1.4R à 2.0R. N'étire pas les profits comme un swing trade.
+${body.targetProfile === "mdt_extended"
+  ? "PROFIL DE SORTIE ÉTENDU SÉLECTIONNÉ (il remplace les objectifs scalping prudents ci-dessus): conserve un SL placé à l'invalidation structurelle; calcule TP1 à 0,67R, TP2 à 2,0R pour un ACHAT ou 2,67R pour une VENTE; prévois 50% de prise au TP1 puis protection du solde à breakeven. Ces ratios sont des objectifs calculés, jamais une promesse; si la structure ou les données ne justifient pas l'entrée et le SL, retourne AUCUN SIGNAL. Ne transforme pas ces ratios en distances fixes en dollars."
+  : "PROFIL PRUDENT ACTUEL: conserve les objectifs courts actuels, le SL structurel et la gestion du risque configurée. Ce profil reste le choix par défaut."}
 En mode Protection maximale, privilégie une prise partielle forte à TP1, un déplacement du SL à breakeven après TP1, et rappelle que la taille de lot doit limiter la perte à 0.5% du capital.
+Si le profil étendu est sélectionné, la règle de sortie est exactement 50% à TP1 puis BE pour le solde, quel que soit le profil de risque; le pourcentage de risque ne change que la taille de position, jamais les niveaux.
 Si la détection automatique est désactivée, utilise la paire et le timeframe du formulaire comme contexte confirmé.
-Si le setup n'est pas confirmé, retourne AUCUN SIGNAL au lieu de forcer une opportunité. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
+  Si le setup n'est pas confirme, retourne AUCUN SIGNAL au lieu de forcer une opportunite. En Price Action scalping, un biais directionnel, une variation de prix ou une bougie isolee ne suffisent pas: exige une cloture de cassure suivie d'un retest/reprise, ou un rejet avec cloture de confirmation sur un support/resistance identifiable. Si les bougies requises ne sont pas fournies, indique quoi attendre et n'invente aucune entree, SL ou TP. Si le graphe est absent ou incomplet, fais une analyse prudente basée sur la paire, le timeframe et le prix live, sans prétendre lire des bougies.
 Les niveaux doivent rester cohérents avec la structure du graphique et le ratio risque/rendement doit être calculable.
 Format des niveaux: Forex non-JPY toujours avec 5 décimales (ex: 1.08472), paires JPY avec 3 décimales, métaux avec 2 décimales, indices/crypto selon leur cotation.
 Si plusieurs graphes sont fournis ou si le mode Profonde est actif: utilise les timeframes élevés pour la tendance/contexte et le plus petit timeframe détecté pour l'entrée finale.
 Si le contexte news/API est activé, croise le setup avec les titres récents et le calendrier économique. Si une news rouge proche touche la devise, bloque ou baisse le score au lieu de forcer un trade.
-Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE, et une ligne "STYLE_EFFICACITE:[style]=[0-100]".
+SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 0-100, jamais une probabilité de gain ni un taux de réussite historique. Retour obligatoire: si le setup est confirme, donne direction, entree, stop loss, TP1, TP2, R/R, SCORE_CONFIANCE, TECHNIQUE_UTILISEE et STYLE_EFFICACITE; sinon indique AUCUN SIGNAL, la raison et le declencheur a attendre, sans faux niveaux.
 
     Analyse le contexte fourni et donne un setup éducatif exploitable avec prudence.`;
     const aiBudgetMs = images.length
@@ -5354,13 +6129,17 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     // API call, not extra latency (both resolve around the same time; awaited once
     // `answer` is already settled). No-ops instantly (checked: false) unless both
     // GROQ_KEYS and GEMINI_KEYS are configured.
-    const visionConsensusPromise = images.length ? visionConsensusCheck(images) : Promise.resolve({ checked: false });
-    let answer = !deepAnalysis && !images.length
+    const visionConsensusPromise = images.length && !smcMode ? visionConsensusCheck(images) : Promise.resolve({ checked: false, skipped: smcMode });
+    let answer = smcMode
+      ? buildSmcOnlyAnswer(smcAnalysis)
+      : priceActionResearchMode
+      ? buildPriceActionResearchText({ pair: selectedPair, timeframe: selectedTimeframe, priceActionAnalysis, technicalSnapshot })
+      : !deepAnalysis && !images.length
       ? buildDeterministicAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
-        style: body.style || "Mixte",
-        strategy: body.strategy || "Swing Trading",
+        style: body.style || "Price Action",
+        strategy: body.strategy || "Scalping",
         livePrice,
         risk: body.risk,
         capital: body.capital,
@@ -5372,8 +6151,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
       ? buildApiOnlyAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
-        style: body.style || "Mixte",
-        strategy: body.strategy || "Swing Trading",
+        style: body.style || "Price Action",
+        strategy: body.strategy || "Scalping",
         risk: body.risk,
         livePrice,
         technicalSnapshot,
@@ -5384,8 +6163,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         ? buildApiOnlyNoSignalText({
           pair: selectedPair,
           timeframe: selectedTimeframe,
-          style: body.style || "Mixte",
-          strategy: body.strategy || "Swing Trading",
+          style: body.style || "Price Action",
+          strategy: body.strategy || "Scalping",
           livePrice,
           technicalSnapshot,
           newsContext,
@@ -5401,8 +6180,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
       answer = buildDeterministicAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
-        style: body.style || "Mixte",
-        strategy: body.strategy || "Swing Trading",
+        style: body.style || "Price Action",
+        strategy: body.strategy || "Scalping",
         livePrice,
         risk: body.risk,
         capital: body.capital,
@@ -5411,13 +6190,13 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
         multiTimeframe,
       });
     }
-    if (deepAnalysis && isUnproductiveAnalysis(answer) && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice)
+    if (!smcMode && !priceActionResearchMode && deepAnalysis && isUnproductiveAnalysis(answer) && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice)
       && newsContext?.calendarStatus === "ok" && !newsContext?.activeRisk) {
       answer = buildApiOnlyAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
-        style: body.style || "Mixte",
-        strategy: body.strategy || "Swing Trading",
+        style: body.style || "Price Action",
+        strategy: body.strategy || "Scalping",
         risk: body.risk,
         livePrice,
         technicalSnapshot,
@@ -5439,6 +6218,10 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
     // last step.
     const refreshedPrice = await getAnalysisPrice(selectedPair).catch(() => null);
     if (refreshedPrice && Number.isFinite(Number(refreshedPrice.price))) livePrice = refreshedPrice;
+    if (priceActionResearchMode) {
+      priceActionAnalysis = buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice });
+      answer = buildPriceActionResearchText({ pair: selectedPair, timeframe: selectedTimeframe, priceActionAnalysis, technicalSnapshot });
+    }
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, {
       livePrice,
       imageQuality,
@@ -5451,6 +6234,8 @@ Retour obligatoire: direction, entrée, stop loss, TP1, TP2, R/R, SCORE_CONFIANC
       apiOnlySetup: apiOnlySetup || quickApiSetup,
       visionConsensus,
       deterministicCrossCheck: deterministicCheck,
+      smcAnalysis,
+      priceActionAnalysis,
     });
     if (!result.educationalOnly) {
       await recordLearningAnalysis(result, body, {
@@ -5554,6 +6339,193 @@ async function getExternalPrice(symbol) {
   }
 }
 
+function derivWebSocketBatch(requests, timeoutMs = 6000) {
+  if (typeof WebSocket !== "function") return Promise.reject(new Error("websocket_unavailable"));
+  return new Promise((resolve, reject) => {
+    let socket;
+    try {
+      socket = new WebSocket(env.DERIV_MARKET_DATA_WS_URL || "wss://ws.binaryws.com/websockets/v3");
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let settled = false;
+    const results = Array(requests.length);
+    const pending = new Map();
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch {}
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => finish(new Error("deriv_ws_timeout")), timeoutMs);
+    requests.forEach((request, index) => {
+      const reqId = ++derivRequestSequence;
+      pending.set(reqId, index);
+      request.req_id = reqId;
+    });
+    socket.addEventListener("open", () => {
+      if (settled) return;
+      for (const request of requests) socket.send(JSON.stringify(request));
+    }, { once: true });
+    socket.addEventListener("message", (event) => {
+      let response;
+      try {
+        response = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
+      } catch {
+        return;
+      }
+      const reqId = Number(response.req_id ?? response.echo_req?.req_id);
+      if (!pending.has(reqId)) return;
+      if (response.error) {
+        finish(new Error(response.error.message || response.error.code || "deriv_ws_error"));
+        return;
+      }
+      const index = pending.get(reqId);
+      pending.delete(reqId);
+      results[index] = response;
+      if (!pending.size) finish(null, results);
+    });
+    socket.addEventListener("error", () => finish(new Error("deriv_ws_connection_error")), { once: true });
+    socket.addEventListener("close", () => {
+      if (!settled) finish(new Error("deriv_ws_closed_before_response"));
+    }, { once: true });
+  });
+}
+
+async function derivActiveSymbols() {
+  if (derivActiveSymbolsCache.items.length && Date.now() < derivActiveSymbolsCache.expiresAt) {
+    return derivActiveSymbolsCache.items;
+  }
+  if (Date.now() < derivActiveSymbolsRetryAt) return [];
+  if (derivActiveSymbolsInFlight) return derivActiveSymbolsInFlight;
+  derivActiveSymbolsInFlight = (async () => {
+    const endpoint = env.DERIV_MARKET_DATA_WS_URL || "wss://ws.binaryws.com/websockets/v3";
+    const activeSymbolsRequest = { active_symbols: "brief" };
+    if (!endpoint.includes("api.derivws.com/trading/v1/options/ws/public")) activeSymbolsRequest.product_type = "basic";
+    const [response] = await derivWebSocketBatch([activeSymbolsRequest], 7000);
+    const items = Array.isArray(response?.active_symbols) ? response.active_symbols : [];
+    if (!items.length) throw new Error("deriv_active_symbols_empty");
+    derivActiveSymbolsCache = { items, expiresAt: Date.now() + 60 * 60 * 1000 };
+    derivActiveSymbolsRetryAt = 0;
+    return items;
+  })();
+  try {
+    return await derivActiveSymbolsInFlight;
+  } catch (error) {
+    derivActiveSymbolsRetryAt = Date.now() + 30_000;
+    throw error;
+  } finally {
+    derivActiveSymbolsInFlight = null;
+  }
+}
+
+function derivSymbolForPair(records, pair) {
+  const target = normalizePair(pair);
+  if (!target) return null;
+  // The isolated XAUUSD forward collector uses Deriv's verified public symbol
+  // directly. This avoids an active-symbols metadata round trip that can time
+  // out on some Node hosts while leaving normal site symbol discovery intact.
+  if (PA_FORWARD_STANDALONE && target === "XAU/USD") return "frxXAUUSD";
+  const match = records.find((record) => {
+    const code = String(record.underlying_symbol || record.symbol || "");
+    const names = [record.underlying_symbol_name, record.display_name, record.name, code];
+    const candidates = names.flatMap((value) => {
+      const text = String(value || "");
+      return [text, text.replace(/^(frx|cry|otc)/i, "")];
+    });
+    if (candidates.some((candidate) => normalizePair(candidate) === target)) return true;
+    const description = names.join(" ").toLowerCase();
+    if (target === "NAS100" && /nasdaq|nas 100|us tech 100/.test(description)) return true;
+    if (target === "US500" && /s\s*&\s*p 500|us 500|spx 500/.test(description)) return true;
+    return false;
+  });
+  return match?.underlying_symbol || match?.symbol || null;
+}
+
+function derivSymbolRecordForPair(records, pair) {
+  const symbol = derivSymbolForPair(records, pair);
+  if (!symbol) return null;
+  return records.find((record) => String(record.underlying_symbol || record.symbol || "") === symbol)
+    || (PA_FORWARD_STANDALONE && symbol === "frxXAUUSD"
+      ? { underlying_symbol: symbol, underlying_symbol_name: "Gold/USD", pip_size: 0.01 }
+      : null);
+}
+
+async function fetchDerivAnalysisPrice(pair) {
+  const records = PA_FORWARD_STANDALONE ? [] : await derivActiveSymbols();
+  const symbol = derivSymbolForPair(records, pair);
+  if (!symbol) return null;
+  const [response] = await derivWebSocketBatch([{ ticks: symbol }], 5000);
+  const tick = response?.tick;
+  const price = Number(tick?.quote);
+  const epoch = Number(tick?.epoch);
+  if (!Number.isFinite(price) || !Number.isFinite(epoch)) return null;
+  const bid = tick?.bid == null ? NaN : Number(tick.bid);
+  const ask = tick?.ask == null ? NaN : Number(tick.ask);
+  const validBidAsk = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid;
+  const ageMs = Math.max(0, Date.now() - epoch * 1000);
+  return pricePayload(pair, {
+    price,
+    ...(validBidAsk ? { bid, ask, spread: ask - bid } : {}),
+    change: 0,
+    asOf: new Date(epoch * 1000).toISOString(),
+    derivSymbol: symbol,
+  }, "deriv_ws", null, {
+    stale: ageMs > 90_000,
+    reliability: ageMs <= 30_000 ? 99 : ageMs <= 90_000 ? 85 : 35,
+  });
+}
+
+async function fetchDerivAnalysisHistory(pair, timeframe, timeoutMs = 6000) {
+  const granularityByTimeframe = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
+  const normalizedTimeframe = normalizeTimeframe(timeframe);
+  const granularity = granularityByTimeframe[normalizedTimeframe];
+  if (!granularity) return [];
+  const records = PA_FORWARD_STANDALONE ? [] : await derivActiveSymbols();
+  const symbol = derivSymbolForPair(records, pair);
+  if (!symbol) return [];
+  const [response] = await derivWebSocketBatch([{
+    ticks_history: symbol,
+    end: "latest",
+    count: derivHistoryCount(normalizedTimeframe),
+    style: "candles",
+    granularity,
+  }], timeoutMs);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const candles = Array.isArray(response?.candles) ? response.candles : [];
+  const bars = candles.map((candle) => {
+    const epoch = Number(candle.epoch);
+    return {
+      open: Number(candle.open),
+      close: Number(candle.close),
+      high: Number(candle.high),
+      low: Number(candle.low),
+      volume: Number(candle.volume) || 0,
+      datetime: Number.isFinite(epoch) ? new Date(epoch * 1000).toISOString() : null,
+      epoch,
+    };
+  }).filter((bar) => Number.isFinite(bar.epoch)
+    && [bar.open, bar.close, bar.high, bar.low].every(Number.isFinite)
+    && bar.epoch + granularity <= nowSeconds)
+    .sort((a, b) => a.epoch - b.epoch);
+  if (bars.length < 30) return [];
+  const last = bars[bars.length - 1];
+  const latestCloseAge = nowSeconds - (last.epoch + granularity);
+  const stale = latestCloseAge > Math.max(granularity * 3, 300);
+  const normalizedBars = bars.map(({ epoch, ...bar }) => bar);
+  tagHistory(normalizedBars, `deriv_ws:${granularity === 60 ? "1min" : granularity === 300 ? "5min" : granularity === 900 ? "15min" : granularity === 1800 ? "30min" : granularity === 3600 ? "1h" : granularity === 14400 ? "4h" : "1day"}`, stale, new Date().toISOString(), normalizedTimeframe);
+  return normalizedBars;
+}
+
+function derivHistoryCount(timeframe) {
+  // Enough completed candles for intraday structure while keeping the live chart
+  // response small. Longer candles need fewer samples to cover the same context.
+  return ({ M1: 500, M5: 360, M15: 240, M30: 180, H1: 160, H4: 120, D1: 90 })[normalizeTimeframe(timeframe)] || 220;
+}
+
 async function getAnalysisPrice(symbol) {
   if (!symbol) return null;
   const cache = await loadMarketCache();
@@ -5562,7 +6534,10 @@ async function getAnalysisPrice(symbol) {
   // (up to 20min for an open market, see cacheTtlMs) just to save a provider call.
   // fastPriceCacheTtlMs (3min open / 90s crypto) forces a real re-check far more
   // often while still protecting provider quota from a burst of back-to-back clicks.
-  const price = await fetchBestPrice(symbol, cache.prices?.[symbol], fastPriceCacheTtlMs(symbol));
+  const derivPrice = await fetchDerivAnalysisPrice(symbol).catch(() => null);
+  const price = derivPrice && Number.isFinite(Number(derivPrice.price))
+    ? derivPrice
+    : await fetchBestPrice(symbol, cache.prices?.[symbol], fastPriceCacheTtlMs(symbol));
   if (price && Number.isFinite(Number(price.price)) && isLivePriceSource(price.source)) {
     await saveMarketCache({
       ...cache,
@@ -5964,13 +6939,27 @@ async function loadHistories(prices, usableKey, options = {}) {
 async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cache = await loadMarketCache();
   const cached = cachedHistory(symbol, cache, options);
+  const cachedHasOpen = !options.requireOpen || cached.every((bar) => Number.isFinite(Number(bar.open)));
   const preferredIntervals = historyIntervals(symbol, options);
-  if (cached.length >= 30 && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
-  if (!price?.open || !isUsableLivePrice(price)) return cached;
   const budget = Number.isFinite(Number(options.historyBudgetMs)) ? Number(options.historyBudgetMs) : 12000;
   const deadline = Date.now() + Math.max(2500, Math.min(12000, budget));
+  if (options.preferDeriv && price?.source === "deriv_ws" && price.open && isUsableLivePrice(price)) {
+    try {
+      const derivBars = await fetchDerivAnalysisHistory(symbol, options.timeframe, Math.max(2500, Math.min(10000, budget)));
+      if (derivBars.length >= 30 && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
+        && !derivBars._meta?.stale && isHistoryCompatible(derivBars, options)) {
+        await saveMarketCache(historyCacheUpdate(cache, { [symbol]: derivBars }, options));
+        recordProviderHealth("deriv_ws_history", true);
+        return derivBars;
+      }
+    } catch (error) {
+      recordProviderHealth("deriv_ws_history", false, error.message);
+    }
+  }
+  if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
+  if (!price?.open || !isUsableLivePrice(price)) return cachedHasOpen ? cached : [];
   const errors = [];
-  let fallbackHistory = cached.length >= 30 ? cached : [];
+  let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
   const attempts = [
     ["binance", fetchBinanceHistory],
     ["massive", fetchMassiveHistory],
@@ -5987,6 +6976,10 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       try {
         const bars = await loader(symbol, interval);
         if (bars.length >= 30) {
+          if (options.requireOpen && !bars.every((bar) => Number.isFinite(Number(bar.open)))) {
+            errors.push(`${source}_${interval}:open_missing`);
+            continue;
+          }
           tagHistory(bars, `${source}:${interval}`, false, null, options.timeframe || null);
           if (isHistoryCompatible(bars, options)) {
             // Keep the fresh timeframe in memory immediately, but let the normal
@@ -6006,7 +6999,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       }
     }
   }
-  if (Date.now() <= deadline) {
+  if (Date.now() <= deadline && options.requireExactTimeframe !== true) {
     try {
       const bars = await fetchDukascopyHistory(symbol);
       if (bars.length >= 30) {
@@ -6024,16 +7017,20 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
 }
 
 async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
-  const timeframes = analysisTimeframes(options.timeframe, options.strategy);
+  const timeframes = options.timeframes || analysisTimeframes(options.timeframe, options.strategy);
   return Promise.all(timeframes.map(async (timeframe) => {
     const history = await getHistoryForSymbol(symbol, livePrice, {
       timeframe,
       strategy: options.strategy,
+      preferDeriv: options.preferDeriv === true,
+      requireExactTimeframe: options.requireExactTimeframe === true,
+      requireOpen: options.requireOpen === true,
       historyBudgetMs: options.historyBudgetMs || 4500,
     });
     const snapshot = buildTechnicalSnapshot(symbol, history, livePrice, {
       timeframe,
       strategy: options.strategy,
+      requireExactTimeframe: options.requireExactTimeframe === true,
     });
     return {
       timeframe,
@@ -6046,18 +7043,31 @@ async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
       resistance: snapshot.resistance,
       volatility: snapshot.volatility,
       timeframeCompatible: snapshot.timeframeCompatible,
+      ...(options.includeHistory ? { history } : {}),
     };
   }));
 }
 
-function analysisTimeframes(timeframe = "H1", strategy = "") {
-  const normalized = normalizeTimeframe(timeframe) || "H1";
+function analysisTimeframes(timeframe = "M5", strategy = "") {
+  const normalized = normalizeTimeframe(timeframe) || "M5";
   if (isScalpingStrategy(strategy) || ["M1", "M5", "M15"].includes(normalized)) {
     return uniqueList(["H1", "M15", normalized === "M1" ? "M5" : normalized, "M1"]);
   }
   if (/breakout|reversal/i.test(String(strategy))) return uniqueList(["H4", "H1", normalized, "M15"]);
   if (/position/i.test(String(strategy)) || ["D1", "W1", "MN1"].includes(normalized)) return uniqueList(["W1", "D1", "H4", normalized]);
   return uniqueList(["D1", "H4", normalized, "M15"]);
+}
+
+function smcTimeframePlan(timeframe = "M5", strategy = "Scalping") {
+  const selected = normalizeTimeframe(timeframe) || "M5";
+  const scalp = /scalp/i.test(String(strategy));
+  const setupTimeframe = scalp && selected === "M1" ? "M5" : selected;
+  const contextByTimeframe = { M1: "M5", M5: "M15", M15: "H1", M30: "H4", H1: "H4", H4: "D1", D1: "W1", W1: "MN1", MN1: "MN1" };
+  return {
+    setupTimeframe,
+    contextTimeframe: contextByTimeframe[setupTimeframe] || "H4",
+    executionTimeframe: scalp && selected === "M1" ? "M1" : setupTimeframe,
+  };
 }
 
 function uniqueList(values) {
@@ -6139,6 +7149,7 @@ async function fetchTwelveDataHistory(symbol, interval) {
     if (data.status === "error" || data.code) throw new Error(data.message || data.code || "api_error");
     const values = Array.isArray(data.values) ? data.values : [];
     return values.map((bar) => ({
+      open: Number(bar.open),
       close: Number(bar.close),
       high: Number(bar.high),
       low: Number(bar.low),
@@ -6168,6 +7179,7 @@ async function fetchBinanceHistory(symbol, interval) {
   const data = await fetchJson(api);
   if (!Array.isArray(data)) throw new Error("invalid_history");
   return data.map((bar) => ({
+    open: Number(bar[1]),
     close: Number(bar[4]),
     high: Number(bar[2]),
     low: Number(bar[3]),
@@ -6192,6 +7204,7 @@ async function fetchMassiveHistory(symbol, interval) {
     if (data.status === "ERROR" || data.error) throw new Error(data.error || "api_error");
     const values = Array.isArray(data.results) ? data.results : [];
     return values.map((bar) => ({
+      open: Number(bar.o),
       close: Number(bar.c),
       high: Number(bar.h),
       low: Number(bar.l),
@@ -6210,6 +7223,7 @@ async function fetchStooqHistory(symbol, interval) {
   api.searchParams.set("i", stooqInterval);
   const rows = parseCsv(await fetchText(api));
   const bars = rows.map((row) => ({
+    open: Number(row.Open || row.open),
     close: Number(row.Close || row.close),
     high: Number(row.High || row.high),
     low: Number(row.Low || row.low),
@@ -6228,6 +7242,7 @@ async function fetchYahooHistory(symbol, interval) {
   const timestamps = result.timestamp || [];
   const quote = result.indicators?.quote?.[0] || {};
   const bars = timestamps.map((ts, i) => ({
+    open: Number(quote.open?.[i]),
     close: Number(quote.close?.[i]),
     high: Number(quote.high?.[i]),
     low: Number(quote.low?.[i]),
@@ -6246,6 +7261,7 @@ async function fetchDukascopyHistory(symbol) {
   api.searchParams.set("i", "d");
   const rows = parseCsv(await fetchText(api));
   const bars = rows.map((row) => ({
+    open: Number(row.Open || row.open),
     close: Number(row.Close || row.close),
     high: Number(row.High || row.high),
     low: Number(row.Low || row.low),
@@ -6264,7 +7280,7 @@ function historyIntervals(symbol, options = {}) {
   // another interval. Its D1/H4/H1 structure and M5/M1 trigger are only valid
   // when the provider returned that exact interval.
   if (options.requireExactTimeframe) {
-    const exactIntervals = { M1: "1min", M5: "5min", M15: "15min", H1: "1h", H4: "4h", D1: "1day" };
+    const exactIntervals = { M1: "1min", M5: "5min", M15: "15min", M30: "30min", H1: "1h", H4: "4h", D1: "1day", W1: "1week" };
     return exactIntervals[timeframe] ? [exactIntervals[timeframe]] : [];
   }
   if (timeframe === "M1") return ["1min", "5min", "15min"];
@@ -6295,7 +7311,7 @@ function isHistoryCompatible(history, options = {}) {
   const timeframe = normalizeTimeframe(options.timeframe);
   if (options.strictDaily) return historySourceHasInterval(source, ["1day"]);
   if (options.requireExactTimeframe) {
-    const exactIntervals = { M1: "1min", M5: "5min", M15: "15min", H1: "1h", H4: "4h", D1: "1day" };
+    const exactIntervals = { M1: "1min", M5: "5min", M15: "15min", M30: "30min", H1: "1h", H4: "4h", D1: "1day", W1: "1week" };
     return Boolean(exactIntervals[timeframe] && historySourceHasInterval(source, [exactIntervals[timeframe]]));
   }
   if (timeframe === "M1") return historySourceHasInterval(source, ["1min"]);
@@ -7140,7 +8156,7 @@ function pricePayload(symbol, value, source, error, options = {}) {
 }
 
 function isLivePriceSource(source = "") {
-  return ["twelve_data", "massive", "alpha_vantage", "coinbase", "stooq", "binance", "yahoo"].includes(source);
+  return ["deriv_ws", "twelve_data", "massive", "alpha_vantage", "coinbase", "stooq", "binance", "yahoo"].includes(source);
 }
 
 function isUsableLivePrice(price) {
@@ -8080,7 +9096,111 @@ function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, mult
   return "Confluence insuffisante pour proposer un plan sans screenshot.";
 }
 
-function buildApiOnlyNoSignalText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
+function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, reason }) {
+  const rawTrend = String(technicalSnapshot.trend || "").toLowerCase();
+  const bias = /hauss/.test(rawTrend) ? "haussier provisoire"
+    : /baiss/.test(rawTrend) ? "baissier provisoire"
+      : /neutre|range/.test(rawTrend) ? "neutre / range"
+        : "indéterminé";
+  const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
+  const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
+  const forecast = /hauss/.test(rawTrend)
+    ? "Scénario à surveiller: poursuite acheteuse seulement après clôture au-dessus d'une résistance puis retest tenu; une clôture sous le support invalide ce biais."
+    : /baiss/.test(rawTrend)
+      ? "Scénario à surveiller: poursuite vendeuse seulement après clôture sous un support puis retest rejeté; une clôture au-dessus de la résistance invalide ce biais."
+      : "Scénario à surveiller: pas de direction privilégiée; attends une clôture hors du range puis un retest confirmé avant de choisir un sens.";
+  return `PRICE ACTION SCALPING — ${pair} ${timeframe}
+- Prix en direct : ${formatLevel(livePrice?.price, pair)}
+- Synthese technique : ${technicalSnapshot.text || "donnees de bougie insuffisantes"}
+- Support / resistance API : ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"} / ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}
+- Biais technique API : ${bias}; il décrit le contexte calculé, pas une probabilité de hausse/baisse.
+- Prévision conditionnelle : ${forecast}
+- Signal détecté : AUCUN SIGNAL — ${reason}
+- Zone de référence : support ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"}; résistance ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}.
+- A attendre : clôture confirmée puis retest/reprise, ou rejet confirmé sur support/résistance identifiable.
+- Entree, stop et objectifs : aucun niveau emis avant confirmation de ce declencheur.
+Le repli automatique ne lit pas les motifs de bougie sur une capture et ne transforme pas un biais ou une variation de prix en signal de scalping.
+SCORE_CONFIANCE:45
+TECHNIQUE_UTILISEE:Price Action
+STYLE_EFFICACITE:Price Action=45`;
+}
+
+function priceActionTickSize(pair) {
+  const key = String(pair || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (key === "USDJPY") return 0.001;
+  if (key === "XAUUSD") return 0.01;
+  if (["EURUSD", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD"].includes(key)) return 0.00001;
+  return null;
+}
+
+function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], livePrice = null }) {
+  const source = String(history?._meta?.source || "inconnue");
+  const base = {
+    version: KRONOS_PRICE_ACTION_VERSION,
+    pair,
+    timeframe,
+    source,
+    researchOnly: true,
+    actionable: false,
+    candidates: [],
+    rule: "Clôture au-delà du niveau des 30 bougies précédentes, puis retest/reprise dans les 8 bougies suivantes.",
+    exitRule: `Stop derrière le retest; 50% à +${PRICE_ACTION_RULES.tp1R}R, 50% à +${PRICE_ACTION_RULES.tp2R}R ou sortie après ${PRICE_ACTION_RULES.defaultTimeStopMinutes} min.`,
+  };
+  const unavailable = (status, statusLabel, summary) => ({ ...base, status, statusLabel, summary });
+  const supportedPairs = new Set(["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "XAUUSD"]);
+  const pairKey = String(pair || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!supportedPairs.has(pairKey)) {
+    return unavailable("unsupported_market", "Marché non backtesté", "Cette règle de recherche n'a été testée que sur sept paires FX et XAU/USD.");
+  }
+  if (!["M1", "M5", "M15"].includes(String(timeframe || "").toUpperCase())) {
+    return unavailable("unsupported_timeframe", "Unité non backtestée", "La règle est en recherche sur M1, M5 et M15; ce timeframe n'a pas été évalué.");
+  }
+  if (!/^deriv_ws:/i.test(source) || history?._meta?.stale || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true })) {
+    return unavailable("deriv_history_unconfirmed", "Historique Deriv exact indisponible", "Aucun candidat n'est calculé sans bougies Deriv récentes et alignées sur le timeframe sélectionné.");
+  }
+  const bid = Number(livePrice?.bid);
+  const ask = Number(livePrice?.ask);
+  if (livePrice?.source !== "deriv_ws" || !isUsableLivePrice(livePrice)
+    || !(bid > 0) || !(ask >= bid) || !Number.isFinite(ask - bid)) {
+    return unavailable("deriv_quote_unconfirmed", "Prix Deriv ou spread non confirmé", "Le moteur attend le prix bid/ask Deriv pour appliquer le filtre de coût; aucun candidat n'est publié sans ce contrôle.");
+  }
+  const result = analyzeLatestPriceActionScalp(history, {
+    tickSize: priceActionTickSize(pair),
+    spread: ask - bid,
+    commissionPctPerSide: 0,
+    slippageTicksPerSide: 1,
+    timeStopMinutes: PRICE_ACTION_RULES.defaultTimeStopMinutes,
+  });
+  const candidates = result.candidates.map((candidate) => ({
+    ...candidate,
+    directionLabel: candidate.direction === 1 ? "ACHAT" : "VENTE",
+  }));
+  const summary = candidates.length
+    ? `${candidates.length} configuration(s) candidate détectée(s) à la dernière bougie clôturée. Ce moteur n'a pas démontré d'avantage robuste; ces niveaux restent non exécutables.`
+    : "Aucun déclencheur confirmé sur la dernière bougie clôturée. Attendre une cassure puis un retest/reprise; le biais seul ne déclenche rien.";
+  return { ...base, ...result, pair, timeframe, source, researchOnly: true, actionable: false, candidates, summary };
+}
+
+function buildPriceActionResearchText({ pair, timeframe, priceActionAnalysis = {}, technicalSnapshot = {} }) {
+  const candidates = Array.isArray(priceActionAnalysis.candidates) ? priceActionAnalysis.candidates : [];
+  const candidateLines = candidates.map((candidate) => {
+    const setupLabel = candidate.setup === "break_retest" ? "Cassure + retest" : "Rejet confirmé";
+    return `- Candidat ${setupLabel}: ${candidate.directionLabel}; clôture signal ${formatLevel(candidate.entry, pair)}, invalidation ${formatLevel(candidate.stop, pair)}, TP théoriques ${formatLevel(candidate.tp1, pair)} / ${formatLevel(candidate.tp2, pair)}.`;
+  });
+  return `PRICE ACTION OHLC — ${pair} ${timeframe}
+- Moteur : ${priceActionAnalysis.version || KRONOS_PRICE_ACTION_VERSION}; source ${priceActionAnalysis.source || "indisponible"}; ${priceActionAnalysis.bars || 0} bougies clôturées.
+- Règle : ${priceActionAnalysis.rule || "cassure clôturée puis retest confirmé"}
+- Gestion simulée : ${priceActionAnalysis.exitRule || "50% à +1R, 50% à +1.6R, arrêt temporel 30 min"}
+- Lecture OHLC : ${technicalSnapshot.priceActionRead?.summary || technicalSnapshot.text || "historique insuffisant"}
+- Statut : ${priceActionAnalysis.summary || priceActionAnalysis.statusLabel || "historique non validé"}
+${candidateLines.length ? candidateLines.join("\n") : "- Niveau candidat : aucun."}
+- Décision Kronos : AUCUN SIGNAL COPIABLE. Ce calcul est un diagnostic de recherche; les niveaux éventuels ne sont ni une probabilité ni une recommandation d'entrée.
+SCORE_CONFIANCE:0
+TECHNIQUE_UTILISEE:Price Action
+STYLE_EFFICACITE:Price Action=0`;
+}
+
+function buildApiOnlyNoSignalText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
   const technique = style === "Mixte" ? "Price Action" : style;
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   return `📸 LECTURE DES GRAPHIQUES :
@@ -8106,7 +9226,17 @@ TECHNIQUE_UTILISEE:${technique}
 STYLE_EFFICACITE:${technique}=45`;
 }
 
-function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+  const technique = style === "Mixte" ? "Price Action" : style;
+  if (style === "Price Action" && isScalpingStrategy(strategy)) {
+    return buildPriceActionScalpNoSignalText({
+      pair,
+      timeframe,
+      livePrice,
+      technicalSnapshot,
+      reason: "la tendance et les niveaux API ne confirment pas le setup sur les bougies.",
+    });
+  }
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
     ? String(technicalSnapshot.trend)
@@ -8134,7 +9264,6 @@ function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = 
     risk,
   });
   const rr = rewardRisk(direction, levels.entry, levels.sl, levels.tp);
-  const technique = style === "Mixte" ? "Price Action" : style;
   const newsLine = newsContext?.enabled
     ? newsContext.activeRisk ? "risque macro actif détecté" : "aucune news rouge proche détectée"
     : "contexte news non demandé";
@@ -8177,7 +9306,30 @@ function extractTradeDirection(text = "") {
   return trendDirection(text);
 }
 
-function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", style = "Mixte", strategy = "Swing Trading", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+function buildSmcOnlyAnswer(smc = null) {
+  const reason = smc?.summary || "Le moteur SMC n'a pas recu les bougies confirmees necessaires.";
+  return [
+    "Analyse SMC Kronos deterministe, calculee sur les bougies OHLC confirmees.",
+    "AUCUN SIGNAL",
+    `Etat: ${smc?.statusLabel || "historique indisponible"}. ${reason}`,
+    "Le panneau SMC decrit les etapes observees et les zones de recherche.",
+    "Les niveaux eventuels sont indicatifs et ne sont pas valides pour execution.",
+    "SCORE_CONFIANCE:0",
+    "TECHNIQUE_UTILISEE:SMC",
+    "STYLE_EFFICACITE:SMC=0",
+  ].join("\n");
+}
+function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+  const technique = style === "Mixte" ? "Price Action" : style;
+  if (style === "Price Action" && isScalpingStrategy(strategy)) {
+    return buildPriceActionScalpNoSignalText({
+      pair,
+      timeframe,
+      livePrice,
+      technicalSnapshot,
+      reason: "le repli deterministe ne confirme ni rejet ni cassure/retest avec les donnees de bougie.",
+    });
+  }
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;
@@ -8196,7 +9348,6 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "H1", st
     strategy,
     risk,
   });
-  const technique = style === "Mixte" ? "Price Action" : style;
   const evidence = styleEvidenceLine(technique);
   const strategyLine = strategyGuide(strategy, timeframe);
   const rr = rewardRisk(direction, levels.entry, levels.sl, levels.tp);
@@ -8248,8 +9399,8 @@ function styleEvidenceLine(style = "Price Action") {
   return "Lecture Price Action prudente: tendance, support/résistance, cassure/retest et rejet à confirmer visuellement.";
 }
 
-function strategyGuide(strategy = "Swing Trading", timeframe = "H1") {
-  const clean = String(strategy || "Swing Trading").toLowerCase();
+function strategyGuide(strategy = "Scalping", timeframe = "M5") {
+  const clean = String(strategy || "Scalping").toLowerCase();
   if (clean.includes("scalping")) return `Scalping ${timeframe}: réaction courte sur support/résistance, attendre impulsion et retest`;
   if (clean.includes("position")) return `Position Trading ${timeframe}: tendance de fond, privilégier niveaux majeurs et patience`;
   if (clean.includes("breakout")) return `Breakout ${timeframe}: cassure à confirmer par clôture/retest avant entrée`;
@@ -8304,6 +9455,7 @@ function buildAnalysisSnapshot({ pair, timeframe, livePrice, history = [], techn
       confirmations: Number(technicalSnapshot.confirmations) || 0,
       rsi: Number.isFinite(Number(technicalSnapshot.rsi)) ? Number(technicalSnapshot.rsi) : null,
       volatility: Number.isFinite(Number(technicalSnapshot.volatility)) ? Number(technicalSnapshot.volatility) : null,
+      structureLookbackBars: Number(technicalSnapshot.structureLookbackBars) || null,
     },
     multiTimeframe: Array.isArray(multiTimeframe)
       ? multiTimeframe.slice(0, 8).map((item) => ({ timeframe: item?.timeframe || null, trend: item?.trend || null, source: item?.source || null, stale: Boolean(item?.stale) }))
@@ -8336,6 +9488,46 @@ function buildDecisionReasonCodes({ livePrice, technicalSnapshot = {}, multiTime
   return [...new Set(reasons)];
 }
 
+function structureLookbackForTimeframe(timeframe) {
+  return ({ M1: 180, M5: 120, M15: 96, M30: 72, H1: 60, H4: 48, D1: 40, W1: 26, MN1: 24 })[normalizeTimeframe(timeframe)] || 60;
+}
+
+function buildMarketChartPayload(pair, timeframe, history = [], technicalSnapshot = {}) {
+  if (!Array.isArray(history) || !history.length) return null;
+  const candles = history.slice(-80).flatMap((bar, index, rows) => {
+    const open = Number(bar.open);
+    const high = Number(bar.high);
+    const low = Number(bar.low);
+    const close = Number(bar.close);
+    if (![open, high, low, close].every(Number.isFinite) || high < low) return [];
+    const rawTime = bar.epoch ?? bar.time ?? bar.timestamp ?? bar.datetime;
+    let seconds = Number(rawTime);
+    if (!Number.isFinite(seconds) && typeof rawTime === "string") seconds = Date.parse(rawTime) / 1000;
+    if (Number.isFinite(seconds) && seconds > 1e12) seconds /= 1000;
+    return [{
+      t: Number.isFinite(seconds) ? Math.floor(seconds) : index - rows.length,
+      o: open,
+      h: high,
+      l: low,
+      c: close,
+    }];
+  });
+  if (candles.length < 10) return null;
+  const meta = history._meta || {};
+  return {
+    pair,
+    timeframe: normalizeTimeframe(timeframe) || "M5",
+    source: meta.source || technicalSnapshot.source || "historique API",
+    stale: Boolean(meta.stale),
+    totalBars: history.length,
+    displayedBars: candles.length,
+    structureLookbackBars: Number(technicalSnapshot.structureLookbackBars) || null,
+    support: technicalSnapshot.support != null && Number.isFinite(Number(technicalSnapshot.support)) ? Number(technicalSnapshot.support) : null,
+    resistance: technicalSnapshot.resistance != null && Number.isFinite(Number(technicalSnapshot.resistance)) ? Number(technicalSnapshot.resistance) : null,
+    candles,
+  };
+}
+
 function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = {}) {
   const bars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
   const closes = bars.map((bar) => Number(bar.close));
@@ -8358,9 +9550,12 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   const sma30 = closes.length >= 30 ? average(closes.slice(-30)) : NaN;
   const rsi = closes.length >= 15 ? calculateRsi(closes.slice(-100)) : NaN;
   const atr = average(bars.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.004;
-  const recent = bars.slice(-30);
+  const timeframe = normalizeTimeframe(options.timeframe || meta.timeframe || "M5") || "M5";
+  const structureLookbackBars = structureLookbackForTimeframe(timeframe);
+  const recent = bars.slice(-structureLookbackBars);
   const support = Math.min(...recent.map((bar) => Number(bar.low)).filter(Number.isFinite));
   const resistance = Math.max(...recent.map((bar) => Number(bar.high)).filter(Number.isFinite));
+  const priceActionRead = summarizePriceActionBars(recent, pair);
   const momentum = Number.isFinite(sma30) && sma30 > 0 ? ((sma10 - sma30) / sma30) * 100 : 0;
   const trend = !Number.isFinite(sma30)
     ? "neutre"
@@ -8399,6 +9594,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     source: meta.source || livePrice?.source || "historique",
     stale: Boolean(meta.stale || livePrice?.stale || !compatible),
     timeframeCompatible: compatible,
+    timeframe,
     valid,
     last: Number(formatLevel(last, pair)),
     sma10: Number(formatLevel(sma10, pair)),
@@ -8407,6 +9603,8 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     atr: Number(formatLevel(atr, pair)),
     support: Number.isFinite(support) ? Number(formatLevel(support, pair)) : null,
     resistance: Number.isFinite(resistance) ? Number(formatLevel(resistance, pair)) : null,
+    structureLookbackBars: recent.length,
+    priceActionRead,
     trend,
     marketRegime: classifyMarketRegime({ trend, volatility }),
     momentum: Number(momentum.toFixed(3)),
@@ -8419,12 +9617,78 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       `SMA10 ${formatLevel(sma10, pair)}${Number.isFinite(sma30) ? ` / SMA30 ${formatLevel(sma30, pair)}` : ""}`,
       Number.isFinite(rsi) ? `RSI ${Math.round(rsi)}` : "RSI indisponible",
       `ATR ${formatLevel(atr, pair)}`,
+      `structure calculÃ©e sur ${recent.length} bougies ${timeframe}`,
       Number.isFinite(support) && Number.isFinite(resistance) ? `support ${formatLevel(support, pair)}, résistance ${formatLevel(resistance, pair)}` : "zones S/R insuffisantes",
+      priceActionRead.summary,
       Number.isFinite(volumeRatio) ? `volume ${volumeRatio}x la moyenne 20 bougies` : "volume indisponible pour cette source",
       `confirmations ${confirmations}/6`,
       compatible ? "timeframe cohérent avec la stratégie" : "historique non aligné avec le timeframe demandé",
       meta.stale ? "historique indicatif/différé" : "historique frais ou cache récent",
     ].join("; "),
+  };
+}
+
+function summarizePriceActionBars(bars, pair) {
+  const usable = bars.filter((bar) => [bar.open, bar.high, bar.low, bar.close].every((value) => Number.isFinite(Number(value))))
+    .map((bar) => ({ open: Number(bar.open), high: Number(bar.high), low: Number(bar.low), close: Number(bar.close) }));
+  if (usable.length < 5) return { summary: "OHLC insuffisant pour les swings et les motifs de bougies." };
+  const last = usable.at(-1);
+  const range = Math.max(last.high - last.low, Math.abs(last.close) * 1e-8);
+  const body = Math.abs(last.close - last.open);
+  const upperWick = last.high - Math.max(last.open, last.close);
+  const lowerWick = Math.min(last.open, last.close) - last.low;
+  const prior = usable.slice(0, -1).slice(-20);
+  const priorBodies = prior.map((bar) => Math.abs(bar.close - bar.open));
+  const avgPriorBody = average(priorBodies);
+  const displacementRatio = avgPriorBody > 0 ? body / avgPriorBody : null;
+  const candleDirection = last.close > last.open ? "haussière" : last.close < last.open ? "baissière" : "doji";
+  const candleText = `${candleDirection}, corps ${(body / range * 100).toFixed(0)}% de l'amplitude, mèches haute/basse ${(upperWick / range * 100).toFixed(0)}%/${(lowerWick / range * 100).toFixed(0)}%`;
+
+  const swingHighs = [];
+  const swingLows = [];
+  for (let index = 2; index < usable.length - 2; index += 1) {
+    const candidate = usable[index];
+    const neighbours = [usable[index - 2], usable[index - 1], usable[index + 1], usable[index + 2]];
+    if (neighbours.every((bar) => candidate.high > bar.high)) swingHighs.push(candidate.high);
+    if (neighbours.every((bar) => candidate.low < bar.low)) swingLows.push(candidate.low);
+  }
+  const highPair = swingHighs.slice(-2);
+  const lowPair = swingLows.slice(-2);
+  const higherHighs = highPair.length === 2 && highPair[1] > highPair[0];
+  const lowerHighs = highPair.length === 2 && highPair[1] < highPair[0];
+  const higherLows = lowPair.length === 2 && lowPair[1] > lowPair[0];
+  const lowerLows = lowPair.length === 2 && lowPair[1] < lowPair[0];
+  const swingStructure = higherHighs && higherLows ? "HH/HL confirmés (structure haussière)"
+    : lowerHighs && lowerLows ? "LH/LL confirmés (structure baissière)"
+      : highPair.length === 2 && lowPair.length === 2 ? "swings mixtes / range"
+        : "swings confirmés insuffisants";
+
+  const priorHigh = Math.max(...prior.map((bar) => bar.high));
+  const priorLow = Math.min(...prior.map((bar) => bar.low));
+  const sweep = last.high > priorHigh && last.close < priorHigh ? `balayage haut puis clôture sous ${formatLevel(priorHigh, pair)}`
+    : last.low < priorLow && last.close > priorLow ? `balayage bas puis clôture au-dessus de ${formatLevel(priorLow, pair)}`
+      : "aucun balayage de l'extrême des 20 bougies précédentes";
+
+  let imbalance = null;
+  const older = usable.at(-3);
+  if (last.low > older.high) imbalance = { direction: "haussière", low: older.high, high: last.low };
+  else if (last.high < older.low) imbalance = { direction: "baissière", low: last.high, high: older.low };
+  const gapText = imbalance
+    ? `imbalance 3 bougies ${imbalance.direction} ${formatLevel(imbalance.low, pair)}-${formatLevel(imbalance.high, pair)}`
+    : "pas d'imbalance 3 bougies sur les 3 dernières bougies";
+  const displacement = displacementRatio == null ? "déplacement non mesurable"
+    : `corps ${displacementRatio.toFixed(2)}x la moyenne des ${priorBodies.length} corps précédents`;
+  return {
+    candle: candleText,
+    swingStructure,
+    sweep,
+    displacementRatio: displacementRatio == null ? null : Number(displacementRatio.toFixed(2)),
+    imbalance: imbalance ? {
+      direction: imbalance.direction,
+      low: Number(formatLevel(imbalance.low, pair)),
+      high: Number(formatLevel(imbalance.high, pair)),
+    } : null,
+    summary: `OHLC: dernière bougie ${candleText}; ${swingStructure}; ${sweep}; ${displacement}; ${gapText}. Motifs algorithmiques à confirmer avec le flux du courtier.`,
   };
 }
 
@@ -8500,31 +9764,37 @@ function normalizeChatAnswer(answer, intent, seed = "") {
   };
 }
 
-function scoreConfidenceBand(score, dataReliability, calibration) {
+function scoreConfidenceBand(score, dataReliability, calibration, cap = 100) {
   let spread = 8;
   if (dataReliability?.grade === "C") spread = 14;
   if (dataReliability?.grade === "D") spread = 20;
   const weakCalibration = !calibration || ["aucune donnée", "échantillon trop petit", "indicatif"].includes(calibration.confidenceLabel);
   if (weakCalibration) spread += 5;
   const low = Math.max(0, Math.round(score - spread));
-  const high = Math.min(100, Math.round(score + spread));
+  const high = Math.min(cap, Math.round(score + spread));
   return {
     low,
     high,
-    note: `Score indicatif ${low}-${high}, pas un chiffre exact — fiabilité données ${dataReliability?.grade || "n/a"}, calibration ${calibration?.confidenceLabel || "aucune donnée"}.`,
+    note: `Fourchette heuristique ${low}-${high}, pas un intervalle statistique ni une probabilité — données ${dataReliability?.grade || "n/a"}, calibration ${calibration?.confidenceLabel || "aucune donnée"}.`,
   };
 }
 
 function normalizeAnalysis(answer, body = {}, context = {}) {
   const normalized = normalizeAiAnswer(answer, body.pair || "");
   const text = normalized.answer;
-  const validation = validateAnalysisStyle(text, body.style || "Mixte");
+  const selectedStyle = body.style || "Price Action";
+  const selectedStrategy = body.strategy || "Scalping";
+  const selectedRisk = body.risk || defaultRiskMode();
+  const targetProfile = normalizeTargetProfile(body.targetProfile);
+  const targetProfileInfo = targetProfileDefinition(targetProfile, "ACHAT");
+  const validation = validateAnalysisStyle(text, selectedStyle);
   const imageQuality = context.imageQuality || { score: 0, reason: "Non mesurée" };
   const hasChartImages = Number(imageQuality.images || 0) > 0;
   const calibration = context.calibration || { adjustment: 0, message: "Aucune calibration." };
   const livePrice = context.livePrice;
   const apiOnlySetup = Boolean(context.apiOnlySetup);
   const quickMode = body.analysisDepth === "Rapide";
+  const strictPriceActionScalp = /^price\s*action$/i.test(String(selectedStyle)) && isScalpingStrategy(selectedStrategy);
   const chartContext = context.chartContext || {};
   const live = Number(livePrice?.price);
   // Distinct from `Number.isFinite(live)`: a stale/emergency fallback price (e.g. the
@@ -8542,7 +9812,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   });
   const dataSnapshot = buildAnalysisSnapshot({
     pair: body.pair || "EUR/USD",
-    timeframe: body.timeframe || "H1",
+    timeframe: body.timeframe || "M5",
     livePrice,
     history: context.history || [],
     technicalSnapshot: context.technicalSnapshot || {},
@@ -8558,10 +9828,12 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
   });
   const meta = {
     pair: body.pair || "EUR/USD",
-    timeframe: body.timeframe || "H1",
-    style: body.style || "Mixte",
-    strategy: body.strategy || "Swing Trading",
-    risk: body.risk || defaultRiskMode(),
+    timeframe: body.timeframe || "M5",
+    style: selectedStyle,
+    strategy: selectedStrategy,
+    targetProfile,
+    targetProfileLabel: targetProfileInfo.label,
+    risk: selectedRisk,
     capital: body.capital || null,
     analysisDepth: body.analysisDepth || "Profonde",
     livePrice: Number.isFinite(live) ? live : null,
@@ -8569,11 +9841,25 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     // presenting it as instantaneous -- see the refetch-before-validation fix in
     // runKronosAnalysis for why this matters (Profonde mode can take 60-90+s).
     livePriceAsOf: livePrice?.asOf || null,
+    livePriceSource: livePrice?.source || null,
+    livePriceBid: livePrice?.bid != null && Number.isFinite(Number(livePrice.bid)) ? Number(livePrice.bid) : null,
+    livePriceAsk: livePrice?.ask != null && Number.isFinite(Number(livePrice.ask)) ? Number(livePrice.ask) : null,
+    livePriceSpread: livePrice?.spread != null && Number.isFinite(Number(livePrice.spread)) ? Number(livePrice.spread) : null,
+    historySource: context.technicalSnapshot?.source || null,
+    scoreMeaning: context.smcAnalysis ? "smc_readiness_not_probability" : "heuristic_quality_not_win_probability",
+    scoreCap: hasChartImages ? 100 : 70,
+    derivFeedConfirmed: livePrice?.source === "deriv_ws" && /^deriv_ws:/i.test(String(context.technicalSnapshot?.source || "")),
+    derivSpreadConfirmed: livePrice?.bid != null && livePrice?.ask != null
+      && Number.isFinite(Number(livePrice.bid)) && Number.isFinite(Number(livePrice.ask))
+      && Number(livePrice.bid) > 0 && Number(livePrice.ask) >= Number(livePrice.bid),
     liveUsable,
     imageQuality,
     calibration,
     chartContext,
     technicalSnapshot: context.technicalSnapshot || null,
+    smcAnalysis: context.smcAnalysis || null,
+    priceActionAnalysis: context.priceActionAnalysis || null,
+    marketChart: buildMarketChartPayload(body.pair || "EUR/USD", body.timeframe || "M5", context.history || [], context.technicalSnapshot || {}),
     newsContext: context.newsContext || null,
     multiTimeframe: context.multiTimeframe || [],
     mtfConsensus,
@@ -8627,6 +9913,15 @@ VALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
       meta,
     });
   }
+  if (strictPriceActionScalp && (!meta.derivFeedConfirmed || !meta.derivSpreadConfirmed)) {
+    return blockAnalysis(normalized, {
+      score: Math.min(normalized.score, validation.score, 35),
+      technique: validation.technique,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: scalp Price Action bloqué. Il faut le prix, les bougies et le bid/ask du flux public Deriv; les données d'un autre fournisseur ne seront pas mélangées et le coût de spread ne sera pas supposé.`,
+      validation: { ...validation, valid: false, reason: "Flux Deriv ou spread bid/ask non confirmé." },
+      meta: { ...meta, derivFeedConfirmed: Boolean(meta.derivFeedConfirmed), derivSpreadConfirmed: Boolean(meta.derivSpreadConfirmed) },
+    });
+  }
   if (!quickMode && !hasChartImages && !apiOnlySetup && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 42),
@@ -8654,14 +9949,42 @@ VALIDATION KRONOS: direction achat/vente non détectée dans la réponse IA — 
   let sl = extractLevel(text, /(?:stop loss|sl)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp = extractLevel(text, /(?:take profit\s*1|tp1|take profit|tp)\s*:?\s*([0-9.,]+)/i, NaN);
   let tp2 = extractLevel(text, /(?:take profit\s*2|tp2)\s*:?\s*([0-9.,]+)/i, NaN);
-  let assistedLevels = buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
+  const requiredPriceActionLevels = targetProfile === "mdt_extended" ? [entry, sl] : [entry, sl, tp, tp2];
+  if (strictPriceActionScalp && !requiredPriceActionLevels.every(Number.isFinite)) {
+    const candidateLevels = targetProfile === "mdt_extended"
+      ? [[entry, "entrée"], [sl, "stop loss"]]
+      : [
+      [entry, "entrée"], [sl, "stop loss"], [tp, "TP1"], [tp2, "TP2"],
+      ];
+    const missing = candidateLevels.filter(([value]) => !Number.isFinite(value)).map(([, label]) => label);
+    return blockAnalysis(normalized, {
+      score: Math.min(normalized.score, validation.score, 40),
+      technique: validation.technique,
+      explanation: `${displayText}\n\nVALIDATION KRONOS: Price Action scalping bloqué. Niveau(x) non explicitement justifié(s) par l'analyse: ${missing.join(", ")}. Aucun niveau ne sera fabriqué à partir du seul prix live.`,
+      validation: { ...validation, valid: false, reason: `Niveaux Price Action incomplets: ${missing.join(", ")}.` },
+      meta: { ...meta, missingLevels: missing, syntheticLevelsDisabled: true },
+    });
+  }
+  let assistedLevels = buildAssistedLevels({ direction, entry, sl, tp, tp2, live, pair: body.pair, strategy: selectedStrategy, risk: selectedRisk });
   if (assistedLevels.used) {
     entry = assistedLevels.entry;
     sl = assistedLevels.sl;
     tp = assistedLevels.tp;
     tp2 = assistedLevels.tp2;
   }
-  let targetConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy, risk: body.risk });
+  let targetConstraint;
+  const profileLevels = calculateTargetProfileLevels({ targetProfile, direction, entry, sl });
+  if (profileLevels) {
+    const riskDistance = Math.abs(entry - sl);
+    const changed = !Number.isFinite(tp) || !Number.isFinite(tp2)
+      || Math.abs(profileLevels.tp - tp) > riskDistance * 0.05
+      || Math.abs(profileLevels.tp2 - tp2) > riskDistance * 0.05;
+    targetConstraint = { ...profileLevels, used: changed };
+  } else {
+    targetConstraint = strictPriceActionScalp
+      ? { used: false, tp, tp2 }
+      : constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: selectedStrategy, risk: selectedRisk });
+  }
   if (targetConstraint.used) {
     tp = targetConstraint.tp;
     tp2 = targetConstraint.tp2;
@@ -8677,22 +10000,23 @@ VALIDATION KRONOS: niveaux entrée/SL/TP incomplets et aucun prix live disponibl
       meta,
     });
   }
-  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair: body.pair, strategy: body.strategy, risk: body.risk });
-  if (!levelCheck.valid) {
-    const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair, strategy: body.strategy, risk: body.risk });
+  let levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, executionSpread: livePrice?.spread, pair: body.pair, strategy: selectedStrategy, risk: selectedRisk, targetProfile });
+  if (!levelCheck.valid && !strictPriceActionScalp) {
+    const repairedLevels = buildAssistedLevels({ direction, entry: NaN, sl: NaN, tp: NaN, tp2: NaN, live, pair: body.pair, strategy: selectedStrategy, risk: selectedRisk });
     if (repairedLevels.used) {
       entry = repairedLevels.entry;
       sl = repairedLevels.sl;
       tp = repairedLevels.tp;
       tp2 = repairedLevels.tp2;
-      const repairedConstraint = constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: body.strategy, risk: body.risk });
+      const repairedConstraint = calculateTargetProfileLevels({ targetProfile, direction, entry, sl })
+        || constrainTargetsToStrategy({ direction, entry, sl, tp, tp2, strategy: selectedStrategy, risk: selectedRisk });
       if (repairedConstraint.used) {
         tp = repairedConstraint.tp;
         tp2 = repairedConstraint.tp2;
         targetConstraint = repairedConstraint;
       }
       assistedLevels = repairedLevels;
-      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair: body.pair, strategy: body.strategy, risk: body.risk });
+      levelCheck = validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, executionSpread: livePrice?.spread, pair: body.pair, strategy: selectedStrategy, risk: selectedRisk, targetProfile });
     }
   }
   if (!levelCheck.valid) {
@@ -8707,6 +10031,12 @@ VALIDATION KRONOS: ${levelCheck.reason}`,
     });
   }
   const rr = rewardRisk(direction, entry, sl, tp);
+  const tp2R = Number.isFinite(tp2) && Math.abs(entry - sl) > 0
+    ? Math.abs(tp2 - entry) / Math.abs(entry - sl) : null;
+  meta.tp1R = rr;
+  meta.tp2R = tp2R;
+  meta.targetProfile = targetProfile;
+  meta.targetProfileLabel = targetProfileDefinition(targetProfile, direction).label;
   const suspicious = inspectSuspiciousLevels({ direction, entry, sl, tp1: tp, rr, pair: body.pair });
   if (suspicious.risky) {
     return blockAnalysis(normalized, {
@@ -8738,8 +10068,7 @@ VALIDATION KRONOS: Trade risqué — ${suspicious.reason}. Les niveaux sont indi
   }
   meta.visionConsensus = visionConsensus;
   // Informational only, by design: this never blocks or lowers the score. The point
-  // (per explicit user decision) is to show a second, statistically-proven-but-
-  // limited-coverage opinion next to the LLM's read so a human can weigh both --
+  // is to show a separately backtested but limited-coverage opinion next to the LLM's read so a human can weigh both --
   // not to let one silently override the other.
   if (meta.deterministicCrossCheck) {
     meta.deterministicCrossCheck = {
@@ -8766,10 +10095,16 @@ VALIDATION KRONOS: contrôle qualité non validé — ${qualityGate.reason}`,
   }
   const profile = riskProfile(body.risk);
   const riskPlan = buildRiskPlan({ capital: body.capital, profile });
-  const effectiveImageScore = hasChartImages ? imageQuality.score : apiOnlySetup ? 78 : 65;
-  const calibratedScore = Math.max(0, Math.min(100, Math.round(
-    normalized.score * 0.42 + validation.score * 0.18 + effectiveImageScore * 0.2 + levelCheck.score * 0.2 + calibration.adjustment,
-  )));
+  if (targetProfile === "mdt_extended") riskPlan.closeAtTp1 = 50;
+  // Pixel dimensions indicate whether an image might be readable; they do not
+  // measure whether a trade setup has an edge. Score the data/validation instead,
+  // and keep the no-chart ceiling that the analysis prompt promises.
+  const uncappedQualityScore = Math.round(
+    normalized.score * 0.42 + validation.score * 0.18 + dataReliability.score * 0.2 + levelCheck.score * 0.2 + calibration.adjustment,
+  );
+  const scoreCap = hasChartImages ? 100 : 70;
+  const calibratedScore = Math.max(0, Math.min(scoreCap, uncappedQualityScore));
+  meta.scoreCap = scoreCap;
   if (calibratedScore < 30) {
     return blockAnalysis(normalized, {
       score: calibratedScore,
@@ -8781,7 +10116,7 @@ VALIDATION KRONOS: score d'efficacité insuffisant (${calibratedScore}%).`,
       meta: { ...meta, levelCheck, rr },
     });
   }
-  const beginnerPlan = buildBeginnerPlan({ direction, entry, sl, tp1: tp, tp2, pair: body.pair, strategy: body.strategy, risk: body.risk, capital: body.capital });
+  const beginnerPlan = buildBeginnerPlan({ direction, entry, sl, tp1: tp, tp2, pair: body.pair, strategy: body.strategy, risk: body.risk, capital: body.capital, targetProfile });
   return {
     ...normalized,
     direction,
@@ -8791,7 +10126,7 @@ VALIDATION KRONOS: score d'efficacité insuffisant (${calibratedScore}%).`,
     tp2: formatLevel(Number.isFinite(tp2) ? tp2 : projectTp2(direction, entry, sl, tp), body.pair),
     rr: `1:${rr.toFixed(1)}`,
     score: calibratedScore,
-    scoreRange: scoreConfidenceBand(calibratedScore, dataReliability, calibration),
+    scoreRange: scoreConfidenceBand(calibratedScore, dataReliability, calibration, scoreCap),
     dangerScore: danger.score,
     beginnerPlan,
     explanation: `${displayText}
@@ -8809,6 +10144,7 @@ VALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.
       riskPlan,
       styleComparison: validation.styleComparison,
       assistedLevels: assistedLevels.used ? assistedLevels.reason : null,
+      levelsAreSynthetic: Boolean(assistedLevels.used || targetConstraint.used),
       targetConstraint: targetConstraint.used ? targetConstraint.reason : null,
       decisionReasons: buildDecisionReasonCodes({
         livePrice,
@@ -8822,6 +10158,8 @@ VALIDATION KRONOS: ${validation.reason} Niveaux cohérents. R/R calculé 1:${rr.
 }
 
 function blockAnalysis(normalized, details) {
+  const scoreCap = Number.isFinite(Number(details.meta?.scoreCap)) ? Number(details.meta.scoreCap) : 100;
+  const blockedScore = Math.max(0, Math.min(scoreCap, Number(details.score) || 0));
   const diagnostic = buildNoSignalDiagnostic(details);
   const auditReasons = [
     ...(details.meta?.decisionReasons || []),
@@ -8856,7 +10194,7 @@ function blockAnalysis(normalized, details) {
     tp1: "—",
     tp2: "—",
     rr: "—",
-    score: details.score,
+    score: blockedScore,
     technique: details.technique,
     explanation: details.explanation,
     validation: details.validation,
@@ -8879,6 +10217,32 @@ function buildNoSignalDiagnostic(details = {}) {
   const technical = meta.technicalSnapshot || {};
   const levelCheck = meta.levelCheck || {};
   const explanation = `${details.explanation || ""} ${validation.reason || ""} ${levelCheck.reason || ""}`.toLowerCase();
+
+  if (/flux public deriv|flux deriv ou spread bid\/ask non confirmé/.test(explanation)) {
+    return {
+      status: "FLUX_DERIV_INCOMPLET",
+      statusLabel: "Flux Deriv incomplet",
+      userMessage: "Le prix, les bougies et le bid/ask ne sont pas confirmés sur le même flux Deriv. Kronos bloque le scalping plutôt que de mélanger des cotations différentes.",
+      nextActions: [
+        "Réessaie quand les cotations Deriv répondent.",
+        "Vérifie la paire et l'unité de temps choisies.",
+        "Ne copie pas un plan affiché avec une source externe pour l'exécuter chez Deriv.",
+      ],
+    };
+  }
+
+  if (/niveaux price action incomplets/.test(explanation)) {
+    return {
+      status: "PA_TRIGGER_INCOMPLETE",
+      statusLabel: "Déclencheur Price Action incomplet",
+      userMessage: "Kronos n'a pas pu justifier tous les niveaux à partir du setup visible. Aucun SL ou TP n'a été complété automatiquement.",
+      nextActions: [
+        "Attends une clôture de cassure puis un retest, ou un rejet confirmé sur un niveau clair.",
+        "Envoie une capture nette avec prix, paire et timeframe visibles.",
+        "Relance seulement quand les niveaux peuvent être lus et justifiés.",
+      ],
+    };
+  }
 
   if (/trade risqué|niveaux suspects|sl trop proche|r\/r trop élevé|tp1 suspect/.test(explanation)) {
     return {
@@ -8987,6 +10351,44 @@ function buildNoSignalDiagnostic(details = {}) {
 
 function defaultRiskMode() {
   return "Protection maximale 0.5%";
+}
+
+function normalizeTargetProfile(value = "") {
+  return String(value).trim().toLowerCase() === "mdt_extended" ? "mdt_extended" : "prudent";
+}
+
+function targetProfileDefinition(targetProfile, direction) {
+  if (normalizeTargetProfile(targetProfile) === "mdt_extended") {
+    return {
+      key: "mdt_extended",
+      label: "Objectifs étendus (inspiré des captures, expérimental)",
+      tp1R: 0.67,
+      tp2R: direction === "VENTE" ? 2.67 : 2,
+      closeAtTp1: 50,
+      moveStopToBreakeven: true,
+    };
+  }
+  return {
+    key: "prudent",
+    label: "Prudent (profil actuel)",
+    tp1R: null,
+    tp2R: null,
+    closeAtTp1: null,
+    moveStopToBreakeven: true,
+  };
+}
+
+function calculateTargetProfileLevels({ targetProfile, direction, entry, sl }) {
+  if (normalizeTargetProfile(targetProfile) !== "mdt_extended"
+    || ![entry, sl].every(Number.isFinite) || entry === sl) return null;
+  const profile = targetProfileDefinition(targetProfile, direction);
+  const riskDistance = Math.abs(entry - sl);
+  return {
+    used: true,
+    tp: direction === "ACHAT" ? entry + riskDistance * profile.tp1R : entry - riskDistance * profile.tp1R,
+    tp2: direction === "ACHAT" ? entry + riskDistance * profile.tp2R : entry - riskDistance * profile.tp2R,
+    reason: `Profil étendu calculé sur le SL structurel: TP1 ${profile.tp1R.toFixed(2)}R, TP2 ${profile.tp2R.toFixed(2)}R.`,
+  };
 }
 
 function riskProfile(value = "") {
@@ -9266,8 +10668,10 @@ function microLotMoneyExample({ entry, sl, tp1, tp2, pair }) {
   };
 }
 
-function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, risk, capital }) {
+function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, risk, capital, targetProfile }) {
   const profile = riskProfile(risk);
+  const exitProfile = targetProfileDefinition(targetProfile, direction);
+  const closeAtTp1 = exitProfile.closeAtTp1 ?? profile.closeAtTp1;
   const riskAmount = riskAmountForCapital(capital, profile.percent);
   const riskLine = riskAmount
     ? `Risque max: ${profile.percent}% du capital, soit environ ${riskAmount.toFixed(2)} unité(s) si le capital indiqué est correct.`
@@ -9277,25 +10681,28 @@ function buildBeginnerPlan({ direction, entry, sl, tp1, tp2, pair, strategy, ris
     ? `Astuce débutant (0.01 lot): perte ≈ ${money.lossAtSl} ${money.currency} si le SL est touché · gain ≈ ${money.gainAtTp1} ${money.currency} à TP1 · ≈ ${money.gainAtTp2} ${money.currency} à TP2. ${money.note}`
     : null;
   return {
-    title: isScalpingStrategy(strategy) ? "Plan scalping débutant" : "Plan débutant",
+    title: targetProfile === "mdt_extended"
+      ? "Plan objectifs étendus (expérimental)"
+      : isScalpingStrategy(strategy) ? "Plan scalping débutant" : "Plan débutant",
     steps: [
       riskLine,
       ...(moneyLine ? [moneyLine] : []),
       `Entrée seulement si le prix confirme ${formatLevel(entry, pair)}.`,
       `Stop Loss à ${formatLevel(sl, pair)} sans l'élargir après entrée.`,
-      `TP1 prudent à ${formatLevel(tp1, pair)}: fermer ${profile.closeAtTp1}% ou sécuriser une partie.`,
+      `TP1 à ${formatLevel(tp1, pair)}: fermer ${closeAtTp1}% ou sécuriser une partie.`,
       `Après TP1, déplacer le SL vers breakeven si la plateforme le permet.`,
-      `TP2 moyen à ${formatLevel(tp2, pair)}: laisser courir uniquement si le momentum reste propre.`,
+      `TP2 à ${formatLevel(tp2, pair)}${targetProfile === "mdt_extended" ? ` (${exitProfile.tp2R.toFixed(2)}R)` : " moyen"}: laisser courir uniquement si le momentum reste propre.`,
       "Ne pas augmenter le lot après une perte: attendre un nouveau setup validé.",
     ],
     microLotExample: money,
     copy: [
       `ENTREE: ${formatLevel(entry, pair)}`,
       `SL: ${formatLevel(sl, pair)}`,
-      `TP1 PRUDENT: ${formatLevel(tp1, pair)}`,
-      `TP2 MOYEN: ${formatLevel(tp2, pair)}`,
+      `PROFIL DE SORTIE: ${exitProfile.label}`,
+      `TP1 ${targetProfile === "mdt_extended" ? `${exitProfile.tp1R.toFixed(2)}R` : "PRUDENT"}: ${formatLevel(tp1, pair)}`,
+      `TP2 ${targetProfile === "mdt_extended" ? `${exitProfile.tp2R.toFixed(2)}R` : "MOYEN"}: ${formatLevel(tp2, pair)}`,
       `RISQUE MAX: ${profile.percent}% du capital`,
-      `GESTION: Fermer ${profile.closeAtTp1}% à TP1 puis protéger le reste.`,
+      `GESTION: Fermer ${closeAtTp1}% à TP1 puis protéger le reste à BE.`,
       ...(money ? [`EXEMPLE 0.01 LOT: perte ~${money.lossAtSl} ${money.currency} au SL, gain ~${money.gainAtTp1} ${money.currency} au TP1`] : []),
     ].join("\n"),
   };
@@ -9470,8 +10877,8 @@ function validateAnalysisStyle(text, style) {
     matched: scored.matchedGroups.length,
     required: selected.groups.length,
     reason: valid
-      ? `Style ${style} validé: ${scored.matchedGroups.length}/${selected.groups.length} familles confirmées.`
-      : `Style ${style} faible mais utilisable: ${scored.matchedGroups.length}/${selected.groups.length} familles confirmées, direction=${scored.hasDirection}, risque=${scored.hasRisk}, niveaux=${scored.hasLevels}.`,
+      ? `Texte cohérent avec ${style}: ${scored.matchedGroups.length}/${selected.groups.length} familles de critères retrouvées.`
+      : `Correspondance narrative faible pour ${style}: ${scored.matchedGroups.length}/${selected.groups.length} familles, direction=${scored.hasDirection}, risque=${scored.hasRisk}, niveaux=${scored.hasLevels}.`,
   };
 }
 
@@ -9507,8 +10914,8 @@ function validateMixedStyle(text) {
       candidates: candidates.map((item) => ({ style: item.style, score: item.score, matched: item.matched, required: item.required })),
     },
     reason: valid
-      ? `Mode Mixte: ${best.style} retenu avec ${best.score}% d'efficacité visible (${best.matched}/${best.required} familles).`
-      : `Mode Mixte prudent: meilleur style ${best.style} à ${best.score}%, confirmations partielles.`,
+      ? `Mode Mixte: le texte correspond le plus à ${best.style} (${best.score}/100, ${best.matched}/${best.required} familles de critères).`
+      : `Mode Mixte prudent: correspondance narrative la plus forte avec ${best.style} (${best.score}/100), critères partiels.`,
   };
 }
 
@@ -9618,17 +11025,20 @@ function assessImageQuality(images) {
   return { score, reason, images: images.length };
 }
 
-function validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, pair, strategy, risk }) {
+function validateTradeLevels({ direction, entry, sl, tp, live, liveUsable, executionSpread, pair, strategy, risk, targetProfile }) {
   if (![entry, sl, tp].every(Number.isFinite)) return { valid: false, score: 0, reason: "Niveaux numériques invalides." };
   const buy = direction === "ACHAT";
   if (buy && !(sl < entry && tp > entry)) return { valid: false, score: 20, reason: "Pour un achat, SL doit être sous l'entrée et TP au-dessus." };
   if (!buy && !(sl > entry && tp < entry)) return { valid: false, score: 20, reason: "Pour une vente, SL doit être au-dessus de l'entrée et TP sous l'entrée." };
   const rr = rewardRisk(direction, entry, sl, tp);
   const profile = riskProfile(risk);
-  const minRr = isScalpingStrategy(strategy) ? 0.75 : profile.percent <= 0.5 ? 1.0 : 1.2;
+  const minRr = normalizeTargetProfile(targetProfile) === "mdt_extended"
+    ? 0.6
+    : isScalpingStrategy(strategy) ? 0.75 : profile.percent <= 0.5 ? 1.0 : 1.2;
   if (!Number.isFinite(rr) || rr < minRr) return { valid: false, score: 35, reason: `R/R trop faible (${Number.isFinite(rr) ? rr.toFixed(1) : "n/a"}).` };
   const riskDistance = Math.abs(entry - sl);
-  const executionBuffer = executionCostBuffer(pair, strategy);
+  const observedSpread = Number(executionSpread);
+  const executionBuffer = Math.max(executionCostBuffer(pair, strategy), Number.isFinite(observedSpread) ? observedSpread : 0);
   if (riskDistance < executionBuffer * 3) {
     return {
       valid: false,
@@ -11250,6 +12660,7 @@ function rowToAnalysis(row) {
     timeframe: row.timeframe,
     style: row.style,
     strategy: row.strategy,
+    targetProfile: normalizeTargetProfile(row.target_profile),
     risk: row.risk,
     capital: row.capital,
     analysisDepth: row.analysis_depth,
@@ -11288,12 +12699,12 @@ function rowToAnalysis(row) {
 
 async function upsertAnalysisRow(analysis) {
   await sqlRun(
-    `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, risk, capital, analysis_depth,
+    `INSERT INTO analyses (id, user_id, created_at, pair, timeframe, style, strategy, target_profile, risk, capital, analysis_depth,
        direction, entry, sl, tp1, tp2, rr, score, active, status, block_reason, live_price_at_signal,
        image_quality, calibration, validation, technical_snapshot, multi_timeframe,
        closed_at, close_price, outcome, outcome_reason, r_multiple, broker_profit_amount,
        executed_entry, data_snapshot, news_snapshot, decision_reasons, market_regime, is_test, source, broker_slot)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -11315,6 +12726,7 @@ async function upsertAnalysisRow(analysis) {
       analysis.timeframe || null,
       analysis.style || null,
       analysis.strategy || null,
+      normalizeTargetProfile(analysis.targetProfile),
       analysis.risk ? String(analysis.risk) : null,
       analysis.capital ? String(analysis.capital) : null,
       analysis.analysisDepth || null,
@@ -12417,6 +13829,7 @@ async function loadLearningLog() {
       timeframe: item.timeframe,
       style: item.style,
       strategy: item.strategy || "Swing Trading",
+      targetProfile: item.targetProfile || "prudent",
       analysisDepth: item.analysisDepth || "Profonde",
       score: item.score,
       result: item.outcome,
@@ -12444,7 +13857,7 @@ async function loadLearningLog() {
 async function loadCalibrationOutcomes() {
   await ensureRelationalTables();
   const rows = await sqlAll(
-    `SELECT id, user_id, pair, timeframe, style, strategy, analysis_depth, score, outcome, status, r_multiple, closed_at
+    `SELECT id, user_id, pair, timeframe, style, strategy, target_profile, analysis_depth, score, outcome, status, r_multiple, closed_at
      FROM analyses WHERE is_test = 0 AND outcome IS NOT NULL ORDER BY created_at ASC`,
   );
   return rows.map((row) => ({
@@ -12454,6 +13867,7 @@ async function loadCalibrationOutcomes() {
     timeframe: row.timeframe,
     style: row.style,
     strategy: row.strategy || "Swing Trading",
+    targetProfile: normalizeTargetProfile(row.target_profile),
     analysisDepth: row.analysis_depth || "Profonde",
     score: row.score,
     result: row.outcome,
@@ -12476,9 +13890,10 @@ async function recordLearningAnalysis(result, body, context) {
     createdAt: new Date().toISOString(),
     userId: context.user?.id || null,
     pair: body.pair || "EUR/USD",
-    timeframe: body.timeframe || "H1",
-    style: body.style || "Hybride SMC+Chartiste",
-    strategy: body.strategy || "Swing Trading",
+    timeframe: body.timeframe || "M5",
+    style: body.style || "Price Action",
+    strategy: body.strategy || "Scalping",
+    targetProfile: normalizeTargetProfile(body.targetProfile),
     risk: body.risk || defaultRiskMode(),
     capital: body.capital || null,
     analysisDepth: context.analysisDepth || normalizeAnalysisDepth(body.analysisDepth),
@@ -12500,7 +13915,7 @@ async function recordLearningAnalysis(result, body, context) {
     multiTimeframe: context.multiTimeframe || [],
     dataSnapshot: result.meta?.dataSnapshot || buildAnalysisSnapshot({
       pair: body.pair || "EUR/USD",
-      timeframe: body.timeframe || "H1",
+      timeframe: body.timeframe || "M5",
       livePrice: context.livePrice,
       history: context.history || [],
       technicalSnapshot: context.technicalSnapshot || {},
@@ -13208,16 +14623,29 @@ async function updateLearningOutcomes(prices = null, histories = null) {
         // then TP2, then TP1 ordering scripts/backtest.mjs uses) catches the actual
         // touch; the point check remains as a fallback only for pairs/moments where
         // no history is available.
-        const outcome = evaluateOutcomeFromHistory(analysis, histories?.[analysis.pair]) || evaluateOutcome(analysis, price);
         const ageHours = (Date.now() - new Date(analysis.createdAt).getTime()) / 3600000;
+        const expired = ageHours >= 24;
+        const outcome = evaluateOutcomeFromHistory(analysis, histories?.[analysis.pair], {
+          finalizeAtPrice: expired ? price : null,
+        }) || evaluateOutcome(analysis, price);
         if (!outcome && ageHours < 24) continue;
-        const finalOutcome = outcome || {
+        const extendedTp1ReachedNow = normalizeTargetProfile(analysis.targetProfile) === "mdt_extended"
+          && (analysis.direction === "ACHAT" ? price >= analysis.tp1 : price <= analysis.tp1);
+        const finalOutcome = outcome || (extendedTp1ReachedNow ? {
+          status: "EXPIRED_AFTER_TP1",
+          result: "win",
+          price,
+          rMultiple: realizedExtendedProfileR(analysis, Math.max(0, analysis.direction === "ACHAT"
+            ? (price - analysis.entry) / Math.abs(analysis.entry - analysis.sl)
+            : (analysis.entry - price) / Math.abs(analysis.entry - analysis.sl))),
+          reason: "Après TP1 (50%), solde clôturé à la fin de l'horizon.",
+        } : {
           status: "EXPIRED",
           result: "neutral",
           price,
           rMultiple: markToMarketRMultiple(analysis, price),
           reason: "Ni TP1 ni SL touché après 24h.",
-        };
+        });
         analysis.status = finalOutcome.status;
         analysis.closedAt = new Date().toISOString();
         // finalOutcome.price, not the current point `price`: for a history-detected
@@ -13384,7 +14812,7 @@ async function notifyNewSignals(signals) {
     if (subs.length) {
       const payload = JSON.stringify({
         title: `Oracle Forex · Nouveau signal ${signal.paire}`,
-        body: `${signal.direction} ${formatLevel(signal.entree, signal.paire)} · confiance ${signal.confiance}% · ${signal.technique}`,
+        body: `${signal.direction} ${formatLevel(signal.entree, signal.paire)} · indice qualité Kronos ${signal.confiance}/100 · ${signal.technique}`,
         url: "/analyse.html",
       });
       await sendPushToSubscriptions(subs, payload);
@@ -13403,10 +14831,20 @@ async function notifyNewSignals(signals) {
 // fast setups. Ordering (SL, then TP2, then TP1) matches
 // scripts/backtest.mjs's simulateForward() so live results and backtested results
 // stay comparable instead of using two different definitions of "hit".
-function evaluateOutcomeFromHistory(analysis, bars) {
+function realizedExtendedProfileR(analysis, remainingExitR) {
+  const risk = Math.abs(analysis.entry - analysis.sl);
+  if (!(risk > 0)) return null;
+  const tp1R = Math.abs(analysis.tp1 - analysis.entry) / risk;
+  const remainingR = Number(remainingExitR);
+  if (!Number.isFinite(tp1R) || !Number.isFinite(remainingR)) return null;
+  return Math.round((0.5 * tp1R + 0.5 * remainingR) * 1000) / 1000;
+}
+
+function evaluateOutcomeFromHistory(analysis, bars, { finalizeAtPrice = null } = {}) {
   if (!Array.isArray(bars) || !bars.length) return null;
   if (![analysis.entry, analysis.sl, analysis.tp1].every(Number.isFinite)) return null;
   const buy = analysis.direction === "ACHAT";
+  const extended = normalizeTargetProfile(analysis.targetProfile) === "mdt_extended";
   const risk = Math.abs(analysis.entry - analysis.sl);
   const rMultipleAt = (level) => (risk > 0 ? Math.round((Math.abs(level - analysis.entry) / risk) * 1000) / 1000 : null);
   const createdAtMs = new Date(analysis.createdAt).getTime();
@@ -13414,29 +14852,59 @@ function evaluateOutcomeFromHistory(analysis, bars) {
   const relevant = bars
     .filter((bar) => Number.isFinite(bar.high) && Number.isFinite(bar.low) && Number.isFinite(new Date(bar.datetime).getTime()) && new Date(bar.datetime).getTime() >= createdAtMs)
     .sort((a, b) => new Date(a.datetime).getTime() - new Date(b.datetime).getTime());
+  let tp1Reached = false;
   for (const bar of relevant) {
     const hitSl = buy ? bar.low <= analysis.sl : bar.high >= analysis.sl;
     const hitTp2 = Number.isFinite(analysis.tp2) && (buy ? bar.high >= analysis.tp2 : bar.low <= analysis.tp2);
     const hitTp1 = buy ? bar.high >= analysis.tp1 : bar.low <= analysis.tp1;
+    if (extended) {
+      if (!tp1Reached) {
+        // If SL and TP1 occur in one candle, candle OHLC cannot reveal their order;
+        // assume the adverse level came first to avoid overstating the result.
+        if (hitSl) return { status: "SL_HIT", result: "loss", price: analysis.sl, rMultiple: -1, reason: "Stop Loss touché avant confirmation de TP1 (ordre intrabar prudent)." };
+        if (!hitTp1) continue;
+        tp1Reached = true;
+      }
+      const hitBreakeven = buy ? bar.low <= analysis.entry : bar.high >= analysis.entry;
+      // Once TP1 is paid, the remaining half is protected at entry. If BE and
+      // TP2 are both inside one candle, resolve the ambiguity in favor of BE.
+      if (hitBreakeven) {
+        const realizedR = realizedExtendedProfileR(analysis, 0);
+        return { status: "BE_HIT", result: "win", price: analysis.entry, rMultiple: realizedR, reason: `TP1 payé à 50%, solde fermé à BE; résultat profil ${realizedR}R.` };
+      }
+      if (hitTp2) {
+        const remainingR = rMultipleAt(analysis.tp2);
+        const realizedR = realizedExtendedProfileR(analysis, remainingR);
+        return { status: "TP2_HIT", result: "win", price: analysis.tp2, rMultiple: realizedR, reason: `TP1 payé à 50%, solde clôturé à TP2; résultat profil ${realizedR}R.` };
+      }
+      continue;
+    }
     if (hitSl) return { status: "SL_HIT", result: "loss", price: analysis.sl, rMultiple: -1, reason: "Stop Loss touché (détecté sur l'historique des bougies)." };
     if (hitTp2) return { status: "TP2_HIT", result: "win", price: analysis.tp2, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché (détecté sur l'historique des bougies)." };
     if (hitTp1) return { status: "TP1_HIT", result: "win", price: analysis.tp1, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché (détecté sur l'historique des bougies)." };
+  }
+  if (extended && tp1Reached && Number.isFinite(Number(finalizeAtPrice))) {
+    const mark = Number(finalizeAtPrice);
+    const remainingR = Math.max(0, buy ? (mark - analysis.entry) / risk : (analysis.entry - mark) / risk);
+    const realizedR = realizedExtendedProfileR(analysis, remainingR);
+    return { status: "EXPIRED_AFTER_TP1", result: "win", price: mark, rMultiple: realizedR, reason: `Après TP1 (50%), solde clôturé en fin d'horizon; résultat profil ${realizedR}R.` };
   }
   return null;
 }
 
 function evaluateOutcome(analysis, price) {
   const buy = analysis.direction === "ACHAT";
+  const extended = normalizeTargetProfile(analysis.targetProfile) === "mdt_extended";
   if (![analysis.entry, analysis.sl, analysis.tp1].every(Number.isFinite)) return null;
   const risk = Math.abs(analysis.entry - analysis.sl);
   const rMultipleAt = (level) => (risk > 0 ? Math.round((Math.abs(level - analysis.entry) / risk) * 1000) / 1000 : null);
   if (Number.isFinite(analysis.tp2)) {
-    if (buy && price >= analysis.tp2) return { status: "TP2_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché." };
-    if (!buy && price <= analysis.tp2) return { status: "TP2_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp2), reason: "TP2 touché." };
+    if (buy && price >= analysis.tp2) return { status: "TP2_HIT", result: "win", price, rMultiple: extended ? realizedExtendedProfileR(analysis, rMultipleAt(analysis.tp2)) : rMultipleAt(analysis.tp2), reason: extended ? "TP1 50% + TP2 50% touchés." : "TP2 touché." };
+    if (!buy && price <= analysis.tp2) return { status: "TP2_HIT", result: "win", price, rMultiple: extended ? realizedExtendedProfileR(analysis, rMultipleAt(analysis.tp2)) : rMultipleAt(analysis.tp2), reason: extended ? "TP1 50% + TP2 50% touchés." : "TP2 touché." };
   }
-  if (buy && price >= analysis.tp1) return { status: "TP1_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché." };
+  if (buy && price >= analysis.tp1) return extended ? null : { status: "TP1_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché." };
   if (buy && price <= analysis.sl) return { status: "SL_HIT", result: "loss", price, rMultiple: -1, reason: "Stop Loss touché." };
-  if (!buy && price <= analysis.tp1) return { status: "TP1_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché." };
+  if (!buy && price <= analysis.tp1) return extended ? null : { status: "TP1_HIT", result: "win", price, rMultiple: rMultipleAt(analysis.tp1), reason: "TP1 touché." };
   if (!buy && price >= analysis.sl) return { status: "SL_HIT", result: "loss", price, rMultiple: -1, reason: "Stop Loss touché." };
   return null;
 }
@@ -13464,19 +14932,9 @@ function markToMarketRMultiple(analysis, price) {
 // XAU/USD, GBP/JPY, US500; ~2.7y BTC/USD, ETH/USD -- see that script's git
 // history for the exact run). It is a "this pair's general character" prior
 // (some pairs trend-follow more cleanly than others), NOT a measurement of the
-// LLM chart-reading engine's accuracy on that pair -- those are different
-// mechanisms. As real per-bucket (style+strategy+pair+timeframe) outcomes
-// accumulate, `trust` shifts weight from this backtested guess to what the LLM
-// path is actually producing for that specific bucket.
-const PAIR_WIN_RATE_PRIOR = {
-  "EUR/USD": 0.34,
-  "XAU/USD": 0.55,
-  "GBP/JPY": 0.30,
-  US500: 0.41,
-  "BTC/USD": 0.36,
-  "ETH/USD": 0.34,
-};
-const CALIBRATION_REFERENCE_WIN_RATE = 0.55; // anchor the +-15/+12 adjustment range was tuned against
+// Neutral anchor for this analysis path. Do not borrow another engine's pair
+// win rate: its rules and execution are not the AI/API analysis being scored.
+const CALIBRATION_REFERENCE_WIN_RATE = 0.55;
 const CALIBRATION_SHRINKAGE_K = 40;
 
 function winRateConfidenceLabel(samples) {
@@ -13488,15 +14946,16 @@ function winRateConfidenceLabel(samples) {
 
 function calibrationFor(log, body = {}) {
   const pair = body.pair || "EUR/USD";
-  const timeframe = body.timeframe || "H1";
-  const style = body.style || "Mixte";
-  const strategy = body.strategy || "Swing Trading";
-  const prior = PAIR_WIN_RATE_PRIOR[pair] ?? CALIBRATION_REFERENCE_WIN_RATE;
+  const timeframe = body.timeframe || "M5";
+  const style = body.style || "Price Action";
+  const strategy = body.strategy || "Scalping";
+  const targetProfile = normalizeTargetProfile(body.targetProfile);
+  const prior = CALIBRATION_REFERENCE_WIN_RATE;
   const buckets = [
-    (item) => item.style === style && (item.strategy || "Swing Trading") === strategy && item.pair === pair && item.timeframe === timeframe,
-    (item) => item.style === style && item.pair === pair,
-    (item) => item.style === style && (item.strategy || "Swing Trading") === strategy,
-    (item) => item.style === style,
+    (item) => item.targetProfile === targetProfile && item.style === style && (item.strategy || "Swing Trading") === strategy && item.pair === pair && item.timeframe === timeframe,
+    (item) => item.targetProfile === targetProfile && item.style === style && item.pair === pair,
+    (item) => item.targetProfile === targetProfile && item.style === style && (item.strategy || "Swing Trading") === strategy,
+    (item) => item.targetProfile === targetProfile && item.style === style,
   ];
   for (const matches of buckets) {
     const sample = log.outcomes.filter((item) => matches(item) && ["win", "loss"].includes(item.result)).slice(-200);
@@ -13517,13 +14976,12 @@ function calibrationFor(log, body = {}) {
       };
     }
   }
-  const noDataAdjustment = Math.max(-15, Math.min(12, Math.round((prior - CALIBRATION_REFERENCE_WIN_RATE) * 35)));
   return {
     samples: 0,
     winRate: null,
     confidenceLabel: "aucune donnée",
-    adjustment: noDataAdjustment,
-    message: `Pas d'historique réel pour ce contexte: départ sur le prior backtesté ${pair} (${Math.round(prior * 100)}%), ajustement ${noDataAdjustment}.`,
+    adjustment: 0,
+    message: "Aucun résultat confirmé pour ce style/contexte: aucun ajustement de score appliqué.",
   };
 }
 

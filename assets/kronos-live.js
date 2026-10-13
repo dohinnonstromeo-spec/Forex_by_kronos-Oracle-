@@ -292,7 +292,7 @@
 
   function shareText(signal) {
     const direction = signal.direction === "ACHAT" ? "ACHAT" : "VENTE";
-    return `Signal Oracle Forex · ${signal.paire} ${direction}\nEntrée ${signal.entree} · SL ${signal.sl} · TP1 ${signal.tp1} · TP2 ${signal.tp2}\nConfiance ${Math.round(Number(signal.confiance) || 0)}% · ${signal.technique || "SMC"}`;
+    return `Signal Oracle Forex · ${signal.paire} ${direction}\nEntrée ${signal.entree} · SL ${signal.sl} · TP1 ${signal.tp1} · TP2 ${signal.tp2}\nIndice qualité Kronos ${Math.round(Number(signal.confiance) || 0)}/100 · ce n'est pas une probabilité de gain · ${signal.technique || "SMC"}`;
   }
 
   function metric(label, value, color = "text-foreground") {
@@ -306,7 +306,7 @@
       ${metric("SL", signal.sl, "text-neon-red")}
       ${metric("TP1", signal.tp1, "text-neon-green")}
       ${metric("TP2", signal.tp2, "text-neon-green")}
-      <div class="flex items-center justify-between"><span class="text-muted-foreground">Confiance</span><span data-kronos-score class="font-bold text-amber-neon">${flap(String(score))}</span></div>
+      <div class="flex items-center justify-between"><span class="text-muted-foreground">Indice qualité /100</span><span data-kronos-score class="font-bold text-amber-neon">${flap(String(score))}</span></div>
     </div>
     <div class="mt-4 h-1 overflow-hidden rounded-full bg-secondary"><div data-kronos-bar class="h-full bg-gradient-to-r from-amber-neon to-neon-orange" style="width:${score}%"></div></div>`;
   }

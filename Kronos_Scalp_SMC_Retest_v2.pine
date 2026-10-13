@@ -1,0 +1,298 @@
+//@version=6
+strategy("KRONOS — Scalp SMC Retest v2", shorttitle="K-SMCv2", overlay=true, pyramiding=0, initial_capital=1000, currency=currency.USD, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.0, slippage=1, margin_long=20, margin_short=20, process_orders_on_close=true, max_lines_count=30, max_labels_count=100, max_boxes_count=30)
+
+// Entry sequence: confirmed M15 bias -> M5 liquidity sweep -> M5 structure break
+// -> retest of a three-candle FVG or the latest opposite-candle OB.
+// Designed for an M5 chart. The original KRONOS Mixte indicator remains separate.
+
+string G_SETUP = "01 · Scénario scalp"
+string G_RISK = "02 · Risque et coûts"
+string G_ZONES = "03 · Zones et confluences"
+string G_ALERTS = "04 · Alertes"
+
+int liquidityLookback = input.int(8, "Liquidité · fenêtre M5 (bougies)", minval=3, maxval=50, group=G_SETUP)
+int pivotSpan = input.int(2, "Structure · pivot gauche/droite", minval=1, maxval=10, group=G_SETUP)
+int setupExpiry = input.int(12, "Expiration de chaque étape (M5)", minval=2, maxval=60, group=G_SETUP)
+int obSearchBars = input.int(12, "OB · recherche avant cassure", minval=2, maxval=50, group=G_SETUP)
+int atrLength = input.int(14, "ATR M5", minval=2, maxval=100, group=G_SETUP)
+float stopBufferAtr = input.float(0.1, "Marge derrière le sweep (× ATR)", minval=0.0, maxval=2.0, step=0.05, group=G_SETUP)
+float maxStopAtr = input.float(2.5, "Stop maximal (× ATR)", minval=0.5, maxval=10.0, step=0.25, group=G_SETUP)
+float targetR = input.float(1.25, "Objectif (R)", minval=0.5, maxval=10.0, step=0.05, group=G_SETUP)
+int maxHoldMinutes = input.int(60, "Durée maximale (minutes)", minval=5, maxval=1440, group=G_SETUP)
+bool useSessionFilter = input.bool(true, "Filtrer par séance UTC", group=G_SETUP)
+string tradeSession = input.session("0700-1700:12345", "Séance (UTC)", group=G_SETUP)
+
+string riskMode = input.string("0.5%", "Risque par trade", options=["0.25%", "0.5%", "1.0%", "Personnalisé"], group=G_RISK)
+float customRiskPct = input.float(0.5, "Risque personnalisé (%)", minval=0.05, maxval=5.0, step=0.05, group=G_RISK)
+float maxCostR = input.float(0.15, "Coût aller-retour maximal (R)", minval=0.0, maxval=1.0, step=0.01, group=G_RISK)
+float estimatedCostPct = input.float(0.005, "Coût estimé complet (% du prix)", minval=0.0, maxval=1.0, step=0.001, group=G_RISK, tooltip="Estimation pour filtrer les signaux. À ajuster au symbole et au courtier. Le Strategy Tester règle séparément commission et glissement dans Propriétés.")
+
+bool requireOte = input.bool(false, "Exiger que la zone recoupe l'OTE", group=G_ZONES)
+bool showOte = input.bool(true, "Tracer le dernier OTE 61,8–79%", group=G_ZONES)
+bool showLiquidity = input.bool(true, "Tracer les derniers swings", group=G_ZONES)
+bool showActiveZone = input.bool(true, "Tracer la FVG ou l'OB du setup", group=G_ZONES)
+bool enableAlerts = input.bool(true, "Activer les alertes JSON", group=G_ALERTS)
+
+float riskPct = switch riskMode
+    "0.25%" => 0.25
+    "0.5%" => 0.5
+    "1.0%" => 1.0
+    => customRiskPct
+
+bool chartIsM5 = timeframe.isminutes and timeframe.multiplier == 5
+bool sessionOk = not useSessionFilter or not na(time(timeframe.period, tradeSession, "Etc/UTC"))
+[m15Fast, m15Slow, m15Close] = request.security(syminfo.tickerid, "15", [ta.ema(close, 20)[1], ta.ema(close, 50)[1], close[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+bool trendBull = not na(m15Fast) and m15Fast > m15Slow and m15Close > m15Slow
+bool trendBear = not na(m15Fast) and m15Fast < m15Slow and m15Close < m15Slow
+
+float pivotHigh = ta.pivothigh(high, pivotSpan, pivotSpan)
+float pivotLow = ta.pivotlow(low, pivotSpan, pivotSpan)
+float lastSwingHigh = ta.valuewhen(not na(pivotHigh), pivotHigh, 0)
+float lastSwingLow = ta.valuewhen(not na(pivotLow), pivotLow, 0)
+int lastSwingHighBar = ta.valuewhen(not na(pivotHigh), bar_index - pivotSpan, 0)
+int lastSwingLowBar = ta.valuewhen(not na(pivotLow), bar_index - pivotSpan, 0)
+float priorRangeLow = ta.lowest(low[1], liquidityLookback)
+float priorRangeHigh = ta.highest(high[1], liquidityLookback)
+float atr = ta.sma(ta.tr(true), atrLength)
+bool pivotsRecent = not na(lastSwingHighBar) and not na(lastSwingLowBar) and bar_index - lastSwingHighBar <= 90 and bar_index - lastSwingLowBar <= 90
+bool bullSweep = chartIsM5 and sessionOk and trendBull and pivotsRecent and not na(priorRangeLow) and low < math.min(lastSwingLow, priorRangeLow) * 0.9998 and close > math.min(lastSwingLow, priorRangeLow) and close > open
+bool bearSweep = chartIsM5 and sessionOk and trendBear and pivotsRecent and not na(priorRangeHigh) and high > math.max(lastSwingHigh, priorRangeHigh) * 1.0002 and close < math.max(lastSwingHigh, priorRangeHigh) and close < open
+bool bullFvg = bar_index >= 2 and high[2] < low
+bool bearFvg = bar_index >= 2 and low[2] > high
+
+bool bullishLeg = not na(lastSwingLowBar) and not na(lastSwingHighBar) and lastSwingLowBar < lastSwingHighBar and lastSwingHigh > lastSwingLow
+bool bearishLeg = not na(lastSwingLowBar) and not na(lastSwingHighBar) and lastSwingHighBar < lastSwingLowBar and lastSwingHigh > lastSwingLow
+float swingRange = lastSwingHigh - lastSwingLow
+float oteTop = bullishLeg ? lastSwingHigh - swingRange * 0.618 : bearishLeg ? lastSwingLow + swingRange * 0.79 : na
+float oteBottom = bullishLeg ? lastSwingHigh - swingRange * 0.79 : bearishLeg ? lastSwingLow + swingRange * 0.618 : na
+int oteStartBar = bullishLeg ? lastSwingLowBar : bearishLeg ? lastSwingHighBar : na
+int oteEndBar = bullishLeg ? lastSwingHighBar : bearishLeg ? lastSwingLowBar : na
+var box oteBox = na
+var int drawnOteStart = na
+var int drawnOteEnd = na
+var int drawnOteDirection = 0
+int oteDirection = bullishLeg ? 1 : bearishLeg ? -1 : 0
+if showOte and oteDirection != 0 and (na(drawnOteStart) or oteStartBar != drawnOteStart or oteEndBar != drawnOteEnd or oteDirection != drawnOteDirection)
+    if not na(oteBox)
+        box.delete(oteBox)
+    oteBox := box.new(left=oteStartBar, top=oteTop, right=bar_index, bottom=oteBottom, extend=extend.right, bgcolor=color.new(color.purple, 87), border_color=color.new(color.purple, 25), text=oteDirection == 1 ? "OTE ↑" : "OTE ↓", text_color=color.white, text_size=size.tiny)
+    drawnOteStart := oteStartBar
+    drawnOteEnd := oteEndBar
+    drawnOteDirection := oteDirection
+if showOte and not na(oteBox)
+    box.set_right(oteBox, bar_index)
+if not showOte and not na(oteBox)
+    box.delete(oteBox)
+    oteBox := na
+    drawnOteStart := na
+    drawnOteEnd := na
+    drawnOteDirection := 0
+
+var line swingHighLine = na
+var line swingLowLine = na
+var int drawnHighBar = na
+var int drawnLowBar = na
+if showLiquidity and not na(lastSwingHighBar) and (na(drawnHighBar) or lastSwingHighBar != drawnHighBar)
+    if not na(swingHighLine)
+        line.delete(swingHighLine)
+    swingHighLine := line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh, extend=extend.right, color=color.new(color.red, 20), style=line.style_dotted)
+    drawnHighBar := lastSwingHighBar
+if showLiquidity and not na(lastSwingLowBar) and (na(drawnLowBar) or lastSwingLowBar != drawnLowBar)
+    if not na(swingLowLine)
+        line.delete(swingLowLine)
+    swingLowLine := line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow, extend=extend.right, color=color.new(color.lime, 20), style=line.style_dotted)
+    drawnLowBar := lastSwingLowBar
+if not showLiquidity
+    if not na(swingHighLine)
+        line.delete(swingHighLine)
+        swingHighLine := na
+    if not na(swingLowLine)
+        line.delete(swingLowLine)
+        swingLowLine := na
+    drawnHighBar := na
+    drawnLowBar := na
+
+// Setup states: 0 idle, 1 waiting for CHoCH/BOS, 2 waiting for zone retest.
+var int setupStage = 0
+var int setupDirection = 0
+var int sweepBar = na
+var int zoneBar = na
+var float sweepExtreme = na
+var float breakLevel = na
+var float zoneTop = na
+var float zoneBottom = na
+var string zoneKind = ""
+var box activeZoneBox = na
+bool bullChoch = false
+bool bearChoch = false
+bool rawLongSignal = false
+bool rawShortSignal = false
+
+if barstate.isconfirmed and chartIsM5
+    bool setupExpired = setupStage == 1 and not na(sweepBar) and bar_index - sweepBar > setupExpiry or setupStage == 2 and not na(zoneBar) and bar_index - zoneBar > setupExpiry
+    if setupExpired or (setupStage != 0 and not ((setupDirection == 1 and trendBull) or (setupDirection == -1 and trendBear)))
+        setupStage := 0
+        setupDirection := 0
+        zoneTop := na
+        zoneBottom := na
+        if not na(activeZoneBox)
+            box.set_extend(activeZoneBox, extend.none)
+            box.set_bgcolor(activeZoneBox, color.new(color.gray, 88))
+            activeZoneBox := na
+
+    if bullSweep
+        setupStage := 1
+        setupDirection := 1
+        sweepBar := bar_index
+        sweepExtreme := low
+        breakLevel := lastSwingHigh
+        zoneTop := na
+        zoneBottom := na
+        if not na(activeZoneBox)
+            box.delete(activeZoneBox)
+        activeZoneBox := na
+    else if bearSweep
+        setupStage := 1
+        setupDirection := -1
+        sweepBar := bar_index
+        sweepExtreme := high
+        breakLevel := lastSwingLow
+        zoneTop := na
+        zoneBottom := na
+        if not na(activeZoneBox)
+            box.delete(activeZoneBox)
+        activeZoneBox := na
+    else if setupStage == 1 and bar_index > sweepBar
+        bool breakConfirmed = setupDirection == 1 ? close > breakLevel : close < breakLevel
+        if breakConfirmed
+            bullChoch := setupDirection == 1
+            bearChoch := setupDirection == -1
+            float foundTop = na
+            float foundBottom = na
+            string foundKind = ""
+            if setupDirection == 1 and bullFvg
+                foundTop := low
+                foundBottom := high[2]
+                foundKind := "FVG"
+            else if setupDirection == -1 and bearFvg
+                foundTop := low[2]
+                foundBottom := high
+                foundKind := "FVG"
+            else
+                for i = 1 to obSearchBars
+                    if na(foundTop) and ((setupDirection == 1 and close[i] < open[i]) or (setupDirection == -1 and close[i] > open[i]))
+                        foundTop := high[i]
+                        foundBottom := low[i]
+                        foundKind := "OB"
+            if not na(foundTop) and not na(foundBottom) and foundTop > foundBottom
+                zoneTop := foundTop
+                zoneBottom := foundBottom
+                zoneKind := foundKind
+                zoneBar := bar_index
+                setupStage := 2
+                if showActiveZone
+                    color zoneColor = setupDirection == 1 ? color.green : color.red
+                    activeZoneBox := box.new(left=bar_index, top=zoneTop, right=bar_index, bottom=zoneBottom, extend=extend.right, bgcolor=color.new(zoneColor, 84), border_color=color.new(zoneColor, 20), text=zoneKind + (setupDirection == 1 ? " ↑" : " ↓"), text_color=color.white, text_size=size.tiny)
+            else
+                setupStage := 0
+
+    else if setupStage == 2 and bar_index > zoneBar
+        bool zoneTouched = low <= zoneTop and high >= zoneBottom
+        bool zoneInvalid = setupDirection == 1 ? close < zoneBottom : close > zoneTop
+        bool rejection = setupDirection == 1 ? close > open and close > zoneTop : close < open and close < zoneBottom
+        bool oteOverlap = not na(oteTop) and zoneTop >= oteBottom and zoneBottom <= oteTop
+        float signalEntry = close
+        float signalStop = setupDirection == 1 ? sweepExtreme - atr * stopBufferAtr : sweepExtreme + atr * stopBufferAtr
+        float signalRisk = math.abs(signalEntry - signalStop)
+        float estimatedCostR = signalRisk > 0 ? (signalEntry * estimatedCostPct / 100.0 + syminfo.mintick * 2.0) / signalRisk : 999.0
+        bool riskAcceptable = signalRisk > 0 and atr > 0 and signalRisk <= atr * maxStopAtr and estimatedCostR <= maxCostR
+        if zoneInvalid
+            setupStage := 0
+            if not na(activeZoneBox)
+                box.set_extend(activeZoneBox, extend.none)
+                box.set_bgcolor(activeZoneBox, color.new(color.gray, 88))
+                activeZoneBox := na
+        else if zoneTouched and rejection and sessionOk and riskAcceptable and (not requireOte or oteOverlap)
+            rawLongSignal := setupDirection == 1
+            rawShortSignal := setupDirection == -1
+            setupStage := 0
+            if not na(activeZoneBox)
+                box.set_extend(activeZoneBox, extend.none)
+                box.set_bgcolor(activeZoneBox, color.new(color.orange, 78))
+                activeZoneBox := na
+
+if not na(activeZoneBox)
+    box.set_right(activeZoneBox, bar_index)
+    if low <= zoneTop and high >= zoneBottom
+        box.set_bgcolor(activeZoneBox, color.new(color.orange, 80))
+
+float activeEntry = close
+float activeStop = rawLongSignal ? sweepExtreme - atr * stopBufferAtr : rawShortSignal ? sweepExtreme + atr * stopBufferAtr : na
+float activeRisk = not na(activeStop) ? math.abs(activeEntry - activeStop) : na
+float activeTarget = rawLongSignal ? activeEntry + activeRisk * targetR : rawShortSignal ? activeEntry - activeRisk * targetR : na
+float riskPerUnit = not na(activeRisk) ? strategy.convert_to_account(activeRisk * syminfo.pointvalue) : na
+float riskCash = strategy.equity * riskPct / 100.0
+float rawQty = not na(riskPerUnit) and riskPerUnit > 0 ? riskCash / riskPerUnit : na
+float qtyStep = syminfo.mincontract
+float orderQty = qtyStep > 0 and not na(rawQty) ? math.floor(rawQty / qtyStep) * qtyStep : na
+bool qtyValid = not na(orderQty) and qtyStep > 0 and orderQty >= qtyStep
+bool enterLong = rawLongSignal and strategy.position_size == 0 and qtyValid and chartIsM5
+bool enterShort = rawShortSignal and strategy.position_size == 0 and qtyValid and chartIsM5
+var float storedStop = na
+var float storedTarget = na
+var int entryBar = na
+if enterLong
+    storedStop := activeStop
+    storedTarget := activeTarget
+    entryBar := bar_index
+    strategy.entry("Long", strategy.long, qty=orderQty, comment=zoneKind + " retest ACHAT")
+    strategy.exit("Long exit", from_entry="Long", stop=storedStop, limit=storedTarget)
+if enterShort
+    storedStop := activeStop
+    storedTarget := activeTarget
+    entryBar := bar_index
+    strategy.entry("Short", strategy.short, qty=orderQty, comment=zoneKind + " retest VENTE")
+    strategy.exit("Short exit", from_entry="Short", stop=storedStop, limit=storedTarget)
+if strategy.position_size > 0
+    strategy.exit("Long exit", from_entry="Long", stop=storedStop, limit=storedTarget)
+if strategy.position_size < 0
+    strategy.exit("Short exit", from_entry="Short", stop=storedStop, limit=storedTarget)
+int maxHoldBars = math.max(1, int(math.ceil(maxHoldMinutes / 5.0)))
+bool timedExit = strategy.position_size != 0 and not na(entryBar) and bar_index - entryBar >= maxHoldBars
+if timedExit
+    strategy.cancel("Long exit")
+    strategy.cancel("Short exit")
+    strategy.close_all(comment="Durée maximale")
+
+if enableAlerts and (enterLong or enterShort)
+    string side = enterLong ? "ACHAT" : "VENTE"
+    string payload = "{\"system\":\"KRONOS_SMC_RETEST\",\"action\":\"" + side + "\",\"symbol\":\"" + syminfo.tickerid + "\",\"timeframe\":\"" + timeframe.period + "\",\"zone\":\"" + zoneKind + "\",\"entry\":" + str.tostring(activeEntry, format.mintick) + ",\"stop\":" + str.tostring(activeStop, format.mintick) + ",\"target\":" + str.tostring(activeTarget, format.mintick) + ",\"risk_percent\":" + str.tostring(riskPct) + "}"
+    alert(payload, alert.freq_once_per_bar_close)
+
+plotshape(bullSweep, title="Sweep haussier", style=shape.triangleup, location=location.belowbar, color=color.aqua, text="SWEEP", textcolor=color.black, size=size.tiny)
+plotshape(bearSweep, title="Sweep baissier", style=shape.triangledown, location=location.abovebar, color=color.orange, text="SWEEP", textcolor=color.black, size=size.tiny)
+plotshape(bullChoch, title="CHoCH/BOS haussier", style=shape.labelup, location=location.belowbar, color=color.green, text="CHoCH", textcolor=color.white, size=size.tiny)
+plotshape(bearChoch, title="CHoCH/BOS baissier", style=shape.labeldown, location=location.abovebar, color=color.red, text="CHoCH", textcolor=color.white, size=size.tiny)
+plotshape(enterLong, title="KRONOS ACHAT", style=shape.labelup, location=location.belowbar, color=color.lime, text="ACHAT", textcolor=color.black, size=size.tiny)
+plotshape(enterShort, title="KRONOS VENTE", style=shape.labeldown, location=location.abovebar, color=color.red, text="VENTE", textcolor=color.white, size=size.tiny)
+
+var table board = table.new(position.top_right, 2, 7, border_width=1)
+if barstate.islast
+    color bg = color.rgb(26, 34, 52)
+    string bias = trendBull ? "M15 haussier" : trendBear ? "M15 baissier" : "M15 neutre"
+    string setupText = setupStage == 0 ? "En attente" : setupStage == 1 ? "Sweep · attente CHoCH" : "Attente retest " + zoneKind
+    string sessionText = sessionOk ? "Séance active" : "Hors séance"
+    table.cell(board, 0, 0, "KRONOS · SCALP", text_color=color.white, bgcolor=color.rgb(19, 26, 43))
+    table.cell(board, 1, 0, chartIsM5 ? "M5 · v2" : "Choisir M5", text_color=color.white, bgcolor=chartIsM5 ? bg : color.new(color.orange, 45))
+    table.cell(board, 0, 1, "Biais", text_color=color.silver, bgcolor=bg)
+    table.cell(board, 1, 1, bias, text_color=color.white, bgcolor=bg)
+    table.cell(board, 0, 2, "Configuration", text_color=color.silver, bgcolor=bg)
+    table.cell(board, 1, 2, setupText, text_color=color.white, bgcolor=bg)
+    table.cell(board, 0, 3, "Session UTC", text_color=color.silver, bgcolor=bg)
+    table.cell(board, 1, 3, sessionText, text_color=color.white, bgcolor=bg)
+    table.cell(board, 0, 4, "Zone active", text_color=color.silver, bgcolor=bg)
+    table.cell(board, 1, 4, setupStage == 2 ? zoneKind : "—", text_color=color.white, bgcolor=bg)
+    table.cell(board, 0, 5, "Risque / coût max", text_color=color.silver, bgcolor=bg)
+    table.cell(board, 1, 5, str.tostring(riskPct) + "% / " + str.tostring(maxCostR) + "R", text_color=color.white, bgcolor=bg)
+    table.cell(board, 0, 6, "Taille", text_color=color.silver, bgcolor=bg)
+    table.cell(board, 1, 6, qtyValid ? str.tostring(orderQty, "#.####") + " unités approx." : "Sous minimum / sans signal", text_color=color.white, bgcolor=qtyValid ? bg : color.new(color.orange, 60))

@@ -12,3 +12,4 @@ backups/
 .vision-test/
 data-backtest/
 data/*.tmp
+data/pa-forward-standalone/

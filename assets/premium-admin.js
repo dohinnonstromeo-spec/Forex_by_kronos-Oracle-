@@ -280,6 +280,103 @@
   tradingPause?.addEventListener("click", () => runTradingToggle(tradingPause, true));
   tradingResume?.addEventListener("click", () => runTradingToggle(tradingResume, false));
 
+  const paForwardRefresh = document.querySelector("[data-pa-forward-refresh]");
+  const paForwardStatus = document.querySelector("[data-pa-forward-status]");
+  const paForwardSummary = document.querySelector("[data-pa-forward-summary]");
+  const paForwardTrades = document.querySelector("[data-pa-forward-trades]");
+  const paForwardStates = {
+    starting: "Démarrage",
+    connecting: "Connexion au flux Deriv",
+    connected_waiting_for_ticks: "Flux connecté, attente des cotations",
+    streaming_bid_ask: "Flux bid/ask en direct",
+    bid_ask_stream_stale: "Flux bid/ask ancien",
+    waiting_for_valid_m5_history: "En attente d'un historique M5 Deriv valide",
+    waiting_for_bid_ask_quotes: "En attente de cotations bid/ask récentes",
+    waiting_for_complete_bid_ask_m5: "En attente des cinq minutes bid/ask complètes",
+    another_instance_collecting: "Collecte assurée par une autre instance du site",
+    reconnecting: "Reconnexion au flux Deriv",
+    stream_error: "Erreur de flux",
+    quote_stream_lease_lost: "Reprise du verrou de collecte",
+    disabled_by_environment: "Suivi désactivé par configuration",
+    disabled: "Suivi désactivé",
+  };
+  const paForwardEvidenceStates = {
+    insufficient_sample: "Collecte en cours · échantillon insuffisant",
+    inconclusive: "Résultat non concluant · intervalle traverse zéro",
+    negative_candidate: "Résultat négatif · candidat à écarter",
+    positive_candidate_unconfirmed: "Piste positive · réplication indépendante requise",
+  };
+  const paForwardTradeStates = {
+    OPEN: "En cours",
+    CLOSED: "Clôturé",
+    DATA_GAP: "Données manquantes · censuré",
+    PENDING_ENTRY: "Attente du cours d'entrée",
+    MISSED_NO_ENTRY_QUOTE: "Entrée manquée · pas de cotation",
+    SKIPPED_OVERLAP: "Ignoré · position précédente",
+    REJECTED: "Rejeté par le filtre de coût/stop",
+  };
+  function formatPaForwardPrice(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : "—";
+  }
+  function hasFinitePaForwardValue(value) {
+    return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+  }
+  function formatPaForwardTime(epoch) {
+    const value = Number(epoch);
+    return Number.isFinite(value) ? new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short" }).format(new Date(value * 1000)) : "—";
+  }
+  async function refreshPaForwardResearch() {
+    const token = requireToken();
+    if (!token) return;
+    if (paForwardRefresh) paForwardRefresh.disabled = true;
+    try {
+      const data = await adminFetch("/api/admin/research/pa-forward", null, token);
+      if (!data?.ok) {
+        if (paForwardStatus) paForwardStatus.textContent = data?.message || data?.error || "Suivi prospectif indisponible.";
+        return;
+      }
+      const stream = data.stream || {};
+      if (paForwardStatus) {
+        const state = paForwardStates[stream.state] || stream.state || "Statut inconnu";
+        paForwardStatus.textContent = `${state} · Deriv ${stream.symbol || "XAUUSD"} · dernier tick ${formatDateTime(stream.lastTickAt)} · dernière analyse ${formatDateTime(stream.lastScanAt)}${stream.lastError ? " · " + stream.lastError : ""}`;
+      }
+      const summary = data.summary || {};
+      const evidence = summary.evidence || {};
+      if (paForwardSummary) {
+        const interval = hasFinitePaForwardValue(evidence.lower95R) && hasFinitePaForwardValue(evidence.upper95R)
+          ? `${Number(evidence.lower95R).toFixed(3)} à ${Number(evidence.upper95R).toFixed(3)} R/trade`
+          : "Trop peu de semaines";
+        const items = [
+          ["Trades clos", summary.sampleClosed ?? 0],
+          ["Trades en cours", summary.sampleOpen ?? 0],
+          ["Trades censurés · coupure de cotations", summary.statusCounts?.DATA_GAP ?? 0],
+          ["Entrées manquées · cours absent", summary.statusCounts?.MISSED_NO_ENTRY_QUOTE ?? 0],
+          ["Win rate descriptif", hasFinitePaForwardValue(summary.winRatePct) ? Number(summary.winRatePct).toFixed(1) + "%" : "—"],
+          ["Espérance moyenne", hasFinitePaForwardValue(summary.averageR) ? Number(summary.averageR).toFixed(3) + "R" : "—"],
+          ["Profit factor", hasFinitePaForwardValue(summary.profitFactor) ? Number(summary.profitFactor).toFixed(2) : "—"],
+          ["Résultat net", summary.sampleClosed && hasFinitePaForwardValue(summary.netR) ? Number(summary.netR).toFixed(2) + "R" : "—"],
+          ["Drawdown maximal", summary.sampleClosed && hasFinitePaForwardValue(summary.maxDrawdownR) ? Number(summary.maxDrawdownR).toFixed(2) + "R" : "—"],
+          ["Bougies M5 ignorées après interruption", summary.missedBars ?? 0],
+          ["Minutes bid/ask partielles écartées", stream.quoteMinutesIncomplete ?? 0],
+          ["M1 capturées", stream.lastCompleteMinuteAt ? formatDateTime(stream.lastCompleteMinuteAt) : "En attente"],
+          ["Semaines actives / minimum", `${evidence.weeksWithTrades ?? 0} / ${evidence.minWeeks ?? 20}`],
+          ["IC 95 % par semaines", interval],
+          ["Lecture statistique", paForwardEvidenceStates[evidence.status] || "En attente de données"],
+        ];
+        paForwardSummary.innerHTML = items.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+      }
+      const trades = Array.isArray(data.trades) ? data.trades : [];
+      if (paForwardTrades) {
+        const rows = trades.length ? trades.map((trade) => `<tr><td>${escapeHtml(formatPaForwardTime(trade.signal_epoch))}</td><td>${escapeHtml(formatPaForwardPrice(trade.entry))}</td><td>${escapeHtml(formatPaForwardPrice(trade.stop))}</td><td>${escapeHtml(formatPaForwardPrice(trade.tp1))}</td><td>${escapeHtml(formatPaForwardPrice(trade.tp2))}</td><td>${escapeHtml(paForwardTradeStates[trade.status] || trade.status || "—")}${trade.outcome_reason ? " · " + escapeHtml(trade.outcome_reason) : ""}</td><td>${trade.status === "CLOSED" ? escapeHtml(formatNumber(trade.realized_r, "R")) : "—"}</td></tr>`).join("") : "<tr><td colspan=\"7\">Aucun signal prospectif enregistré. Les premiers résultats attendent des bougies et cotations capturées après le démarrage du suivi.</td></tr>";
+        paForwardTrades.innerHTML = `<table class="member-detail-table"><thead><tr><th>Signal</th><th>Entrée</th><th>SL</th><th>TP1</th><th>TP2</th><th>État</th><th>R net</th></tr></thead><tbody>${rows}</tbody></table>`;
+      }
+    } finally {
+      if (paForwardRefresh) paForwardRefresh.disabled = false;
+    }
+  }
+  paForwardRefresh?.addEventListener("click", refreshPaForwardResearch);
+
   const adminOverviewRefresh = document.querySelector('[data-admin-overview-refresh]');
   async function refreshAdminOverview() {
     const token = form?.elements?.token?.value || '';
@@ -373,7 +470,7 @@
     outside_user_trading_hours: "Hors horaires utilisateur",
     outside_user_trading_days: "Jour non autorisé (utilisateur)",
     no_approved_pairs: "Aucune paire approuvée",
-    no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le seuil confiance/R:R",
+    no_signal_meets_confidence_or_rr: "Aucun signal n'atteint le score Kronos minimal ou le R:R requis",
     daily_loss_limit_percent_reached: "Limite de perte quotidienne (%) atteinte",
     daily_loss_limit_amount_reached: "Limite de perte quotidienne ($) atteinte",
     weekly_loss_limit_percent_reached: "Limite de perte hebdomadaire (%) atteinte",
@@ -412,7 +509,7 @@
      if (detail.rejected) parts.push(`${detail.rejected} rejeté(s) par le broker`);
       if (detail.pyramidingDisabled) parts.push(`${detail.pyramidingDisabled} entrée(s) ignorée(s) : paire déjà ouverte`);
     } else if (reason === "no_signal_meets_confidence_or_rr") {
-      if (detail.minConfidence != null) parts.push(`seuil de confiance ${detail.minConfidence}%`);
+      if (detail.minConfidence != null) parts.push(`score Kronos minimal ${detail.minConfidence}/100`);
       if (detail.minRiskReward) parts.push(`R:R min ${detail.minRiskReward}`);
       if (detail.approvedPairs?.length) parts.push(`paires : ${detail.approvedPairs.join(", ")}`);
     } else if (reason === "max_concurrent_positions_reached") {
@@ -541,7 +638,7 @@
           <label class="dashboard-autotrade-field">Positions ouvertes max
             <input type="number" min="1" max="20" step="1" value="${request.maxConcurrentPositions ?? DEFAULT_MAX_CONCURRENT_POSITIONS}" data-field="maxConcurrentPositions">
           </label>
-          <label class="dashboard-autotrade-field">Confiance min (%)
+          <label class="dashboard-autotrade-field">Score Kronos minimal (0–100)
             <input type="number" min="60" max="95" step="1" value="${request.minConfidenceFloor ?? 70}" data-field="minConfidenceFloor">
           </label>
         </div>
@@ -583,7 +680,7 @@
           `).join("")}
         </div>
         ${request.userMinConfidence != null && request.userMinConfidence > (request.minConfidenceFloor ?? 70) ? `
-          <p class="dashboard-autotrade-warning">⚠ Ce compte a lui-même réglé sa confiance minimale à ${escapeHtml(request.userMinConfidence)}%, plus haut que le plancher admin ci-dessus (${escapeHtml(request.minConfidenceFloor ?? 70)}%) -- c'est la valeur la plus haute des deux qui s'applique réellement, donc c'est celle du compte, pas celle-ci, qui filtre les trades tant qu'elle reste au-dessus.</p>
+          <p class="dashboard-autotrade-warning">⚠ Ce compte a réglé son score Kronos minimal à ${escapeHtml(request.userMinConfidence)}/100, au-dessus du plancher admin (${escapeHtml(request.minConfidenceFloor ?? 70)}/100). La valeur la plus élevée filtre les trades; ce score mesure la cohérence du filtre, pas la probabilité de gain.</p>
         ` : ""}
         <div class="premium-admin-actions">
           <button type="button" data-autotrade-approve="${escapeHtml(request.userId)}">Approuver</button>
