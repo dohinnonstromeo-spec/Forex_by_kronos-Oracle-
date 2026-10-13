@@ -6006,12 +6006,15 @@ async function runKronosAnalysis({ body, images, req, user }) {
     const historyOptions = {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Scalping",
-      preferDeriv: !independentOhlcMode && isScalpingStrategy(body.strategy || "Scalping"),
+      // The chartless default is the Deriv M1/M5/M15 scalp path. The old
+      // independent-OHLC condition disabled Deriv here, even though strict PA
+      // scalping later required same-venue candles before accepting a setup.
+      preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
       allowHistoricalWithoutLive: !images.length,
       requireExactTimeframe: smcMode || priceActionResearchMode
         || (/^price\s*action$/i.test(String(body.style || "Price Action")) && isScalpingStrategy(body.strategy || "Scalping")),
       requireOpen: smcMode,
-      historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 6500,
+      historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 10000,
     };
     let history;
     if (independentOhlcMode) {
@@ -6020,8 +6023,18 @@ async function runKronosAnalysis({ body, images, req, user }) {
         historyPromise,
         promiseWithTimeout(livePricePromise, 1800, null),
       ]);
+      // History may take long enough for the initially timed-out quote request to
+      // finish. Reuse that result once before declaring live pricing unavailable.
+      if (!livePrice) livePrice = await promiseWithTimeout(livePricePromise, 1800, null);
     } else {
       history = await getHistoryForSymbol(selectedPair, livePrice, historyOptions);
+    }
+    // Never merge an external quote with Deriv candles as though they were one
+    // synchronized feed. If Deriv OHLC wins but its quote is still pending, use
+    // the last completed Deriv close for the read; order validation stays closed.
+    if (independentOhlcMode && /^deriv_ws:/i.test(String(history?._meta?.source || ""))
+      && livePrice?.source !== "deriv_ws") {
+      livePrice = null;
     }
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
@@ -7021,8 +7034,12 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cached = cachedHistory(symbol, cache, options);
   const cachedHasOpen = !options.requireOpen || cached.every((bar) => Number.isFinite(Number(bar.open)));
   const preferredIntervals = historyIntervals(symbol, options);
-  const deadline = Date.now() + diagnostics.budgetMs;
-  if (options.preferDeriv && price?.source === "deriv_ws" && price.open && isUsableLivePrice(price)) {
+  // Chartless history and quote requests run concurrently, so the quote may not
+  // be available yet. Completed Deriv candles still support a read-only analysis;
+  // executable setups are separately gated on a trustworthy live quote.
+  const derivQuoteConfirmed = price?.source === "deriv_ws" && price.open && isUsableLivePrice(price);
+  const canReadHistoricalDeriv = options.allowHistoricalWithoutLive === true;
+  if (options.preferDeriv && (derivQuoteConfirmed || canReadHistoricalDeriv)) {
     try {
       const derivBars = await fetchDerivAnalysisHistory(symbol, options.timeframe, Math.max(2500, Math.min(10000, diagnostics.budgetMs)));
       if (derivBars.length >= 30 && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
@@ -7043,6 +7060,9 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       recordProviderHealth("deriv_ws_history", false, reason);
     }
   }
+  // Give fallback vendors their own bounded window after the Deriv attempt: the
+  // websocket may first spend several seconds resolving active-symbol metadata.
+  const deadline = Date.now() + diagnostics.budgetMs;
   if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) {
     diagnostics.cache = true;
     return finish(cached, "cache_frais");

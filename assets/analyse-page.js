@@ -120,21 +120,35 @@
       const idleLabel = submit.textContent.trim() || "Lancer l'analyse Kronos";
       submit.disabled = true;
       const progress = startAnalysisProgress(form);
-      const body = Object.fromEntries(new FormData(form).entries());
-      const deep = body.analysisDepth !== "Rapide";
-      setSubmitLabel(submit, deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...");
-      body.images = images;
-      body.autoDetect = isAutoDetectEnabled() && Boolean(detectedContext);
-      body.detectedContext = body.autoDetect ? detectedContext : null;
-      if (isAutoDetectEnabled() && images.length && !detectedContext) {
-        const panel = document.querySelector("#chartDetectionPanel");
-        if (panel) panel.innerHTML = `<span class="oracle-chat-dot closed"></span> Détection non confirmée : la paire et l'unité de temps du formulaire seront utilisées.`;
+      let analysisReceived = false;
+      try {
+        const body = Object.fromEntries(new FormData(form).entries());
+        const deep = body.analysisDepth !== "Rapide";
+        setSubmitLabel(submit, deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...");
+        body.images = images;
+        body.autoDetect = isAutoDetectEnabled() && Boolean(detectedContext);
+        body.detectedContext = body.autoDetect ? detectedContext : null;
+        if (isAutoDetectEnabled() && images.length && !detectedContext) {
+          const panel = document.querySelector("#chartDetectionPanel");
+          if (panel) panel.innerHTML = `<span class="oracle-chat-dot closed"></span> Détection non confirmée : la paire et l'unité de temps du formulaire seront utilisées.`;
+        }
+        const response = await postJson("/api/analyze-chart", body, deep ? 120000 : 45000);
+        renderAnalysisResult(result, response);
+        analysisReceived = Boolean(response);
+      } catch (error) {
+        result.classList.add("show");
+        result.innerHTML = `
+          <div class="analysis-card">
+            <div class="direction-label">Analyse interrompue</div>
+            <p class="mt-4 text-sm text-muted-foreground">${escapeHtml(error?.message || "Une erreur inattendue a interrompu l'affichage de l'analyse.")}</p>
+            <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
+          </div>
+        `;
+      } finally {
+        finishAnalysisProgress(progress, analysisReceived);
+        submit.disabled = false;
+        setSubmitLabel(submit, idleLabel, "zap");
       }
-      const response = await postJson("/api/analyze-chart", body, deep ? 120000 : 45000);
-      finishAnalysisProgress(progress, Boolean(response));
-      renderAnalysisResult(result, response);
-      submit.disabled = false;
-      setSubmitLabel(submit, idleLabel, "zap");
     });
 
     result.addEventListener("click", (event) => {
@@ -660,12 +674,15 @@
     const historyDiagnostics = technical.historyDiagnostics;
     const providerAttempts = Array.isArray(historyDiagnostics?.attempts) ? historyDiagnostics.attempts : [];
     const providerErrors = Array.isArray(historyDiagnostics?.errors) ? historyDiagnostics.errors : [];
-    const dataTroubleshooting = Number(technical.bars || 0) < 30 && historyDiagnostics
-      ? `<details class="no-signal-data-status"><summary>Pourquoi l'historique OHLC manque</summary>
+    const historyNeedsAttention = Number(technical.bars || 0) < 30
+      || technical.historyFresh === false
+      || technical.timeframeCompatible === false;
+    const dataTroubleshooting = historyNeedsAttention && historyDiagnostics
+      ? `<details class="no-signal-data-status"><summary>Diagnostic de l'historique OHLC</summary>
           <p>${escapeHtml(`${historyDiagnostics.status || "données insuffisantes"} · timeframe demandé ${historyDiagnostics.timeframe || timeframe || "n/a"} · ${historyDiagnostics.elapsedMs ?? "?"} ms · budget ${historyDiagnostics.budgetMs ?? "?"} ms`)}</p>
           ${providerAttempts.length ? `<ul>${providerAttempts.map((attempt) => `<li>${escapeHtml(`${attempt.provider || "source"}${attempt.interval ? `/${attempt.interval}` : ""} : ${attempt.result || "réponse inconnue"}${attempt.bars ? ` (${attempt.bars} bougies)` : ""}`)}</li>`).join("")}</ul>` : ""}
           ${providerErrors.length ? `<p>Détails : ${escapeHtml(providerErrors.join(" · "))}</p>` : ""}
-          <p>Kronos suspend le biais confirmé et les niveaux d'ordre tant qu'il n'a pas 30 bougies clôturées sur l'unité demandée.</p>
+          <p>Kronos exige au moins 30 bougies clôturées, récentes et alignées sur l'unité choisie. Tant que cette condition manque, aucun biais confirmé ni niveau d'ordre n'est validé.</p>
         </details>`
       : "";
     const formatValue = (value) => {
