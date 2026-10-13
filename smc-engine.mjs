@@ -43,6 +43,28 @@ function timeframeMs(value) {
   return minutes ? minutes * 60_000 : null;
 }
 
+function consecutiveBarStarts(previousMs, currentMs, timeframe, intervalMs) {
+  const normalized = String(timeframe || "").toUpperCase();
+  const previous = new Date(previousMs);
+  const current = new Date(currentMs);
+  if (normalized === "MN1") {
+    const previousMonth = previous.getUTCFullYear() * 12 + previous.getUTCMonth();
+    const currentMonth = current.getUTCFullYear() * 12 + current.getUTCMonth();
+    return currentMonth - previousMonth === 1;
+  }
+  if (normalized === "D1") {
+    const previousDay = Date.UTC(previous.getUTCFullYear(), previous.getUTCMonth(), previous.getUTCDate());
+    const currentDay = Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate());
+    const dayDelta = (currentDay - previousDay) / 86_400_000;
+    return dayDelta >= 1 && dayDelta <= 3;
+  }
+  if (normalized === "W1") {
+    const delta = currentMs - previousMs;
+    return delta >= 6 * 86_400_000 && delta <= 8 * 86_400_000;
+  }
+  return Math.abs((currentMs - previousMs) - intervalMs) <= 1000;
+}
+
 function timestampMs(bar) {
   const raw = bar?.epoch ?? bar?.time ?? bar?.timestamp ?? bar?.datetime;
   if (raw == null) return null;
@@ -53,25 +75,67 @@ function timestampMs(bar) {
 }
 
 function confirmedBars(rawBars, timeframe, now) {
-  if (!Array.isArray(rawBars)) return { bars: [], hasTimestamps: false, excludedPartial: 0 };
+  if (!Array.isArray(rawBars)) return {
+    bars: [], hasTimestamps: false, excludedPartial: 0, invalidBars: 0,
+    missingTimestamps: 0, duplicateBars: 0, conflictingDuplicates: 0,
+    gaps: 0, trailingConsecutiveBars: 0,
+  };
   const interval = timeframeMs(timeframe);
-  const seen = new Set();
-  const parsed = rawBars.map((bar) => {
+  let invalidBars = 0;
+  let missingTimestamps = 0;
+  let duplicateBars = 0;
+  let conflictingDuplicates = 0;
+  const parsed = [];
+  for (const bar of rawBars) {
     const open = finite(bar?.open);
     const high = finite(bar?.high);
     const low = finite(bar?.low);
     const close = finite(bar?.close);
     const startMs = timestampMs(bar);
-    if ([open, high, low, close].some((value) => value == null) || high < low || startMs == null) return null;
-    return { open, high, low, close, startMs, endMs: interval ? startMs + interval : null };
-  }).filter(Boolean).sort((a, b) => a.startMs - b.startMs);
-  const unique = parsed.filter((bar) => {
-    if (seen.has(bar.startMs)) return false;
-    seen.add(bar.startMs);
-    return true;
-  });
+    if (startMs == null) missingTimestamps += 1;
+    const coherent = [open, high, low, close].every((value) => value != null && value > 0)
+      && high >= Math.max(open, close, low)
+      && low <= Math.min(open, close, high);
+    if (!coherent || startMs == null) {
+      invalidBars += 1;
+      continue;
+    }
+    parsed.push({ open, high, low, close, startMs, endMs: interval ? startMs + interval : null });
+  }
+  parsed.sort((a, b) => a.startMs - b.startMs);
+  const unique = [];
+  for (const bar of parsed) {
+    const previous = unique.at(-1);
+    if (previous?.startMs !== bar.startMs) {
+      unique.push(bar);
+      continue;
+    }
+    duplicateBars += 1;
+    if (bar.open !== previous.open || bar.high !== previous.high || bar.low !== previous.low || bar.close !== previous.close) {
+      conflictingDuplicates += 1;
+    }
+  }
   const bars = interval ? unique.filter((bar) => bar.endMs <= now) : unique;
-  return { bars, hasTimestamps: parsed.length > 0, excludedPartial: unique.length - bars.length };
+  let gaps = 0;
+  let trailingConsecutiveBars = bars.length ? 1 : 0;
+  for (let index = 1; index < bars.length; index += 1) {
+    if (!consecutiveBarStarts(bars[index - 1].startMs, bars[index].startMs, timeframe, interval)) gaps += 1;
+  }
+  for (let index = bars.length - 1; index > 0; index -= 1) {
+    if (!consecutiveBarStarts(bars[index - 1].startMs, bars[index].startMs, timeframe, interval)) break;
+    trailingConsecutiveBars += 1;
+  }
+  return {
+    bars,
+    hasTimestamps: rawBars.length > 0 && missingTimestamps === 0,
+    excludedPartial: unique.length - bars.length,
+    invalidBars,
+    missingTimestamps,
+    duplicateBars,
+    conflictingDuplicates,
+    gaps,
+    trailingConsecutiveBars,
+  };
 }
 
 function trueRanges(bars) {
@@ -277,13 +341,33 @@ export function analyzeKronosSmc({
   const contextAgeMs = context.at(-1) ? Math.max(0, evaluationTime - context.at(-1).endMs) : null;
   inputMeta.setupAgeSeconds = setupAgeMs == null ? null : Math.floor(setupAgeMs / 1000);
   inputMeta.contextAgeSeconds = contextAgeMs == null ? null : Math.floor(contextAgeMs / 1000);
-  inputMeta.sourceAligned = sourceFamily(setupSource) === sourceFamily(contextSource);
+  const setupSourceFamily = sourceFamily(setupSource);
+  const contextSourceFamily = sourceFamily(contextSource);
+  inputMeta.setupSourceFamily = setupSourceFamily;
+  inputMeta.contextSourceFamily = contextSourceFamily;
+  inputMeta.sourceAligned = setupSourceFamily !== "inconnue" && setupSourceFamily === contextSourceFamily;
+  inputMeta.setupInvalidBars = setupResult.invalidBars;
+  inputMeta.contextInvalidBars = contextResult.invalidBars;
+  inputMeta.setupDuplicateBars = setupResult.duplicateBars;
+  inputMeta.contextDuplicateBars = contextResult.duplicateBars;
+  inputMeta.setupConflictingDuplicates = setupResult.conflictingDuplicates;
+  inputMeta.contextConflictingDuplicates = contextResult.conflictingDuplicates;
+  inputMeta.setupGaps = setupResult.gaps;
+  inputMeta.contextGaps = contextResult.gaps;
+  inputMeta.setupTrailingConsecutiveBars = setupResult.trailingConsecutiveBars;
+  inputMeta.contextTrailingConsecutiveBars = contextResult.trailingConsecutiveBars;
 
-  if (!setupResult.hasTimestamps || !contextResult.hasTimestamps) {
+  if ((rawSetupBars.length > 0 && !setupResult.hasTimestamps) || (rawContextBars.length > 0 && !contextResult.hasTimestamps)) {
     return unavailable("horodatage_absent", "Historique non confirmé", "Kronos a besoin de l'horodatage des bougies pour aligner le biais supérieur sans utiliser d'information future.", { setupTimeframe, contextTimeframe, inputs: inputMeta });
+  }
+  if (setupResult.invalidBars || contextResult.invalidBars || setupResult.conflictingDuplicates || contextResult.conflictingDuplicates) {
+    return unavailable("donnees_incoherentes", "Données OHLC incohérentes", "Au moins une bougie contient un OHLC invalide ou des valeurs contradictoires au même horodatage. Aucun setup SMC n'est confirmé avec ces données.", { setupTimeframe, contextTimeframe, inputs: inputMeta });
   }
   if (bars.length < MIN_SETUP_BARS || context.length < MIN_CONTEXT_BARS) {
     return unavailable("historique_insuffisant", "Historique insuffisant", `SMC requiert au moins ${MIN_SETUP_BARS} bougies clôturées ${setupTimeframe} et ${MIN_CONTEXT_BARS} bougies clôturées ${contextTimeframe}.`, { setupTimeframe, contextTimeframe, inputs: inputMeta });
+  }
+  if (setupResult.trailingConsecutiveBars < 3 || contextResult.trailingConsecutiveBars < 2) {
+    return unavailable("historique_discontinu", "Historique MTF discontinu", "Les dernières bougies setup/contexte comportent une coupure de données. Attends au moins trois bougies setup et deux bougies contexte consécutives avant de confirmer un setup.", { setupTimeframe, contextTimeframe, inputs: inputMeta });
   }
 
   const stale = Boolean(setupStale || contextStale
@@ -308,6 +392,14 @@ export function analyzeKronosSmc({
 
   for (let index = 0; index < bars.length; index += 1) {
     const bar = bars[index];
+    if (index > 0 && !consecutiveBarStarts(bars[index - 1].startMs, bar.startMs, setupTimeframe, setupMs)) {
+      activeSetup = null;
+      activeZone = null;
+      latestSweep = null;
+      latestChoch = null;
+      latestZoneEvent = null;
+      latestRetest = null;
+    }
     const center = index - PIVOT_SPAN;
     if (center >= PIVOT_SPAN) {
       let isHigh = true;
@@ -576,7 +668,7 @@ export function analyzeKronosSmc({
     zones,
     candidateLevels,
     diagnostics,
-    ...(includeResearchSignals ? { researchSignals } : {}),
+    ...(includeResearchSignals ? { researchSignals: stale || sourceMismatch ? [] : researchSignals } : {}),
     lastClosedBarAt: lastBar ? new Date(lastBar.endMs).toISOString() : null,
     benchmark: KRONOS_SMC_BENCHMARK,
     caveat: "OHLC ne révèle pas les ordres institutionnels. Ce panneau décrit une règle mécanique, pas une probabilité de gain ni une recommandation automatique.",

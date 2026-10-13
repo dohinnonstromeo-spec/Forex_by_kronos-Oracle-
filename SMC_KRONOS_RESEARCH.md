@@ -46,6 +46,12 @@ Un second backtest reprend les memes regles strictes et le meme moteur de produc
 
 Le nombre de trades est faible et les dates de fin varient selon les historiques. Le R agregé n'est pas le rendement d'un compte: les transactions sur plusieurs paires peuvent se chevaucher et le calcul ne fixe pas une allocation de risque du portefeuille. Ce resultat ne valide donc pas des signaux SMC copiables. La console conserve SMC comme categorie distincte de recherche, affichee a cote de l'analyse Price Action par defaut, sans ordre copiable; le benchmark affiche maintenant le resultat multi-paires et le sous-resultat XAU/USD.
 
+## Garde-fous de donnees et tests de non-regression
+
+Avant d'evaluer un setup, le moteur bloque les OHLC invalides, les bougies sans horodatage, les doublons contradictoires, les sources non identifiees ou non alignees et une coupure dans les dernieres bougies. Les doublons identiques sont dedoublonnes et comptes. Les bougies encore ouvertes restent exclues. Un setup ou une zone en attente est remis a zero lors d'une coupure historique; les signaux de recherche sont aussi supprimes si l'historique est perime ou si les sources divergent.
+
+Les tests unitaires SMC couvrent ces blocages, l'alignement multi-timeframe sans fuite de bougie future et l'absence d'ordre executable. Ils sont inclus dans `npm test`. Apres ces changements, les backtests fixes ne montrent aucune amelioration de performance: le resultat strict multi-paires reste negatif. Ces garde-fous fiabilisent le diagnostic, mais ne transforment pas la methode en strategie rentable validee.
+
 ## Fichiers principaux
 
 - `smc-engine.mjs`: moteur SMC partage par le serveur et la variante stricte du backtest.
