@@ -645,7 +645,7 @@
     const timeframe = String(meta.timeframe || "");
     const hasImages = Number(meta.imageQuality?.images || 0) > 0;
     const facts = [
-      ["Prix observé", meta.livePrice],
+      [technical.livePriceUsable ? "Prix live" : "Dernière clôture OHLC", technical.livePriceUsable ? meta.livePrice : technical.last],
       ["Tendance", technical.trend],
       ["RSI", technical.rsi],
       ["ATR", technical.atr],
@@ -1052,6 +1052,11 @@
   function renderPriceFreshness(result) {
     const asOf = result.meta?.livePriceAsOf;
     const source = result.meta?.livePriceSource || "source non précisée";
+    if (result.meta?.liveUsable === false) {
+      const technical = result.meta?.technicalSnapshot || {};
+      const lastClose = technical.last == null ? "aucune clôture OHLC disponible" : `dernière clôture OHLC ${technical.last}`;
+      return `<p class="result-price-freshness stale">Cotation live indisponible (${escapeHtml(source)}) · ${escapeHtml(lastClose)} · analyse de contexte seulement, sans niveaux d'ordre copiables.</p>`;
+    }
     const timestamp = asOf ? new Date(asOf).getTime() : NaN;
     const seconds = Number.isFinite(timestamp) ? Math.max(0, Math.round((Date.now() - timestamp) / 1000)) : null;
     if (seconds == null) return `<p class="result-price-freshness stale">Source prix : ${escapeHtml(source)} · horodatage indisponible; vérifie la cotation du courtier.</p>`;
@@ -1081,7 +1086,7 @@
     if (!quality && !calibration && !live && !id && !chartContext && !technical && !news) return "";
     return `<div class="mt-3 text-[10px] uppercase tracking-widest text-muted-foreground">
       ${quality ? `<div>Qualité fichier image: ${quality.score}% · dimensions uniquement, ne confirme pas la lecture des prix · ${escapeHtml(quality.reason || "")}</div>` : ""}
-      ${live ? `<div>Prix d'analyse: ${escapeHtml(live)} · source ${escapeHtml(meta.livePriceSource || "n/a")}</div>` : ""}
+      ${meta.liveUsable && live ? `<div>Prix live d'analyse: ${escapeHtml(live)} · source ${escapeHtml(meta.livePriceSource || "n/a")}</div>` : technical?.last != null ? `<div>Dernière clôture OHLC: ${escapeHtml(technical.last)} · source ${escapeHtml(technical.source || "historique indisponible")}</div>` : ""}
       ${meta.historySource ? `<div>Historique bougies: ${escapeHtml(meta.historySource)} · ${meta.derivFeedConfirmed ? "prix et bougies issus de Deriv" : "source potentiellement différente de Deriv"}</div>` : ""}
       ${technical ? `<div>Technique API: ${escapeHtml(technical.trend || "n/a")} · RSI ${escapeHtml(technical.rsi ?? "n/a")} · ${escapeHtml(technical.bars || 0)} bougies · ${escapeHtml(technical.source || "source n/a")}</div>` : ""}
       ${dataReliability ? `<div>Indice de fiabilité des données: ${Number(dataReliability.score || 0)}/100 · grade ${escapeHtml(dataReliability.grade || "n/a")}${Array.isArray(dataReliability.blockers) && dataReliability.blockers.length ? ` · ${escapeHtml(dataReliability.blockers.slice(0, 2).join(" · "))}` : ""}</div>` : ""}

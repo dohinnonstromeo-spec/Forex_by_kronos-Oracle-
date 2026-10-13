@@ -6002,13 +6002,17 @@ async function runKronosAnalysis({ body, images, req, user }) {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Scalping",
       preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
-      requireExactTimeframe: smcMode || priceActionResearchMode,
+      allowHistoricalWithoutLive: !images.length,
+      requireExactTimeframe: smcMode || priceActionResearchMode
+        || (/^price\s*action$/i.test(String(body.style || "Price Action")) && isScalpingStrategy(body.strategy || "Scalping")),
       requireOpen: smcMode,
       historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 6500,
     });
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
       strategy: body.strategy || "Scalping",
+      requireExactTimeframe: smcMode || priceActionResearchMode
+        || (/^price\s*action$/i.test(String(body.style || "Price Action")) && isScalpingStrategy(body.strategy || "Scalping")),
     });
     let priceActionAnalysis = priceActionResearchMode
       ? buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice })
@@ -6964,7 +6968,9 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     }
   }
   if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) return cached;
-  if (!price?.open || !isUsableLivePrice(price)) return cachedHasOpen ? cached : [];
+  if ((!price?.open || !isUsableLivePrice(price)) && options.allowHistoricalWithoutLive !== true) {
+    return cachedHasOpen ? cached : [];
+  }
   const errors = [];
   let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
   const attempts = [
@@ -9105,10 +9111,12 @@ function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, mult
 
 function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, reason }) {
   const outlook = buildPriceActionMarketOutlook({ pair, timeframe, livePrice, technicalSnapshot });
+  const quoteUsable = isUsableLivePrice(livePrice);
+  const observedPrice = quoteUsable ? livePrice?.price : technicalSnapshot.last;
   const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
   const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
   return `PRICE ACTION SCALPING — ${pair} ${timeframe}
-- Prix en direct : ${formatLevel(livePrice?.price, pair)}
+- ${quoteUsable ? "Prix en direct" : "Derniere cloture OHLC"} : ${formatLevel(observedPrice, pair)}${quoteUsable ? "" : ` (${livePrice?.source || "cotation live indisponible"})`}
 - Synthese technique : ${technicalSnapshot.text || "donnees de bougie insuffisantes"}
 - Support / resistance API : ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"} / ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}
 - Lecture du marché : ${outlook.bias} — ${outlook.primaryScenario}
@@ -9135,8 +9143,12 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
   const structureBias = /structure haussi[eè]re|hh\/hl/i.test(structure) ? 1
     : /structure baissi[eè]re|lh\/ll/i.test(structure) ? -1 : 0;
   const enoughBars = bars >= 30;
-  const fresh = !technicalSnapshot.stale && technicalSnapshot.timeframeCompatible !== false;
-  const price = Number(livePrice?.price ?? technicalSnapshot.last);
+  const historyFresh = typeof technicalSnapshot.historyFresh === "boolean"
+    ? technicalSnapshot.historyFresh
+    : !technicalSnapshot.stale && technicalSnapshot.timeframeCompatible !== false;
+  const fresh = historyFresh && technicalSnapshot.timeframeCompatible !== false;
+  const quoteUsable = isUsableLivePrice(livePrice);
+  const price = Number(quoteUsable ? livePrice?.price : technicalSnapshot.last);
   const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
   const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
   const zonesUsable = Number.isFinite(support) && Number.isFinite(resistance) && resistance > support;
@@ -9194,7 +9206,7 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     priceLocation = `${rangePosition.toFixed(0)} % de la fourchette ${formatLevel(support, pair)}–${formatLevel(resistance, pair)} (repère OHLC, pas une zone d'ordre)`;
   }
   const source = String(technicalSnapshot.source || "source inconnue");
-  const dataNote = `${bars} bougies ${timeframe} · ${source}${technicalSnapshot.stale ? " · historique périmé/indicatif" : " · historique non marqué périmé"}${technicalSnapshot.timeframeCompatible === false ? " · timeframe non aligné" : ""}`;
+  const dataNote = `${bars} bougies ${timeframe} · ${source}${fresh ? " · historique clôturé récent" : " · fraîcheur OHLC non confirmée"}${technicalSnapshot.timeframeCompatible === false ? " · timeframe non aligné" : ""}${quoteUsable ? " · cotation live utilisable" : " · cotation live indisponible, lecture basée sur la dernière clôture"}`;
   return {
     status: !enoughBars ? "insufficient_history" : !fresh ? "indicative_data" : "context_only",
     pair,
@@ -9214,7 +9226,9 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
       ? `${read.imbalance.direction || "direction inconnue"} ${formatLevel(read.imbalance.low, pair)}–${formatLevel(read.imbalance.high, pair)}`
       : "aucune imbalance détectée sur les 3 dernières bougies",
     dataNote,
-    levelsNote: "Entrée, SL et TP ne sont publiés qu'après confirmation d'un déclencheur et validation de la cotation/spread. Aucun niveau n'est inventé ici.",
+    levelsNote: quoteUsable
+      ? "Entrée, SL et TP ne sont publiés qu'après confirmation d'un déclencheur et validation du spread. Aucun niveau n'est inventé ici."
+      : "Lecture du dernier OHLC seulement : sans cotation live/spread, aucun niveau d'ordre copiable n'est publié.",
   };
 }
 
@@ -9624,28 +9638,47 @@ function buildMarketChartPayload(pair, timeframe, history = [], technicalSnapsho
 }
 
 function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = {}) {
-  const bars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
+  const rawBars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
+  const meta = history?._meta || {};
+  const timeframe = normalizeTimeframe(options.timeframe || meta.timeframe || "M5") || "M5";
+  const timeframeMs = timeframeMinutes(timeframe) * 60_000;
+  const bars = rawBars.filter((bar) => {
+    const openedAt = Date.parse(String(bar.datetime || bar.time || ""));
+    if (!Number.isFinite(openedAt) || !Number.isFinite(timeframeMs)) return options.requireExactTimeframe !== true;
+    return openedAt + timeframeMs <= Date.now();
+  });
   const closes = bars.map((bar) => Number(bar.close));
   const live = Number(livePrice?.price);
-  const last = Number.isFinite(live) ? live : closes.at(-1);
-  const meta = history?._meta || {};
+  const livePriceUsable = isUsableLivePrice(livePrice);
+  const last = livePriceUsable ? live : closes.at(-1);
   const compatible = isHistoryCompatible(history, options);
+  const lastBar = bars.at(-1);
+  const lastBarTime = Date.parse(String(lastBar?.datetime || lastBar?.time || ""));
+  const lastClosedAgeMs = Number.isFinite(lastBarTime) && Number.isFinite(timeframeMs)
+    ? Math.max(0, Date.now() - (lastBarTime + timeframeMs))
+    : Number.POSITIVE_INFINITY;
+  const historyFresh = closes.length >= 30
+    && !meta.stale
+    && compatible
+    && Number.isFinite(lastClosedAgeMs)
+    && lastClosedAgeMs <= Math.max(timeframeMs * 3, 60_000);
   if (!Number.isFinite(last) || closes.length < 10) {
     return {
       pair,
       bars: closes.length,
       source: meta.source || livePrice?.source || "aucun historique",
       stale: Boolean(meta.stale || livePrice?.stale),
+      historyFresh: false,
+      livePriceUsable,
       valid: false,
       marketRegime: "unknown",
-      text: "Historique insuffisant: lecture visuelle prioritaire, aucun setup direct à forcer.",
+      text: "Historique OHLC insuffisant pour lire la structure Price Action; aucun biais ni niveau ne sera inventé.",
     };
   }
   const sma10 = average(closes.slice(-10));
   const sma30 = closes.length >= 30 ? average(closes.slice(-30)) : NaN;
   const rsi = closes.length >= 15 ? calculateRsi(closes.slice(-100)) : NaN;
   const atr = average(bars.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.004;
-  const timeframe = normalizeTimeframe(options.timeframe || meta.timeframe || "M5") || "M5";
   const structureLookbackBars = structureLookbackForTimeframe(timeframe);
   const recent = bars.slice(-structureLookbackBars);
   const support = Math.min(...recent.map((bar) => Number(bar.low)).filter(Number.isFinite));
@@ -9688,6 +9721,9 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     bars: closes.length,
     source: meta.source || livePrice?.source || "historique",
     stale: Boolean(meta.stale || livePrice?.stale || !compatible),
+    historyFresh,
+    historyAgeMinutes: Number.isFinite(lastClosedAgeMs) ? Number((lastClosedAgeMs / 60_000).toFixed(1)) : null,
+    livePriceUsable,
     timeframeCompatible: compatible,
     timeframe,
     valid,
@@ -9718,7 +9754,8 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       Number.isFinite(volumeRatio) ? `volume ${volumeRatio}x la moyenne 20 bougies` : "volume indisponible pour cette source",
       `confirmations ${confirmations}/6`,
       compatible ? "timeframe cohérent avec la stratégie" : "historique non aligné avec le timeframe demandé",
-      meta.stale ? "historique indicatif/différé" : "historique frais ou cache récent",
+      historyFresh ? "bougies clôturées récentes confirmées par leur horodatage" : "fraîcheur OHLC non confirmée",
+      livePriceUsable ? "cotation live exploitable" : "cotation live non fiable; dernier close OHLC utilisé",
     ].join("; "),
   };
 }
