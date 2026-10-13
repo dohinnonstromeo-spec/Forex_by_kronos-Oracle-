@@ -202,6 +202,14 @@
               <p class="mt-1 text-xs text-muted-foreground">Le mode prudent reste le défaut. Le profil étendu conserve le SL structurel; il vise TP1 à 0,67R puis TP2 à 2R (achat) ou 2,67R (vente), avec 50 % pris à TP1 et le reste protégé à BE. Ces ratios ne garantissent pas que la cible sera atteinte.</p>
             </div>
             <div class="analysis-field">
+              <label for="analysisMode">Moteur Price Action sans capture</label>
+              <select id="analysisMode" name="analysisMode">
+                <option value="prudent" selected>Standard Kronos (prudent)</option>
+                <option value="pa_research">Recherche OHLC expérimentale (non exécutable)</option>
+              </select>
+              <p id="analysisModeHint" class="mt-1 text-xs text-muted-foreground" aria-live="polite">Ce choix concerne Price Action en scalping sans capture. Le profil prudent/étendu s'applique au moteur standard; la recherche suit ses propres règles fixes.</p>
+            </div>
+            <div class="analysis-field">
               <label for="capital">Capital disponible</label>
               <input id="capital" name="capital" type="number" min="0" step="1" placeholder="Ex: 50">
             </div>

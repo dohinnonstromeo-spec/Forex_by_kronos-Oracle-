@@ -5889,6 +5889,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
     if (body.strategy) body.strategy = sanitizeUserText(body.strategy, 40);
     if (body.risk) body.risk = sanitizeUserText(body.risk, 40);
     body.targetProfile = normalizeTargetProfile(body.targetProfile);
+    const requestedAnalysisMode = String(body.analysisMode || "prudent").trim().toLowerCase();
     const selectedTargetProfile = targetProfileDefinition(body.targetProfile, "ACHAT");
     const targetProfileMeta = {
       targetProfile: body.targetProfile,
@@ -5900,8 +5901,13 @@ async function runKronosAnalysis({ body, images, req, user }) {
     }
     const smcMode = /^smc$/i.test(String(body.style || ""));
     const priceActionResearchMode = !images.length
+      && requestedAnalysisMode === "pa_research"
       && /^price\s*action$/i.test(String(body.style || "Price Action"))
       && isScalpingStrategy(body.strategy || "Scalping");
+    // Keep the research engine separate from the normal prudent Price Action path.
+    // It used to be selected implicitly by the default Price Action + Scalping form,
+    // which forced ordinary analyses through a Deriv-only, non-executable experiment.
+    body.analysisMode = priceActionResearchMode ? "pa_research" : "prudent";
     const imageQuality = assessImageQuality(images);
     if (images.length && imageQuality.score < 20 && !smcMode) {
       const result = {
@@ -5998,7 +6004,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
       preferDeriv: isScalpingStrategy(body.strategy || "Scalping"),
       requireExactTimeframe: smcMode || priceActionResearchMode,
       requireOpen: smcMode,
-      historyBudgetMs: deepAnalysis ? 11000 : 3500,
+      historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 6500,
     });
     const technicalSnapshot = buildTechnicalSnapshot(selectedPair, history, livePrice, {
       timeframe: selectedTimeframe,
@@ -6216,7 +6222,8 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
     // matters -- falls back to the original price if the refetch itself fails, rather
     // than losing an otherwise-valid analysis to a transient provider hiccup on this
     // last step.
-    const refreshedPrice = await getAnalysisPrice(selectedPair).catch(() => null);
+    const shouldRefreshPrice = !priceActionResearchMode && (images.length > 0 || deepAnalysis);
+    const refreshedPrice = shouldRefreshPrice ? await getAnalysisPrice(selectedPair).catch(() => null) : null;
     if (refreshedPrice && Number.isFinite(Number(refreshedPrice.price))) livePrice = refreshedPrice;
     if (priceActionResearchMode) {
       priceActionAnalysis = buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice });
@@ -9140,6 +9147,8 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
     pair,
     timeframe,
     source,
+    bars: Array.isArray(history) ? history.length : 0,
+    stale: Boolean(history?._meta?.stale),
     researchOnly: true,
     actionable: false,
     candidates: [],
@@ -9833,6 +9842,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     strategy: selectedStrategy,
     targetProfile,
     targetProfileLabel: targetProfileInfo.label,
+    analysisMode: body.analysisMode || "prudent",
     risk: selectedRisk,
     capital: body.capital || null,
     analysisDepth: body.analysisDepth || "Profonde",

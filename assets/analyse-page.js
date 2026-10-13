@@ -12,6 +12,7 @@
     setupAnalyzeForm();
     setupAnalysisDepthHints();
     setupAnalysisStyleHints();
+    setupAnalysisModeHints();
     setupTradingView();
     setupQuickPairControls();
     setupTimeframeControls();
@@ -193,6 +194,19 @@
         : "Price Action reste le choix par defaut. SMC est un diagnostic experimental calcule sur les bougies OHLC cloturees.";
     };
     style.addEventListener("change", update);
+    update();
+  }
+
+  function setupAnalysisModeHints() {
+    const mode = document.querySelector("#analysisMode");
+    const hint = document.querySelector("#analysisModeHint");
+    if (!mode || !hint) return;
+    const update = () => {
+      hint.textContent = mode.value === "pa_research"
+        ? "Recherche séparée : exige des bougies Deriv clôturées et alignées. Ses paramètres de sortie sont fixes; les candidats ne sont jamais copiables."
+        : "Moteur standard prudent par défaut : il analyse les bougies disponibles et bloque l'entrée si les données ou le déclencheur manquent.";
+    };
+    mode.addEventListener("change", update);
     update();
   }
 
@@ -664,6 +678,9 @@
   }
 
   function renderTargetProfileSummary(result) {
+    if (result.meta?.analysisMode === "pa_research") {
+      return `<div class="target-profile-summary"><span>Profil de sortie</span><strong>Règles de recherche fixes</strong><small>Le profil prudent/étendu du formulaire ne s'applique pas aux candidats expérimentaux non exécutables.</small></div>`;
+    }
     const extended = result.meta?.targetProfile === "mdt_extended";
     const label = result.meta?.targetProfileLabel || (extended ? "Objectifs étendus (expérimental)" : "Prudent (profil actuel)");
     const tp1R = Number(result.meta?.tp1R);
