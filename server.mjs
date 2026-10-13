@@ -9104,32 +9104,118 @@ function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, mult
 }
 
 function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, reason }) {
-  const rawTrend = String(technicalSnapshot.trend || "").toLowerCase();
-  const bias = /hauss/.test(rawTrend) ? "haussier provisoire"
-    : /baiss/.test(rawTrend) ? "baissier provisoire"
-      : /neutre|range/.test(rawTrend) ? "neutre / range"
-        : "indéterminé";
+  const outlook = buildPriceActionMarketOutlook({ pair, timeframe, livePrice, technicalSnapshot });
   const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
   const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
-  const forecast = /hauss/.test(rawTrend)
-    ? "Scénario à surveiller: poursuite acheteuse seulement après clôture au-dessus d'une résistance puis retest tenu; une clôture sous le support invalide ce biais."
-    : /baiss/.test(rawTrend)
-      ? "Scénario à surveiller: poursuite vendeuse seulement après clôture sous un support puis retest rejeté; une clôture au-dessus de la résistance invalide ce biais."
-      : "Scénario à surveiller: pas de direction privilégiée; attends une clôture hors du range puis un retest confirmé avant de choisir un sens.";
   return `PRICE ACTION SCALPING — ${pair} ${timeframe}
 - Prix en direct : ${formatLevel(livePrice?.price, pair)}
 - Synthese technique : ${technicalSnapshot.text || "donnees de bougie insuffisantes"}
 - Support / resistance API : ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"} / ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}
-- Biais technique API : ${bias}; il décrit le contexte calculé, pas une probabilité de hausse/baisse.
-- Prévision conditionnelle : ${forecast}
+- Lecture du marché : ${outlook.bias} — ${outlook.primaryScenario}
+- Déclencheur à attendre : ${outlook.trigger}
+- Invalidation du scénario : ${outlook.invalidation}
+- Bougies OHLC : ${outlook.candle}; ${outlook.structure}; ${outlook.liquidity}; ${outlook.imbalance}.
+- Données : ${outlook.dataNote}
 - Signal détecté : AUCUN SIGNAL — ${reason}
 - Zone de référence : support ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"}; résistance ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}.
 - A attendre : clôture confirmée puis retest/reprise, ou rejet confirmé sur support/résistance identifiable.
 - Entree, stop et objectifs : aucun niveau emis avant confirmation de ce declencheur.
-Le repli automatique ne lit pas les motifs de bougie sur une capture et ne transforme pas un biais ou une variation de prix en signal de scalping.
+Cette lecture explique les conditions à surveiller à partir des bougies reçues. Elle ne donne ni probabilité de gain ni ordre à copier.
 SCORE_CONFIANCE:45
 TECHNIQUE_UTILISEE:Price Action
 STYLE_EFFICACITE:Price Action=45`;
+}
+
+function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {} } = {}) {
+  const bars = Math.max(0, Number(technicalSnapshot.bars) || 0);
+  const read = technicalSnapshot.priceActionRead || {};
+  const trend = String(technicalSnapshot.trend || "").toLowerCase();
+  const structure = String(read.swingStructure || "");
+  const trendBias = /hauss/.test(trend) ? 1 : /baiss/.test(trend) ? -1 : 0;
+  const structureBias = /structure haussi[eè]re|hh\/hl/i.test(structure) ? 1
+    : /structure baissi[eè]re|lh\/ll/i.test(structure) ? -1 : 0;
+  const enoughBars = bars >= 30;
+  const fresh = !technicalSnapshot.stale && technicalSnapshot.timeframeCompatible !== false;
+  const price = Number(livePrice?.price ?? technicalSnapshot.last);
+  const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
+  const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
+  const zonesUsable = Number.isFinite(support) && Number.isFinite(resistance) && resistance > support;
+  let bias = "Neutre / structure non concluante";
+  if (!enoughBars) bias = "Lecture partielle — historique insuffisant";
+  else if (!fresh) bias = "Lecture indicative — source ou timeframe non confirmé";
+  else if (trendBias && trendBias === structureBias) bias = trendBias > 0
+    ? "Biais haussier provisoire — tendance et swings concordent"
+    : "Biais baissier provisoire — tendance et swings concordent";
+  else if (trendBias && structureBias && trendBias !== structureBias) bias = "Biais contradictoire — tendance et swings divergent";
+  else if (trendBias) bias = `${trendBias > 0 ? "Biais haussier" : "Biais baissier"} faible — structure non confirmée`;
+  else if (structureBias) bias = `${structureBias > 0 ? "Structure haussière" : "Structure baissière"} — tendance non confirmée`;
+
+  const direction = fresh && enoughBars && trendBias && trendBias === structureBias ? trendBias : 0;
+  let primaryScenario = "Le marché ne donne pas encore de direction concordante. Le scénario prioritaire est d'attendre une clôture nette hors des bornes, puis un retest tenu.";
+  let trigger = zonesUsable
+    ? `clôture ${formatLevel(resistance, pair)} au-dessus ou ${formatLevel(support, pair)} en dessous, puis retest confirmé de la borne cassée`
+    : "attendre des bougies fraîches et des niveaux de structure mesurables";
+  let invalidation = "pas de biais directionnel à invalider tant qu'une cassure confirmée n'a pas eu lieu";
+  if (!enoughBars || !fresh) {
+    primaryScenario = !enoughBars
+      ? `Prévision suspendue : ${bars} bougie(s) reçue(s), 30 bougies clôturées minimum sont requises pour cette lecture scalp.`
+      : "Prévision suspendue : l'historique est périmé ou ne correspond pas au timeframe choisi.";
+    trigger = !enoughBars
+      ? "attendre que Kronos reçoive au moins 30 bougies clôturées sur l'unité choisie"
+      : "attendre un historique frais et aligné avant d'évaluer une cassure/retest";
+    invalidation = "indisponible tant que les données ne sont pas validées";
+  } else if (direction > 0) {
+    primaryScenario = `La poursuite haussière est le scénario à surveiller tant que la structure ne casse pas. Une mèche seule au-dessus d'une borne ne suffit pas.`;
+    trigger = Number.isFinite(resistance)
+      ? `clôture au-dessus de ${formatLevel(resistance, pair)}, puis retest tenu avec clôture haussière`
+      : "cassure d'une résistance identifiable, puis retest tenu avec clôture haussière";
+    invalidation = Number.isFinite(support)
+      ? `clôture sous le support de référence ${formatLevel(support, pair)}`
+      : "clôture sous le dernier creux confirmé";
+  } else if (direction < 0) {
+    primaryScenario = "La poursuite baissière est le scénario à surveiller tant que la structure ne casse pas. Une mèche seule sous une borne ne suffit pas.";
+    trigger = Number.isFinite(support)
+      ? `clôture sous ${formatLevel(support, pair)}, puis retest rejeté avec clôture baissière`
+      : "cassure d'un support identifiable, puis retest rejeté avec clôture baissière";
+    invalidation = Number.isFinite(resistance)
+      ? `clôture au-dessus de la résistance de référence ${formatLevel(resistance, pair)}`
+      : "clôture au-dessus du dernier sommet confirmé";
+  } else if (trendBias && structureBias && trendBias !== structureBias) {
+    primaryScenario = "La tendance et les swings se contredisent. Le biais est suspendu jusqu'à une nouvelle cassure/reprise qui remet les deux lectures en accord.";
+    trigger = zonesUsable
+      ? `clôture hors de ${formatLevel(support, pair)}–${formatLevel(resistance, pair)}, puis retest confirmé dans le même sens`
+      : "attendre que les swings et la tendance convergent";
+    invalidation = "tout retour dans la zone cassée invalide le scénario de cassure";
+  }
+
+  let priceLocation = "indisponible";
+  if (zonesUsable && Number.isFinite(price)) {
+    const rangePosition = Math.max(0, Math.min(100, (price - support) / (resistance - support) * 100));
+    priceLocation = `${rangePosition.toFixed(0)} % de la fourchette ${formatLevel(support, pair)}–${formatLevel(resistance, pair)} (repère OHLC, pas une zone d'ordre)`;
+  }
+  const source = String(technicalSnapshot.source || "source inconnue");
+  const dataNote = `${bars} bougies ${timeframe} · ${source}${technicalSnapshot.stale ? " · historique périmé/indicatif" : " · historique non marqué périmé"}${technicalSnapshot.timeframeCompatible === false ? " · timeframe non aligné" : ""}`;
+  return {
+    status: !enoughBars ? "insufficient_history" : !fresh ? "indicative_data" : "context_only",
+    pair,
+    timeframe,
+    bars,
+    bias,
+    primaryScenario,
+    trigger,
+    invalidation,
+    priceLocation,
+    support: zonesUsable ? formatLevel(support, pair) : null,
+    resistance: zonesUsable ? formatLevel(resistance, pair) : null,
+    candle: String(read.candle || "motif de bougie non disponible"),
+    structure: structure || "swings confirmés insuffisants",
+    liquidity: String(read.sweep || "balayage non mesurable"),
+    imbalance: read.imbalance
+      ? `${read.imbalance.direction || "direction inconnue"} ${formatLevel(read.imbalance.low, pair)}–${formatLevel(read.imbalance.high, pair)}`
+      : "aucune imbalance détectée sur les 3 dernières bougies",
+    dataNote,
+    levelsNote: "Entrée, SL et TP ne sont publiés qu'après confirmation d'un déclencheur et validation de la cotation/spread. Aucun niveau n'est inventé ici.",
+  };
 }
 
 function priceActionTickSize(pair) {
@@ -9867,6 +9953,14 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     calibration,
     chartContext,
     technicalSnapshot: context.technicalSnapshot || null,
+    marketOutlook: strictPriceActionScalp && !hasChartImages && body.analysisMode !== "pa_research"
+      ? buildPriceActionMarketOutlook({
+        pair: body.pair || "EUR/USD",
+        timeframe: body.timeframe || "M5",
+        livePrice,
+        technicalSnapshot: context.technicalSnapshot || {},
+      })
+      : null,
     smcAnalysis: context.smcAnalysis || null,
     priceActionAnalysis: context.priceActionAnalysis || null,
     marketChart: buildMarketChartPayload(body.pair || "EUR/USD", body.timeframe || "M5", context.history || [], context.technicalSnapshot || {}),

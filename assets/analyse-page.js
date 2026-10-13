@@ -534,6 +534,7 @@
               ? `${result.rr} / 1:${Number(result.meta.tp2R).toFixed(2)}` : result.rr, "rr")}
           <div class="level-card tech"><span>Technique</span><strong>${escapeHtml(result.technique)}</strong></div>
         </div>
+        ${renderPriceActionMarketOutlook(result)}
         ${renderPriceFreshness(result)}
         ${renderSmcAnalysis(result)}
         ${renderMarketChart(result)}
@@ -593,6 +594,7 @@
         </div>
         <p class="no-signal-message">${escapeHtml(message)}</p>
         ${renderNoSignalAnalysis(result)}
+        ${renderPriceActionMarketOutlook(result)}
         ${renderTargetProfileSummary(result)}
         ${renderPriceFreshness(result)}
         ${renderPriceActionResearch(result)}
@@ -673,6 +675,36 @@
         ${factMarkup ? `<div class="no-signal-analysis-facts">${factMarkup}</div>` : ""}
         ${reading ? `<p class="no-signal-analysis-reading"><strong>Structure lue :</strong> ${escapeHtml(reading)}</p>` : ""}
         ${narrative ? `<details class="no-signal-analysis-details" open><summary>Raisonnement et données utilisées</summary><p>${escapeHtml(narrative)}</p></details>` : ""}
+      </section>
+    `;
+  }
+
+  function renderPriceActionMarketOutlook(result) {
+    const outlook = result.meta?.marketOutlook;
+    if (!outlook) return "";
+    const rows = [
+      ["Scénario à surveiller", outlook.primaryScenario],
+      ["Confirmation requise", outlook.trigger],
+      ["Invalidation", outlook.invalidation],
+      ["Bougie clôturée", outlook.candle],
+      ["Structure des swings", outlook.structure],
+      ["Balayage de liquidité", outlook.liquidity],
+      ["Imbalance récente", outlook.imbalance],
+    ].filter(([, value]) => Boolean(value));
+    return `
+      <section class="pa-market-outlook" aria-label="Prévision conditionnelle Price Action">
+        <div class="pa-market-outlook-head">
+          <div><span>Price Action · lecture OHLC</span><strong>${escapeHtml(outlook.bias || "Biais non déterminé")}</strong></div>
+          <b>SCÉNARIO CONDITIONNEL</b>
+        </div>
+        <div class="pa-market-outlook-location"><span>Position actuelle dans la structure</span><strong>${escapeHtml(outlook.priceLocation || "indisponible")}</strong></div>
+        <div class="pa-market-outlook-grid">${rows.map(([label, value]) => `
+          <div><span>${escapeHtml(label)}</span><p>${escapeHtml(value)}</p></div>
+        `).join("")}</div>
+        <div class="pa-market-outlook-footer">
+          <span>${escapeHtml(outlook.dataNote || "Données OHLC indisponibles")}</span>
+          <strong>${escapeHtml(outlook.levelsNote || "Aucun niveau d'ordre calculé sans déclencheur confirmé.")}</strong>
+        </div>
       </section>
     `;
   }

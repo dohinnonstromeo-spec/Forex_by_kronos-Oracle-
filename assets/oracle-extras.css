@@ -1123,6 +1123,78 @@ body {
   white-space: pre-line;
 }
 
+.pa-market-outlook {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid rgba(72, 211, 164, .28);
+  border-radius: 14px;
+  background: linear-gradient(145deg, rgba(14, 31, 35, .88), rgba(15, 20, 28, .92));
+}
+.pa-market-outlook-head,
+.pa-market-outlook-head > div {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.pa-market-outlook-head > div { flex-direction: column; }
+.pa-market-outlook-head span,
+.pa-market-outlook-location span,
+.pa-market-outlook-grid span {
+  color: var(--muted-foreground);
+  font-size: 10px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.pa-market-outlook-head strong { color: var(--foreground); font-size: 14px; }
+.pa-market-outlook-head b {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid rgba(72, 211, 164, .25);
+  border-radius: 999px;
+  color: #80e6bd;
+  font-size: 8px;
+  letter-spacing: .08em;
+}
+.pa-market-outlook-location {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .035);
+}
+.pa-market-outlook-location strong { color: var(--foreground); font-size: 11px; }
+.pa-market-outlook-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.pa-market-outlook-grid > div {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid rgba(255, 255, 255, .06);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .025);
+}
+.pa-market-outlook-grid p {
+  margin: 5px 0 0;
+  color: var(--foreground);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.pa-market-outlook-footer { display: grid; gap: 6px; }
+.pa-market-outlook-footer span,
+.pa-market-outlook-footer strong { color: var(--muted-foreground); font-size: 9px; line-height: 1.45; }
+.pa-market-outlook-footer strong { color: #f6c85f; font-weight: 500; }
+@media (max-width: 560px) {
+  .pa-market-outlook { padding: 12px; }
+  .pa-market-outlook-grid { grid-template-columns: 1fr; }
+  .pa-market-outlook-head { flex-direction: column; }
+}
+
 .no-signal-grid {
   margin-top: 14px;
   display: grid;
