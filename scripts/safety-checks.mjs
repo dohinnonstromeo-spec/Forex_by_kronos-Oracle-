@@ -610,11 +610,6 @@ const backtestStyleSource = await readFile(new URL("../scripts/backtest-analysis
 const exitRulesSource = await readFile(new URL("../trading-exit-rules.mjs", import.meta.url), "utf8");
 const brokerE2eSource = await readFile(new URL("../scripts/broker-e2e-tests.mjs", import.meta.url), "utf8");
 const packageSource = await readFile(new URL("../package.json", import.meta.url), "utf8");
-const chartlessPaAnswerStart = serverSource.indexOf("const deterministicPriceActionScalp =");
-const chartlessPaAnswerEnd = serverSource.indexOf("let answer = smcMode", chartlessPaAnswerStart);
-const chartlessPaAnswerBlock = chartlessPaAnswerStart >= 0 && chartlessPaAnswerEnd > chartlessPaAnswerStart
-  ? serverSource.slice(chartlessPaAnswerStart, chartlessPaAnswerEnd)
-  : "";
 const apiOnlyPaStart = serverSource.indexOf("function buildApiOnlyAnalysisText(");
 const apiOnlyPaEnd = serverSource.indexOf("function trendDirection(", apiOnlyPaStart);
 const apiOnlyPaSource = apiOnlyPaStart >= 0 && apiOnlyPaEnd > apiOnlyPaStart
@@ -637,13 +632,12 @@ const paRenderSource = paRenderStart >= 0 && paRenderEnd > paRenderStart
   ? paFrontendSource.slice(paRenderStart, paRenderEnd)
   : "";
 check(
-  "chartless Price Action scalping uses its OHLC read at every analysis depth, outside the separate research mode",
-  chartlessPaAnswerBlock.includes("!images.length && !smcMode && !priceActionResearchMode")
-    && serverSource.includes(": deterministicPriceActionScalp\n      ? buildPriceActionScalpNoSignalText({")
-    && apiOnlyPaSource.includes("isScalpingStrategy(strategy)")
-    && apiOnlyPaSource.indexOf("return buildPriceActionScalpNoSignalText") < apiOnlyPaSource.indexOf("const rawTrend")
-    && deterministicPaSource.includes("isScalpingStrategy(strategy)")
-    && deterministicPaSource.indexOf("return buildPriceActionScalpNoSignalText") < deterministicPaSource.indexOf("const price"),
+  "chartless Price Action can return a validated plan while keeping a no-signal fallback",
+  !serverSource.includes("const deterministicPriceActionScalp =")
+    && apiOnlyPaSource.includes("!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !trendDirection(rawTrend)")
+    && deterministicPaSource.includes("!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !directionalEvidence")
+    && apiOnlyPaSource.includes("return buildPriceActionScalpNoSignalText")
+    && deterministicPaSource.includes("return buildPriceActionScalpNoSignalText"),
 );
 check(
   "chartless Price Action displays both conditional directions and their OHLC context",

@@ -678,7 +678,7 @@
       || technical.historyFresh === false
       || technical.timeframeCompatible === false;
     const dataTroubleshooting = historyNeedsAttention && historyDiagnostics
-      ? `<details class="no-signal-data-status"><summary>Diagnostic de l'historique OHLC</summary>
+      ? `<details class="no-signal-data-status" open><summary>Diagnostic de l'historique OHLC</summary>
           <p>${escapeHtml(`${historyDiagnostics.status || "données insuffisantes"} · timeframe demandé ${historyDiagnostics.timeframe || timeframe || "n/a"} · ${historyDiagnostics.elapsedMs ?? "?"} ms · budget ${historyDiagnostics.budgetMs ?? "?"} ms`)}</p>
           ${providerAttempts.length ? `<ul>${providerAttempts.map((attempt) => `<li>${escapeHtml(`${attempt.provider || "source"}${attempt.interval ? `/${attempt.interval}` : ""} : ${attempt.result || "réponse inconnue"}${attempt.bars ? ` (${attempt.bars} bougies)` : ""}`)}</li>`).join("")}</ul>` : ""}
           ${providerErrors.length ? `<p>Détails : ${escapeHtml(providerErrors.join(" · "))}</p>` : ""}

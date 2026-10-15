@@ -6172,9 +6172,6 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
     const aiBudgetMs = images.length
       ? deepAnalysis ? 85000 : 35000
       : deepAnalysis ? 32000 : 9000;
-    const deterministicPriceActionScalp = !images.length && !smcMode && !priceActionResearchMode
-      && /^price\s*action$/i.test(String(body.style || "Price Action"))
-      && isScalpingStrategy(body.strategy || "Scalping");
     // Fired now, alongside the main vision call below, so this only costs an extra
     // API call, not extra latency (both resolve around the same time; awaited once
     // `answer` is already settled). No-ops instantly (checked: false) unless both
@@ -6184,16 +6181,6 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
       ? buildSmcOnlyAnswer(smcAnalysis)
       : priceActionResearchMode
       ? buildPriceActionResearchText({ pair: selectedPair, timeframe: selectedTimeframe, priceActionAnalysis, technicalSnapshot })
-      : deterministicPriceActionScalp
-      ? buildPriceActionScalpNoSignalText({
-        pair: selectedPair,
-        timeframe: selectedTimeframe,
-        livePrice,
-        technicalSnapshot,
-        newsContext,
-        multiTimeframe,
-        reason: "lecture OHLC sans capture: Kronos affiche le biais et les scénarios conditionnels, mais n'émet pas d'ordre sans déclencheur confirmé.",
-      })
       : !deepAnalysis && !images.length
       ? buildDeterministicAnalysisText({
         pair: selectedPair,
@@ -9513,7 +9500,12 @@ STYLE_EFFICACITE:${technique}=45`;
 
 function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
-  if (/^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy)) {
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
+    ? String(technicalSnapshot.trend)
+    : mtf.dominant;
+  const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
+  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !trendDirection(rawTrend))) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
@@ -9521,13 +9513,9 @@ function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = 
       technicalSnapshot,
       newsContext,
       multiTimeframe,
-      reason: "sans déclencheur OHLC confirmé, la lecture reste un scénario conditionnel et ne donne pas d'ordre à copier.",
+      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
     });
   }
-  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
-  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
-    ? String(technicalSnapshot.trend)
-    : mtf.dominant;
   const trend = /baissi/i.test(String(rawTrend || "")) ? "baissière" : "haussière";
   const direction = trend === "baissière" ? "VENTE" : "ACHAT";
   const live = Number(livePrice?.price);
@@ -9608,7 +9596,10 @@ function buildSmcOnlyAnswer(smc = null) {
 }
 function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
-  if (/^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy)) {
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
+  const directionalEvidence = trendDirection(technicalSnapshot.trend) || trendDirection(mtf.dominant);
+  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !directionalEvidence)) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
@@ -9616,10 +9607,9 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", st
       technicalSnapshot,
       newsContext,
       multiTimeframe,
-      reason: "le biais seul ne suffit pas; aucune cassure/retest ou réaction confirmée n'est validée comme entrée.",
+      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
     });
   }
-  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;
