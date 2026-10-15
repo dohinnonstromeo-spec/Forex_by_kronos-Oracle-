@@ -713,6 +713,9 @@
     if (!outlook) return "";
     const rows = [
       ["Scénario à surveiller", outlook.primaryScenario],
+      ["Position dans la structure", outlook.marketState],
+      ["Option haussière · conditionnelle", outlook.bullishScenario],
+      ["Option baissière · conditionnelle", outlook.bearishScenario],
       ["Confirmation requise", outlook.trigger],
       ["Invalidation", outlook.invalidation],
       ["Bougie clôturée", outlook.candle],

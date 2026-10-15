@@ -6172,6 +6172,9 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
     const aiBudgetMs = images.length
       ? deepAnalysis ? 85000 : 35000
       : deepAnalysis ? 32000 : 9000;
+    const deterministicPriceActionScalp = !images.length && !smcMode && !priceActionResearchMode
+      && /^price\s*action$/i.test(String(body.style || "Price Action"))
+      && isScalpingStrategy(body.strategy || "Scalping");
     // Fired now, alongside the main vision call below, so this only costs an extra
     // API call, not extra latency (both resolve around the same time; awaited once
     // `answer` is already settled). No-ops instantly (checked: false) unless both
@@ -6181,6 +6184,16 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
       ? buildSmcOnlyAnswer(smcAnalysis)
       : priceActionResearchMode
       ? buildPriceActionResearchText({ pair: selectedPair, timeframe: selectedTimeframe, priceActionAnalysis, technicalSnapshot })
+      : deterministicPriceActionScalp
+      ? buildPriceActionScalpNoSignalText({
+        pair: selectedPair,
+        timeframe: selectedTimeframe,
+        livePrice,
+        technicalSnapshot,
+        newsContext,
+        multiTimeframe,
+        reason: "lecture OHLC sans capture: Kronos affiche le biais et les scénarios conditionnels, mais n'émet pas d'ordre sans déclencheur confirmé.",
+      })
       : !deepAnalysis && !images.length
       ? buildDeterministicAnalysisText({
         pair: selectedPair,
@@ -9216,12 +9229,16 @@ function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, mult
   return "Confluence insuffisante pour proposer un plan sans screenshot.";
 }
 
-function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, reason }) {
+function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
   const outlook = buildPriceActionMarketOutlook({ pair, timeframe, livePrice, technicalSnapshot });
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const quoteUsable = isUsableLivePrice(livePrice);
   const observedPrice = quoteUsable ? livePrice?.price : technicalSnapshot.last;
   const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
   const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
+  const newsLine = newsContext?.enabled
+    ? newsContext.activeRisk ? "risque macro actif détecté" : newsContext.summary || "contexte consulté, aucun risque rouge confirmé"
+    : "contexte macro non inclus dans cette analyse";
   return `PRICE ACTION SCALPING — ${pair} ${timeframe}
 - ${quoteUsable ? "Prix en direct" : "Derniere cloture OHLC"} : ${formatLevel(observedPrice, pair)}${quoteUsable ? "" : ` (${livePrice?.source || "cotation live indisponible"})`}
 - Synthese technique : ${technicalSnapshot.text || "donnees de bougie insuffisantes"}
@@ -9230,6 +9247,8 @@ function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5",
 - Déclencheur à attendre : ${outlook.trigger}
 - Invalidation du scénario : ${outlook.invalidation}
 - Bougies OHLC : ${outlook.candle}; ${outlook.structure}; ${outlook.liquidity}; ${outlook.imbalance}.
+- Multi-timeframe : ${mtf.summary}.
+- News / macro : ${newsLine}.
 - Données : ${outlook.dataNote}
 - Signal détecté : AUCUN SIGNAL — ${reason}
 - Zone de référence : support ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"}; résistance ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}.
@@ -9308,9 +9327,44 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
   }
 
   let priceLocation = "indisponible";
+  let rangePosition = null;
   if (zonesUsable && Number.isFinite(price)) {
-    const rangePosition = Math.max(0, Math.min(100, (price - support) / (resistance - support) * 100));
+    rangePosition = Math.max(0, Math.min(100, (price - support) / (resistance - support) * 100));
     priceLocation = `${rangePosition.toFixed(0)} % de la fourchette ${formatLevel(support, pair)}–${formatLevel(resistance, pair)} (repère OHLC, pas une zone d'ordre)`;
+  }
+  const atr = Number(technicalSnapshot.atr);
+  const rangeWidth = zonesUsable ? resistance - support : NaN;
+  const proximity = Number.isFinite(atr) && atr > 0
+    ? Number.isFinite(rangeWidth) && rangeWidth > 0
+      ? Math.min(atr * 0.25, rangeWidth * 0.2)
+      : atr * 0.25
+    : Number.isFinite(rangeWidth) && rangeWidth > 0 ? rangeWidth * 0.04 : NaN;
+  const nearSupport = zonesUsable && Number.isFinite(price) && Number.isFinite(proximity) && Math.abs(price - support) <= proximity;
+  const nearResistance = zonesUsable && Number.isFinite(price) && Number.isFinite(proximity) && Math.abs(resistance - price) <= proximity;
+  const marketState = !zonesUsable || !Number.isFinite(price)
+    ? "Position dans la structure indisponible"
+    : price > resistance + (Number.isFinite(proximity) ? proximity : 0)
+      ? "Prix au-dessus de la résistance calculée; attendre une clôture puis un retest tenu"
+      : price < support - (Number.isFinite(proximity) ? proximity : 0)
+        ? "Prix sous le support calculé; attendre une clôture puis un retest rejeté"
+        : nearSupport
+      ? "Prix proche du support calculé; réaction à confirmer à la clôture"
+      : nearResistance
+        ? "Prix proche de la résistance calculée; rejet ou cassure à confirmer à la clôture"
+        : "Prix entre les bornes calculées; marché au milieu de la structure, patience préférable";
+  let bullishScenario = "Scénario haussier suspendu: historique frais et niveaux mesurables requis.";
+  let bearishScenario = "Scénario baissier suspendu: historique frais et niveaux mesurables requis.";
+  if (enoughBars && fresh && zonesUsable) {
+    if (nearSupport) {
+      bullishScenario = `Achat à envisager seulement si une bougie clôturée rejette ${formatLevel(support, pair)} puis reprend le niveau; une mèche seule ne confirme rien.`;
+      bearishScenario = `Biais vendeur si une clôture passe sous ${formatLevel(support, pair)} puis échoue à le reprendre au retest; retour au-dessus du support invalide cette lecture.`;
+    } else if (nearResistance) {
+      bullishScenario = `Biais acheteur si une clôture passe au-dessus de ${formatLevel(resistance, pair)} puis tient le retest; un simple dépassement par mèche ne suffit pas.`;
+      bearishScenario = `Vente à envisager seulement si une bougie clôturée rejette ${formatLevel(resistance, pair)} et clôture de nouveau sous le niveau.`;
+    } else {
+      bullishScenario = `Biais acheteur uniquement après clôture au-dessus de ${formatLevel(resistance, pair)} puis retest tenu.`;
+      bearishScenario = `Biais vendeur uniquement après clôture sous ${formatLevel(support, pair)} puis retest rejeté.`;
+    }
   }
   const source = String(technicalSnapshot.source || "source inconnue");
   const dataNote = `${bars} bougies ${timeframe} · ${source}${fresh ? " · historique clôturé récent" : " · fraîcheur OHLC non confirmée"}${technicalSnapshot.timeframeCompatible === false ? " · timeframe non aligné" : ""}${quoteUsable ? " · cotation live utilisable" : " · cotation live indisponible, lecture basée sur la dernière clôture"}`;
@@ -9324,6 +9378,10 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     trigger,
     invalidation,
     priceLocation,
+    marketState,
+    bullishScenario,
+    bearishScenario,
+    rangePosition,
     support: zonesUsable ? formatLevel(support, pair) : null,
     resistance: zonesUsable ? formatLevel(resistance, pair) : null,
     candle: String(read.candle || "motif de bougie non disponible"),
@@ -9417,6 +9475,17 @@ STYLE_EFFICACITE:Price Action=0`;
 }
 
 function buildApiOnlyNoSignalText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
+  if (/^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy)) {
+    return buildPriceActionScalpNoSignalText({
+      pair,
+      timeframe,
+      livePrice,
+      technicalSnapshot,
+      newsContext,
+      multiTimeframe,
+      reason: `${reason || "confluence insuffisante"} Un biais de tendance seul ne valide pas une entrée scalp.`,
+    });
+  }
   const technique = style === "Mixte" ? "Price Action" : style;
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   return `📸 LECTURE DES GRAPHIQUES :
@@ -9444,20 +9513,21 @@ STYLE_EFFICACITE:${technique}=45`;
 
 function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
-  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
-  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
-    ? String(technicalSnapshot.trend)
-    : mtf.dominant;
-  const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
-  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !trendDirection(rawTrend))) {
+  if (/^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy)) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
       livePrice,
       technicalSnapshot,
-      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
+      newsContext,
+      multiTimeframe,
+      reason: "sans déclencheur OHLC confirmé, la lecture reste un scénario conditionnel et ne donne pas d'ordre à copier.",
     });
   }
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
+    ? String(technicalSnapshot.trend)
+    : mtf.dominant;
   const trend = /baissi/i.test(String(rawTrend || "")) ? "baissière" : "haussière";
   const direction = trend === "baissière" ? "VENTE" : "ACHAT";
   const live = Number(livePrice?.price);
@@ -9538,18 +9608,18 @@ function buildSmcOnlyAnswer(smc = null) {
 }
 function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
-  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
-  const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
-  const directionalEvidence = trendDirection(technicalSnapshot.trend) || trendDirection(mtf.dominant);
-  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !directionalEvidence)) {
+  if (/^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy)) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
       livePrice,
       technicalSnapshot,
-      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
+      newsContext,
+      multiTimeframe,
+      reason: "le biais seul ne suffit pas; aucune cassure/retest ou réaction confirmée n'est validée comme entrée.",
     });
   }
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;

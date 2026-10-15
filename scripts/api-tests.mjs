@@ -486,6 +486,28 @@ test("supported PNG image quality is parsed without image-size", { skip: !hasSec
   assert.equal(result.data.noSignal, true);
   assert.match(result.data.meta?.imageQuality?.reason || "", /1x1/);
 });
+test("chartless Price Action M5 returns an OHLC reading without inventing an order", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+  resetRateLimits();
+  const result = await postJson("/api/analyze-chart", {
+    pair: "EUR/USD",
+    timeframe: "M5",
+    style: "Price Action",
+    strategy: "Scalping",
+    analysisDepth: "Rapide",
+  }, { "X-Kronos-Test-Token": TEST_TOKEN });
+  assert.equal(result.status, 200);
+  assert.equal(result.data.noSignal, true);
+  assert.equal(result.data.direction, "AUCUN SIGNAL");
+  assert.equal(result.data.entry, "—");
+  assert.equal(result.data.sl, "—");
+  assert.equal(result.data.tp1, "—");
+  assert.equal(result.data.tp2, "—");
+  assert.equal(result.data.meta?.marketOutlook?.pair, "EUR/USD");
+  assert.ok(result.data.meta?.marketOutlook?.bullishScenario);
+  assert.ok(result.data.meta?.marketOutlook?.bearishScenario);
+  assert.match(result.data.explanation || "", /PRICE ACTION SCALPING/);
+  assert.match(result.data.explanation || "", /AUCUN SIGNAL/);
+});
 test("public health and config expose safe shapes only", async () => {
   const health = await fetch(`${BASE}/api/health`);
   const healthData = await health.json();
