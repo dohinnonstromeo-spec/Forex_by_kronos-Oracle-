@@ -9444,19 +9444,20 @@ STYLE_EFFICACITE:${technique}=45`;
 
 function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
-  if (style === "Price Action" && isScalpingStrategy(strategy)) {
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
+    ? String(technicalSnapshot.trend)
+    : mtf.dominant;
+  const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
+  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !trendDirection(rawTrend))) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
       livePrice,
       technicalSnapshot,
-      reason: "la tendance et les niveaux API ne confirment pas le setup sur les bougies.",
+      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
     });
   }
-  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
-  const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
-    ? String(technicalSnapshot.trend)
-    : mtf.dominant;
   const trend = /baissi/i.test(String(rawTrend || "")) ? "baissière" : "haussière";
   const direction = trend === "baissière" ? "VENTE" : "ACHAT";
   const live = Number(livePrice?.price);
@@ -9537,20 +9538,22 @@ function buildSmcOnlyAnswer(smc = null) {
 }
 function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
-  if (style === "Price Action" && isScalpingStrategy(strategy)) {
+  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
+  const directionalEvidence = trendDirection(technicalSnapshot.trend) || trendDirection(mtf.dominant);
+  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !directionalEvidence)) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
       livePrice,
       technicalSnapshot,
-      reason: "le repli deterministe ne confirme ni rejet ni cassure/retest avec les donnees de bougie.",
+      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
     });
   }
   const price = Number.isFinite(Number(livePrice?.price))
     ? Number(livePrice.price)
     : Number(fallbackPrices[pair]?.price) || 1;
   const snapshotDirection = trendDirection(technicalSnapshot.trend);
-  const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const mtfDirection = trendDirection(mtf.dominant);
   const direction = snapshotDirection || mtfDirection || (Number(livePrice?.change) < 0 ? "VENTE" : "ACHAT");
   const levels = buildAssistedLevels({
