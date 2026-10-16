@@ -6023,9 +6023,14 @@ async function runKronosAnalysis({ body, images, req, user }) {
         historyPromise,
         promiseWithTimeout(livePricePromise, 1800, null),
       ]);
-      // History may take long enough for the initially timed-out quote request to
-      // finish. Reuse that result once before declaring live pricing unavailable.
-      if (!livePrice) livePrice = await promiseWithTimeout(livePricePromise, 1800, null);
+      // A successful Deriv candle response means symbol discovery has completed;
+      // the parallel tick request can still need its full 5s websocket window.
+      // Waiting only another 1.8s made healthy same-feed quote/spread responses
+      // lose a timing race and falsely closed the execution gate.
+      if (!livePrice) {
+        const derivHistory = /^deriv_ws:/i.test(String(history?._meta?.source || ""));
+        livePrice = await promiseWithTimeout(livePricePromise, derivHistory ? 5500 : 1800, null);
+      }
     } else {
       history = await getHistoryForSymbol(selectedPair, livePrice, historyOptions);
     }
@@ -7025,6 +7030,11 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     attempts: [],
     errors: [],
   };
+  // The budget covers the whole fetch path, including Deriv symbol discovery.
+  // Previously the fallback deadline started only after Deriv finished, so a
+  // cold websocket lookup plus a full series of vendor timeouts could keep the
+  // chartless analysis request open far beyond its advertised history budget.
+  const deadline = startedAt + diagnostics.budgetMs;
   const finish = (history, status = null) => {
     const bars = Array.isArray(history) ? history : [];
     if (!bars._meta) tagHistory(bars, bars.length ? "historique" : "aucun historique", true, null, options.timeframe || null);
@@ -7057,9 +7067,22 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const derivQuoteConfirmed = price?.source === "deriv_ws" && price.open && isUsableLivePrice(price);
   const canReadHistoricalDeriv = options.allowHistoricalWithoutLive === true;
   if (options.preferDeriv && (derivQuoteConfirmed || canReadHistoricalDeriv)) {
-    try {
-      const derivBars = await fetchDerivAnalysisHistory(symbol, options.timeframe, Math.max(2500, Math.min(10000, diagnostics.budgetMs)));
-      if (derivBars.length >= 30 && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      diagnostics.errors.push("budget_historique_atteint_avant_deriv");
+    } else try {
+      const budgetExpired = Symbol("history_budget_expired");
+      const derivPromise = fetchDerivAnalysisHistory(
+        symbol,
+        options.timeframe,
+        Math.max(2500, Math.min(10000, remainingMs)),
+      );
+      const derivBars = await promiseWithTimeout(derivPromise, remainingMs, budgetExpired);
+      if (derivBars === budgetExpired) {
+        diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "budget_timeout" });
+        diagnostics.errors.push("deriv_ws:budget_historique_atteint");
+        recordProviderHealth("deriv_ws_history", false, "history_budget_timeout");
+      } else if (derivBars.length >= 30 && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
         && !derivBars._meta?.stale && isHistoryCompatible(derivBars, options)) {
         try {
           await saveMarketCache(historyCacheUpdate(cache, { [symbol]: derivBars }, options));
@@ -7068,9 +7091,10 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
         }
         recordProviderHealth("deriv_ws_history", true);
         return finish(derivBars, "deriv_live");
+      } else {
+        diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: derivBars.length >= 30 ? "incompatible" : "insufficient_bars" });
+        recordProviderHealth("deriv_ws_history", false, derivBars.length >= 30 ? "stale_or_incompatible" : `insufficient_bars:${derivBars.length}`);
       }
-      diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: derivBars.length >= 30 ? "incompatible" : "insufficient_bars" });
-      recordProviderHealth("deriv_ws_history", false, derivBars.length >= 30 ? "stale_or_incompatible" : `insufficient_bars:${derivBars.length}`);
     } catch (error) {
       const reason = safeHistoryError(error);
       diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "error" });
@@ -7078,9 +7102,6 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       recordProviderHealth("deriv_ws_history", false, reason);
     }
   }
-  // Give fallback vendors their own bounded window after the Deriv attempt: the
-  // websocket may first spend several seconds resolving active-symbol metadata.
-  const deadline = Date.now() + diagnostics.budgetMs;
   if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) {
     diagnostics.cache = true;
     return finish(cached, "cache_frais");
@@ -7099,12 +7120,19 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   ];
   for (const [source, loader] of attempts) {
     for (const interval of preferredIntervals) {
-      if (Date.now() > deadline) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
         diagnostics.errors.push("budget_historique_atteint");
         return finish(fallbackHistory, "budget_atteint");
       }
       try {
-        const bars = await loader(symbol, interval);
+        const budgetExpired = Symbol("history_budget_expired");
+        const bars = await promiseWithTimeout(loader(symbol, interval), remainingMs, budgetExpired);
+        if (bars === budgetExpired) {
+          diagnostics.attempts.push({ provider: source, interval, result: "budget_timeout" });
+          diagnostics.errors.push(`${source}:${interval}:budget_historique_atteint`);
+          return finish(fallbackHistory, "budget_atteint");
+        }
         if (bars.length >= 30) {
           if (options.requireOpen && !bars.every((bar) => Number.isFinite(Number(bar.open)))) {
             diagnostics.attempts.push({ provider: source, interval, result: "open_missing" });
@@ -7134,9 +7162,15 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       }
     }
   }
-  if (Date.now() <= deadline && options.requireExactTimeframe !== true) {
+  if (Date.now() < deadline && options.requireExactTimeframe !== true) {
     try {
-      const bars = await fetchDukascopyHistory(symbol);
+      const budgetExpired = Symbol("history_budget_expired");
+      const bars = await promiseWithTimeout(fetchDukascopyHistory(symbol), deadline - Date.now(), budgetExpired);
+      if (bars === budgetExpired) {
+        diagnostics.attempts.push({ provider: "dukascopy", interval: "1day", result: "budget_timeout" });
+        diagnostics.errors.push("dukascopy:budget_historique_atteint");
+        return finish(fallbackHistory, "budget_atteint");
+      }
       if (bars.length >= 30) {
         tagHistory(bars, "dukascopy:daily", true, null, options.timeframe || null);
         diagnostics.attempts.push({ provider: "dukascopy", interval: "1day", result: "indicative_daily_fallback", bars: bars.length });
@@ -8937,10 +8971,11 @@ async function fetchText(url, timeoutMs = 2200) {
 }
 
 function promiseWithTimeout(promise, timeoutMs, fallbackValue = null) {
-  return Promise.race([
-    promise,
-    new Promise((resolve) => setTimeout(() => resolve(fallbackValue), timeoutMs)),
-  ]);
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(fallbackValue), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function parseCsv(text) {

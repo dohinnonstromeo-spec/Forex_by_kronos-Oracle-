@@ -649,6 +649,18 @@ check(
     && paFrontendSource.includes("${executionDiagnostics}"),
 );
 check(
+  "chartless OHLC history has one wall-clock budget across Deriv and fallback providers",
+  /const deadline = startedAt \+ diagnostics\.budgetMs/.test(serverSource)
+    && /promiseWithTimeout\(derivPromise, remainingMs, budgetExpired\)/.test(serverSource)
+    && /promiseWithTimeout\(loader\(symbol, interval\), remainingMs, budgetExpired\)/.test(serverSource)
+    && serverSource.includes('result: "budget_timeout"'),
+);
+check(
+  "chartless Deriv history waits for its parallel tick request before closing execution readiness",
+  serverSource.includes("derivHistory ? 5500 : 1800")
+    && serverSource.includes("full 5s websocket window"),
+);
+check(
   "chartless Price Action displays both conditional directions and their OHLC context",
   paOutlookSource.includes("bullishScenario")
     && paOutlookSource.includes("bearishScenario")
