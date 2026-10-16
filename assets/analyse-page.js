@@ -676,7 +676,7 @@
     const providerErrors = Array.isArray(historyDiagnostics?.errors) ? historyDiagnostics.errors : [];
     const executionReadiness = meta.executionReadiness || null;
     const executionDiagnostics = executionReadiness
-      ? `<div class="no-signal-data-status"><strong>Validation d'exécution Deriv</strong><p>Cotation et bougies sur le même flux : ${executionReadiness.feedConfirmed ? "confirmé" : "non confirmé"} · bid/ask pour mesurer le spread : ${executionReadiness.bidAskConfirmed ? "confirmé" : "non confirmé"}.</p><p>${escapeHtml(executionReadiness.reason || "Le contexte reste lisible; le plan d'ordre attend une validation complète du flux.")}</p></div>`
+      ? `<div class="no-signal-data-status"><strong>Pourquoi aucun ordre copiable n'est affiché</strong><p>Historique OHLC frais et aligné : ${executionReadiness.historyConfirmed ? "confirmé" : "non confirmé"} · prix et bougies Deriv alignés : ${executionReadiness.feedConfirmed ? "confirmé" : "non confirmé"} · bid/ask pour mesurer le spread : ${executionReadiness.bidAskConfirmed ? "confirmé" : "non confirmé"} · déclencheur Price Action : ${executionReadiness.triggerConfirmed ? "confirmé" : "non confirmé"}.</p><p>${escapeHtml(executionReadiness.reason || "L'analyse du marché reste disponible; le plan d'ordre attend sa confirmation.")}</p></div>`
       : "";
     const historyNeedsAttention = Number(technical.bars || 0) < 30
       || technical.historyFresh === false

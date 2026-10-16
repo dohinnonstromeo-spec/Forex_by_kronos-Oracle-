@@ -632,20 +632,27 @@ const paRenderSource = paRenderStart >= 0 && paRenderEnd > paRenderStart
   ? paFrontendSource.slice(paRenderStart, paRenderEnd)
   : "";
 check(
-  "chartless Price Action can return a validated plan while keeping a no-signal fallback",
+  "chartless PA scalping keeps the OHLC read but cannot turn trend bias into default order levels",
   !serverSource.includes("const deterministicPriceActionScalp =")
-    && apiOnlyPaSource.includes("!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !trendDirection(rawTrend)")
-    && deterministicPaSource.includes("!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !directionalEvidence")
+    && apiOnlyPaSource.includes("if (scalpPriceAction) {")
+    && deterministicPaSource.includes("if (scalpPriceAction) {")
     && apiOnlyPaSource.includes("return buildPriceActionScalpNoSignalText")
-    && deterministicPaSource.includes("return buildPriceActionScalpNoSignalText"),
+    && deterministicPaSource.includes("return buildPriceActionScalpNoSignalText")
+    && deterministicPaSource.indexOf("return buildPriceActionScalpNoSignalText") < deterministicPaSource.indexOf("const price =")
+    && serverSource.includes("function chartlessPriceActionScalpReason(")
+    && serverSource.includes("Le détecteur cassure/retest reste en recherche")
+    && serverSource.indexOf("The deterministic price snapshot (SMA/RSI + trend) is context") > serverSource.indexOf("deepAnalysis && isUnproductiveAnalysis(answer)")
+    && serverSource.indexOf("The deterministic price snapshot (SMA/RSI + trend) is context") < serverSource.indexOf("const visionConsensus = await visionConsensusPromise"),
 );
 check(
   "chartless Price Action keeps the OHLC reading visible when Deriv execution data is incomplete",
   serverSource.includes("const chartlessExecutionBlocked = strictPriceActionScalp && !hasChartImages")
     && serverSource.includes("plan d'ordre est bloqué: cotation, bougies Deriv")
-    && serverSource.includes("executionReadiness: {")
+    && serverSource.includes("executionReadiness: strictPriceActionScalp && !hasChartImages")
+    && serverSource.includes("triggerConfirmed: false")
+    && serverSource.includes("historyConfirmed,")
     && serverSource.includes("meta.executionReadiness?.reason")
-    && paFrontendSource.includes("Validation d'exécution Deriv")
+    && paFrontendSource.includes("Pourquoi aucun ordre copiable n'est affiché")
     && paFrontendSource.includes("${executionDiagnostics}"),
 );
 check(

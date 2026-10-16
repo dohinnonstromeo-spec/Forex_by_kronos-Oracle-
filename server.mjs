@@ -6256,6 +6256,24 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         multiTimeframe,
       });
     }
+    // The deterministic price snapshot (SMA/RSI + trend) is context, not a
+    // Price Action trigger. Keep the complete OHLC/news/MTF read in the result,
+    // but never turn that directional bias into copyable scalp levels. The
+    // only mechanical break/retest detector is explicitly research-only: the
+    // frozen walk-forward runs did not establish a robust positive edge.
+    if (!smcMode && !priceActionResearchMode && !images.length
+      && /^price\s*action$/i.test(String(body.style || "Price Action"))
+      && isScalpingStrategy(body.strategy || "Scalping")) {
+      answer = buildPriceActionScalpNoSignalText({
+        pair: selectedPair,
+        timeframe: selectedTimeframe,
+        livePrice,
+        technicalSnapshot,
+        newsContext,
+        multiTimeframe,
+        reason: chartlessPriceActionScalpReason(technicalSnapshot),
+      });
+    }
     const visionConsensus = await visionConsensusPromise;
     const deterministicCheck = await crossCheckPromise;
     // Reported live: a real user kept getting entries visibly far from the price they
@@ -9300,6 +9318,13 @@ TECHNIQUE_UTILISEE:Price Action
 STYLE_EFFICACITE:Price Action=45`;
 }
 
+function chartlessPriceActionScalpReason(technicalSnapshot = {}) {
+  if (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || technicalSnapshot.timeframeCompatible === false) {
+    return "Historique OHLC insuffisant, périmé ou non aligné : la lecture reste partielle et aucun biais confirmé n'est publié.";
+  }
+  return "Lecture de tendance disponible, mais elle ne confirme pas à elle seule un déclencheur Price Action. Le détecteur cassure/retest reste en recherche et n'a pas démontré d'avantage robuste après coûts; aucun ordre copiable ne sera déduit du seul biais.";
+}
+
 function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {} } = {}) {
   const bars = Math.max(0, Number(technicalSnapshot.bars) || 0);
   const read = technicalSnapshot.priceActionRead || {};
@@ -9558,7 +9583,7 @@ function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = 
     ? String(technicalSnapshot.trend)
     : mtf.dominant;
   const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
-  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !trendDirection(rawTrend))) {
+  if (scalpPriceAction) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
@@ -9566,7 +9591,7 @@ function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = 
       technicalSnapshot,
       newsContext,
       multiTimeframe,
-      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
+      reason: chartlessPriceActionScalpReason(technicalSnapshot),
     });
   }
   const trend = /baissi/i.test(String(rawTrend || "")) ? "baissière" : "haussière";
@@ -9651,8 +9676,7 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", st
   const technique = style === "Mixte" ? "Price Action" : style;
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
-  const directionalEvidence = trendDirection(technicalSnapshot.trend) || trendDirection(mtf.dominant);
-  if (scalpPriceAction && (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || !directionalEvidence)) {
+  if (scalpPriceAction) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
@@ -9660,7 +9684,7 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", st
       technicalSnapshot,
       newsContext,
       multiTimeframe,
-      reason: "l'historique OHLC ne confirme pas une tendance exploitable pour le scalp.",
+      reason: chartlessPriceActionScalpReason(technicalSnapshot),
     });
   }
   const price = Number.isFinite(Number(livePrice?.price))
@@ -10210,6 +10234,31 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     derivSpreadConfirmed: livePrice?.bid != null && livePrice?.ask != null
       && Number.isFinite(Number(livePrice.bid)) && Number.isFinite(Number(livePrice.ask))
       && Number(livePrice.bid) > 0 && Number(livePrice.ask) >= Number(livePrice.bid),
+    executionReadiness: strictPriceActionScalp && !hasChartImages && body.analysisMode !== "pa_research"
+      ? (() => {
+        const feedConfirmed = livePrice?.source === "deriv_ws"
+          && /^deriv_ws:/i.test(String(context.technicalSnapshot?.source || ""));
+        const historyConfirmed = Boolean(context.technicalSnapshot?.valid
+          && context.technicalSnapshot?.historyFresh
+          && context.technicalSnapshot?.timeframeCompatible !== false);
+        const bidAskConfirmed = livePrice?.bid != null && livePrice?.ask != null
+          && Number.isFinite(Number(livePrice.bid)) && Number.isFinite(Number(livePrice.ask))
+          && Number(livePrice.bid) > 0 && Number(livePrice.ask) >= Number(livePrice.bid);
+        const blockers = [];
+        if (!historyConfirmed) blockers.push("historique OHLC insuffisant, périmé ou non aligné avec l'unité choisie");
+        if (!feedConfirmed) blockers.push("prix live et bougies Deriv non confirmés sur le même flux");
+        if (!bidAskConfirmed) blockers.push("bid/ask Deriv indisponible pour mesurer le spread");
+        if (historyConfirmed && feedConfirmed && bidAskConfirmed) blockers.push("aucune règle automatique de déclenchement n'est validée pour la production");
+        return {
+          ready: false,
+          feedConfirmed,
+          historyConfirmed,
+          bidAskConfirmed,
+          triggerConfirmed: false,
+          reason: blockers.join("; "),
+        };
+      })()
+      : null,
     liveUsable,
     imageQuality,
     calibration,
@@ -10308,7 +10357,11 @@ VALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
         executionReadiness: {
           ready: false,
           feedConfirmed: Boolean(meta.derivFeedConfirmed),
+          historyConfirmed: Boolean(meta.technicalSnapshot?.valid
+            && meta.technicalSnapshot?.historyFresh
+            && meta.technicalSnapshot?.timeframeCompatible !== false),
           bidAskConfirmed: Boolean(meta.derivSpreadConfirmed),
+          triggerConfirmed: false,
           reason: executionIssueSummary || "Données d'exécution Deriv incomplètes.",
         },
       },
@@ -10613,15 +10666,28 @@ function buildNoSignalDiagnostic(details = {}) {
 
   if (/flux public deriv|flux deriv ou spread bid\/ask non confirmé/.test(explanation)) {
     return {
-      status: "FLUX_DERIV_INCOMPLET",
-      statusLabel: "Flux Deriv incomplet",
+      status: "EXECUTION_DATA_INCOMPLETE",
+      statusLabel: "Lecture disponible · exécution suspendue",
       userMessage: meta.marketOutlook
-        ? `Lecture OHLC conservée. Aucun plan d'ordre exécutable : ${meta.executionReadiness?.reason || "flux Deriv ou bid/ask non confirmé"}.`
+        ? `Analyse OHLC terminée. Seul le plan d'ordre copiable est suspendu : ${meta.executionReadiness?.reason || "flux Deriv ou bid/ask non confirmé"}.`
         : "Le prix, les bougies et le bid/ask ne sont pas confirmés sur le même flux Deriv. Kronos bloque le scalping plutôt que de mélanger des cotations différentes.",
       nextActions: [
         "Réessaie quand les cotations Deriv répondent.",
         "Vérifie la paire et l'unité de temps choisies.",
         "Ne copie pas un plan affiché avec une source externe pour l'exécuter chez Deriv.",
+      ],
+    };
+  }
+
+  if (/détecteur cassure\/retest reste en recherche|aucun déclencheur price action validé|aucune règle automatique de déclenchement n'est validée pour la production/.test(explanation)) {
+    return {
+      status: "PA_TRIGGER_REQUIRED",
+      statusLabel: "Analyse Price Action · confirmation attendue",
+      userMessage: "Kronos a lu les bougies et décrit les deux scénarios. La tendance seule ne constitue pas une entrée; attends une cassure suivie d'un retest confirmé ou un rejet clôturé sur un niveau mesurable.",
+      nextActions: [
+        "Lis le scénario principal et son invalidation dans la carte Price Action.",
+        "Attends la clôture du déclencheur avant toute entrée.",
+        "Le mode Recherche OHLC peut montrer un candidat expérimental, sans niveau copiable.",
       ],
     };
   }

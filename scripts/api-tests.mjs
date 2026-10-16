@@ -486,7 +486,7 @@ test("supported PNG image quality is parsed without image-size", { skip: !hasSec
   assert.equal(result.data.noSignal, true);
   assert.match(result.data.meta?.imageQuality?.reason || "", /1x1/);
 });
-test("chartless Price Action M5 returns an OHLC reading and only exposes levels for a validated plan", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+test("chartless Price Action M5 returns an OHLC reading and never converts trend bias into order levels", { skip: !hasSecrets && "needs secret.dev" }, async () => {
   resetRateLimits();
   const result = await postJson("/api/analyze-chart", {
     pair: "EUR/USD",
@@ -499,25 +499,17 @@ test("chartless Price Action M5 returns an OHLC reading and only exposes levels 
   assert.equal(result.data.meta?.marketOutlook?.pair, "EUR/USD");
   assert.ok(result.data.meta?.marketOutlook?.bullishScenario);
   assert.ok(result.data.meta?.marketOutlook?.bearishScenario);
-  if (result.data.noSignal) {
-    assert.equal(result.data.direction, "AUCUN SIGNAL");
-    assert.equal(result.data.entry, "—");
-    assert.equal(result.data.sl, "—");
-    assert.equal(result.data.tp1, "—");
-    assert.equal(result.data.tp2, "—");
-    assert.ok(result.data.explanation || result.data.userMessage || result.data.statusLabel);
-    if (result.data.meta?.executionReadiness?.ready === false) {
-      assert.match(result.data.explanation || "", /PRICE ACTION SCALPING/i);
-      assert.doesNotMatch(result.data.explanation || "", /(?:Zone d'entrée|Stop Loss|Take Profit 1|Take Profit 2)\s*:\s*[0-9]/i);
-    }
-  } else {
-    assert.ok(["ACHAT", "VENTE"].includes(result.data.direction));
-    for (const level of [result.data.entry, result.data.sl, result.data.tp1, result.data.tp2]) {
-      assert.ok(Number.isFinite(Number(level)) && Number(level) > 0);
-    }
-    assert.equal(result.data.meta?.technicalSnapshot?.historyFresh, true);
-    assert.ok(Number(result.data.meta?.technicalSnapshot?.bars) >= 30);
-  }
+  assert.equal(result.data.noSignal, true, "trend-only context must not be emitted as a validated PA scalp order");
+  assert.equal(result.data.direction, "AUCUN SIGNAL");
+  assert.equal(result.data.entry, "—");
+  assert.equal(result.data.sl, "—");
+  assert.equal(result.data.tp1, "—");
+  assert.equal(result.data.tp2, "—");
+  assert.equal(result.data.meta?.executionReadiness?.ready, false);
+  assert.equal(typeof result.data.meta?.executionReadiness?.historyConfirmed, "boolean");
+  assert.equal(result.data.meta?.executionReadiness?.triggerConfirmed, false);
+  assert.ok(result.data.explanation || result.data.userMessage || result.data.statusLabel);
+  assert.doesNotMatch(result.data.explanation || "", /(?:Zone d'entrée|Stop Loss|Take Profit 1|Take Profit 2)\s*:\s*[0-9]/i);
 });
 test("public health and config expose safe shapes only", async () => {
   const health = await fetch(`${BASE}/api/health`);
