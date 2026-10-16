@@ -6014,7 +6014,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
       requireExactTimeframe: smcMode || priceActionResearchMode
         || (/^price\s*action$/i.test(String(body.style || "Price Action")) && isScalpingStrategy(body.strategy || "Scalping")),
       requireOpen: smcMode,
-      historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 10000,
+      historyBudgetMs: deepAnalysis ? 11000 : images.length ? 3500 : 12000,
     };
     let history;
     if (independentOhlcMode) {
