@@ -218,7 +218,7 @@
     const update = () => {
       hint.textContent = mode.value === "pa_research"
         ? "Recherche séparée : exige des bougies Deriv clôturées et alignées. Ses paramètres de sortie sont fixes; les candidats ne sont jamais copiables."
-        : "Moteur standard prudent par défaut : il analyse les bougies disponibles et bloque l'entrée si les données ou le déclencheur manquent.";
+        : "Mode prudent : lecture du marche et scenarios conditionnels, avec un panneau de candidats experimental separe. Aucun candidat ne devient un ordre copiable.";
     };
     mode.addEventListener("change", update);
     update();
@@ -549,6 +549,7 @@
           <div class="level-card tech"><span>Technique</span><strong>${escapeHtml(result.technique)}</strong></div>
         </div>
         ${renderPriceActionMarketOutlook(result)}
+        ${renderPriceActionResearch(result)}
         ${renderPriceFreshness(result)}
         ${renderSmcAnalysis(result)}
         ${renderMarketChart(result)}

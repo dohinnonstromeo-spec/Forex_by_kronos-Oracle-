@@ -486,7 +486,7 @@ test("supported PNG image quality is parsed without image-size", { skip: !hasSec
   assert.equal(result.data.noSignal, true);
   assert.match(result.data.meta?.imageQuality?.reason || "", /1x1/);
 });
-test("chartless Price Action M5 returns an OHLC reading and never converts trend bias into order levels", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+test("chartless prudent Price Action M5 keeps its market read and separate non-executable research panel", { skip: !hasSecrets && "needs secret.dev" }, async () => {
   resetRateLimits();
   const result = await postJson("/api/analyze-chart", {
     pair: "EUR/USD",
@@ -496,9 +496,13 @@ test("chartless Price Action M5 returns an OHLC reading and never converts trend
     analysisDepth: "Rapide",
   }, { "X-Kronos-Test-Token": TEST_TOKEN });
   assert.equal(result.status, 200);
+  assert.equal(result.data.meta?.analysisMode, "prudent");
   assert.equal(result.data.meta?.marketOutlook?.pair, "EUR/USD");
   assert.ok(result.data.meta?.marketOutlook?.bullishScenario);
   assert.ok(result.data.meta?.marketOutlook?.bearishScenario);
+  assert.equal(result.data.meta?.priceActionAnalysis?.researchOnly, true);
+  assert.equal(result.data.meta?.priceActionAnalysis?.actionable, false);
+  assert.ok(result.data.meta?.priceActionAnalysis?.statusLabel);
   assert.equal(result.data.noSignal, true, "trend-only context must not be emitted as a validated PA scalp order");
   assert.equal(result.data.direction, "AUCUN SIGNAL");
   assert.equal(result.data.entry, "—");

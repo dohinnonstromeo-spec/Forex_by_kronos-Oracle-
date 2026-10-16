@@ -5900,13 +5900,15 @@ async function runKronosAnalysis({ body, images, req, user }) {
       body.capital = Number.isFinite(capital) && capital > 0 ? Math.min(capital, 100_000_000) : null;
     }
     const smcMode = /^smc$/i.test(String(body.style || ""));
-    const priceActionResearchMode = !images.length
-      && requestedAnalysisMode === "pa_research"
+    const chartlessPriceActionMode = !images.length && !smcMode
       && /^price\s*action$/i.test(String(body.style || "Price Action"))
       && isScalpingStrategy(body.strategy || "Scalping");
-    // Keep the research engine separate from the normal prudent Price Action path.
-    // It used to be selected implicitly by the default Price Action + Scalping form,
-    // which forced ordinary analyses through a Deriv-only, non-executable experiment.
+    const priceActionResearchMode = !images.length
+      && requestedAnalysisMode === "pa_research"
+      && chartlessPriceActionMode;
+    // Keep the research engine's execution rules separate from the prudent path.
+    // The default can show its non-executable candidates for transparency, but
+    // only the explicit research selection uses its experimental answer format.
     body.analysisMode = priceActionResearchMode ? "pa_research" : "prudent";
     const imageQuality = assessImageQuality(images);
     if (images.length && imageQuality.score < 20 && !smcMode) {
@@ -6047,7 +6049,10 @@ async function runKronosAnalysis({ body, images, req, user }) {
       requireExactTimeframe: smcMode || priceActionResearchMode
         || (/^price\s*action$/i.test(String(body.style || "Price Action")) && isScalpingStrategy(body.strategy || "Scalping")),
     });
-    let priceActionAnalysis = priceActionResearchMode
+    // Keep the tested PA candidate engine visible beside the prudent market
+    // read. It is a separate research panel: its levels are never copied into
+    // the executable plan and it cannot turn a missing trigger into a trade.
+    let priceActionAnalysis = chartlessPriceActionMode
       ? buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice })
       : null;
     const smcPlan = smcMode ? smcTimeframePlan(selectedTimeframe, body.strategy || "Scalping") : null;
@@ -6289,8 +6294,10 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
     const shouldRefreshPrice = !independentOhlcMode && !priceActionResearchMode && (images.length > 0 || deepAnalysis);
     const refreshedPrice = shouldRefreshPrice ? await getAnalysisPrice(selectedPair).catch(() => null) : null;
     if (refreshedPrice && Number.isFinite(Number(refreshedPrice.price))) livePrice = refreshedPrice;
-    if (priceActionResearchMode) {
+    if (chartlessPriceActionMode) {
       priceActionAnalysis = buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice });
+    }
+    if (priceActionResearchMode) {
       answer = buildPriceActionResearchText({ pair: selectedPair, timeframe: selectedTimeframe, priceActionAnalysis, technicalSnapshot });
     }
     const result = normalizeAnalysis(answer, { ...body, pair: selectedPair, timeframe: selectedTimeframe, analysisDepth }, {
