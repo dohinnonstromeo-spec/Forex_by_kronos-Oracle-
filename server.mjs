@@ -6506,28 +6506,45 @@ function derivSymbolRecordForPair(records, pair) {
 }
 
 async function fetchDerivAnalysisPrice(pair) {
-  const records = PA_FORWARD_STANDALONE ? [] : await derivActiveSymbols();
-  const symbol = derivSymbolForPair(records, pair);
-  if (!symbol) return null;
-  const [response] = await derivWebSocketBatch([{ ticks: symbol }], 5000);
-  const tick = response?.tick;
-  const price = Number(tick?.quote);
-  const epoch = Number(tick?.epoch);
-  if (!Number.isFinite(price) || !Number.isFinite(epoch)) return null;
-  const bid = tick?.bid == null ? NaN : Number(tick.bid);
-  const ask = tick?.ask == null ? NaN : Number(tick.ask);
-  const validBidAsk = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid;
-  const ageMs = Math.max(0, Date.now() - epoch * 1000);
-  return pricePayload(pair, {
-    price,
-    ...(validBidAsk ? { bid, ask, spread: ask - bid } : {}),
-    change: 0,
-    asOf: new Date(epoch * 1000).toISOString(),
-    derivSymbol: symbol,
-  }, "deriv_ws", null, {
-    stale: ageMs > 90_000,
-    reliability: ageMs <= 30_000 ? 99 : ageMs <= 90_000 ? 85 : 35,
-  });
+  if (!pair) return null;
+  try {
+    const records = PA_FORWARD_STANDALONE ? [] : await derivActiveSymbols();
+    const symbol = derivSymbolForPair(records, pair);
+    if (!symbol) {
+      recordProviderHealth("deriv_ws_quote", false, "symbol_unavailable");
+      return null;
+    }
+    const [response] = await derivWebSocketBatch([{ ticks: symbol }], 5000);
+    const tick = response?.tick;
+    const price = Number(tick?.quote);
+    const epoch = Number(tick?.epoch);
+    if (!Number.isFinite(price) || !Number.isFinite(epoch)) {
+      recordProviderHealth("deriv_ws_quote", false, "tick_price_or_time_missing");
+      return null;
+    }
+    const bid = tick?.bid == null ? NaN : Number(tick.bid);
+    const ask = tick?.ask == null ? NaN : Number(tick.ask);
+    const validBidAsk = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid;
+    const ageMs = Math.max(0, Date.now() - epoch * 1000);
+    recordProviderHealth("deriv_ws_quote", true);
+    // Deriv's documented tick contract requires quote/epoch/symbol, while bid/ask
+    // are not guaranteed. Track spread availability separately so a missing optional
+    // field is visible in /api/health instead of looking like an unexplained PA veto.
+    recordProviderHealth("deriv_ws_spread", validBidAsk, validBidAsk ? null : "bid_ask_not_returned");
+    return pricePayload(pair, {
+      price,
+      ...(validBidAsk ? { bid, ask, spread: ask - bid } : {}),
+      change: 0,
+      asOf: new Date(epoch * 1000).toISOString(),
+      derivSymbol: symbol,
+    }, "deriv_ws", null, {
+      stale: ageMs > 90_000,
+      reliability: ageMs <= 30_000 ? 99 : ageMs <= 90_000 ? 85 : 35,
+    });
+  } catch (error) {
+    recordProviderHealth("deriv_ws_quote", false, safeHistoryError(error));
+    throw error;
+  }
 }
 
 async function fetchDerivAnalysisHistory(pair, timeframe, timeoutMs = 6000) {
@@ -7053,6 +7070,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
         return finish(derivBars, "deriv_live");
       }
       diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: derivBars.length >= 30 ? "incompatible" : "insufficient_bars" });
+      recordProviderHealth("deriv_ws_history", false, derivBars.length >= 30 ? "stale_or_incompatible" : `insufficient_bars:${derivBars.length}`);
     } catch (error) {
       const reason = safeHistoryError(error);
       diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "error" });
@@ -10191,7 +10209,23 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     sections: extractNarrativeSections(text),
     deterministicCrossCheck: context.deterministicCrossCheck || null,
   };
-  const displayText = stripMachineTags(text);
+  const chartlessExecutionBlocked = strictPriceActionScalp && !hasChartImages
+    && (!meta.derivFeedConfirmed || !meta.derivSpreadConfirmed);
+  const executionIssueSummary = [
+    ...(!meta.derivFeedConfirmed ? ["cotation et bougies Deriv non alignées"] : []),
+    ...(!meta.derivSpreadConfirmed ? ["bid/ask Deriv absent"] : []),
+  ].join("; ");
+  const displayText = chartlessExecutionBlocked
+    ? buildPriceActionScalpNoSignalText({
+      pair: body.pair || "EUR/USD",
+      timeframe: body.timeframe || "M5",
+      livePrice,
+      technicalSnapshot: context.technicalSnapshot || {},
+      newsContext: context.newsContext || {},
+      multiTimeframe: context.multiTimeframe || [],
+      reason: "le plan d'ordre est bloqué: cotation, bougies Deriv et/ou bid/ask ne sont pas confirmés ensemble",
+    })
+    : stripMachineTags(text);
   if (!normalized.scoreParsed) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, 35),
@@ -10232,7 +10266,17 @@ VALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
       technique: validation.technique,
       explanation: `${displayText}\n\nVALIDATION KRONOS: scalp Price Action bloqué. Il faut le prix, les bougies et le bid/ask du flux public Deriv; les données d'un autre fournisseur ne seront pas mélangées et le coût de spread ne sera pas supposé.`,
       validation: { ...validation, valid: false, reason: "Flux Deriv ou spread bid/ask non confirmé." },
-      meta: { ...meta, derivFeedConfirmed: Boolean(meta.derivFeedConfirmed), derivSpreadConfirmed: Boolean(meta.derivSpreadConfirmed) },
+      meta: {
+        ...meta,
+        derivFeedConfirmed: Boolean(meta.derivFeedConfirmed),
+        derivSpreadConfirmed: Boolean(meta.derivSpreadConfirmed),
+        executionReadiness: {
+          ready: false,
+          feedConfirmed: Boolean(meta.derivFeedConfirmed),
+          bidAskConfirmed: Boolean(meta.derivSpreadConfirmed),
+          reason: executionIssueSummary || "Données d'exécution Deriv incomplètes.",
+        },
+      },
     });
   }
   if (!quickMode && !hasChartImages && !apiOnlySetup && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
@@ -10536,7 +10580,9 @@ function buildNoSignalDiagnostic(details = {}) {
     return {
       status: "FLUX_DERIV_INCOMPLET",
       statusLabel: "Flux Deriv incomplet",
-      userMessage: "Le prix, les bougies et le bid/ask ne sont pas confirmés sur le même flux Deriv. Kronos bloque le scalping plutôt que de mélanger des cotations différentes.",
+      userMessage: meta.marketOutlook
+        ? `Lecture OHLC conservée. Aucun plan d'ordre exécutable : ${meta.executionReadiness?.reason || "flux Deriv ou bid/ask non confirmé"}.`
+        : "Le prix, les bougies et le bid/ask ne sont pas confirmés sur le même flux Deriv. Kronos bloque le scalping plutôt que de mélanger des cotations différentes.",
       nextActions: [
         "Réessaie quand les cotations Deriv répondent.",
         "Vérifie la paire et l'unité de temps choisies.",

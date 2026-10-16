@@ -674,6 +674,10 @@
     const historyDiagnostics = technical.historyDiagnostics;
     const providerAttempts = Array.isArray(historyDiagnostics?.attempts) ? historyDiagnostics.attempts : [];
     const providerErrors = Array.isArray(historyDiagnostics?.errors) ? historyDiagnostics.errors : [];
+    const executionReadiness = meta.executionReadiness || null;
+    const executionDiagnostics = executionReadiness
+      ? `<div class="no-signal-data-status"><strong>Validation d'exécution Deriv</strong><p>Cotation et bougies sur le même flux : ${executionReadiness.feedConfirmed ? "confirmé" : "non confirmé"} · bid/ask pour mesurer le spread : ${executionReadiness.bidAskConfirmed ? "confirmé" : "non confirmé"}.</p><p>${escapeHtml(executionReadiness.reason || "Le contexte reste lisible; le plan d'ordre attend une validation complète du flux.")}</p></div>`
+      : "";
     const historyNeedsAttention = Number(technical.bars || 0) < 30
       || technical.historyFresh === false
       || technical.timeframeCompatible === false;
@@ -702,6 +706,7 @@
         </div>
         ${factMarkup ? `<div class="no-signal-analysis-facts">${factMarkup}</div>` : ""}
         ${reading ? `<p class="no-signal-analysis-reading"><strong>Structure lue :</strong> ${escapeHtml(reading)}</p>` : ""}
+        ${executionDiagnostics}
         ${dataTroubleshooting}
         ${narrative ? `<details class="no-signal-analysis-details" open><summary>Raisonnement et données utilisées</summary><p>${escapeHtml(narrative)}</p></details>` : ""}
       </section>

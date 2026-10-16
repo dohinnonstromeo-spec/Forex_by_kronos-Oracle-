@@ -506,6 +506,10 @@ test("chartless Price Action M5 returns an OHLC reading and only exposes levels 
     assert.equal(result.data.tp1, "—");
     assert.equal(result.data.tp2, "—");
     assert.ok(result.data.explanation || result.data.userMessage || result.data.statusLabel);
+    if (result.data.meta?.executionReadiness?.ready === false) {
+      assert.match(result.data.explanation || "", /PRICE ACTION SCALPING/i);
+      assert.doesNotMatch(result.data.explanation || "", /(?:Zone d'entrée|Stop Loss|Take Profit 1|Take Profit 2)\s*:\s*[0-9]/i);
+    }
   } else {
     assert.ok(["ACHAT", "VENTE"].includes(result.data.direction));
     for (const level of [result.data.entry, result.data.sl, result.data.tp1, result.data.tp2]) {

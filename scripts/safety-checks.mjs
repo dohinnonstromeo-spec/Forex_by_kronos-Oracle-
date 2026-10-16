@@ -640,6 +640,15 @@ check(
     && deterministicPaSource.includes("return buildPriceActionScalpNoSignalText"),
 );
 check(
+  "chartless Price Action keeps the OHLC reading visible when Deriv execution data is incomplete",
+  serverSource.includes("const chartlessExecutionBlocked = strictPriceActionScalp && !hasChartImages")
+    && serverSource.includes("plan d'ordre est bloqué: cotation, bougies Deriv")
+    && serverSource.includes("executionReadiness: {")
+    && serverSource.includes("meta.executionReadiness?.reason")
+    && paFrontendSource.includes("Validation d'exécution Deriv")
+    && paFrontendSource.includes("${executionDiagnostics}"),
+);
+check(
   "chartless Price Action displays both conditional directions and their OHLC context",
   paOutlookSource.includes("bullishScenario")
     && paOutlookSource.includes("bearishScenario")
