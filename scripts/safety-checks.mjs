@@ -656,6 +656,15 @@ check(
     && paFrontendSource.includes("${executionDiagnostics}"),
 );
 check(
+  "closed Deriv sessions expose aligned stale OHLC as context while keeping freshness and execution gates closed",
+  serverSource.includes("adjust_start_time: 1")
+    && serverSource.includes('result: "stale_context_only"')
+    && serverSource.includes("fallbackHistory = derivBars")
+    && serverSource.includes('"deriv_contexte_perime"')
+    && serverSource.includes("if (derivCompatible && !derivBars._meta?.stale)")
+    && serverSource.includes("if (derivCompatible && derivBars._meta?.stale && canReadHistoricalDeriv)"),
+);
+check(
   "chartless OHLC history has one wall-clock budget across Deriv and fallback providers",
   /const deadline = startedAt \+ diagnostics\.budgetMs/.test(serverSource)
     && /promiseWithTimeout\(derivPromise, remainingMs, budgetExpired\)/.test(serverSource)

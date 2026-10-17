@@ -6592,6 +6592,11 @@ async function fetchDerivAnalysisHistory(pair, timeframe, timeoutMs = 6000) {
     count: derivHistoryCount(normalizedTimeframe),
     style: "candles",
     granularity,
+    // Deriv can return an empty candle array when `latest` falls inside a
+    // closed session, even though the previous session has usable history.
+    // This documented flag moves the requested interval back to the last
+    // available market data instead of treating a weekend/holiday as no data.
+    adjust_start_time: 1,
   }], timeoutMs);
   const nowSeconds = Math.floor(Date.now() / 1000);
   const candles = Array.isArray(response?.candles) ? response.candles : [];
@@ -7087,6 +7092,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cached = cachedHistory(symbol, cache, options);
   const cachedHasOpen = !options.requireOpen || cached.every((bar) => Number.isFinite(Number(bar.open)));
   const preferredIntervals = historyIntervals(symbol, options);
+  let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
   // Chartless history and quote requests run concurrently, so the quote may not
   // be available yet. Completed Deriv candles still support a read-only analysis;
   // executable setups are separately gated on a trustworthy live quote.
@@ -7108,18 +7114,30 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
         diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "budget_timeout" });
         diagnostics.errors.push("deriv_ws:budget_historique_atteint");
         recordProviderHealth("deriv_ws_history", false, "history_budget_timeout");
-      } else if (derivBars.length >= 30 && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
-        && !derivBars._meta?.stale && isHistoryCompatible(derivBars, options)) {
-        try {
-          await saveMarketCache(historyCacheUpdate(cache, { [symbol]: derivBars }, options));
-        } catch (error) {
-          logOnce("history-cache-write", safeHistoryError(error));
-        }
-        recordProviderHealth("deriv_ws_history", true);
-        return finish(derivBars, "deriv_live");
       } else {
-        diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: derivBars.length >= 30 ? "incompatible" : "insufficient_bars" });
-        recordProviderHealth("deriv_ws_history", false, derivBars.length >= 30 ? "stale_or_incompatible" : `insufficient_bars:${derivBars.length}`);
+        const derivCompatible = derivBars.length >= 30
+          && (!options.requireOpen || derivBars.every((bar) => Number.isFinite(Number(bar.open))))
+          && isHistoryCompatible(derivBars, options);
+        if (derivCompatible && !derivBars._meta?.stale) {
+          try {
+            await saveMarketCache(historyCacheUpdate(cache, { [symbol]: derivBars }, options));
+          } catch (error) {
+            logOnce("history-cache-write", safeHistoryError(error));
+          }
+          recordProviderHealth("deriv_ws_history", true);
+          return finish(derivBars, "deriv_live");
+        }
+        if (derivCompatible && derivBars._meta?.stale && canReadHistoricalDeriv) {
+          // Preserve the broker's last completed session for a chartless market
+          // read. Its stale metadata remains attached, so the PA/SMC and order
+          // gates cannot treat this context as a current setup.
+          fallbackHistory = derivBars;
+          diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "stale_context_only", bars: derivBars.length });
+          recordProviderHealth("deriv_ws_history", false, "stale_context_only");
+        } else {
+          diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: derivBars.length >= 30 ? "incompatible" : "insufficient_bars" });
+          recordProviderHealth("deriv_ws_history", false, derivBars.length >= 30 ? "stale_or_incompatible" : `insufficient_bars:${derivBars.length}`);
+        }
       }
     } catch (error) {
       const reason = safeHistoryError(error);
@@ -7136,7 +7154,6 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
     diagnostics.errors.push("prix_live_requis_pour_demander_l_historique");
     return finish(cachedHasOpen ? cached : [], "prix_live_requis");
   }
-  let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
   const attempts = [
     ["binance", fetchBinanceHistory],
     ["massive", fetchMassiveHistory],
@@ -7176,7 +7193,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
             recordProviderHealth(`${source}_history_single`, true);
             return finish(bars, "frais");
           }
-          if (!fallbackHistory.length || fallbackHistory._meta?.stale) fallbackHistory = bars;
+          if (!fallbackHistory.length || (fallbackHistory._meta?.stale && !isHistoryCompatible(fallbackHistory, options))) fallbackHistory = bars;
           diagnostics.attempts.push({ provider: source, interval, result: "timeframe_incompatible", bars: bars.length });
           continue;
         }
@@ -7210,7 +7227,10 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   }
   const errorSummary = diagnostics.errors.join(" | ") || "no_history";
   recordProviderHealth("history_single", false, errorSummary);
-  return finish(fallbackHistory, fallbackHistory.length ? "cache_perime" : "aucune_source_disponible");
+  const fallbackStatus = /^deriv_ws:/i.test(String(fallbackHistory?._meta?.source || ""))
+    ? "deriv_contexte_perime"
+    : fallbackHistory.length ? "cache_perime" : "aucune_source_disponible";
+  return finish(fallbackHistory, fallbackStatus);
 }
 
 async function buildMultiTimeframeContext(symbol, livePrice, options = {}) {
