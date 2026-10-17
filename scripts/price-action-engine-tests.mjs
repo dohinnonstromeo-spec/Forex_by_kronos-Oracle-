@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   analyzeLatestPriceActionScalp,
   createPriceActionSetupState,
+  isDerivPriceActionHistorySource,
   stepPriceActionScalp,
 } from "../price-action-scalp-engine.mjs";
 
@@ -77,4 +78,12 @@ test("latest-candle analysis preserves an OHLC candidate when only the Deriv spr
 
 test("setup state factory remains neutral", () => {
   assert.deepEqual(createPriceActionSetupState(), { direction: 0, level: Number.NaN, index: -1 });
+});
+
+test("Deriv history source recognition accepts fresh-cache lineage but rejects unrelated feeds", () => {
+  assert.equal(isDerivPriceActionHistorySource("deriv_ws:5min"), true);
+  assert.equal(isDerivPriceActionHistorySource("cache:deriv_ws:5min"), true);
+  assert.equal(isDerivPriceActionHistorySource("cache:cache:deriv_ws:5min"), true);
+  assert.equal(isDerivPriceActionHistorySource("twelve_data:5min"), false);
+  assert.equal(isDerivPriceActionHistorySource("cache:yahoo:5min"), false);
 });

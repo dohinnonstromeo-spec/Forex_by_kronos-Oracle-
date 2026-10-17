@@ -16,6 +16,10 @@ export const PRICE_ACTION_RULES = Object.freeze({
   defaultTimeStopMinutes: 30,
 });
 
+export function isDerivPriceActionHistorySource(source) {
+  return /^(?:cache:)*deriv_ws:/i.test(String(source || "").trim());
+}
+
 export function createPriceActionSetupState() {
   return { direction: 0, level: Number.NaN, index: -1 };
 }

@@ -23,6 +23,7 @@ import {
 import { analyzeKronosSmc } from "./smc-engine.mjs";
 import {
   analyzeLatestPriceActionScalp,
+  isDerivPriceActionHistorySource,
   KRONOS_PRICE_ACTION_VERSION,
   PRICE_ACTION_RULES,
 } from "./price-action-scalp-engine.mjs";
@@ -9501,14 +9502,24 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   if (!["M1", "M5", "M15"].includes(String(timeframe || "").toUpperCase())) {
     return unavailable("unsupported_timeframe", "Unité non backtestée", "La règle est en recherche sur M1, M5 et M15; ce timeframe n'a pas été évalué.");
   }
-  if (!/^deriv_ws:/i.test(source) || history?._meta?.stale || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true })) {
+  if (!isDerivPriceActionHistorySource(source) || history?._meta?.stale || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true })) {
     return unavailable("deriv_history_unconfirmed", "Historique Deriv exact indisponible", "Aucun candidat n'est calculé sans bougies Deriv récentes et alignées sur le timeframe sélectionné.");
   }
   const bid = Number(livePrice?.bid);
   const ask = Number(livePrice?.ask);
   const quoteConfirmed = livePrice?.source === "deriv_ws" && isUsableLivePrice(livePrice);
-  const spreadConfirmed = quoteConfirmed && bid > 0 && ask >= bid && Number.isFinite(ask - bid);
+  const directDerivHistory = /^deriv_ws:/i.test(source);
+  const cachedDerivHistory = /^(?:cache:)+deriv_ws:/i.test(source);
+  // A current quote cannot verify execution costs against an older cached
+  // candle series, even when both originated from Deriv.
+  const spreadConfirmed = directDerivHistory && quoteConfirmed
+    && bid > 0 && ask >= bid && Number.isFinite(ask - bid);
   const spread = spreadConfirmed ? ask - bid : null;
+  const costMessage = spreadConfirmed
+    ? "Spread du tick Deriv mesuré; commission non confirmée."
+    : cachedDerivHistory
+      ? "Historique OHLC Deriv en cache : le spread actuel n'est pas synchronisé avec ces bougies; coût total et filtre de coût non validés."
+      : "Bid/ask Deriv indisponible : coût total et filtre de coût non validés.";
   const result = analyzeLatestPriceActionScalp(history, {
     tickSize: priceActionTickSize(pair),
     spread,
@@ -9525,8 +9536,8 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
     directionLabel: candidate.direction === 1 ? "ACHAT" : "VENTE",
   }));
   const summary = candidates.length
-    ? `${candidates.length} configuration${candidates.length > 1 ? "s" : ""} candidate${candidates.length > 1 ? "s" : ""} détectée${candidates.length > 1 ? "s" : ""} à la dernière bougie clôturée. ${spreadConfirmed ? "Le spread du tick Deriv est mesuré, sans commission confirmée." : "Le spread Deriv n'est pas disponible : le coût total reste inconnu et le filtre de coût n'est pas validé."} Ce moteur n'a pas démontré d'avantage robuste; ces niveaux restent non exécutables.`
-    : `Aucun déclencheur confirmé sur la dernière bougie clôturée. Attendre une cassure puis un retest/reprise; le biais seul ne déclenche rien.${spreadConfirmed ? "" : " Le spread Deriv manque aussi : le coût ne peut pas être évalué."}`;
+    ? `${candidates.length} configuration${candidates.length > 1 ? "s" : ""} candidate${candidates.length > 1 ? "s" : ""} détectée${candidates.length > 1 ? "s" : ""} à la dernière bougie clôturée. ${costMessage} Ce moteur n'a pas démontré d'avantage robuste; ces niveaux restent non exécutables.`
+    : `Aucun déclencheur confirmé sur la dernière bougie clôturée. Attendre une cassure puis un retest/reprise; le biais seul ne déclenche rien.${spreadConfirmed ? "" : ` ${costMessage}`}`;
   return {
     ...base,
     ...result,
@@ -9537,8 +9548,9 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
     actionable: false,
     costValidation: {
       status: spreadConfirmed ? "spread_confirmed_commission_unknown" : "spread_unverified",
+      message: costMessage,
       spread: spreadConfirmed ? spread : null,
-      quoteAsOf: quoteConfirmed ? livePrice.asOf || null : null,
+      quoteAsOf: spreadConfirmed ? livePrice.asOf || null : null,
       costFilterPassed: candidates.length
         ? spreadConfirmed && candidates.every((candidate) => candidate.costStatus === "spread_confirmed")
         : null,
@@ -9561,7 +9573,7 @@ function buildPriceActionResearchText({ pair, timeframe, priceActionAnalysis = {
 - Moteur : ${priceActionAnalysis.version || KRONOS_PRICE_ACTION_VERSION}; source ${priceActionAnalysis.source || "indisponible"}; ${priceActionAnalysis.bars || 0} bougies clôturées.
 - Règle : ${priceActionAnalysis.rule || "cassure clôturée puis retest confirmé"}
 - Gestion simulée : ${priceActionAnalysis.exitRule || "50% à +1R, 50% à +1.6R, arrêt temporel 30 min"}
-- Contrôle des coûts : ${priceActionAnalysis.costValidation?.status === "spread_unverified" ? "spread indisponible; coût total inconnu et filtre de coût non validé" : priceActionAnalysis.costValidation?.status === "spread_confirmed_commission_unknown" ? "spread Deriv mesuré; commission non confirmée" : "non validé"}
+- Contrôle des coûts : ${priceActionAnalysis.costValidation?.message || "non validé"}
 - Lecture OHLC : ${technicalSnapshot.priceActionRead?.summary || technicalSnapshot.text || "historique insuffisant"}
 - Statut : ${priceActionAnalysis.summary || priceActionAnalysis.statusLabel || "historique non validé"}
 ${candidateLines.length ? candidateLines.join("\n") : "- Niveau candidat : aucun."}

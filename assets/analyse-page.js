@@ -843,7 +843,7 @@
         <span>Invalidation théorique : ${formatPrice(candidate.stop)}</span>
         <span>TP théoriques : ${formatPrice(candidate.tp1)} / ${formatPrice(candidate.tp2)}</span>
         <small>${candidate.costStatus === "spread_unverified"
-          ? "Spread Deriv indisponible : coût total inconnu · filtre de coût non validé · niveaux non copiables"
+          ? `${escapeHtml(research.costValidation?.message || "Coût total inconnu et filtre de coût non validé.")} · niveaux non copiables`
           : `Coût estimé ${Number(candidate.costR).toFixed(3)}R, commission non incluse · niveaux non copiables`}</small>
       </div>
     `).join("") : `<p class="pa-research-empty">Aucun déclencheur sur la dernière bougie clôturée. ${escapeHtml(research.statusLabel || "Attendre le setup complet.")}</p>`;
@@ -855,7 +855,7 @@
         <div class="pa-research-candidates">${candidateMarkup}</div>
         <small>${escapeHtml(research.rule || "Cassure clôturée puis retest confirmé.")} ${costsVerified
           ? "Spread ponctuel mesuré, commission non confirmée; un tick de slippage par côté est modélisé."
-          : "Spread indisponible : coût total et filtre de coût non validés; un tick de slippage par côté est seulement indicatif."} Ces scénarios ne valident pas l'exécution.</small>
+          : `${escapeHtml(research.costValidation?.message || "Coût total et filtre de coût non validés.")} Un tick de slippage par côté est seulement indicatif.`} Ces scénarios ne valident pas l'exécution.</small>
       </section>
     `;
   }
