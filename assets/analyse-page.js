@@ -835,13 +835,16 @@
       return Number.isFinite(number) ? number.toFixed(levelPrecision(pair, number)) : "indisponible";
     };
     const candidates = Array.isArray(research.candidates) ? research.candidates : [];
+    const costsVerified = research.costValidation?.status === "spread_confirmed_commission_unknown";
     const candidateMarkup = candidates.length ? candidates.map((candidate) => `
       <div class="pa-research-candidate">
         <strong>${candidate.setup === "break_retest" ? "Cassure + retest" : "Rejet confirmé"} · ${escapeHtml(candidate.directionLabel || (candidate.direction === 1 ? "ACHAT" : "VENTE"))}</strong>
         <span>Clôture candidate : ${formatPrice(candidate.entry)}</span>
         <span>Invalidation théorique : ${formatPrice(candidate.stop)}</span>
         <span>TP théoriques : ${formatPrice(candidate.tp1)} / ${formatPrice(candidate.tp2)}</span>
-        <small>Coût estimé ${Number(candidate.costR || 0).toFixed(3)}R · niveaux non copiables</small>
+        <small>${candidate.costStatus === "spread_unverified"
+          ? "Spread Deriv indisponible : coût total inconnu · filtre de coût non validé · niveaux non copiables"
+          : `Coût estimé ${Number(candidate.costR).toFixed(3)}R, commission non incluse · niveaux non copiables`}</small>
       </div>
     `).join("") : `<p class="pa-research-empty">Aucun déclencheur sur la dernière bougie clôturée. ${escapeHtml(research.statusLabel || "Attendre le setup complet.")}</p>`;
     return `
@@ -850,7 +853,9 @@
         <p>${escapeHtml(research.summary || "Le moteur attend des bougies Deriv alignées.")}</p>
         <small>${escapeHtml(research.timeframe || result.meta?.timeframe || "UT")} · ${Number(research.bars || 0)} bougies clôturées · ${escapeHtml(research.source || "source inconnue")}</small>
         <div class="pa-research-candidates">${candidateMarkup}</div>
-        <small>${escapeHtml(research.rule || "Cassure clôturée puis retest confirmé.")} Coût testé sans commission connue, avec un tick de slippage par côté. Ces résultats ne valident pas l'exécution.</small>
+        <small>${escapeHtml(research.rule || "Cassure clôturée puis retest confirmé.")} ${costsVerified
+          ? "Spread ponctuel mesuré, commission non confirmée; un tick de slippage par côté est modélisé."
+          : "Spread indisponible : coût total et filtre de coût non validés; un tick de slippage par côté est seulement indicatif."} Ces scénarios ne valident pas l'exécution.</small>
       </section>
     `;
   }

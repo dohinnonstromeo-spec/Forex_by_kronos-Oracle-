@@ -37,6 +37,7 @@ export function stepPriceActionScalp({
   spreadPct = 0,
   commissionPctPerSide = 0,
   slippageTicksPerSide = 1,
+  allowUnverifiedCosts = false,
 }) {
   const { open, high, low, close } = bar || {};
   if (![open, high, low, close, averageRange, support, resistance, tickSize].every(Number.isFinite)
@@ -67,10 +68,18 @@ export function stepPriceActionScalp({
       : Math.max(level, invalidationExtreme) + buffer;
     const risk = Math.abs(close - stop);
     if (!(risk > 0) || risk > averageRange * PRICE_ACTION_RULES.maxStopRangeR) return null;
-    const roundTripCost = close * spreadPct / 100
-      + close * 2 * commissionPctPerSide / 100
-      + tickSize * slippageTicksPerSide * 2;
-    if (roundTripCost / risk > PRICE_ACTION_RULES.maxCostR) return null;
+    const spreadKnown = spreadPct != null
+      && Number.isFinite(Number(spreadPct))
+      && Number(spreadPct) >= 0;
+    const slippageCost = tickSize * slippageTicksPerSide * 2;
+    const roundTripCost = spreadKnown
+      ? close * Number(spreadPct) / 100
+        + close * 2 * commissionPctPerSide / 100
+        + slippageCost
+      : null;
+    const costR = Number.isFinite(roundTripCost) ? roundTripCost / risk : null;
+    if (spreadKnown && costR > PRICE_ACTION_RULES.maxCostR) return null;
+    if (!spreadKnown && !allowUnverifiedCosts) return null;
     return {
       setup: setupType,
       direction,
@@ -81,7 +90,9 @@ export function stepPriceActionScalp({
       tp1: close + direction * risk * PRICE_ACTION_RULES.tp1R,
       tp2: close + direction * risk * PRICE_ACTION_RULES.tp2R,
       roundTripCost,
-      costR: roundTripCost / risk,
+      costR,
+      slippageCost,
+      costStatus: spreadKnown ? "spread_confirmed" : "spread_unverified",
     };
   };
 
@@ -149,6 +160,7 @@ export function analyzeLatestPriceActionScalp(bars, {
   commissionPctPerSide = 0,
   slippageTicksPerSide = 1,
   timeStopMinutes = PRICE_ACTION_RULES.defaultTimeStopMinutes,
+  allowUnverifiedCosts = false,
 } = {}) {
   const usable = Array.isArray(bars) ? bars.filter((bar) => [bar.open, bar.high, bar.low, bar.close]
     .every((value) => Number.isFinite(Number(value)))) : [];
@@ -168,8 +180,9 @@ export function analyzeLatestPriceActionScalp(bars, {
   }
 
   const last = usable.length - 1;
-  const currentSpreadPct = Number.isFinite(Number(spread)) && Number(usable[last].close) > 0
-    ? Number(spread) / Number(usable[last].close) * 100 : 0;
+  const spreadKnown = spread != null && Number.isFinite(Number(spread)) && Number(spread) >= 0;
+  const currentSpreadPct = spreadKnown && Number(usable[last].close) > 0
+    ? Number(spread) / Number(usable[last].close) * 100 : null;
   const scanStart = Math.max(0, usable.length - 60);
   for (const setup of ["retest", "rejection"]) {
     const state = createPriceActionSetupState();
@@ -197,6 +210,7 @@ export function analyzeLatestPriceActionScalp(bars, {
         spreadPct: index === last ? currentSpreadPct : 0,
         commissionPctPerSide,
         slippageTicksPerSide,
+        allowUnverifiedCosts: index === last && allowUnverifiedCosts,
       });
       if (index === last && result.signal) {
         latestSignal = {

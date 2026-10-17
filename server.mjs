@@ -9506,37 +9506,62 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   }
   const bid = Number(livePrice?.bid);
   const ask = Number(livePrice?.ask);
-  if (livePrice?.source !== "deriv_ws" || !isUsableLivePrice(livePrice)
-    || !(bid > 0) || !(ask >= bid) || !Number.isFinite(ask - bid)) {
-    return unavailable("deriv_quote_unconfirmed", "Prix Deriv ou spread non confirmé", "Le moteur attend le prix bid/ask Deriv pour appliquer le filtre de coût; aucun candidat n'est publié sans ce contrôle.");
-  }
+  const quoteConfirmed = livePrice?.source === "deriv_ws" && isUsableLivePrice(livePrice);
+  const spreadConfirmed = quoteConfirmed && bid > 0 && ask >= bid && Number.isFinite(ask - bid);
+  const spread = spreadConfirmed ? ask - bid : null;
   const result = analyzeLatestPriceActionScalp(history, {
     tickSize: priceActionTickSize(pair),
-    spread: ask - bid,
+    spread,
     commissionPctPerSide: 0,
     slippageTicksPerSide: 1,
     timeStopMinutes: PRICE_ACTION_RULES.defaultTimeStopMinutes,
+    // OHLC can identify a structural research scenario without a live quote.
+    // Missing spread must remain visibly unverified and may never pass the
+    // execution or cost-validation gates.
+    allowUnverifiedCosts: true,
   });
   const candidates = result.candidates.map((candidate) => ({
     ...candidate,
     directionLabel: candidate.direction === 1 ? "ACHAT" : "VENTE",
   }));
   const summary = candidates.length
-    ? `${candidates.length} configuration(s) candidate détectée(s) à la dernière bougie clôturée. Ce moteur n'a pas démontré d'avantage robuste; ces niveaux restent non exécutables.`
-    : "Aucun déclencheur confirmé sur la dernière bougie clôturée. Attendre une cassure puis un retest/reprise; le biais seul ne déclenche rien.";
-  return { ...base, ...result, pair, timeframe, source, researchOnly: true, actionable: false, candidates, summary };
+    ? `${candidates.length} configuration${candidates.length > 1 ? "s" : ""} candidate${candidates.length > 1 ? "s" : ""} détectée${candidates.length > 1 ? "s" : ""} à la dernière bougie clôturée. ${spreadConfirmed ? "Le spread du tick Deriv est mesuré, sans commission confirmée." : "Le spread Deriv n'est pas disponible : le coût total reste inconnu et le filtre de coût n'est pas validé."} Ce moteur n'a pas démontré d'avantage robuste; ces niveaux restent non exécutables.`
+    : `Aucun déclencheur confirmé sur la dernière bougie clôturée. Attendre une cassure puis un retest/reprise; le biais seul ne déclenche rien.${spreadConfirmed ? "" : " Le spread Deriv manque aussi : le coût ne peut pas être évalué."}`;
+  return {
+    ...base,
+    ...result,
+    pair,
+    timeframe,
+    source,
+    researchOnly: true,
+    actionable: false,
+    costValidation: {
+      status: spreadConfirmed ? "spread_confirmed_commission_unknown" : "spread_unverified",
+      spread: spreadConfirmed ? spread : null,
+      quoteAsOf: quoteConfirmed ? livePrice.asOf || null : null,
+      costFilterPassed: candidates.length
+        ? spreadConfirmed && candidates.every((candidate) => candidate.costStatus === "spread_confirmed")
+        : null,
+    },
+    candidates,
+    summary,
+  };
 }
 
 function buildPriceActionResearchText({ pair, timeframe, priceActionAnalysis = {}, technicalSnapshot = {} }) {
   const candidates = Array.isArray(priceActionAnalysis.candidates) ? priceActionAnalysis.candidates : [];
   const candidateLines = candidates.map((candidate) => {
     const setupLabel = candidate.setup === "break_retest" ? "Cassure + retest" : "Rejet confirmé";
-    return `- Candidat ${setupLabel}: ${candidate.directionLabel}; clôture signal ${formatLevel(candidate.entry, pair)}, invalidation ${formatLevel(candidate.stop, pair)}, TP théoriques ${formatLevel(candidate.tp1, pair)} / ${formatLevel(candidate.tp2, pair)}.`;
+    const costNote = candidate.costStatus === "spread_unverified"
+      ? "coût total inconnu (spread non vérifié)"
+      : `coût estimé ${Number(candidate.costR).toFixed(3)}R, commission non incluse`;
+    return `- Candidat ${setupLabel}: ${candidate.directionLabel}; clôture signal ${formatLevel(candidate.entry, pair)}, invalidation ${formatLevel(candidate.stop, pair)}, TP théoriques ${formatLevel(candidate.tp1, pair)} / ${formatLevel(candidate.tp2, pair)}; ${costNote}.`;
   });
   return `PRICE ACTION OHLC — ${pair} ${timeframe}
 - Moteur : ${priceActionAnalysis.version || KRONOS_PRICE_ACTION_VERSION}; source ${priceActionAnalysis.source || "indisponible"}; ${priceActionAnalysis.bars || 0} bougies clôturées.
 - Règle : ${priceActionAnalysis.rule || "cassure clôturée puis retest confirmé"}
 - Gestion simulée : ${priceActionAnalysis.exitRule || "50% à +1R, 50% à +1.6R, arrêt temporel 30 min"}
+- Contrôle des coûts : ${priceActionAnalysis.costValidation?.status === "spread_unverified" ? "spread indisponible; coût total inconnu et filtre de coût non validé" : priceActionAnalysis.costValidation?.status === "spread_confirmed_commission_unknown" ? "spread Deriv mesuré; commission non confirmée" : "non validé"}
 - Lecture OHLC : ${technicalSnapshot.priceActionRead?.summary || technicalSnapshot.text || "historique insuffisant"}
 - Statut : ${priceActionAnalysis.summary || priceActionAnalysis.statusLabel || "historique non validé"}
 ${candidateLines.length ? candidateLines.join("\n") : "- Niveau candidat : aucun."}
