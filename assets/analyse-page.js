@@ -1456,24 +1456,38 @@
     }
   }
 
+  function createRequestTimeout(timeoutMs) {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return { signal: AbortSignal.timeout(timeoutMs), clear: () => {} };
+    }
+    if (typeof AbortController === "undefined") return { signal: undefined, clear: () => {} };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || 1));
+    return { signal: controller.signal, clear: () => clearTimeout(timer) };
+  }
+
   async function getJson(url, timeoutMs = 9000) {
+    const timeout = createRequestTimeout(timeoutMs);
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-      return response.ok ? response.json() : null;
+      const response = await fetch(url, { signal: timeout.signal });
+      return response.ok ? await response.json() : null;
     } catch {
       return null;
+    } finally {
+      timeout.clear();
     }
   }
 
   async function postJson(url, body, timeoutMs = 120000) {
+    const timeout = createRequestTimeout(timeoutMs);
     try {
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: timeout.signal,
       });
-      if (response.ok) return response.json();
+      if (response.ok) return await response.json();
       let message = `Erreur serveur ${response.status}`;
       try {
         const payload = await response.json();
@@ -1531,6 +1545,8 @@
         userMessage: "Le navigateur n'a pas pu lire la réponse de Kronos.",
         nextActions: ["Vérifier la console serveur.", "Relancer le serveur local.", "Réessayer avec une seule image."],
       };
+    } finally {
+      timeout.clear();
     }
   }
 
