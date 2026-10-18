@@ -699,11 +699,26 @@
       <div><span>${escapeHtml(label)}</span><strong>${escapeHtml(formatValue(value))}</strong></div>
     `).join("");
     const reading = technical.priceActionRead?.summary || technical.text || "";
+    const lastCloseTimestamp = technical.lastCandleClosedAt ? Date.parse(technical.lastCandleClosedAt) : NaN;
+    const lastCloseText = Number.isFinite(lastCloseTimestamp)
+      ? new Date(lastCloseTimestamp).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })
+      : "date inconnue";
+    const lastCloseAgeMinutes = Number.isFinite(lastCloseTimestamp)
+      ? Math.max(0, Math.round((Date.now() - lastCloseTimestamp) / 60_000))
+      : null;
+    const lastCloseAgeText = lastCloseAgeMinutes == null
+      ? "âge inconnu"
+      : lastCloseAgeMinutes < 60
+        ? `${lastCloseAgeMinutes} min`
+        : lastCloseAgeMinutes < 1440
+          ? `${(lastCloseAgeMinutes / 60).toFixed(1)} h`
+          : `${(lastCloseAgeMinutes / 1440).toFixed(1)} j`;
     return `
       <section class="no-signal-analysis" aria-label="Analyse du marché sans capture">
         <div class="no-signal-analysis-head">
           <strong>${hasImages ? "Lecture Kronos" : "Lecture OHLC sans capture"} · ${escapeHtml(pair)}${timeframe ? ` · ${escapeHtml(timeframe)}` : ""}</strong>
           <small>${Number(technical.bars || 0)} bougies · ${escapeHtml(technical.source || meta.historySource || "source indisponible")}</small>
+          <small>Dernière bougie clôturée : ${escapeHtml(lastCloseText)} · il y a ${escapeHtml(lastCloseAgeText)}${technical.historyFresh === false ? " · historique différé/non confirmé" : " · horodatage OHLC"}</small>
         </div>
         ${factMarkup ? `<div class="no-signal-analysis-facts">${factMarkup}</div>` : ""}
         ${reading ? `<p class="no-signal-analysis-reading"><strong>Structure lue :</strong> ${escapeHtml(reading)}</p>` : ""}
@@ -735,7 +750,7 @@
           <div><span>Price Action · lecture OHLC</span><strong>${escapeHtml(outlook.bias || "Biais non déterminé")}</strong></div>
           <b>SCÉNARIO CONDITIONNEL</b>
         </div>
-        <div class="pa-market-outlook-location"><span>Position actuelle dans la structure</span><strong>${escapeHtml(outlook.priceLocation || "indisponible")}</strong></div>
+        <div class="pa-market-outlook-location"><span>${outlook.dataFresh === false ? "Position actuelle indisponible" : outlook.liveQuoteUsable ? "Position au prix live" : "Position du dernier close OHLC"}</span><strong>${escapeHtml(outlook.priceLocation || "indisponible")}</strong></div>
         <div class="pa-market-outlook-grid">${rows.map(([label, value]) => `
           <div><span>${escapeHtml(label)}</span><p>${escapeHtml(value)}</p></div>
         `).join("")}</div>

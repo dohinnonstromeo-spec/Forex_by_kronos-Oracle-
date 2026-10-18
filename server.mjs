@@ -9427,11 +9427,12 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     invalidation = "tout retour dans la zone cassée invalide le scénario de cassure";
   }
 
-  let priceLocation = "indisponible";
+  let priceLocation = fresh ? "indisponible" : "Position indisponible : historique périmé ou timeframe non confirmé";
   let rangePosition = null;
-  if (zonesUsable && Number.isFinite(price)) {
+  if (fresh && zonesUsable && Number.isFinite(price)) {
     rangePosition = Math.max(0, Math.min(100, (price - support) / (resistance - support) * 100));
     priceLocation = `${rangePosition.toFixed(0)} % de la fourchette ${formatLevel(support, pair)}–${formatLevel(resistance, pair)} (repère OHLC, pas une zone d'ordre)`;
+    if (!quoteUsable) priceLocation += " · calcul sur la dernière clôture, pas sur un prix live";
   }
   const atr = Number(technicalSnapshot.atr);
   const rangeWidth = zonesUsable ? resistance - support : NaN;
@@ -9442,7 +9443,9 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     : Number.isFinite(rangeWidth) && rangeWidth > 0 ? rangeWidth * 0.04 : NaN;
   const nearSupport = zonesUsable && Number.isFinite(price) && Number.isFinite(proximity) && Math.abs(price - support) <= proximity;
   const nearResistance = zonesUsable && Number.isFinite(price) && Number.isFinite(proximity) && Math.abs(resistance - price) <= proximity;
-  const marketState = !zonesUsable || !Number.isFinite(price)
+  const marketState = !fresh
+    ? "Position actuelle non calculée : historique périmé ou timeframe non confirmé"
+    : !zonesUsable || !Number.isFinite(price)
     ? "Position dans la structure indisponible"
     : price > resistance + (Number.isFinite(proximity) ? proximity : 0)
       ? "Prix au-dessus de la résistance calculée; attendre une clôture puis un retest tenu"
@@ -9453,6 +9456,9 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
       : nearResistance
         ? "Prix proche de la résistance calculée; rejet ou cassure à confirmer à la clôture"
         : "Prix entre les bornes calculées; marché au milieu de la structure, patience préférable";
+  const displayedMarketState = fresh && !quoteUsable
+    ? `Dernière clôture OHLC seulement : ${marketState.charAt(0).toLowerCase()}${marketState.slice(1)}`
+    : marketState;
   let bullishScenario = "Scénario haussier suspendu: historique frais et niveaux mesurables requis.";
   let bearishScenario = "Scénario baissier suspendu: historique frais et niveaux mesurables requis.";
   if (enoughBars && fresh && zonesUsable) {
@@ -9474,12 +9480,14 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     pair,
     timeframe,
     bars,
+    dataFresh: fresh,
+    liveQuoteUsable: quoteUsable,
     bias,
     primaryScenario,
     trigger,
     invalidation,
     priceLocation,
-    marketState,
+    marketState: displayedMarketState,
     bullishScenario,
     bearishScenario,
     rangePosition,
@@ -9852,6 +9860,12 @@ function timestampAgeSeconds(value, now = Date.now()) {
 function buildAnalysisSnapshot({ pair, timeframe, livePrice, history = [], technicalSnapshot = {}, multiTimeframe = [], newsContext = null }) {
   const historyMeta = history?._meta || {};
   const lastBar = Array.isArray(history) ? history.at(-1) : null;
+  const historyTimeframe = normalizeTimeframe(historyMeta.timeframe || timeframe || "M5");
+  const historyTimeframeMs = timeframeMinutes(historyTimeframe) * 60_000;
+  const lastBarOpenedAt = Date.parse(String(lastBar?.datetime || lastBar?.time || ""));
+  const lastBarClosedAt = Number.isFinite(lastBarOpenedAt) && Number.isFinite(historyTimeframeMs)
+    ? new Date(lastBarOpenedAt + historyTimeframeMs).toISOString()
+    : null;
   const liveAsOf = livePrice?.asOf || null;
   return {
     capturedAt: new Date().toISOString(),
@@ -9873,6 +9887,8 @@ function buildAnalysisSnapshot({ pair, timeframe, livePrice, history = [], techn
       bars: Array.isArray(history) ? history.length : 0,
       source: historyMeta.source || null,
       asOf: historyMeta.asOf || lastBar?.datetime || lastBar?.timestamp || lastBar?.time || null,
+      lastBarClosedAt,
+      lastBarAgeSeconds: timestampAgeSeconds(lastBarClosedAt),
       stale: Boolean(historyMeta.stale),
       timeframe: historyMeta.timeframe || timeframe || null,
     },
@@ -9976,6 +9992,12 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   const lastClosedAgeMs = Number.isFinite(lastBarTime) && Number.isFinite(timeframeMs)
     ? Math.max(0, Date.now() - (lastBarTime + timeframeMs))
     : Number.POSITIVE_INFINITY;
+  const lastCandleClosedAt = Number.isFinite(lastBarTime) && Number.isFinite(timeframeMs)
+    ? new Date(lastBarTime + timeframeMs).toISOString()
+    : null;
+  const historyAgeMinutes = Number.isFinite(lastClosedAgeMs)
+    ? Number((lastClosedAgeMs / 60_000).toFixed(1))
+    : null;
   const historyFresh = closes.length >= 30
     && !meta.stale
     && compatible
@@ -9988,6 +10010,8 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       source: meta.source || livePrice?.source || "aucun historique",
       stale: Boolean(meta.stale || livePrice?.stale),
       historyFresh: false,
+      historyAgeMinutes,
+      lastCandleClosedAt,
       historyDiagnostics: meta.diagnostics || null,
       livePriceUsable,
       valid: false,
@@ -10042,7 +10066,8 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     source: meta.source || livePrice?.source || "historique",
     stale: Boolean(meta.stale || livePrice?.stale || !compatible),
     historyFresh,
-    historyAgeMinutes: Number.isFinite(lastClosedAgeMs) ? Number((lastClosedAgeMs / 60_000).toFixed(1)) : null,
+    historyAgeMinutes,
+    lastCandleClosedAt,
     historyDiagnostics: meta.diagnostics || null,
     livePriceUsable,
     timeframeCompatible: compatible,

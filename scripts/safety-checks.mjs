@@ -687,6 +687,19 @@ check(
     && paRenderSource.includes("Option haussière · conditionnelle")
     && paRenderSource.includes("Option baissière · conditionnelle"),
 );
+check(
+  "chartless Price Action never labels stale-close location as current and shows the latest candle time",
+  paOutlookSource.includes("let priceLocation = fresh ?")
+    && paOutlookSource.includes("if (fresh && zonesUsable && Number.isFinite(price))")
+    && paOutlookSource.includes("Position actuelle non calculée : historique périmé ou timeframe non confirmé")
+    && paOutlookSource.includes("dataFresh: fresh")
+    && paOutlookSource.includes("liveQuoteUsable: quoteUsable")
+    && serverSource.includes("const lastCandleClosedAt =")
+    && serverSource.includes("lastCandleClosedAt,")
+    && serverSource.includes("lastBarAgeSeconds: timestampAgeSeconds(lastBarClosedAt)")
+    && paFrontendSource.includes("Dernière bougie clôturée :")
+    && paRenderSource.includes("Position actuelle indisponible"),
+);
 check("Render runbook documents broker encryption, push keys and readiness", readmeSource.includes("BROKER_CREDENTIALS_ENCRYPTION_KEY") && readmeSource.includes("VAPID_PUBLIC_KEY") && readmeSource.includes("VAPID_PRIVATE_KEY") && readmeSource.includes("/api/ready"));
 check("durable auto-trade lease table exists", /CREATE TABLE IF NOT EXISTS auto_trade_leases/.test(serverSource));
 check("lease acquisition uses an expiry condition", /async function tryAcquireLease[\s\S]{0,600}\$\{table\} SET[\s\S]{0,300}lease_until < \?/.test(serverSource));
