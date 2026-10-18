@@ -661,6 +661,9 @@ check(
     && serverSource.includes('result: "stale_context_only"')
     && serverSource.includes("fallbackHistory = derivBars")
     && serverSource.includes('"deriv_contexte_perime"')
+    && serverSource.includes("let staleDerivContextOnly = false")
+    && serverSource.includes('if (staleDerivContextOnly) {')
+    && serverSource.includes('return finish(fallbackHistory, "deriv_contexte_perime")')
     && serverSource.includes("if (derivCompatible && !derivBars._meta?.stale)")
     && serverSource.includes("if (derivCompatible && derivBars._meta?.stale && canReadHistoricalDeriv)"),
 );

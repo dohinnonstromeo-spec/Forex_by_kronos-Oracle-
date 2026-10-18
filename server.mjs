@@ -7093,6 +7093,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cachedHasOpen = !options.requireOpen || cached.every((bar) => Number.isFinite(Number(bar.open)));
   const preferredIntervals = historyIntervals(symbol, options);
   let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
+  let staleDerivContextOnly = false;
   // Chartless history and quote requests run concurrently, so the quote may not
   // be available yet. Completed Deriv candles still support a read-only analysis;
   // executable setups are separately gated on a trustworthy live quote.
@@ -7132,6 +7133,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
           // read. Its stale metadata remains attached, so the PA/SMC and order
           // gates cannot treat this context as a current setup.
           fallbackHistory = derivBars;
+          staleDerivContextOnly = true;
           diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "stale_context_only", bars: derivBars.length });
           recordProviderHealth("deriv_ws_history", false, "stale_context_only");
         } else {
@@ -7145,6 +7147,12 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       diagnostics.errors.push(`deriv_ws:${reason}`);
       recordProviderHealth("deriv_ws_history", false, reason);
     }
+  }
+  if (staleDerivContextOnly) {
+    // Do not replace broker-specific closed-session candles with a different
+    // provider that labels its response fresh without checking the latest bar's
+    // timestamp. This is a historical read only; stale metadata stays in place.
+    return finish(fallbackHistory, "deriv_contexte_perime");
   }
   if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) {
     diagnostics.cache = true;
