@@ -649,11 +649,23 @@ check(
   serverSource.includes("const chartlessExecutionBlocked = strictPriceActionScalp && !hasChartImages")
     && serverSource.includes("plan d'ordre est bloqué: cotation, bougies Deriv")
     && serverSource.includes("executionReadiness: strictPriceActionScalp && !hasChartImages")
-    && serverSource.includes("triggerConfirmed: false")
+    && serverSource.includes("triggerConfirmed: researchCandidateDetected")
     && serverSource.includes("historyConfirmed,")
     && serverSource.includes("meta.executionReadiness?.reason")
     && paFrontendSource.includes("Pourquoi aucun ordre copiable n'est affiché")
     && paFrontendSource.includes("${executionDiagnostics}"),
+);
+check(
+  "chartless scalp shows a real closed-trade rate and keeps its scope explicit",
+  !/answer\s*=\s*buildPriceActionScalpNoSignalText/.test(serverSource)
+    && serverSource.includes("scope: bucket.label")
+    && serverSource.includes("no score adjustment because the sample is below 8")
+    && paFrontendSource.includes("function renderObservedCalibration(result)")
+    && paFrontendSource.includes("calibration.scope")
+    && paFrontendSource.includes("Taux observ")
+    && paFrontendSource.includes("pas la probabilit")
+    && paFrontendSource.includes("Analyse OHLC termin")
+    && paFrontendSource.includes("marketReadAvailable"),
 );
 check(
   "closed Deriv sessions expose aligned stale OHLC as context while keeping freshness and execution gates closed",
@@ -684,13 +696,67 @@ check(
   paOutlookSource.includes("bullishScenario")
     && paOutlookSource.includes("bearishScenario")
     && paOutlookSource.includes("marketState")
+    && paOutlookSource.includes("const scenariosUsable = enoughBars && fresh && integrityConfirmed && zonesUsable")
+    && paOutlookSource.includes("Échantillon partiel ${continuousBars}/${requiredStructureBars}")
+    && paOutlookSource.includes("if (scenariosUsable)")
+    && paOutlookSource.includes("orientation haussière provisoire")
+    && paOutlookSource.includes("orientation baissière provisoire")
+    && paOutlookSource.includes("const direction = enoughBars && fresh && integrityConfirmed && continuityReady ? structureBias : 0")
     && paRenderSource.includes("Option haussière · conditionnelle")
-    && paRenderSource.includes("Option baissière · conditionnelle"),
+    && paRenderSource.includes("Option baissière · conditionnelle")
+    && paFrontendSource.includes("partialScenariosAvailable")
+    && paFrontendSource.includes("Lecture OHLC partielle")
+    && serverSource.includes("Pour l'instant, surveille uniquement les clôtures et retests")
+    && serverSource.includes("Pour afficher un ordre exécutable chez Deriv"),
+);
+check(
+  "chartless PA candidates are shown with theoretical levels while remaining read-only",
+  serverSource.includes("CANDIDAT ${candidateDirection} DÉTECTÉ")
+    && serverSource.includes("Candidat OHLC de recherche")
+    && serverSource.includes("researchOnlyPaCandidate")
+    && serverSource.includes('status: "PA_CANDIDATE_READ_ONLY"')
+    && paFrontendSource.includes("Non copiable · validation en cours")
+    && paFrontendSource.includes("${renderPriceActionResearch(result)}"),
+);
+const paDiagnosticStart = serverSource.indexOf("function buildNoSignalDiagnostic(");
+const paDiagnosticEnd = serverSource.indexOf("function ", paDiagnosticStart + 10);
+const paDiagnosticSource = paDiagnosticStart >= 0 && paDiagnosticEnd > paDiagnosticStart
+  ? serverSource.slice(paDiagnosticStart, paDiagnosticEnd)
+  : "";
+check(
+  "chartless scalp labels timeframe-specific structure depth and exposes recent swing ages",
+  serverSource.includes("function priceActionMinimumStructureBars(timeframe)")
+    && serverSource.includes("M1: 120, M5: 72, M15: 48")
+    && paOutlookSource.includes("requiredStructureBars")
+    && paOutlookSource.includes("supportBarsAgo:")
+    && paOutlookSource.includes("resistanceBarsAgo:")
+    && paRenderSource.includes("outlook.broaderStructure")
+    && paRenderSource.includes("Profondeur pour le biais scalp")
+    && paRenderSource.includes("il y a ${outlook.supportBarsAgo} bougies")
+    && paDiagnosticSource.indexOf('marketOutlook?.status === "insufficient_structure"') >= 0
+    && paDiagnosticSource.includes("Une orientation HH/HL ou LH/LL peut être affichée comme provisoire")
+    && paDiagnosticSource.indexOf('marketOutlook?.status === "insufficient_structure"') < paDiagnosticSource.indexOf('status: "PA_TRIGGER_REQUIRED"'),
+);
+check(
+  "chartless PA uses validated OHLC, recent integrity stats, and a continuous run before confirming bias or research candidates",
+  serverSource.includes("inspectClosedOhlcHistory(inputBars, timeframe, nowMs)")
+    && serverSource.includes("rawBars.slice(-qualityWindowBars)")
+    && serverSource.includes("cleanBars.slice(-qualityWindowBars)")
+    && serverSource.includes("qualityWindow.trailingConsecutiveBars")
+    && serverSource.includes("historyIntegrityConfirmed")
+    && paOutlookSource.includes("continuousBars >= requiredStructureBars")
+    && serverSource.includes("qualityWindow.trailingConsecutiveBars < requiredCandidateBars")
+    && serverSource.includes("PRICE_ACTION_RULES.lookbackBars + 3")
+    && paRenderSource.includes("outlook.historyQuality")
+    && paRenderSource.includes("outlook.continuousBars")
+    && paDiagnosticSource.indexOf('marketOutlook?.status === "incoherent_data"') >= 0
+    && paDiagnosticSource.indexOf('marketOutlook?.status === "insufficient_continuity"') >= 0
+    && paDiagnosticSource.indexOf('marketOutlook?.status === "insufficient_continuity"') < paDiagnosticSource.indexOf('status: "PA_TRIGGER_REQUIRED"'),
 );
 check(
   "chartless Price Action never labels stale-close location as current and shows the latest candle time",
   paOutlookSource.includes("let priceLocation = fresh ?")
-    && paOutlookSource.includes("if (fresh && zonesUsable && Number.isFinite(price))")
+    && paOutlookSource.includes("if (fresh && rangeZonesUsable && Number.isFinite(price))")
     && paOutlookSource.includes("Position actuelle non calculée : historique périmé ou timeframe non confirmé")
     && paOutlookSource.includes("dataFresh: fresh")
     && paOutlookSource.includes("liveQuoteUsable: quoteUsable")

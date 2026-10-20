@@ -100,7 +100,15 @@ function confirmedBars(rawBars, timeframe, now) {
       invalidBars += 1;
       continue;
     }
-    parsed.push({ open, high, low, close, startMs, endMs: interval ? startMs + interval : null });
+    parsed.push({
+      open,
+      high,
+      low,
+      close,
+      volume: finite(bar?.volume) ?? 0,
+      startMs,
+      endMs: interval ? startMs + interval : null,
+    });
   }
   parsed.sort((a, b) => a.startMs - b.startMs);
   const unique = [];
@@ -136,6 +144,10 @@ function confirmedBars(rawBars, timeframe, now) {
     gaps,
     trailingConsecutiveBars,
   };
+}
+
+export function inspectClosedOhlcHistory(rawBars, timeframe = "M5", now = Date.now()) {
+  return confirmedBars(rawBars, timeframe, now);
 }
 
 function trueRanges(bars) {

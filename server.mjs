@@ -20,7 +20,7 @@ import {
   SWING_TRAILING_PARAMS_BY_PAIR,
   computeTrailingStopPrice,
 } from "./trading-exit-rules.mjs";
-import { analyzeKronosSmc } from "./smc-engine.mjs";
+import { analyzeKronosSmc, inspectClosedOhlcHistory } from "./smc-engine.mjs";
 import {
   analyzeLatestPriceActionScalp,
   isDerivPriceActionHistorySource,
@@ -6054,7 +6054,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
     // read. It is a separate research panel: its levels are never copied into
     // the executable plan and it cannot turn a missing trigger into a trade.
     let priceActionAnalysis = chartlessPriceActionMode
-      ? buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice })
+      ? buildPriceActionResearchSnapshot({ pair: selectedPair, timeframe: selectedTimeframe, history, livePrice, technicalSnapshot })
       : null;
     const smcPlan = smcMode ? smcTimeframePlan(selectedTimeframe, body.strategy || "Scalping") : null;
     const requestedTimeframes = uniqueList([
@@ -6202,6 +6202,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         risk: body.risk,
         capital: body.capital,
         technicalSnapshot,
+        priceActionAnalysis,
         newsContext,
         multiTimeframe,
       })
@@ -6214,6 +6215,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         risk: body.risk,
         livePrice,
         technicalSnapshot,
+        priceActionAnalysis,
         newsContext,
         multiTimeframe,
       })
@@ -6225,6 +6227,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
           strategy: body.strategy || "Scalping",
           livePrice,
           technicalSnapshot,
+          priceActionAnalysis,
           newsContext,
           multiTimeframe,
           reason: apiOnlyBlockReason,
@@ -6244,6 +6247,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         risk: body.risk,
         capital: body.capital,
         technicalSnapshot,
+        priceActionAnalysis,
         newsContext,
         multiTimeframe,
       });
@@ -6258,28 +6262,18 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         risk: body.risk,
         livePrice,
         technicalSnapshot,
+        priceActionAnalysis,
         newsContext,
         multiTimeframe,
       });
     }
     // The deterministic price snapshot (SMA/RSI + trend) is context, not a
-    // Price Action trigger. Keep the complete OHLC/news/MTF read in the result,
-    // but never turn that directional bias into copyable scalp levels. The
-    // only mechanical break/retest detector is explicitly research-only: the
-    // frozen walk-forward runs did not establish a robust positive edge.
-    if (!smcMode && !priceActionResearchMode && !images.length
-      && /^price\s*action$/i.test(String(body.style || "Price Action"))
-      && isScalpingStrategy(body.strategy || "Scalping")) {
-      answer = buildPriceActionScalpNoSignalText({
-        pair: selectedPair,
-        timeframe: selectedTimeframe,
-        livePrice,
-        technicalSnapshot,
-        newsContext,
-        multiTimeframe,
-        reason: chartlessPriceActionScalpReason(technicalSnapshot),
-      });
-    }
+    // Price Action trigger. Preserve the completed analysis and keep execution
+    // checks separate from the chartless OHLC read.
+    // Keep a completed OHLC/AI analysis intact. Execution gates below may
+    // suspend copying an order when the Deriv quote or spread is unverified,
+    // but must not replace every chartless Price Action answer with the same
+    // unconditional no-signal paragraph.
     const visionConsensus = await visionConsensusPromise;
     const deterministicCheck = await crossCheckPromise;
     // Reported live: a real user kept getting entries visibly far from the price they
@@ -9323,9 +9317,19 @@ function apiOnlyNoSignalReason({ livePrice, technicalSnapshot, newsContext, mult
   return "Confluence insuffisante pour proposer un plan sans screenshot.";
 }
 
-function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
+function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {}, priceActionAnalysis = null, newsContext = {}, multiTimeframe = [], reason }) {
   const outlook = buildPriceActionMarketOutlook({ pair, timeframe, livePrice, technicalSnapshot });
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
+  const candidate = Array.isArray(priceActionAnalysis?.candidates) ? priceActionAnalysis.candidates[0] : null;
+  const candidateDirection = candidate?.directionLabel || (candidate?.direction === 1 ? "ACHAT" : candidate?.direction === -1 ? "VENTE" : "");
+  const candidateLine = candidate && [candidate.entry, candidate.stop, candidate.tp1, candidate.tp2].every((value) => value != null && Number.isFinite(Number(value)))
+    ? `- Candidat OHLC de recherche (${candidate.setup === "break_retest" ? "cassure + retest" : "rejet confirmé"}) : ${candidateDirection}; entrée théorique ${formatLevel(candidate.entry, pair)}, invalidation ${formatLevel(candidate.stop, pair)}, TP1 ${formatLevel(candidate.tp1, pair)}, TP2 ${formatLevel(candidate.tp2, pair)}.`
+    : "- Candidat OHLC de recherche : aucun niveau d'entrée complet détecté.";
+  const candidateCostLine = candidate
+    ? candidate.costStatus === "spread_confirmed"
+      ? `- Coûts du candidat : spread mesuré (${candidate.costR != null && Number.isFinite(Number(candidate.costR)) ? `${Number(candidate.costR).toFixed(3)}R` : "R indisponible"}), commission non confirmée; candidat non validé pour exécution.`
+      : "- Coûts du candidat : bid/ask non confirmé; niveaux de recherche non copiables."
+    : "";
   const quoteUsable = isUsableLivePrice(livePrice);
   const observedPrice = quoteUsable ? livePrice?.price : technicalSnapshot.last;
   const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
@@ -9336,7 +9340,8 @@ function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5",
   return `PRICE ACTION SCALPING — ${pair} ${timeframe}
 - ${quoteUsable ? "Prix en direct" : "Derniere cloture OHLC"} : ${formatLevel(observedPrice, pair)}${quoteUsable ? "" : ` (${livePrice?.source || "cotation live indisponible"})`}
 - Synthese technique : ${technicalSnapshot.text || "donnees de bougie insuffisantes"}
-- Support / resistance API : ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"} / ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}
+- Bornes OHLC du lookback : ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"} / ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}
+- Swings proches confirmés : support ${technicalSnapshot.priceActionRead?.nearestSupport ?? "indisponible"}; résistance ${technicalSnapshot.priceActionRead?.nearestResistance ?? "indisponible"}
 - Lecture du marché : ${outlook.bias} — ${outlook.primaryScenario}
 - Déclencheur à attendre : ${outlook.trigger}
 - Invalidation du scénario : ${outlook.invalidation}
@@ -9344,21 +9349,48 @@ function buildPriceActionScalpNoSignalText({ pair = "EUR/USD", timeframe = "M5",
 - Multi-timeframe : ${mtf.summary}.
 - News / macro : ${newsLine}.
 - Données : ${outlook.dataNote}
-- Signal détecté : AUCUN SIGNAL — ${reason}
+- Décision d'exécution : ${candidate ? `CANDIDAT ${candidateDirection} DÉTECTÉ — ${reason}` : `AUCUN DÉCLENCHEUR VALIDÉ — ${reason}`}
+${candidateLine}
+${candidateCostLine}
 - Zone de référence : support ${Number.isFinite(support) ? formatLevel(support, pair) : "indisponible"}; résistance ${Number.isFinite(resistance) ? formatLevel(resistance, pair) : "indisponible"}.
 - A attendre : clôture confirmée puis retest/reprise, ou rejet confirmé sur support/résistance identifiable.
-- Entree, stop et objectifs : aucun niveau emis avant confirmation de ce declencheur.
-Cette lecture explique les conditions à surveiller à partir des bougies reçues. Elle ne donne ni probabilité de gain ni ordre à copier.
+- Ces niveaux candidats sont des repères de recherche issus des bougies clôturées; ils ne sont pas validés pour exécution et restent non copiables.
+Cette lecture distingue un candidat structurel d'un ordre validé. Elle ne donne aucune probabilité de gain; le taux historique Kronos, s'il existe, est affiché séparément avec son échantillon.
 SCORE_CONFIANCE:45
 TECHNIQUE_UTILISEE:Price Action
 STYLE_EFFICACITE:Price Action=45`;
 }
 
-function chartlessPriceActionScalpReason(technicalSnapshot = {}) {
-  if (!technicalSnapshot.valid || !technicalSnapshot.historyFresh || technicalSnapshot.timeframeCompatible === false) {
+function chartlessPriceActionScalpReason(technicalSnapshot = {}, priceActionAnalysis = null) {
+  const continuousBars = technicalSnapshot.continuousBars == null
+    ? Number(technicalSnapshot.bars) || 0
+    : Number(technicalSnapshot.continuousBars) || 0;
+  const candidate = Array.isArray(priceActionAnalysis?.candidates) ? priceActionAnalysis.candidates[0] : null;
+  const candidateHistoryReady = Number(technicalSnapshot.bars) >= 30
+    && technicalSnapshot.historyFresh === true
+    && technicalSnapshot.timeframeCompatible !== false
+    && technicalSnapshot.historyIntegrityConfirmed !== false
+    && continuousBars >= 30;
+  if (candidate && candidateHistoryReady) {
+    const setup = candidate.setup === "break_retest" ? "cassure + retest" : "rejet confirmÃ©";
+    const costState = candidate.costStatus === "spread_confirmed"
+      ? "spread mesurÃ©, commission non confirmÃ©e"
+      : "spread non confirmÃ©";
+    return `Configuration ${setup} ${candidate.directionLabel || (candidate.direction === 1 ? "ACHAT" : "VENTE")} dÃ©tectÃ©e sur la derniÃ¨re bougie clÃ´ture; candidat et niveaux visibles dans le panneau Price Action (${costState}), sans validation de rentabilitÃ© ni ordre copiable.`;
+  }
+  if (technicalSnapshot.historyIntegrityConfirmed === false) {
+    return "L'historique OHLC récent contient des bougies invalides ou des horodatages contradictoires; les observations restent visibles, mais aucun biais scalp n'est confirmé.";
+  }
+  if (continuousBars < 30) {
+    return `Historique interrompu : ${continuousBars} bougies consécutives seulement; au moins 30 sont requises pour le contexte scalp.`;
+  }
+  const historyReady = Number(technicalSnapshot.bars) >= 30
+    && technicalSnapshot.historyFresh === true
+    && technicalSnapshot.timeframeCompatible !== false;
+  if (!historyReady) {
     return "Historique OHLC insuffisant, périmé ou non aligné : la lecture reste partielle et aucun biais confirmé n'est publié.";
   }
-  return "Lecture de tendance disponible, mais elle ne confirme pas à elle seule un déclencheur Price Action. Le détecteur cassure/retest reste en recherche et n'a pas démontré d'avantage robuste après coûts; aucun ordre copiable ne sera déduit du seul biais.";
+  return "Historique OHLC exploitable, mais confluence et déclencheur d'entrée non confirmés. Le biais peut rester neutre ou contradictoire. Le détecteur cassure/retest reste en recherche et n'a pas démontré d'avantage robuste après coûts. Aucun ordre copiable n'est déduit du seul contexte.";
 }
 
 function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", livePrice, technicalSnapshot = {} } = {}) {
@@ -9366,72 +9398,118 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
   const read = technicalSnapshot.priceActionRead || {};
   const trend = String(technicalSnapshot.trend || "").toLowerCase();
   const structure = String(read.swingStructure || "");
+  const broaderStructure = String(read.broadSwingStructure || "");
   const trendBias = /hauss/.test(trend) ? 1 : /baiss/.test(trend) ? -1 : 0;
   const structureBias = /structure haussi[eè]re|hh\/hl/i.test(structure) ? 1
     : /structure baissi[eè]re|lh\/ll/i.test(structure) ? -1 : 0;
   const enoughBars = bars >= 30;
+  const requiredStructureBars = priceActionMinimumStructureBars(timeframe);
+  const continuousBars = technicalSnapshot.continuousBars != null && Number.isFinite(Number(technicalSnapshot.continuousBars))
+    ? Number(technicalSnapshot.continuousBars) : bars;
+  const integrityConfirmed = technicalSnapshot.historyIntegrityConfirmed !== false;
+  const continuityReady = continuousBars >= 30;
+  const structureReady = bars >= requiredStructureBars
+    && continuousBars >= requiredStructureBars
+    && integrityConfirmed;
   const historyFresh = typeof technicalSnapshot.historyFresh === "boolean"
     ? technicalSnapshot.historyFresh
     : !technicalSnapshot.stale && technicalSnapshot.timeframeCompatible !== false;
   const fresh = historyFresh && technicalSnapshot.timeframeCompatible !== false;
   const quoteUsable = isUsableLivePrice(livePrice);
   const price = Number(quoteUsable ? livePrice?.price : technicalSnapshot.last);
-  const support = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
-  const resistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
+  const rangeSupport = technicalSnapshot.support == null ? NaN : Number(technicalSnapshot.support);
+  const rangeResistance = technicalSnapshot.resistance == null ? NaN : Number(technicalSnapshot.resistance);
+  const localSupport = read.nearestSupport == null ? NaN : Number(read.nearestSupport);
+  const localResistance = read.nearestResistance == null ? NaN : Number(read.nearestResistance);
+  const support = Number.isFinite(localSupport) ? localSupport : rangeSupport;
+  const resistance = Number.isFinite(localResistance) ? localResistance : rangeResistance;
+  const rangeZonesUsable = Number.isFinite(rangeSupport) && Number.isFinite(rangeResistance) && rangeResistance > rangeSupport;
   const zonesUsable = Number.isFinite(support) && Number.isFinite(resistance) && resistance > support;
   let bias = "Neutre / structure non concluante";
   if (!enoughBars) bias = "Lecture partielle — historique insuffisant";
   else if (!fresh) bias = "Lecture indicative — source ou timeframe non confirmé";
-  else if (trendBias && trendBias === structureBias) bias = trendBias > 0
-    ? "Biais haussier provisoire — tendance et swings concordent"
-    : "Biais baissier provisoire — tendance et swings concordent";
-  else if (trendBias && structureBias && trendBias !== structureBias) bias = "Biais contradictoire — tendance et swings divergent";
-  else if (trendBias) bias = `${trendBias > 0 ? "Biais haussier" : "Biais baissier"} faible — structure non confirmée`;
-  else if (structureBias) bias = `${structureBias > 0 ? "Structure haussière" : "Structure baissière"} — tendance non confirmée`;
+  else if (!integrityConfirmed) bias = "OHLC à vérifier — bougie invalide ou doublon contradictoire";
+  else if (!continuityReady) bias = `Historique discontinu — ${continuousBars}/30 bougies consécutives ${timeframe}`;
+  else if (!structureReady) {
+    const provisionalLabel = structureBias > 0 ? "HH/HL suggèrent une orientation haussière provisoire"
+      : structureBias < 0 ? "LH/LL suggèrent une orientation baissière provisoire"
+        : "aucune orientation HH/HL ou LH/LL ne ressort";
+    bias = `Structure partielle — ${continuousBars}/${requiredStructureBars} bougies consécutives ${timeframe} requises · ${provisionalLabel}`;
+  }
+  else if (structureBias) {
+    const structureLabel = structureBias > 0 ? "Structure HH/HL haussière" : "Structure LH/LL baissière";
+    const momentumLabel = trendBias === structureBias ? "momentum SMA/RSI concordant"
+      : trendBias ? "momentum SMA/RSI divergent" : "momentum SMA/RSI neutre";
+    bias = `${structureLabel} · ${momentumLabel}`;
+  } else if (trendBias) {
+    bias = `Momentum SMA/RSI ${trendBias > 0 ? "haussier" : "baissier"} · swings non confirmés, biais Price Action indéterminé`;
+  }
 
-  const direction = fresh && enoughBars && trendBias && trendBias === structureBias ? trendBias : 0;
-  let primaryScenario = "Le marché ne donne pas encore de direction concordante. Le scénario prioritaire est d'attendre une clôture nette hors des bornes, puis un retest tenu.";
+  // Price Action structure sets the provisional context. SMA/RSI is shown as
+  // a separate confluence check and may lower confidence, but cannot erase a
+  // confirmed HH/HL or LH/LL read. Neither state creates a trade signal.
+  // A shorter clean run may describe a provisional swing direction. The status
+  // and order gates still require the full timeframe sample before confirmation.
+  const direction = enoughBars && fresh && integrityConfirmed && continuityReady ? structureBias : 0;
+  let primaryScenario = "Les swings ne donnent pas de direction confirmée. Surveiller les derniers niveaux locaux et attendre une clôture qui établit une nouvelle structure.";
   let trigger = zonesUsable
     ? `clôture ${formatLevel(resistance, pair)} au-dessus ou ${formatLevel(support, pair)} en dessous, puis retest confirmé de la borne cassée`
     : "attendre des bougies fraîches et des niveaux de structure mesurables";
   let invalidation = "pas de biais directionnel à invalider tant qu'une cassure confirmée n'a pas eu lieu";
-  if (!enoughBars || !fresh) {
+  if (!enoughBars || !fresh || !integrityConfirmed || !continuityReady || !structureReady) {
     primaryScenario = !enoughBars
-      ? `Prévision suspendue : ${bars} bougie(s) reçue(s), 30 bougies clôturées minimum sont requises pour cette lecture scalp.`
-      : "Prévision suspendue : l'historique est périmé ou ne correspond pas au timeframe choisi.";
+      ? `Lecture partielle : ${bars} bougie(s) reçue(s); 30 bougies clôturées minimum sont requises pour calculer les repères OHLC.`
+      : !fresh
+        ? "Prévision suspendue : l'historique est périmé ou ne correspond pas au timeframe choisi."
+        : !integrityConfirmed
+          ? "Lecture suspendue pour le biais : au moins une bougie OHLC récente est invalide ou un même horodatage contient des valeurs contradictoires. Les autres observations restent visibles."
+          : !continuityReady
+            ? `Lecture partielle : ${bars} bougies valides au total, mais seulement ${continuousBars} consécutives. Il en faut 30 à la suite pour lire le contexte scalp.`
+            : `Lecture des swings partielle : ${continuousBars}/${requiredStructureBars} bougies consécutives ${timeframe} disponibles. ${structureBias > 0
+              ? "Les pivots suggèrent HH/HL et une orientation haussière provisoire; elle n'est pas confirmée. "
+              : structureBias < 0
+                ? "Les pivots suggèrent LH/LL et une orientation baissière provisoire; elle n'est pas confirmée. "
+                : "Les pivots ne donnent pas encore d'orientation provisoire nette. "}Aucun ordre n'est déduit de cet échantillon incomplet.`;
     trigger = !enoughBars
-      ? "attendre que Kronos reçoive au moins 30 bougies clôturées sur l'unité choisie"
-      : "attendre un historique frais et aligné avant d'évaluer une cassure/retest";
+      ? "attendre au moins 30 bougies clôturées sur l'unité choisie pour afficher le contexte OHLC"
+      : !fresh
+        ? "attendre un historique frais et aligné avant d'évaluer les swings"
+        : !integrityConfirmed
+          ? "écarter ou recharger les bougies invalides/contradictoires avant de confirmer une structure"
+          : !continuityReady
+            ? `attendre 30 bougies consécutives ${timeframe} sans coupure pour lire le contexte scalp`
+            : `attendre ${requiredStructureBars} bougies consécutives ${timeframe} avant de confirmer une structure scalp`;
     invalidation = "indisponible tant que les données ne sont pas validées";
   } else if (direction > 0) {
-    primaryScenario = `La poursuite haussière est le scénario à surveiller tant que la structure ne casse pas. Une mèche seule au-dessus d'une borne ne suffit pas.`;
-    trigger = Number.isFinite(resistance)
-      ? `clôture au-dessus de ${formatLevel(resistance, pair)}, puis retest tenu avec clôture haussière`
-      : "cassure d'une résistance identifiable, puis retest tenu avec clôture haussière";
+    primaryScenario = `Les swings HH/HL donnent un contexte haussier provisoire${trendBias === -1 ? ", mais le filtre SMA/RSI diverge" : trendBias === 1 ? ", avec le filtre SMA/RSI dans le même sens" : ", sans confirmation du filtre SMA/RSI"}. Ce contexte ne constitue pas une entrée.`;
+    trigger = zonesUsable
+      ? `attendre soit un rejet haussier clôturé du support swing ${formatLevel(support, pair)}, soit une clôture au-dessus de ${formatLevel(resistance, pair)} suivie d'un retest tenu`
+      : "attendre un rejet haussier clôturé d'un creux confirmé ou une cassure suivie d'un retest tenu";
     invalidation = Number.isFinite(support)
-      ? `clôture sous le support de référence ${formatLevel(support, pair)}`
+      ? `clôture sous le dernier support swing de référence ${formatLevel(support, pair)}`
       : "clôture sous le dernier creux confirmé";
   } else if (direction < 0) {
-    primaryScenario = "La poursuite baissière est le scénario à surveiller tant que la structure ne casse pas. Une mèche seule sous une borne ne suffit pas.";
-    trigger = Number.isFinite(support)
-      ? `clôture sous ${formatLevel(support, pair)}, puis retest rejeté avec clôture baissière`
-      : "cassure d'un support identifiable, puis retest rejeté avec clôture baissière";
-    invalidation = Number.isFinite(resistance)
-      ? `clôture au-dessus de la résistance de référence ${formatLevel(resistance, pair)}`
-      : "clôture au-dessus du dernier sommet confirmé";
-  } else if (trendBias && structureBias && trendBias !== structureBias) {
-    primaryScenario = "La tendance et les swings se contredisent. Le biais est suspendu jusqu'à une nouvelle cassure/reprise qui remet les deux lectures en accord.";
+    primaryScenario = `Les swings LH/LL donnent un contexte baissier provisoire${trendBias === 1 ? ", mais le filtre SMA/RSI diverge" : trendBias === -1 ? ", avec le filtre SMA/RSI dans le même sens" : ", sans confirmation du filtre SMA/RSI"}. Ce contexte ne constitue pas une entrée.`;
     trigger = zonesUsable
-      ? `clôture hors de ${formatLevel(support, pair)}–${formatLevel(resistance, pair)}, puis retest confirmé dans le même sens`
-      : "attendre que les swings et la tendance convergent";
-    invalidation = "tout retour dans la zone cassée invalide le scénario de cassure";
+      ? `attendre soit un rejet baissier clôturé de la résistance swing ${formatLevel(resistance, pair)}, soit une clôture sous ${formatLevel(support, pair)} suivie d'un retest rejeté`
+      : "attendre un rejet baissier clôturé d'un sommet confirmé ou une cassure suivie d'un retest rejeté";
+    invalidation = Number.isFinite(resistance)
+      ? `clôture au-dessus de la dernière résistance swing de référence ${formatLevel(resistance, pair)}`
+      : "clôture au-dessus du dernier sommet confirmé";
+  } else if (trendBias) {
+    primaryScenario = `Le momentum SMA/RSI penche ${trendBias > 0 ? "à la hausse" : "à la baisse"}, mais les swings ne confirment pas la structure Price Action. Le biais reste indéterminé jusqu'à la formation de HH/HL ou LH/LL.`;
+    trigger = zonesUsable
+      ? `observer la réaction clôturée aux swings proches ${formatLevel(support, pair)}–${formatLevel(resistance, pair)}; attendre une structure confirmée avant de privilégier un sens`
+      : "attendre des swings confirmés avant de privilégier un sens";
+    invalidation = "aucun biais Price Action confirmé à invalider";
   }
 
   let priceLocation = fresh ? "indisponible" : "Position indisponible : historique périmé ou timeframe non confirmé";
   let rangePosition = null;
-  if (fresh && zonesUsable && Number.isFinite(price)) {
-    rangePosition = Math.max(0, Math.min(100, (price - support) / (resistance - support) * 100));
-    priceLocation = `${rangePosition.toFixed(0)} % de la fourchette ${formatLevel(support, pair)}–${formatLevel(resistance, pair)} (repère OHLC, pas une zone d'ordre)`;
+  if (fresh && rangeZonesUsable && Number.isFinite(price)) {
+    rangePosition = Math.max(0, Math.min(100, (price - rangeSupport) / (rangeResistance - rangeSupport) * 100));
+    priceLocation = `${rangePosition.toFixed(0)} % de la fourchette OHLC ${formatLevel(rangeSupport, pair)}–${formatLevel(rangeResistance, pair)}; repère de contexte, pas une zone d'ordre`;
+    if (zonesUsable) priceLocation += ` · swings proches ${formatLevel(support, pair)}–${formatLevel(resistance, pair)}`;
     if (!quoteUsable) priceLocation += " · calcul sur la dernière clôture, pas sur un prix live";
   }
   const atr = Number(technicalSnapshot.atr);
@@ -9461,25 +9539,38 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     : marketState;
   let bullishScenario = "Scénario haussier suspendu: historique frais et niveaux mesurables requis.";
   let bearishScenario = "Scénario baissier suspendu: historique frais et niveaux mesurables requis.";
-  if (enoughBars && fresh && zonesUsable) {
+  // A gap invalidates a continuous scalp bias, not every useful observation in
+  // the sample. Keep conditional support/resistance scenarios visible when the
+  // total OHLC set is large, fresh, and internally coherent; the partial-sample
+  // note remains explicit and the directional/order gates still require continuity.
+  const scenariosUsable = enoughBars && fresh && integrityConfirmed && zonesUsable;
+  const partialStructureNote = structureReady
+    ? ""
+    : `Échantillon partiel ${continuousBars}/${requiredStructureBars} bougies continues : aucun biais scalp n'est confirmé. `;
+  if (scenariosUsable) {
     if (nearSupport) {
-      bullishScenario = `Achat à envisager seulement si une bougie clôturée rejette ${formatLevel(support, pair)} puis reprend le niveau; une mèche seule ne confirme rien.`;
-      bearishScenario = `Biais vendeur si une clôture passe sous ${formatLevel(support, pair)} puis échoue à le reprendre au retest; retour au-dessus du support invalide cette lecture.`;
+      bullishScenario = `${partialStructureNote}Hypothèse haussière seulement si une bougie clôturée rejette ${formatLevel(support, pair)} puis reprend le niveau; une mèche seule ne confirme rien.`;
+      bearishScenario = `${partialStructureNote}Hypothèse baissière si une clôture passe sous ${formatLevel(support, pair)} puis échoue à le reprendre au retest; une clôture de reprise invalide cette lecture.`;
     } else if (nearResistance) {
-      bullishScenario = `Biais acheteur si une clôture passe au-dessus de ${formatLevel(resistance, pair)} puis tient le retest; un simple dépassement par mèche ne suffit pas.`;
-      bearishScenario = `Vente à envisager seulement si une bougie clôturée rejette ${formatLevel(resistance, pair)} et clôture de nouveau sous le niveau.`;
+      bullishScenario = `${partialStructureNote}Hypothèse haussière si une clôture passe au-dessus de ${formatLevel(resistance, pair)} puis tient le retest; un simple dépassement par mèche ne suffit pas.`;
+      bearishScenario = `${partialStructureNote}Hypothèse baissière seulement si une bougie clôturée rejette ${formatLevel(resistance, pair)} et clôture de nouveau sous le niveau.`;
     } else {
-      bullishScenario = `Biais acheteur uniquement après clôture au-dessus de ${formatLevel(resistance, pair)} puis retest tenu.`;
-      bearishScenario = `Biais vendeur uniquement après clôture sous ${formatLevel(support, pair)} puis retest rejeté.`;
+      bullishScenario = `${partialStructureNote}Hypothèse haussière uniquement après clôture au-dessus de ${formatLevel(resistance, pair)} puis retest tenu.`;
+      bearishScenario = `${partialStructureNote}Hypothèse baissière uniquement après clôture sous ${formatLevel(support, pair)} puis retest rejeté.`;
     }
   }
   const source = String(technicalSnapshot.source || "source inconnue");
-  const dataNote = `${bars} bougies ${timeframe} · ${source}${fresh ? " · historique clôturé récent" : " · fraîcheur OHLC non confirmée"}${technicalSnapshot.timeframeCompatible === false ? " · timeframe non aligné" : ""}${quoteUsable ? " · cotation live utilisable" : " · cotation live indisponible, lecture basée sur la dernière clôture"}`;
+  const dataNote = `${bars} bougies ${timeframe} · ${continuousBars} consécutives · ${source}${fresh ? " · historique clôturé récent" : " · fraîcheur OHLC non confirmée"}${!integrityConfirmed ? " · intégrité OHLC à vérifier" : ""}${technicalSnapshot.timeframeCompatible === false ? " · timeframe non aligné" : ""}${quoteUsable ? " · cotation live utilisable" : " · cotation live indisponible, lecture basée sur la dernière clôture"}`;
   return {
-    status: !enoughBars ? "insufficient_history" : !fresh ? "indicative_data" : "context_only",
+    status: !enoughBars ? "insufficient_history" : !fresh ? "indicative_data" : !integrityConfirmed ? "incoherent_data" : !continuityReady ? "insufficient_continuity" : !structureReady ? "insufficient_structure" : "context_only",
     pair,
     timeframe,
     bars,
+    continuousBars,
+    integrityConfirmed,
+    historyQuality: technicalSnapshot.historyQuality || null,
+    requiredStructureBars,
+    structureReady,
     dataFresh: fresh,
     liveQuoteUsable: quoteUsable,
     bias,
@@ -9493,8 +9584,19 @@ function buildPriceActionMarketOutlook({ pair = "EUR/USD", timeframe = "M5", liv
     rangePosition,
     support: zonesUsable ? formatLevel(support, pair) : null,
     resistance: zonesUsable ? formatLevel(resistance, pair) : null,
+    supportSource: Number.isFinite(localSupport) ? "swing confirmé proche" : "borne OHLC du lookback",
+    resistanceSource: Number.isFinite(localResistance) ? "swing confirmé proche" : "borne OHLC du lookback",
+    supportBarsAgo: Number.isFinite(localSupport) ? Number(read.nearestSupportBarsAgo) : null,
+    resistanceBarsAgo: Number.isFinite(localResistance) ? Number(read.nearestResistanceBarsAgo) : null,
+    rangeSupport: rangeZonesUsable ? formatLevel(rangeSupport, pair) : null,
+    rangeResistance: rangeZonesUsable ? formatLevel(rangeResistance, pair) : null,
     candle: String(read.candle || "motif de bougie non disponible"),
-    structure: structure || "swings confirmés insuffisants",
+    structure: structureReady
+      ? structure || "swings confirmés insuffisants"
+      : enoughBars && fresh && integrityConfirmed && continuityReady
+        ? `${structure || "swings confirmés insuffisants"} · orientation provisoire (${continuousBars}/${requiredStructureBars} bougies)`
+        : structure || "swings confirmés insuffisants",
+    broaderStructure: broaderStructure || "structure étendue non disponible",
     liquidity: String(read.sweep || "balayage non mesurable"),
     imbalance: read.imbalance
       ? `${read.imbalance.direction || "direction inconnue"} ${formatLevel(read.imbalance.low, pair)}–${formatLevel(read.imbalance.high, pair)}`
@@ -9521,7 +9623,8 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
     pair,
     timeframe,
     source,
-    bars: Array.isArray(history) ? history.length : 0,
+    bars: 0,
+    continuousBars: 0,
     stale: Boolean(history?._meta?.stale),
     researchOnly: true,
     actionable: false,
@@ -9541,6 +9644,42 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   if (!isDerivPriceActionHistorySource(source) || history?._meta?.stale || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true })) {
     return unavailable("deriv_history_unconfirmed", "Historique Deriv exact indisponible", "Aucun candidat n'est calculé sans bougies Deriv récentes et alignées sur le timeframe sélectionné.");
   }
+  const nowMs = Date.now();
+  const integrity = inspectClosedOhlcHistory(history, timeframe, nowMs);
+  const qualityWindowBars = Math.max(60, structureLookbackForTimeframe(timeframe), priceActionMinimumStructureBars(timeframe));
+  const cleanBars = integrity.bars.map((bar) => ({
+    open: bar.open,
+    high: bar.high,
+    low: bar.low,
+    close: bar.close,
+    volume: Number(bar.volume) || 0,
+    datetime: new Date(bar.startMs).toISOString(),
+    epoch: bar.startMs / 1000,
+  }));
+  // Providers and cached histories do not all preserve the same array order.
+  // Select the latest closed candles only after timestamp sorting and removal of
+  // partial candles; slicing the raw transport order can inspect an obsolete or
+  // future-dated segment while the full snapshot reads a different set.
+  const qualityWindow = inspectClosedOhlcHistory(cleanBars.slice(-qualityWindowBars), timeframe, nowMs);
+  base.bars = cleanBars.length;
+  base.continuousBars = qualityWindow.trailingConsecutiveBars;
+  base.historyQuality = {
+    checkedBars: Math.min(history.length, qualityWindowBars),
+    validClosedBars: qualityWindow.bars.length,
+    invalidBars: integrity.invalidBars,
+    missingTimestamps: integrity.missingTimestamps,
+    duplicateBars: integrity.duplicateBars,
+    conflictingDuplicates: integrity.conflictingDuplicates,
+    gaps: qualityWindow.gaps,
+  };
+  if (integrity.invalidBars || integrity.conflictingDuplicates || !integrity.hasTimestamps) {
+    return unavailable("incoherent_ohlc", "Bougies OHLC à vérifier", "Aucun candidat de recherche n'est calculé : l'historique récent contient des OHLC invalides ou des valeurs contradictoires au même horodatage.");
+  }
+  const requiredCandidateBars = PRICE_ACTION_RULES.lookbackBars + 3;
+  if (qualityWindow.trailingConsecutiveBars < requiredCandidateBars) {
+    return unavailable("discontinuous_history", "Historique continu insuffisant", `La règle de recherche a besoin de ${requiredCandidateBars} bougies consécutives; la dernière séquence n'en contient que ${qualityWindow.trailingConsecutiveBars}.`);
+  }
+  const candidateBars = cleanBars.slice(-Math.min(60, qualityWindow.trailingConsecutiveBars));
   const bid = Number(livePrice?.bid);
   const ask = Number(livePrice?.ask);
   const quoteConfirmed = livePrice?.source === "deriv_ws" && isUsableLivePrice(livePrice);
@@ -9556,7 +9695,7 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
     : cachedDerivHistory
       ? "Historique OHLC Deriv en cache : le spread actuel n'est pas synchronisé avec ces bougies; coût total et filtre de coût non validés."
       : "Bid/ask Deriv indisponible : coût total et filtre de coût non validés.";
-  const result = analyzeLatestPriceActionScalp(history, {
+  const result = analyzeLatestPriceActionScalp(candidateBars, {
     tickSize: priceActionTickSize(pair),
     spread,
     commissionPctPerSide: 0,
@@ -9577,6 +9716,9 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   return {
     ...base,
     ...result,
+    bars: cleanBars.length,
+    continuousBars: qualityWindow.trailingConsecutiveBars,
+    historyQuality: base.historyQuality,
     pair,
     timeframe,
     source,
@@ -9619,13 +9761,14 @@ TECHNIQUE_UTILISEE:Price Action
 STYLE_EFFICACITE:Price Action=0`;
 }
 
-function buildApiOnlyNoSignalText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [], reason }) {
+function buildApiOnlyNoSignalText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, technicalSnapshot = {}, priceActionAnalysis = null, newsContext = {}, multiTimeframe = [], reason }) {
   if (/^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy)) {
     return buildPriceActionScalpNoSignalText({
       pair,
       timeframe,
       livePrice,
       technicalSnapshot,
+      priceActionAnalysis,
       newsContext,
       multiTimeframe,
       reason: `${reason || "confluence insuffisante"} Un biais de tendance seul ne valide pas une entrée scalp.`,
@@ -9656,7 +9799,7 @@ TECHNIQUE_UTILISEE:${technique}
 STYLE_EFFICACITE:${technique}=45`;
 }
 
-function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", risk, livePrice, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", risk, livePrice, technicalSnapshot = {}, priceActionAnalysis = null, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const rawTrend = /haussi|baissi/i.test(String(technicalSnapshot.trend || ""))
@@ -9669,9 +9812,10 @@ function buildApiOnlyAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = 
       timeframe,
       livePrice,
       technicalSnapshot,
+      priceActionAnalysis,
       newsContext,
       multiTimeframe,
-      reason: chartlessPriceActionScalpReason(technicalSnapshot),
+      reason: chartlessPriceActionScalpReason(technicalSnapshot, priceActionAnalysis),
     });
   }
   const trend = /baissi/i.test(String(rawTrend || "")) ? "baissière" : "haussière";
@@ -9752,7 +9896,7 @@ function buildSmcOnlyAnswer(smc = null) {
     "STYLE_EFFICACITE:SMC=0",
   ].join("\n");
 }
-function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, risk, capital, technicalSnapshot = {}, newsContext = {}, multiTimeframe = [] }) {
+function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", style = "Price Action", strategy = "Scalping", livePrice, risk, capital, technicalSnapshot = {}, priceActionAnalysis = null, newsContext = {}, multiTimeframe = [] }) {
   const technique = style === "Mixte" ? "Price Action" : style;
   const mtf = analyzeMultiTimeframeConsensus(multiTimeframe);
   const scalpPriceAction = /^price\s*action$/i.test(String(style || "")) && isScalpingStrategy(strategy);
@@ -9762,9 +9906,10 @@ function buildDeterministicAnalysisText({ pair = "EUR/USD", timeframe = "M5", st
       timeframe,
       livePrice,
       technicalSnapshot,
+      priceActionAnalysis,
       newsContext,
       multiTimeframe,
-      reason: chartlessPriceActionScalpReason(technicalSnapshot),
+      reason: chartlessPriceActionScalpReason(technicalSnapshot, priceActionAnalysis),
     });
   }
   const price = Number.isFinite(Number(livePrice?.price))
@@ -9936,6 +10081,12 @@ function structureLookbackForTimeframe(timeframe) {
   return ({ M1: 180, M5: 120, M15: 96, M30: 72, H1: 60, H4: 48, D1: 40, W1: 26, MN1: 24 })[normalizeTimeframe(timeframe)] || 60;
 }
 
+function priceActionMinimumStructureBars(timeframe) {
+  // Minimum sample for publishing a scalp structure bias; shorter histories
+  // still show their OHLC facts. M1/M5/M15 span roughly 2h/6h/12h.
+  return ({ M1: 120, M5: 72, M15: 48, M30: 36, H1: 30, H4: 24, D1: 20, W1: 12, MN1: 12 })[normalizeTimeframe(timeframe)] || 30;
+}
+
 function buildMarketChartPayload(pair, timeframe, history = [], technicalSnapshot = {}) {
   if (!Array.isArray(history) || !history.length) return null;
   const candles = history.slice(-80).flatMap((bar, index, rows) => {
@@ -9973,14 +10124,47 @@ function buildMarketChartPayload(pair, timeframe, history = [], technicalSnapsho
 }
 
 function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = {}) {
-  const rawBars = Array.isArray(history) ? history.filter((bar) => Number.isFinite(Number(bar.close))) : [];
+  const inputBars = Array.isArray(history) ? history : [];
   const meta = history?._meta || {};
+  const nowMs = Date.now();
   const timeframe = normalizeTimeframe(options.timeframe || meta.timeframe || "M5") || "M5";
   const timeframeMs = timeframeMinutes(timeframe) * 60_000;
+  const exactTimeframeRequired = options.requireExactTimeframe === true;
+  const structureLookbackBars = structureLookbackForTimeframe(timeframe);
+  const requiredStructureBars = priceActionMinimumStructureBars(timeframe);
+  const qualityWindowBars = Math.max(structureLookbackBars, requiredStructureBars);
+  const fullIntegrity = exactTimeframeRequired
+    ? inspectClosedOhlcHistory(inputBars, timeframe, nowMs)
+    : null;
+  const rawBars = fullIntegrity
+    ? fullIntegrity.bars.map((bar) => ({
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: Number(bar.volume) || 0,
+      datetime: new Date(bar.startMs).toISOString(),
+      epoch: bar.startMs / 1000,
+    }))
+    : inputBars.filter((bar) => {
+      const open = Number(bar.open);
+      const high = Number(bar.high);
+      const low = Number(bar.low);
+      const close = Number(bar.close);
+      return [open, high, low, close].every(Number.isFinite)
+        && high >= Math.max(open, close, low)
+        && low <= Math.min(open, close, high);
+    });
+  // `rawBars` comes from the shared validator, so it is chronologically sorted,
+  // deduplicated and closed. Measure the latest window from that canonical series
+  // instead of slicing provider order (which may be newest-first or mixed-cache).
+  const qualityWindow = exactTimeframeRequired
+    ? inspectClosedOhlcHistory(rawBars.slice(-qualityWindowBars), timeframe, nowMs)
+    : null;
   const bars = rawBars.filter((bar) => {
     const openedAt = Date.parse(String(bar.datetime || bar.time || ""));
-    if (!Number.isFinite(openedAt) || !Number.isFinite(timeframeMs)) return options.requireExactTimeframe !== true;
-    return openedAt + timeframeMs <= Date.now();
+    if (!Number.isFinite(openedAt) || !Number.isFinite(timeframeMs)) return !exactTimeframeRequired;
+    return openedAt + timeframeMs <= nowMs;
   });
   const closes = bars.map((bar) => Number(bar.close));
   const live = Number(livePrice?.price);
@@ -9990,7 +10174,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   const lastBar = bars.at(-1);
   const lastBarTime = Date.parse(String(lastBar?.datetime || lastBar?.time || ""));
   const lastClosedAgeMs = Number.isFinite(lastBarTime) && Number.isFinite(timeframeMs)
-    ? Math.max(0, Date.now() - (lastBarTime + timeframeMs))
+    ? Math.max(0, nowMs - (lastBarTime + timeframeMs))
     : Number.POSITIVE_INFINITY;
   const lastCandleClosedAt = Number.isFinite(lastBarTime) && Number.isFinite(timeframeMs)
     ? new Date(lastBarTime + timeframeMs).toISOString()
@@ -9998,6 +10182,25 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   const historyAgeMinutes = Number.isFinite(lastClosedAgeMs)
     ? Number((lastClosedAgeMs / 60_000).toFixed(1))
     : null;
+  const historyQuality = qualityWindow ? {
+    checkedBars: Math.min(inputBars.length, qualityWindowBars),
+    validClosedBars: qualityWindow.bars.length,
+    invalidBars: fullIntegrity.invalidBars,
+    missingTimestamps: fullIntegrity.missingTimestamps,
+    duplicateBars: fullIntegrity.duplicateBars,
+    conflictingDuplicates: fullIntegrity.conflictingDuplicates,
+    gaps: qualityWindow.gaps,
+    continuousBars: qualityWindow.trailingConsecutiveBars,
+  } : null;
+  const historyIntegrityConfirmed = qualityWindow
+    ? fullIntegrity.invalidBars === 0
+      && fullIntegrity.conflictingDuplicates === 0
+      && fullIntegrity.hasTimestamps
+    : null;
+  const continuousBars = qualityWindow ? qualityWindow.trailingConsecutiveBars : null;
+  const historyDiagnostics = historyQuality
+    ? { ...(meta.diagnostics || {}), barQuality: historyQuality }
+    : meta.diagnostics || null;
   const historyFresh = closes.length >= 30
     && !meta.stale
     && compatible
@@ -10012,7 +10215,10 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       historyFresh: false,
       historyAgeMinutes,
       lastCandleClosedAt,
-      historyDiagnostics: meta.diagnostics || null,
+      historyDiagnostics,
+      historyIntegrityConfirmed,
+      continuousBars,
+      historyQuality,
       livePriceUsable,
       valid: false,
       marketRegime: "unknown",
@@ -10023,11 +10229,10 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   const sma30 = closes.length >= 30 ? average(closes.slice(-30)) : NaN;
   const rsi = closes.length >= 15 ? calculateRsi(closes.slice(-100)) : NaN;
   const atr = average(bars.slice(-14).map((bar) => Math.max(0, Number(bar.high) - Number(bar.low)))) || last * 0.004;
-  const structureLookbackBars = structureLookbackForTimeframe(timeframe);
   const recent = bars.slice(-structureLookbackBars);
   const support = Math.min(...recent.map((bar) => Number(bar.low)).filter(Number.isFinite));
   const resistance = Math.max(...recent.map((bar) => Number(bar.high)).filter(Number.isFinite));
-  const priceActionRead = summarizePriceActionBars(recent, pair);
+  const priceActionRead = summarizePriceActionBars(recent, pair, livePriceUsable ? live : last, continuousBars);
   const momentum = Number.isFinite(sma30) && sma30 > 0 ? ((sma10 - sma30) / sma30) * 100 : 0;
   const trend = !Number.isFinite(sma30)
     ? "neutre"
@@ -10068,7 +10273,10 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
     historyFresh,
     historyAgeMinutes,
     lastCandleClosedAt,
-    historyDiagnostics: meta.diagnostics || null,
+    historyDiagnostics,
+    historyIntegrityConfirmed,
+    continuousBars,
+    historyQuality,
     livePriceUsable,
     timeframeCompatible: compatible,
     timeframe,
@@ -10095,10 +10303,14 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
       Number.isFinite(rsi) ? `RSI ${Math.round(rsi)}` : "RSI indisponible",
       `ATR ${formatLevel(atr, pair)}`,
       `structure calculÃ©e sur ${recent.length} bougies ${timeframe}`,
-      Number.isFinite(support) && Number.isFinite(resistance) ? `support ${formatLevel(support, pair)}, résistance ${formatLevel(resistance, pair)}` : "zones S/R insuffisantes",
+      Number.isFinite(support) && Number.isFinite(resistance) ? `bornes OHLC du lookback ${formatLevel(support, pair)}–${formatLevel(resistance, pair)}` : "bornes OHLC insuffisantes",
+      Number.isFinite(priceActionRead.nearestSupport) || Number.isFinite(priceActionRead.nearestResistance)
+        ? `swings proches support ${priceActionRead.nearestSupport ?? "n/a"}, résistance ${priceActionRead.nearestResistance ?? "n/a"}`
+        : "swings proches non mesurables",
       priceActionRead.summary,
       Number.isFinite(volumeRatio) ? `volume ${volumeRatio}x la moyenne 20 bougies` : "volume indisponible pour cette source",
       `confirmations ${confirmations}/6`,
+      historyQuality ? `OHLC contrôlés: ${historyQuality.validClosedBars}/${historyQuality.checkedBars} bougies valides; séquence continue ${historyQuality.continuousBars}; ${historyQuality.gaps} coupure(s); ${historyQuality.invalidBars} bougie(s) invalide(s), ${historyQuality.conflictingDuplicates} doublon(s) contradictoire(s)` : "contrôle temporel détaillé non requis pour ce profil",
       compatible ? "timeframe cohérent avec la stratégie" : "historique non aligné avec le timeframe demandé",
       historyFresh ? "bougies clôturées récentes confirmées par leur horodatage" : "fraîcheur OHLC non confirmée",
       livePriceUsable ? "cotation live exploitable" : "cotation live non fiable; dernier close OHLC utilisé",
@@ -10106,7 +10318,7 @@ function buildTechnicalSnapshot(pair, history = [], livePrice = null, options = 
   };
 }
 
-function summarizePriceActionBars(bars, pair) {
+function summarizePriceActionBars(bars, pair, referencePrice = null, contiguousBars = null) {
   const usable = bars.filter((bar) => [bar.open, bar.high, bar.low, bar.close].every((value) => Number.isFinite(Number(value))))
     .map((bar) => ({ open: Number(bar.open), high: Number(bar.high), low: Number(bar.low), close: Number(bar.close) }));
   if (usable.length < 5) return { summary: "OHLC insuffisant pour les swings et les motifs de bougies." };
@@ -10122,24 +10334,52 @@ function summarizePriceActionBars(bars, pair) {
   const candleDirection = last.close > last.open ? "haussière" : last.close < last.open ? "baissière" : "doji";
   const candleText = `${candleDirection}, corps ${(body / range * 100).toFixed(0)}% de l'amplitude, mèches haute/basse ${(upperWick / range * 100).toFixed(0)}%/${(lowerWick / range * 100).toFixed(0)}%`;
 
-  const swingHighs = [];
-  const swingLows = [];
+  const swingHighPoints = [];
+  const swingLowPoints = [];
   for (let index = 2; index < usable.length - 2; index += 1) {
     const candidate = usable[index];
     const neighbours = [usable[index - 2], usable[index - 1], usable[index + 1], usable[index + 2]];
-    if (neighbours.every((bar) => candidate.high > bar.high)) swingHighs.push(candidate.high);
-    if (neighbours.every((bar) => candidate.low < bar.low)) swingLows.push(candidate.low);
+    if (neighbours.every((bar) => candidate.high > bar.high)) {
+      swingHighPoints.push({ price: candidate.high, index });
+    }
+    if (neighbours.every((bar) => candidate.low < bar.low)) {
+      swingLowPoints.push({ price: candidate.low, index });
+    }
   }
-  const highPair = swingHighs.slice(-2);
-  const lowPair = swingLows.slice(-2);
-  const higherHighs = highPair.length === 2 && highPair[1] > highPair[0];
-  const lowerHighs = highPair.length === 2 && highPair[1] < highPair[0];
-  const higherLows = lowPair.length === 2 && lowPair[1] > lowPair[0];
-  const lowerLows = lowPair.length === 2 && lowPair[1] < lowPair[0];
-  const swingStructure = higherHighs && higherLows ? "HH/HL confirmés (structure haussière)"
-    : lowerHighs && lowerLows ? "LH/LL confirmés (structure baissière)"
-      : highPair.length === 2 && lowPair.length === 2 ? "swings mixtes / range"
-        : "swings confirmés insuffisants";
+  // Report nearby, confirmed fractal levels separately from the widest high/low
+  // of the lookback. A 60-bar local window gives M1/M5/M15 a usable tactical
+  // reference without pretending that the full lookback extreme is nearby.
+  const localWindowBars = contiguousBars != null && Number.isFinite(Number(contiguousBars))
+    ? Math.min(60, Math.max(0, Number(contiguousBars)))
+    : Math.min(60, usable.length);
+  const localStart = Math.max(0, usable.length - localWindowBars);
+  const localSwingHighs = swingHighPoints.filter((point) => point.index >= localStart);
+  const localSwingLows = swingLowPoints.filter((point) => point.index >= localStart);
+  const classifySwingStructure = (highPoints, lowPoints) => {
+    const highPair = highPoints.slice(-2).map((point) => point.price);
+    const lowPair = lowPoints.slice(-2).map((point) => point.price);
+    const higherHighs = highPair.length === 2 && highPair[1] > highPair[0];
+    const lowerHighs = highPair.length === 2 && highPair[1] < highPair[0];
+    const higherLows = lowPair.length === 2 && lowPair[1] > lowPair[0];
+    const lowerLows = lowPair.length === 2 && lowPair[1] < lowPair[0];
+    return higherHighs && higherLows ? "HH/HL confirmés (structure haussière)"
+      : lowerHighs && lowerLows ? "LH/LL confirmés (structure baissière)"
+        : highPair.length === 2 && lowPair.length === 2 ? "swings mixtes / range"
+          : "swings confirmés insuffisants";
+  };
+  const swingStructure = classifySwingStructure(localSwingHighs, localSwingLows);
+  const broadSwingStructure = classifySwingStructure(swingHighPoints, swingLowPoints);
+  const reference = Number.isFinite(Number(referencePrice)) && Number(referencePrice) > 0
+    ? Number(referencePrice) : last.close;
+  const nearestSupportPoint = swingLowPoints.reduce((nearest, point) =>
+    point.index >= localStart && point.price < reference && (!nearest || point.price > nearest.price) ? point : nearest, null);
+  const nearestResistancePoint = swingHighPoints.reduce((nearest, point) =>
+    point.index >= localStart && point.price > reference && (!nearest || point.price < nearest.price) ? point : nearest, null);
+  const nearestSupport = nearestSupportPoint ? Number(formatLevel(nearestSupportPoint.price, pair)) : null;
+  const nearestResistance = nearestResistancePoint ? Number(formatLevel(nearestResistancePoint.price, pair)) : null;
+  const nearbySwingText = nearestSupport != null || nearestResistance != null
+    ? `swings proches (${localWindowBars} bougies continues max): support ${nearestSupport ?? "n/a"}, résistance ${nearestResistance ?? "n/a"}`
+    : "aucun swing confirmé proche dans les 60 dernières bougies";
 
   const priorHigh = Math.max(...prior.map((bar) => bar.high));
   const priorLow = Math.min(...prior.map((bar) => bar.low));
@@ -10159,6 +10399,11 @@ function summarizePriceActionBars(bars, pair) {
   return {
     candle: candleText,
     swingStructure,
+    broadSwingStructure,
+    nearestSupport,
+    nearestResistance,
+    nearestSupportBarsAgo: nearestSupportPoint ? usable.length - 1 - nearestSupportPoint.index : null,
+    nearestResistanceBarsAgo: nearestResistancePoint ? usable.length - 1 - nearestResistancePoint.index : null,
     sweep,
     displacementRatio: displacementRatio == null ? null : Number(displacementRatio.toFixed(2)),
     imbalance: imbalance ? {
@@ -10166,7 +10411,7 @@ function summarizePriceActionBars(bars, pair) {
       low: Number(formatLevel(imbalance.low, pair)),
       high: Number(formatLevel(imbalance.high, pair)),
     } : null,
-    summary: `OHLC: dernière bougie ${candleText}; ${swingStructure}; ${sweep}; ${displacement}; ${gapText}. Motifs algorithmiques à confirmer avec le flux du courtier.`,
+    summary: `OHLC: dernière bougie ${candleText}; structure locale ${localWindowBars} bougies continues ${swingStructure}; structure étendue ${broadSwingStructure}; ${nearbySwingText}; ${sweep}; ${displacement}; ${gapText}. Les pivots sont confirmés avec deux bougies à droite; repères algorithmiques, pas ordres automatiques.`,
   };
 }
 
@@ -10335,9 +10580,15 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       ? (() => {
         const feedConfirmed = livePrice?.source === "deriv_ws"
           && /^deriv_ws:/i.test(String(context.technicalSnapshot?.source || ""));
-        const historyConfirmed = Boolean(context.technicalSnapshot?.valid
-          && context.technicalSnapshot?.historyFresh
-          && context.technicalSnapshot?.timeframeCompatible !== false);
+        // Data quality and trading confluence are different states. `valid`
+        // also requires a directional trend; a fresh neutral market still has
+        // usable OHLC for its read, even though it has no confirmed setup.
+        const continuousBars = Number(context.technicalSnapshot?.continuousBars ?? context.technicalSnapshot?.bars) || 0;
+        const historyConfirmed = Boolean(Number(context.technicalSnapshot?.bars) >= 30
+          && context.technicalSnapshot?.historyFresh === true
+          && context.technicalSnapshot?.timeframeCompatible !== false
+          && context.technicalSnapshot?.historyIntegrityConfirmed !== false
+          && continuousBars >= 30);
         const bidAskConfirmed = livePrice?.bid != null && livePrice?.ask != null
           && Number.isFinite(Number(livePrice.bid)) && Number.isFinite(Number(livePrice.ask))
           && Number(livePrice.bid) > 0 && Number(livePrice.ask) >= Number(livePrice.bid);
@@ -10346,12 +10597,14 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
         if (!feedConfirmed) blockers.push("prix live et bougies Deriv non confirmés sur le même flux");
         if (!bidAskConfirmed) blockers.push("bid/ask Deriv indisponible pour mesurer le spread");
         if (historyConfirmed && feedConfirmed && bidAskConfirmed) blockers.push("aucune règle automatique de déclenchement n'est validée pour la production");
+        const researchCandidateDetected = Boolean(context.priceActionAnalysis?.candidates?.length);
         return {
           ready: false,
           feedConfirmed,
           historyConfirmed,
           bidAskConfirmed,
-          triggerConfirmed: false,
+          researchCandidateDetected,
+          triggerConfirmed: researchCandidateDetected,
           reason: blockers.join("; "),
         };
       })()
@@ -10402,6 +10655,7 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
       timeframe: body.timeframe || "M5",
       livePrice,
       technicalSnapshot: context.technicalSnapshot || {},
+      priceActionAnalysis: context.priceActionAnalysis || null,
       newsContext: context.newsContext || {},
       multiTimeframe: context.multiTimeframe || [],
       reason: "le plan d'ordre est bloqué: cotation, bougies Deriv et/ou bid/ask ne sont pas confirmés ensemble",
@@ -10419,14 +10673,19 @@ VALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) 
     });
   }
   const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
-  if (explicitNoSignal) {
+  const researchOnlyPaCandidate = strictPriceActionScalp
+    && !hasChartImages
+    && meta.priceActionAnalysis?.researchOnly === true
+    && Array.isArray(meta.priceActionAnalysis.candidates)
+    && meta.priceActionAnalysis.candidates.length > 0;
+  if (explicitNoSignal || researchOnlyPaCandidate) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 45),
       technique: normalized.technique === "Mixte" ? "Aucun style validé" : normalized.technique || validation.technique,
       explanation: `${displayText}
 
-VALIDATION KRONOS: signal bloqué volontairement, car l'analyse IA n'a pas confirmé un setup exploitable.`,
-      validation: { ...validation, valid: false, reason: "Aucun signal confirmé par Kronos." },
+VALIDATION KRONOS: ${researchOnlyPaCandidate ? "candidat expérimental conservé pour l'analyse, mais son moteur n'est pas validé pour émettre un ordre copiable." : "signal bloqué volontairement, car l'analyse n'a pas confirmé un setup exploitable."}`,
+      validation: { ...validation, valid: false, reason: researchOnlyPaCandidate ? "Candidat Price Action expérimental, non validé pour exécution." : "Aucun signal confirmé par Kronos." },
       meta,
     });
   }
@@ -10454,11 +10713,14 @@ VALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
         executionReadiness: {
           ready: false,
           feedConfirmed: Boolean(meta.derivFeedConfirmed),
-          historyConfirmed: Boolean(meta.technicalSnapshot?.valid
-            && meta.technicalSnapshot?.historyFresh
-            && meta.technicalSnapshot?.timeframeCompatible !== false),
+          historyConfirmed: Boolean(Number(meta.technicalSnapshot?.bars) >= 30
+            && meta.technicalSnapshot?.historyFresh === true
+            && meta.technicalSnapshot?.timeframeCompatible !== false
+            && meta.technicalSnapshot?.historyIntegrityConfirmed !== false
+            && Number(meta.technicalSnapshot?.continuousBars ?? meta.technicalSnapshot?.bars) >= 30),
           bidAskConfirmed: Boolean(meta.derivSpreadConfirmed),
-          triggerConfirmed: false,
+          researchCandidateDetected: Boolean(meta.executionReadiness?.researchCandidateDetected),
+          triggerConfirmed: Boolean(meta.executionReadiness?.researchCandidateDetected),
           reason: executionIssueSummary || "Données d'exécution Deriv incomplètes.",
         },
       },
@@ -10758,20 +11020,94 @@ function buildNoSignalDiagnostic(details = {}) {
   const quality = meta.imageQuality || {};
   const technical = meta.technicalSnapshot || {};
   const marketOutlook = meta.marketOutlook || null;
+  const priceActionCandidate = !quality.images && Array.isArray(meta.priceActionAnalysis?.candidates)
+    ? meta.priceActionAnalysis.candidates.find((item) => [item.entry, item.stop, item.tp1, item.tp2].every((value) => value != null && Number.isFinite(Number(value))))
+    : null;
   const levelCheck = meta.levelCheck || {};
   const explanation = `${details.explanation || ""} ${validation.reason || ""} ${levelCheck.reason || ""}`.toLowerCase();
 
   if (/flux public deriv|flux deriv ou spread bid\/ask non confirmé/.test(explanation)) {
+    const partialScenariosAvailable = marketOutlook?.status === "insufficient_continuity"
+      && Number(marketOutlook.bars) >= 30
+      && marketOutlook.integrityConfirmed === true
+      && marketOutlook.dataFresh !== false
+      && marketOutlook.bullishScenario && marketOutlook.bearishScenario
+      && !/suspendu/i.test(`${marketOutlook.bullishScenario} ${marketOutlook.bearishScenario}`);
     return {
       status: "EXECUTION_DATA_INCOMPLETE",
-      statusLabel: "Lecture disponible · exécution suspendue",
-      userMessage: meta.marketOutlook
-        ? `Analyse OHLC terminée. Seul le plan d'ordre copiable est suspendu : ${meta.executionReadiness?.reason || "flux Deriv ou bid/ask non confirmé"}.`
+      statusLabel: partialScenariosAvailable ? "Lecture OHLC partielle · exécution suspendue" : "Lecture disponible · exécution suspendue",
+      userMessage: partialScenariosAvailable
+        ? `Lecture OHLC partielle : ${Number(marketOutlook.bars)} bougies valides, ${Number(marketOutlook.continuousBars)} consécutives. Les deux scénarios conditionnels sont affichés; seul le plan d'ordre copiable attend un flux Deriv et un bid/ask confirmés (${meta.executionReadiness?.reason || "données d'exécution incomplètes"}).`
+        : meta.marketOutlook
+          ? `Analyse OHLC terminée. Seul le plan d'ordre copiable est suspendu : ${meta.executionReadiness?.reason || "flux Deriv ou bid/ask non confirmé"}.`
         : "Le prix, les bougies et le bid/ask ne sont pas confirmés sur le même flux Deriv. Kronos bloque le scalping plutôt que de mélanger des cotations différentes.",
+      nextActions: partialScenariosAvailable
+        ? [
+          "Pour l'instant, surveille uniquement les clôtures et retests décrits dans les deux scénarios conditionnels.",
+          `Pour afficher un ordre exécutable chez Deriv, il faut aussi un historique Deriv aligné et un bid/ask confirmé (${meta.executionReadiness?.reason || "données d'exécution incomplètes"}).`,
+          "Ne copie pas un plan calculé avec une source externe pour l'exécuter chez Deriv.",
+        ]
+        : [
+          "Réessaie quand les cotations Deriv répondent.",
+          "Vérifie la paire et l'unité de temps choisies.",
+          "Ne copie pas un plan affiché avec une source externe pour l'exécuter chez Deriv.",
+        ],
+    };
+  }
+
+  if (marketOutlook?.status === "incoherent_data" && !quality.images) {
+    const qualityRead = technical.historyQuality || {};
+    return {
+      status: "OHLC_INCOHERENT",
+      statusLabel: "Bougies OHLC à vérifier",
+      userMessage: `Les bougies ont été lues, mais l'échantillon récent contient ${Number(qualityRead.invalidBars) || 0} bougie(s) invalide(s) et ${Number(qualityRead.conflictingDuplicates) || 0} horodatage(s) contradictoire(s). Kronos conserve les observations calculables, mais ne publie pas de biais scalp confirmé ni d'ordre copiable sur cette base.`,
       nextActions: [
-        "Réessaie quand les cotations Deriv répondent.",
-        "Vérifie la paire et l'unité de temps choisies.",
-        "Ne copie pas un plan affiché avec une source externe pour l'exécuter chez Deriv.",
+        "Relancer l'analyse pour récupérer une série OHLC Deriv propre.",
+        "Vérifier que la paire et l'unité de temps choisies correspondent bien à la source des bougies.",
+        "Ne pas interpréter les niveaux de cette série comme un plan d'entrée.",
+      ],
+    };
+  }
+
+  if (marketOutlook?.status === "insufficient_continuity" && !quality.images) {
+    const bars = Math.max(0, Number(marketOutlook.continuousBars) || 0);
+    return {
+      status: "OHLC_DISCONTINUOUS",
+      statusLabel: "Historique scalp interrompu",
+      userMessage: `Kronos a reçu ${Number(marketOutlook.bars) || 0} bougies valides, mais seulement ${bars} à la suite sans coupure récente. Les scénarios conditionnels basés sur les niveaux mesurés restent affichés; le biais scalp confirmé et tout ordre copiable attendent un historique continu d'au moins 30 bougies.`,
+      nextActions: [
+        `Attendre au moins 30 bougies consécutives ${marketOutlook.timeframe || meta.timeframe || ""}, puis relancer l'analyse.`,
+        marketOutlook.trigger || "Les scénarios restent suspendus jusqu'à ce que la série soit continue.",
+        "Si la coupure vient d'une fermeture de marché, laisser la nouvelle séance fournir des bougies fraîches.",
+      ],
+    };
+  }
+
+  if (marketOutlook?.status === "insufficient_structure" && !quality.images) {
+    const bars = Math.max(0, Number(marketOutlook.bars) || Number(technical.bars) || 0);
+    const required = Math.max(0, Number(marketOutlook.requiredStructureBars) || 0);
+    return {
+      status: "PA_STRUCTURE_PARTIAL",
+      statusLabel: "OHLC lu · structure scalp partielle",
+      userMessage: `Kronos a bien lu ${bars} bougies ${marketOutlook.timeframe || meta.timeframe || ""}, mais il en faut ${required} pour confirmer un biais structurel sur cette unité. Une orientation HH/HL ou LH/LL peut être affichée comme provisoire; elle reste à confirmer. Aucun ordre copiable n'est émis.`,
+      nextActions: [
+        `Compléter l'historique jusqu'à ${required} bougies clôturées ${marketOutlook.timeframe || meta.timeframe || ""}.`,
+        marketOutlook.trigger || "Conserver les scénarios comme hypothèses, sans biais confirmé.",
+        "Relancer l'analyse après réception d'un historique frais et aligné.",
+      ],
+    };
+  }
+
+  if (priceActionCandidate) {
+    const direction = priceActionCandidate.directionLabel || (priceActionCandidate.direction === 1 ? "ACHAT" : "VENTE");
+    return {
+      status: "PA_CANDIDATE_READ_ONLY",
+      statusLabel: `Candidat ${direction} repéré · analyse disponible`,
+      userMessage: `Kronos a détecté une configuration ${priceActionCandidate.setup === "break_retest" ? "cassure + retest" : "rejet confirmé"} dans les bougies reçues. Ses niveaux théoriques sont détaillés dans le panneau Price Action; le moteur reste en recherche et n'autorise pas leur copie comme ordre.`,
+      nextActions: [
+        "Vérifier la clôture de la bougie et le retest sur le graphique Deriv correspondant.",
+        "Contrôler spread, commission et glissement avant d'évaluer ce scénario.",
+        "Comparer son résultat au taux historique Kronos affiché séparément, s'il existe.",
       ],
     };
   }
@@ -15549,13 +15885,17 @@ function calibrationFor(log, body = {}) {
   const targetProfile = normalizeTargetProfile(body.targetProfile);
   const prior = CALIBRATION_REFERENCE_WIN_RATE;
   const buckets = [
-    (item) => item.targetProfile === targetProfile && item.style === style && (item.strategy || "Swing Trading") === strategy && item.pair === pair && item.timeframe === timeframe,
-    (item) => item.targetProfile === targetProfile && item.style === style && item.pair === pair,
-    (item) => item.targetProfile === targetProfile && item.style === style && (item.strategy || "Swing Trading") === strategy,
-    (item) => item.targetProfile === targetProfile && item.style === style,
+    { label: `${pair} / ${timeframe} / ${strategy} / ${style} / ${targetProfile}`, matches: (item) => item.targetProfile === targetProfile && item.style === style && (item.strategy || "Swing Trading") === strategy && item.pair === pair && item.timeframe === timeframe },
+    { label: `${pair} / ${style} / ${targetProfile} (toutes UT et strategies)`, matches: (item) => item.targetProfile === targetProfile && item.style === style && item.pair === pair },
+    { label: `${strategy} / ${style} / ${targetProfile} (toutes paires et UT)`, matches: (item) => item.targetProfile === targetProfile && item.style === style && (item.strategy || "Swing Trading") === strategy },
+    { label: `${style} / ${targetProfile} (toutes paires, UT et strategies)`, matches: (item) => item.targetProfile === targetProfile && item.style === style },
   ];
-  for (const matches of buckets) {
-    const sample = log.outcomes.filter((item) => matches(item) && ["win", "loss"].includes(item.result)).slice(-200);
+  let smallestAvailable = null;
+  for (const bucket of buckets) {
+    const sample = log.outcomes.filter((item) => bucket.matches(item) && ["win", "loss"].includes(item.result)).slice(-200);
+    if (sample.length && (!smallestAvailable || sample.length > smallestAvailable.sample.length)) {
+      smallestAvailable = { scope: bucket.label, sample };
+    }
     if (sample.length >= 8) {
       const wins = sample.filter((item) => item.result === "win").length;
       const rawWinRate = wins / sample.length;
@@ -15567,15 +15907,29 @@ function calibrationFor(log, body = {}) {
         samples: sample.length,
         winRate: Math.round(rawWinRate * 100),
         shrunkWinRate: Math.round(shrunkWinRate * 100),
+        scope: bucket.label,
         confidenceLabel,
         adjustment,
         message: `${sample.length} résultats (${confidenceLabel}), winrate observé ${Math.round(rawWinRate * 100)}% ramené à ${Math.round(shrunkWinRate * 100)}% après pondération par la taille d'échantillon (prior ${pair} ${Math.round(prior * 100)}%), ajustement ${adjustment}.`,
       };
     }
   }
+  if (smallestAvailable) {
+    const wins = smallestAvailable.sample.filter((item) => item.result === "win").length;
+    return {
+      samples: smallestAvailable.sample.length,
+      winRate: Math.round((wins / smallestAvailable.sample.length) * 100),
+      shrunkWinRate: null,
+      scope: smallestAvailable.scope,
+      confidenceLabel: winRateConfidenceLabel(smallestAvailable.sample.length),
+      adjustment: 0,
+      message: `${smallestAvailable.sample.length} closed outcomes; observed win rate ${Math.round((wins / smallestAvailable.sample.length) * 100)}%; no score adjustment because the sample is below 8.`,
+    };
+  }
   return {
     samples: 0,
     winRate: null,
+    scope: null,
     confidenceLabel: "aucune donnée",
     adjustment: 0,
     message: "Aucun résultat confirmé pour ce style/contexte: aucun ajustement de score appliqué.",

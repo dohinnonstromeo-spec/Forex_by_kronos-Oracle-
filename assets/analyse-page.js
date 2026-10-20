@@ -6,6 +6,7 @@
   let detectedContext = null;
   let pendingDetectedContext = null;
   let chartDetectionVersion = 0;
+  let analysisInFlight = false;
 
   document.addEventListener("DOMContentLoaded", () => {
     setupUpload();
@@ -108,6 +109,11 @@
     if (!form || !result) return;
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      // A disabled submit button does not prevent every Enter/programmatic submit
+      // path. Keep one analysis at a time so an older response cannot overwrite a
+      // newer market selection.
+      if (analysisInFlight) return;
+      analysisInFlight = true;
       const submit = form.querySelector(".analysis-submit");
       // Captured here, not hardcoded below -- this button's idle label can be
       // overridden by the site-content admin CMS (data-cms="analyse.submit_button"),
@@ -119,22 +125,35 @@
       // anyone submits the form.
       const idleLabel = submit.textContent.trim() || "Lancer l'analyse Kronos";
       submit.disabled = true;
+      const body = Object.fromEntries(new FormData(form).entries());
+      body.images = images;
+      body.autoDetect = isAutoDetectEnabled() && Boolean(detectedContext);
+      body.detectedContext = body.autoDetect ? detectedContext : null;
+      const requestedContext = {
+        pair: body.autoDetect ? (detectedContext.primaryPair || body.pair || "EUR/USD") : (body.pair || "EUR/USD"),
+        timeframe: body.autoDetect ? (detectedContext.executionTimeframe || detectedContext.timeframes?.[0] || body.timeframe || "M5") : (body.timeframe || "M5"),
+      };
+      // Never leave another pair's actionable levels visible during a new run.
+      result.classList.add("show");
+      result.setAttribute("aria-busy", "true");
+      result.innerHTML = `
+        <div class="analysis-card analysis-loading-card" role="status" aria-live="polite">
+          <div class="direction-label">Analyse en cours</div>
+          <p class="mt-4 text-sm text-muted-foreground">Lecture de <strong>${escapeHtml(requestedContext.pair)}</strong> · <strong>${escapeHtml(requestedContext.timeframe)}</strong>. Les anciens niveaux sont masqués pendant cette nouvelle analyse.</p>
+        </div>
+      `;
       const progress = startAnalysisProgress(form);
       let analysisReceived = false;
       try {
-        const body = Object.fromEntries(new FormData(form).entries());
         const deep = body.analysisDepth !== "Rapide";
         setSubmitLabel(submit, deep ? "Kronos analyse en profondeur..." : "Kronos analyse rapidement...");
-        body.images = images;
-        body.autoDetect = isAutoDetectEnabled() && Boolean(detectedContext);
-        body.detectedContext = body.autoDetect ? detectedContext : null;
         if (isAutoDetectEnabled() && images.length && !detectedContext) {
           const panel = document.querySelector("#chartDetectionPanel");
           if (panel) panel.innerHTML = `<span class="oracle-chat-dot closed"></span> Détection non confirmée : la paire et l'unité de temps du formulaire seront utilisées.`;
         }
         const response = await postJson("/api/analyze-chart", body, deep ? 120000 : 45000);
         renderAnalysisResult(result, response);
-        analysisReceived = Boolean(response);
+        analysisReceived = Boolean(response) && response.clientError !== true;
       } catch (error) {
         result.classList.add("show");
         result.innerHTML = `
@@ -146,6 +165,8 @@
         `;
       } finally {
         finishAnalysisProgress(progress, analysisReceived);
+        analysisInFlight = false;
+        result.removeAttribute("aria-busy");
         submit.disabled = false;
         setSubmitLabel(submit, idleLabel, "zap");
       }
@@ -355,9 +376,14 @@
   function finishAnalysisProgress(progress, ok) {
     if (!progress) return;
     clearInterval(progress.timer);
-    progress.label.textContent = "100%";
-    progress.fill.style.width = "100%";
-    progress.step.textContent = ok ? "Analyse terminée." : "Délai dépassé: l'analyse profonde n'a pas répondu à temps.";
+    if (ok) {
+      progress.label.textContent = "100%";
+      progress.fill.style.width = "100%";
+      progress.step.textContent = "Réponse reçue.";
+    } else {
+      progress.label.textContent = "!";
+      progress.step.textContent = "Réponse incomplète ou interrompue; consulte le diagnostic affiché.";
+    }
     setTimeout(() => progress.node.classList.remove("show"), 900);
   }
 
@@ -480,7 +506,9 @@
     renderSignals(signals);
     const badge = document.querySelector(".signals-age");
     const status = data?.market?.forex?.open ? "Forex ouvert" : "Forex fermé";
-    if (badge) badge.textContent = `${status} · ${data?.market?.forex?.open ? "signaux uniquement si qualité validée" : "analyses suspendues"}`;
+    if (badge) badge.textContent = data?.market?.forex?.open
+      ? `${status} · signaux auto soumis aux filtres qualité`
+      : `${status} · analyses manuelles disponibles; signaux auto selon le marché`;
     renderMarketNotice(data?.market);
   }
 
@@ -537,6 +565,7 @@
             <span>Indice de qualité interne</span>
           </div>
         </div>
+        ${renderObservedCalibration(result)}
         ${renderTargetProfileSummary(result)}
         <div class="levels-table result-level-grid">
           ${renderCopyValue("Zone d'entrée indicative", getEntryZone(result)?.range || result.entry, "entry", getEntryZoneNote(result))}
@@ -572,6 +601,23 @@
     `;
   }
 
+  function renderObservedCalibration(result) {
+    const calibration = result.meta?.calibration;
+    if (!calibration) return "";
+    const samples = Math.max(0, Number(calibration.samples) || 0);
+    const hasObservedRate = samples > 0 && Number.isFinite(Number(calibration.winRate));
+    const rate = hasObservedRate ? `${Number(calibration.winRate)}%` : "pas encore mesur\u00e9";
+    const scope = calibration.scope ? `P\u00e9rim\u00e8tre : ${calibration.scope}. Donn\u00e9es agr\u00e9g\u00e9es du journal Kronos.` : "P\u00e9rim\u00e8tre demand\u00e9, r\u00e9sultats Kronos cl\u00f4tur\u00e9s.";
+    const confidence = calibration.confidenceLabel ? `Fiabilit\u00e9 de l'\u00e9chantillon : ${calibration.confidenceLabel}.` : "";
+    const caution = hasObservedRate
+      ? "Taux observ\u00e9 sur les trades clos; ce n'est pas la probabilit\u00e9 du prochain trade."
+      : "Aucun pourcentage de r\u00e9ussite n'est invent\u00e9 quand il n'y a pas d'historique.";
+    return `<div class="mt-3 rounded-lg border border-white/10 bg-black/20 p-3 text-xs text-muted-foreground" aria-label="Taux de r\u00e9ussite historique mesur\u00e9">
+      <strong class="text-foreground">Historique observ\u00e9 Kronos : ${rate}${hasObservedRate ? ` sur ${samples} r\u00e9sultats clos` : ""}</strong>
+      <p class="mt-1">${escapeHtml(scope)} ${escapeHtml(confidence)} ${escapeHtml(caution)}</p>
+    </div>`;
+  }
+
   function normalizeAnalysisPayload(data) {
     return {
       direction: "AUCUN SIGNAL",
@@ -595,24 +641,57 @@
     const label = result.statusLabel || diagnostic.statusLabel || "Setup non confirmé";
     const message = result.userMessage || diagnostic.userMessage || "Kronos bloque le trade pour éviter un signal forcé.";
     const actions = Array.isArray(result.nextActions) ? result.nextActions : diagnostic.nextActions || [];
+    const outlook = result.meta?.marketOutlook || null;
+    const candidates = Array.isArray(result.meta?.priceActionAnalysis?.candidates)
+      ? result.meta.priceActionAnalysis.candidates : [];
+    const candidateCount = candidates.length;
+    const candidate = candidates.find((item) => [item.entry, item.stop, item.tp1, item.tp2].every((value) => value != null && Number.isFinite(Number(value)))) || null;
+    const candidateDirection = candidate?.directionLabel || (candidate?.direction === 1 ? "ACHAT" : candidate?.direction === -1 ? "VENTE" : null);
+    const marketReadAvailable = Boolean(outlook
+      && Number(outlook.bars) >= 30
+      && Number(outlook.continuousBars) >= 30
+      && outlook.integrityConfirmed === true
+      && outlook.dataFresh !== false);
+    const priorDisplayLabel = marketReadAvailable && !/lecture disponible/i.test(String(label))
+      ? candidateCount ? "Candidat OHLC d\u00e9tect\u00e9 \u00b7 ex\u00e9cution \u00e0 v\u00e9rifier" : "Analyse termin\u00e9e \u00b7 sc\u00e9narios conditionnels"
+      : label;
+    const partialScenariosAvailable = Boolean(!marketReadAvailable && outlook
+      && Number(outlook.bars) >= 30
+      && outlook.integrityConfirmed === true
+      && outlook.dataFresh !== false
+      && outlook.bullishScenario && outlook.bearishScenario
+      && !/suspendu/i.test(`${outlook.bullishScenario} ${outlook.bearishScenario}`));
+    const scenarioReadAvailable = marketReadAvailable || partialScenariosAvailable;
+    const displayLabel = candidateCount
+      ? "Candidat OHLC d\u00e9tect\u00e9 \u00b7 ex\u00e9cution \u00e0 v\u00e9rifier"
+      : marketReadAvailable
+        ? "Analyse termin\u00e9e \u00b7 sc\u00e9narios conditionnels"
+        : partialScenariosAvailable
+          ? "Lecture OHLC partielle \u00b7 sc\u00e9narios disponibles"
+          : priorDisplayLabel;
     return `
         <div class="analysis-card no-signal-card${smc ? " smc-no-signal-card" : ""}">
         <div class="no-signal-hero">
           <div>
             <p class="analysis-kicker">Diagnostic Kronos</p>
-            <div class="direction-label no-signal-title">⏸ ${escapeHtml(label)}</div>
+            <div class="direction-label no-signal-title">${scenarioReadAvailable ? "◉" : "⏸"} ${escapeHtml(displayLabel)}</div>
           </div>
           <div class="result-confidence no-signal-confidence">
             <strong>${score}/100</strong>
             <span>Qualité du filtre</span>
           </div>
         </div>
-        <p class="no-signal-message">${escapeHtml(message)}</p>
+        ${scenarioReadAvailable
+          ? `<p class="no-signal-message">${marketReadAvailable
+            ? "Analyse OHLC terminée : les deux scénarios, leurs déclencheurs et invalidations sont détaillés ci-dessous."
+            : `Lecture partielle : ${Number(outlook.bars)} bougies valides, dont ${Number(outlook.continuousBars)} consécutives. Les conditions haussière et baissière restent visibles avec cette limite.`}${candidateCount ? ` ${candidateCount} candidat(s) Price Action sont détaillés dans le panneau de recherche.` : ""} Aucun scénario ne devient un ordre copiable sans validation séparée.</p>`
+          : `<p class="no-signal-message">${escapeHtml(message)}</p>`}
+        ${renderObservedCalibration(result)}
+        ${renderPriceActionResearch(result)}
         ${renderNoSignalAnalysis(result)}
         ${renderPriceActionMarketOutlook(result)}
         ${renderTargetProfileSummary(result)}
         ${renderPriceFreshness(result)}
-        ${renderPriceActionResearch(result)}
         ${renderSmcAnalysis(result)}
         ${smc ? `<div class="smc-readiness-mini">Ce mode ne donne pas de probabilite de reussite. Les etapes sont un diagnostic, pas une probabilite.</div>` : ""}
         ${renderMarketChart(result)}
@@ -629,11 +708,11 @@
           </div>
           <div>
             <span>Décision</span>
-            <strong>Pas d'entrée</strong>
+            <strong>${candidateDirection ? `${escapeHtml(candidateDirection)} · recherche` : "Pas d'entrée"}</strong>
           </div>
           <div>
             <span>Copie SL/TP</span>
-            <strong>Désactivée</strong>
+            <strong>${candidateDirection ? "Non copiable · validation en cours" : "Désactivée"}</strong>
           </div>
         </div>
         ${actions.length ? `
@@ -664,8 +743,10 @@
       ["Tendance", technical.trend],
       ["RSI", technical.rsi],
       ["ATR", technical.atr],
-      ["Support calculé", technical.support],
-      ["Résistance calculée", technical.resistance],
+      ["Borne basse OHLC du lookback", technical.support],
+      ["Borne haute OHLC du lookback", technical.resistance],
+      ["Support swing proche", technical.priceActionRead?.nearestSupport],
+      ["Résistance swing proche", technical.priceActionRead?.nearestResistance],
     ].filter(([, value]) => (
       (value != null && value !== "" && Number.isFinite(Number(value)))
       || (typeof value === "string" && Boolean(value.trim()))
@@ -681,13 +762,16 @@
       : "";
     const historyNeedsAttention = Number(technical.bars || 0) < 30
       || technical.historyFresh === false
-      || technical.timeframeCompatible === false;
+      || technical.timeframeCompatible === false
+      || technical.historyIntegrityConfirmed === false
+      || (technical.continuousBars != null && Number(technical.continuousBars) < 30);
     const dataTroubleshooting = historyNeedsAttention && historyDiagnostics
       ? `<details class="no-signal-data-status" open><summary>Diagnostic de l'historique OHLC</summary>
           <p>${escapeHtml(`${historyDiagnostics.status || "données insuffisantes"} · timeframe demandé ${historyDiagnostics.timeframe || timeframe || "n/a"} · ${historyDiagnostics.elapsedMs ?? "?"} ms · budget ${historyDiagnostics.budgetMs ?? "?"} ms`)}</p>
+          ${historyDiagnostics.barQuality ? `<p>${escapeHtml(`Contrôle des ${historyDiagnostics.barQuality.checkedBars} bougies récentes : ${historyDiagnostics.barQuality.validClosedBars} valides · ${historyDiagnostics.barQuality.continuousBars} consécutives · ${historyDiagnostics.barQuality.gaps} coupure(s) · ${historyDiagnostics.barQuality.invalidBars} invalide(s) · ${historyDiagnostics.barQuality.conflictingDuplicates} doublon(s) contradictoire(s).`)}</p>` : ""}
           ${providerAttempts.length ? `<ul>${providerAttempts.map((attempt) => `<li>${escapeHtml(`${attempt.provider || "source"}${attempt.interval ? `/${attempt.interval}` : ""} : ${attempt.result || "réponse inconnue"}${attempt.bars ? ` (${attempt.bars} bougies)` : ""}`)}</li>`).join("")}</ul>` : ""}
           ${providerErrors.length ? `<p>Détails : ${escapeHtml(providerErrors.join(" · "))}</p>` : ""}
-          <p>Kronos exige au moins 30 bougies clôturées, récentes et alignées sur l'unité choisie. Tant que cette condition manque, aucun biais confirmé ni niveau d'ordre n'est validé.</p>
+          <p>Kronos exige au moins 30 bougies clôturées, récentes, alignées et consécutives pour confirmer la lecture scalp. Tant que cette condition manque, aucun biais confirmé ni niveau d'ordre n'est validé.</p>
         </details>`
       : "";
     const formatValue = (value) => {
@@ -741,6 +825,12 @@
       ["Invalidation", outlook.invalidation],
       ["Bougie clôturée", outlook.candle],
       ["Structure des swings", outlook.structure],
+      ["Structure étendue du lookback", outlook.broaderStructure],
+      ["Profondeur pour le biais scalp", `${Number(outlook.bars) || 0} valides · ${Number(outlook.continuousBars) || 0}/${Number(outlook.requiredStructureBars) || 0} consécutives ${outlook.timeframe || ""} · ${outlook.structureReady ? "minimum atteint" : "échantillon incomplet"}`],
+      ["Contrôle de cohérence OHLC", outlook.historyQuality ? `${outlook.historyQuality.validClosedBars}/${outlook.historyQuality.checkedBars} bougies récentes valides · ${outlook.historyQuality.gaps} coupure(s) · ${outlook.historyQuality.invalidBars} invalide(s) · ${outlook.historyQuality.conflictingDuplicates} doublon(s) contradictoire(s)` : null],
+      ["Support swing le plus proche", outlook.support ? `${outlook.support} · ${outlook.supportSource || "repère OHLC"}${outlook.supportBarsAgo != null ? ` · il y a ${outlook.supportBarsAgo} bougies` : ""}` : "non identifié"],
+      ["Résistance swing la plus proche", outlook.resistance ? `${outlook.resistance} · ${outlook.resistanceSource || "repère OHLC"}${outlook.resistanceBarsAgo != null ? ` · il y a ${outlook.resistanceBarsAgo} bougies` : ""}` : "non identifiée"],
+      ["Fourchette OHLC du lookback", outlook.rangeSupport && outlook.rangeResistance ? `${outlook.rangeSupport}–${outlook.rangeResistance} · contexte seulement` : "indisponible"],
       ["Balayage de liquidité", outlook.liquidity],
       ["Imbalance récente", outlook.imbalance],
     ].filter(([, value]) => Boolean(value));
@@ -859,7 +949,7 @@
         <span>TP théoriques : ${formatPrice(candidate.tp1)} / ${formatPrice(candidate.tp2)}</span>
         <small>${candidate.costStatus === "spread_unverified"
           ? `${escapeHtml(research.costValidation?.message || "Coût total inconnu et filtre de coût non validé.")} · niveaux non copiables`
-          : `Coût estimé ${Number(candidate.costR).toFixed(3)}R, commission non incluse · niveaux non copiables`}</small>
+          : `Coût estimé ${candidate.costR != null && Number.isFinite(Number(candidate.costR)) ? `${Number(candidate.costR).toFixed(3)}R` : "indisponible"}, commission non incluse · niveaux non copiables`}</small>
       </div>
     `).join("") : `<p class="pa-research-empty">Aucun déclencheur sur la dernière bougie clôturée. ${escapeHtml(research.statusLabel || "Attendre le setup complet.")}</p>`;
     return `
@@ -1510,6 +1600,7 @@
         score: 0,
         technique: "Diagnostic",
         explanation: message,
+        clientError: true,
         noSignal: true,
         statusLabel: "Analyse interrompue",
         userMessage: "Le serveur a refusé ou interrompu l'analyse avant de renvoyer un setup exploitable.",
@@ -1522,6 +1613,7 @@
           direction: "AUCUN SIGNAL",
           score: 0,
           technique: deep ? "Analyse profonde" : "Analyse rapide",
+          clientError: true,
           explanation: deep
             ? "L'analyse profonde a dépassé le délai côté navigateur. Les APIs ou le modèle IA répondent trop lentement; relancez ou réduisez le nombre d'images/news."
             : "L'analyse rapide n'a pas répondu dans le délai prévu. Relancez avec moins d'images ou sans détection automatique.",
@@ -1539,6 +1631,7 @@
         direction: "AUCUN SIGNAL",
         score: 0,
         technique: "Diagnostic",
+        clientError: true,
         explanation: error?.message || "Erreur réseau inconnue pendant l'analyse.",
         noSignal: true,
         statusLabel: "Réponse non reçue",

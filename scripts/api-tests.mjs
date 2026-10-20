@@ -486,8 +486,9 @@ test("supported PNG image quality is parsed without image-size", { skip: !hasSec
   assert.equal(result.data.noSignal, true);
   assert.match(result.data.meta?.imageQuality?.reason || "", /1x1/);
 });
-test("chartless prudent Price Action M5 keeps its market read and separate non-executable research panel", { skip: !hasSecrets && "needs secret.dev" }, async () => {
+test("chartless prudent Price Action M5 keeps its market read and separate non-executable research panel", { skip: !hasSecrets && "needs secret.dev" }, async (t) => {
   resetRateLimits();
+  const requestStartedAt = Date.now();
   const result = await postJson("/api/analyze-chart", {
     pair: "EUR/USD",
     timeframe: "M5",
@@ -495,15 +496,24 @@ test("chartless prudent Price Action M5 keeps its market read and separate non-e
     strategy: "Scalping",
     analysisDepth: "Rapide",
   }, { "X-Kronos-Test-Token": TEST_TOKEN });
+  const snapshot = result.data.meta?.technicalSnapshot || {};
+  const historyDiagnostics = snapshot.historyDiagnostics || {};
+  const historyQuality = snapshot.historyQuality || {};
+  t.diagnostic(`quick chartless response: ${Date.now() - requestStartedAt} ms; ${snapshot.bars || 0} OHLC bars from ${snapshot.source || "unknown"}; quality=${historyQuality.validClosedBars ?? "n/a"}/${historyQuality.checkedBars ?? "n/a"}; continuous=${snapshot.continuousBars ?? "n/a"}/${historyQuality.continuousBars ?? "n/a"}; gaps=${historyQuality.gaps ?? "n/a"}; fresh=${snapshot.historyFresh}; age=${snapshot.historyAgeMinutes ?? "n/a"}m; history=${historyDiagnostics.status || "n/a"}; outlook=${result.data.meta?.marketOutlook?.status || "none"}; PA=${result.data.meta?.priceActionAnalysis?.status || "none"}`);
   assert.equal(result.status, 200);
   assert.equal(result.data.meta?.analysisMode, "prudent");
   assert.equal(result.data.meta?.marketOutlook?.pair, "EUR/USD");
   assert.ok(result.data.meta?.marketOutlook?.bullishScenario);
   assert.ok(result.data.meta?.marketOutlook?.bearishScenario);
+  if (snapshot.historyQuality && Number.isFinite(Number(snapshot.bars))) {
+    assert.equal(snapshot.historyQuality.validClosedBars, Math.min(Number(snapshot.bars), Number(snapshot.historyQuality.checkedBars)),
+      "the OHLC quality window must be selected from the same canonical closed history as the snapshot");
+  }
   assert.equal(result.data.meta?.priceActionAnalysis?.researchOnly, true);
   assert.equal(result.data.meta?.priceActionAnalysis?.actionable, false);
   assert.ok(result.data.meta?.priceActionAnalysis?.statusLabel);
-  assert.equal(result.data.noSignal, true, "trend-only context must not be emitted as a validated PA scalp order");
+  const paCandidates = result.data.meta?.priceActionAnalysis?.candidates || [];
+  assert.equal(result.data.noSignal, true, "research candidates must not be emitted as validated PA scalp orders");
   assert.equal(result.data.direction, "AUCUN SIGNAL");
   assert.equal(result.data.entry, "—");
   assert.equal(result.data.sl, "—");
@@ -511,9 +521,33 @@ test("chartless prudent Price Action M5 keeps its market read and separate non-e
   assert.equal(result.data.tp2, "—");
   assert.equal(result.data.meta?.executionReadiness?.ready, false);
   assert.equal(typeof result.data.meta?.executionReadiness?.historyConfirmed, "boolean");
-  assert.equal(result.data.meta?.executionReadiness?.triggerConfirmed, false);
+  assert.equal(result.data.meta?.executionReadiness?.triggerConfirmed, paCandidates.length > 0);
   assert.ok(result.data.explanation || result.data.userMessage || result.data.statusLabel);
-  assert.doesNotMatch(result.data.explanation || "", /(?:Zone d'entrée|Stop Loss|Take Profit 1|Take Profit 2)\s*:\s*[0-9]/i);
+  const outlook = result.data.meta?.marketOutlook;
+  if (Number(outlook?.bars) >= 30
+    && outlook.integrityConfirmed === true
+    && outlook.dataFresh !== false
+    && outlook.support != null && outlook.resistance != null) {
+    assert.doesNotMatch(`${outlook.bullishScenario} ${outlook.bearishScenario}`, /suspendu/i);
+  }
+  if (outlook?.status === "insufficient_continuity"
+    && Number(outlook.bars) >= 30
+    && outlook.integrityConfirmed === true
+    && outlook.dataFresh !== false
+    && Number(outlook.continuousBars) < 30
+    && outlook.support != null && outlook.resistance != null) {
+    assert.match(result.data.userMessage || "", /scénarios conditionnels/i);
+    assert.match((result.data.nextActions || []).join(" "), /surveille uniquement les clôtures et retests/i);
+    assert.match((result.data.nextActions || []).join(" "), /ordre exécutable chez Deriv/i);
+    assert.doesNotMatch((result.data.nextActions || []).join(" "), /Réessaie quand les cotations Deriv répondent/i);
+  }
+  if (paCandidates.length) {
+    assert.equal(result.data.status, "PA_CANDIDATE_READ_ONLY");
+    assert.match(result.data.explanation || "", /Candidat OHLC de recherche/);
+    assert.match(result.data.explanation || "", /entrée théorique .* invalidation .* TP1 .* TP2/);
+  } else {
+    assert.doesNotMatch(result.data.explanation || "", /(?:Zone d'entrée|Stop Loss|Take Profit 1|Take Profit 2)\s*:\s*[0-9]/i);
+  }
 });
 test("public health and config expose safe shapes only", async () => {
   const health = await fetch(`${BASE}/api/health`);

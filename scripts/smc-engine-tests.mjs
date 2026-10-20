@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { analyzeKronosSmc } from "../smc-engine.mjs";
+import { analyzeKronosSmc, inspectClosedOhlcHistory } from "../smc-engine.mjs";
 
 const NOW = Date.parse("2026-06-10T12:00:00.000Z");
 const MINUTE = 60_000;
@@ -82,6 +82,20 @@ test("deduplicates identical timestamps and reports their count", () => {
   assert.equal(result.inputs.setupBars, 100);
   assert.equal(result.inputs.setupDuplicateBars, 1);
   assert.notEqual(result.statusKey, "donnees_incoherentes");
+});
+
+test("shared OHLC inspection reports malformed candles, duplicates, gaps, and the latest continuous run", () => {
+  const bars = makeBars("M5", 10);
+  bars[1] = { ...bars[1], high: bars[1].close - 0.01 };
+  bars.splice(8, 1);
+  bars.push({ ...bars[3] });
+  const result = inspectClosedOhlcHistory(bars, "M5", NOW);
+  assert.equal(result.invalidBars, 1);
+  assert.equal(result.duplicateBars, 1);
+  assert.equal(result.conflictingDuplicates, 0);
+  assert.ok(result.gaps >= 2);
+  assert.equal(result.trailingConsecutiveBars, 1);
+  assert.equal(result.bars.length, 8);
 });
 
 test("blocks a setup when the newest M5 or M15 candles are discontinuous", () => {
