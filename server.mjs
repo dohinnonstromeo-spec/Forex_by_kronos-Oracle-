@@ -4398,17 +4398,19 @@ async function handleApi(req, res, url) {
     try {
       await ensureRelationalTables();
       await sqlGet("SELECT 1");
+      markAnalysisStorageAvailable();
       sendJson(res, 200, {
         ok: true,
         ready: true,
         storage: { status: "ok" },
       });
-    } catch {
+    } catch (error) {
       // Readiness describes whether this process can serve the site. PostgreSQL
       // health is reported separately by /api/health: chartless analysis has a
       // bounded visitor-quota fallback and can still run while storage is down.
       // Returning 503 here could make the host keep an older release active even
       // though the new release is specifically able to serve degraded analysis.
+      markAnalysisStorageUnavailable(error?.message || "storage_unavailable");
       sendJson(res, 200, {
         ok: true,
         ready: true,
@@ -13269,10 +13271,32 @@ async function consumeAnonymousQuota(req, feature) {
 const degradedAnalysisUsage = new Map();
 const MAX_DEGRADED_ANALYSIS_QUOTA_ENTRIES = 10_000;
 const ANALYSIS_STORAGE_CHECK_TIMEOUT_MS = 1_800;
+const ANALYSIS_STORAGE_FAILURE_COOLDOWN_MS = 30_000;
+let analysisStorageUnavailableUntil = 0;
 
 function databaseKnownUnavailable() {
   const health = providerHealth.get("database");
-  return Boolean(health && health.fail > health.ok && !health.lastOk);
+  if (Date.now() < analysisStorageUnavailableUntil) return true;
+  if (!health || health.fail <= health.ok) return false;
+  const lastFail = Date.parse(health.lastFail || "") || 0;
+  const lastOk = Date.parse(health.lastOk || "") || 0;
+  return !lastOk || lastFail >= lastOk;
+}
+
+function markAnalysisStorageUnavailable(reason = "storage_unavailable") {
+  analysisStorageUnavailableUntil = Date.now() + ANALYSIS_STORAGE_FAILURE_COOLDOWN_MS;
+  const safeReason = sanitizeError(String(reason || "storage_unavailable"));
+  supabaseUnavailable = true;
+  supabaseLastError = safeReason;
+  recordProviderHealth("database", false, safeReason);
+  logOnce("analysis-storage", safeReason);
+}
+
+function markAnalysisStorageAvailable() {
+  analysisStorageUnavailableUntil = 0;
+  supabaseUnavailable = false;
+  supabaseLastError = null;
+  recordProviderHealth("database", true);
 }
 
 function consumeDegradedAnalysisQuota(req) {
@@ -13333,7 +13357,7 @@ async function getAnalysisRequestAccess(req) {
     );
     if (sessionResult?.timedOut || sessionResult?.error) {
       storageDegraded = true;
-      logOnce("analysis-session-storage", sessionResult.error?.message || "session lookup timed out");
+      markAnalysisStorageUnavailable(sessionResult.error?.message || "session lookup timed out");
     } else {
       session = sessionResult.value;
     }
@@ -13348,9 +13372,10 @@ async function getAnalysisRequestAccess(req) {
     );
     if (quotaResult?.timedOut || quotaResult?.error) {
       storageDegraded = true;
-      logOnce("analysis-quota-storage", quotaResult.error?.message || "quota storage check timed out");
+      markAnalysisStorageUnavailable(quotaResult.error?.message || "quota storage check timed out");
     } else {
       quota = quotaResult.value;
+      markAnalysisStorageAvailable();
     }
   }
 
