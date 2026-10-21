@@ -62,10 +62,11 @@ Dans Render, renseigner ces variables dans l'environnement du service web, sans 
 
 Après chaque remplacement de base ou modification d'environnement :
 
-1. Attendre que `/api/ready` réponde avec `ok: true`.
-2. Ouvrir le centre d'état du tableau de bord et vérifier Neon, le broker et le robot.
-3. Autoriser les notifications dans le navigateur, puis utiliser `Tester sur cet appareil`.
-4. Vérifier le compte broker en mode démo avant toute activation réelle.
+1. Vérifier que `/api/ready` répond `ready: true` pour confirmer que le serveur sert le site. Cette route peut rester prête en mode dégradé si Neon est hors ligne.
+2. Vérifier `/api/health` : `providers.database.status` doit être `ok` pour confirmer le retour de Neon et de l'historique persistant.
+3. Ouvrir le centre d'état du tableau de bord et vérifier Neon, le broker et le robot.
+4. Autoriser les notifications dans le navigateur, puis utiliser `Tester sur cet appareil`.
+5. Vérifier le compte broker en mode démo avant toute activation réelle.
 
 Le centre d'état affiche le dernier motif connu du robot et la prochaine vérification. Ce diagnostic en mémoire est volontairement sans écriture à chaque cycle afin de ne pas consommer inutilement le quota Neon ; il repart de zéro après un redémarrage et indique alors clairement qu'aucun cycle n'a encore été observé.
 

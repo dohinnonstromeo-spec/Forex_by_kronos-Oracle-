@@ -4398,9 +4398,24 @@ async function handleApi(req, res, url) {
     try {
       await ensureRelationalTables();
       await sqlGet("SELECT 1");
-      sendJson(res, 200, { ok: true, ready: true });
+      sendJson(res, 200, {
+        ok: true,
+        ready: true,
+        storage: { status: "ok" },
+      });
     } catch {
-      sendJson(res, 503, { ok: false, ready: false, error: "storage_unavailable" });
+      // Readiness describes whether this process can serve the site. PostgreSQL
+      // health is reported separately by /api/health: chartless analysis has a
+      // bounded visitor-quota fallback and can still run while storage is down.
+      // Returning 503 here could make the host keep an older release active even
+      // though the new release is specifically able to serve degraded analysis.
+      sendJson(res, 200, {
+        ok: true,
+        ready: true,
+        degraded: true,
+        storage: { status: "unavailable" },
+        capabilities: { analysis: "available_with_visitor_quota" },
+      });
     }
     return;
   }
