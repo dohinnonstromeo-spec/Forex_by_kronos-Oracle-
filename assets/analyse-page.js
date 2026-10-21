@@ -541,6 +541,7 @@
         <div class="analysis-card">
           <div class="direction-label">⏸ IMAGE REQUISE</div>
           <p class="mt-4 text-sm text-muted-foreground">${escapeHtml(result.explanation || "")}</p>
+          ${renderStorageDegraded(result)}
           <button class="new-analysis mt-4" type="button">Nouvelle analyse</button>
         </div>
       `;
@@ -565,6 +566,7 @@
             <span>Indice de qualité interne</span>
           </div>
         </div>
+        ${renderStorageDegraded(result)}
         ${renderObservedCalibration(result)}
         ${renderTargetProfileSummary(result)}
         <div class="levels-table result-level-grid">
@@ -634,6 +636,11 @@
     };
   }
 
+  function renderStorageDegraded(result) {
+    if (!result.meta?.storageDegraded) return "";
+    return "<div class='mt-3 rounded-lg border border-amber-400/30 bg-amber-500/10 p-3 text-sm text-amber-100' role='status'><strong>Stockage temporairement indisponible.</strong> L'analyse continue en mode d\u00e9grad\u00e9. L'enregistrement dans l'historique n'est pas confirm\u00e9; le quota provisoire reste en m\u00e9moire du serveur.</div>";
+  }
+
   function renderNoSignalResult(result) {
     const score = Math.max(0, Math.min(100, Number(result.score || 0)));
     const diagnostic = result.diagnostic || {};
@@ -681,6 +688,7 @@
             <span>Qualité du filtre</span>
           </div>
         </div>
+        ${renderStorageDegraded(result)}
         ${scenarioReadAvailable
           ? `<p class="no-signal-message">${marketReadAvailable
             ? "Analyse OHLC terminée : les deux scénarios, leurs déclencheurs et invalidations sont détaillés ci-dessous."
@@ -1590,6 +1598,7 @@
             explanation: message,
             noSignal: true,
             statusLabel: "Limite atteinte",
+            meta: payload.storageDegraded ? { storageDegraded: true } : undefined,
             userMessage: message,
             nextActions: Array.isArray(payload.nextActions) ? payload.nextActions : ["Revenir à l'heure de réinitialisation indiquée.", "Activer Premium pour supprimer la limite."],
           };

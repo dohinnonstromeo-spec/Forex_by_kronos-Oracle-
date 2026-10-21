@@ -5846,15 +5846,20 @@ Réponds en JSON strict:
   }
 
   if (url.pathname === "/api/analyze-chart") {
-    const session = await currentSession(req);
-    const quota = await consumeQuota(session?.user, "analysis", req);
-    if (!quota.ok) {
-      sendJson(res, 429, quota);
+    const access = await getAnalysisRequestAccess(req);
+    if (!access.quota.ok) {
+      sendJson(res, 429, access.quota);
       return;
     }
     const body = await readBody(req);
     const images = normalizeImages(body.images);
-    const result = await runKronosAnalysis({ body, images, req, user: session?.user || null });
+    const result = await runKronosAnalysis({ body, images, req, user: access.session?.user || null });
+    if (access.storageDegraded) {
+      result.meta = {
+        ...(result.meta || {}),
+        storageDegraded: true,
+      };
+    }
     sendJson(res, 200, result);
     return;
   }
@@ -5926,7 +5931,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
         meta: { ...targetProfileMeta, imageQuality, decisionReasons: ['DATA_TECHNICAL_WEAK', 'NO_ACTIONABLE_SIGNAL'] },
         noSignal: true,
       };
-      await recordLearningAnalysis(result, body, {
+      await persistAnalysisBestEffort(result, body, {
         livePrice: null,
         imageQuality,
         calibration: null,
@@ -5963,7 +5968,7 @@ async function runKronosAnalysis({ body, images, req, user }) {
         meta: { ...targetProfileMeta, imageQuality, decisionReasons: ['VISION_UNAVAILABLE', 'NO_ACTIONABLE_SIGNAL'] },
         noSignal: true,
       };
-      await recordLearningAnalysis(result, body, {
+      await persistAnalysisBestEffort(result, body, {
         livePrice: null,
         imageQuality,
         calibration: null,
@@ -6311,7 +6316,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
       priceActionAnalysis,
     });
     if (!result.educationalOnly) {
-      await promiseWithTimeout(recordLearningAnalysis(result, body, {
+      await persistAnalysisBestEffort(result, body, {
         livePrice,
         imageQuality,
         calibration,
@@ -6322,10 +6327,7 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
         analysisDepth,
         user,
         isTest: isTestRequest(req),
-      }).catch((error) => {
-        logOnce("analysis-learning-write", error.message);
-        return null;
-      }), 1200, null);
+      });
     }
     return result;
 }
@@ -13244,6 +13246,103 @@ async function consumeAnonymousQuota(req, feature) {
   }
   return { ok: true, anonymous: true, feature, plan: "visitor", limit, used, remaining: Math.max(0, limit - used) };
 }
+
+// The analysis console must remain usable while PostgreSQL is down. Authentication
+// and durable quota/history still require the database; in degraded mode requests
+// are treated as visitors and receive a small process-local quota, never premium
+// privileges. The UI marks that results won't be persisted.
+const degradedAnalysisUsage = new Map();
+const MAX_DEGRADED_ANALYSIS_QUOTA_ENTRIES = 10_000;
+const ANALYSIS_STORAGE_CHECK_TIMEOUT_MS = 1_800;
+
+function databaseKnownUnavailable() {
+  const health = providerHealth.get("database");
+  return Boolean(health && health.fail > health.ok && !health.lastOk);
+}
+
+function consumeDegradedAnalysisQuota(req) {
+  const today = new Date().toISOString().slice(0, 10);
+  const limit = VISITOR_DAILY_ANALYSES_LIMIT;
+  const identity = clientFingerprint(req) + "|" + cookieValue(req, "oracle_session");
+  const fingerprint = createHash("sha256").update(identity).digest("hex");
+  const key = today + "|" + fingerprint;
+
+  for (const storedKey of degradedAnalysisUsage.keys()) {
+    if (!storedKey.startsWith(today + "|")) degradedAnalysisUsage.delete(storedKey);
+  }
+  while (!degradedAnalysisUsage.has(key) && degradedAnalysisUsage.size >= MAX_DEGRADED_ANALYSIS_QUOTA_ENTRIES) {
+    const oldestKey = degradedAnalysisUsage.keys().next().value;
+    if (!oldestKey) break;
+    degradedAnalysisUsage.delete(oldestKey);
+  }
+
+  const used = degradedAnalysisUsage.get(key) || 0;
+  if (used >= limit) {
+    return {
+      ...quotaExceededPayload({
+        error: "visitor_quota_exceeded",
+        feature: "analysis",
+        plan: "visitor",
+        limit,
+        used,
+        message: "Limite provisoire atteinte pendant l'indisponibilite du stockage.",
+        upgradeHint: "Le quota normal sera retabli avec la base de donnees.",
+      }),
+      storageDegraded: true,
+    };
+  }
+
+  const nextUsed = used + 1;
+  degradedAnalysisUsage.set(key, nextUsed);
+  return {
+    ok: true,
+    anonymous: true,
+    feature: "analysis",
+    plan: "visitor",
+    limit,
+    used: nextUsed,
+    remaining: Math.max(0, limit - nextUsed),
+    storageDegraded: true,
+  };
+}
+
+async function getAnalysisRequestAccess(req) {
+  let session = null;
+  let storageDegraded = databaseKnownUnavailable();
+
+  if (!storageDegraded) {
+    const sessionResult = await promiseWithTimeout(
+      currentSession(req).then((value) => ({ value }), (error) => ({ error })),
+      ANALYSIS_STORAGE_CHECK_TIMEOUT_MS,
+      { timedOut: true },
+    );
+    if (sessionResult?.timedOut || sessionResult?.error) {
+      storageDegraded = true;
+      logOnce("analysis-session-storage", sessionResult.error?.message || "session lookup timed out");
+    } else {
+      session = sessionResult.value;
+    }
+  }
+
+  let quota = null;
+  if (!storageDegraded) {
+    const quotaResult = await promiseWithTimeout(
+      consumeQuota(session?.user, "analysis", req).then((value) => ({ value }), (error) => ({ error })),
+      ANALYSIS_STORAGE_CHECK_TIMEOUT_MS,
+      { timedOut: true },
+    );
+    if (quotaResult?.timedOut || quotaResult?.error) {
+      storageDegraded = true;
+      logOnce("analysis-quota-storage", quotaResult.error?.message || "quota storage check timed out");
+    } else {
+      quota = quotaResult.value;
+    }
+  }
+
+  if (storageDegraded) quota = consumeDegradedAnalysisQuota(req);
+  return { session, quota, storageDegraded };
+}
+
 function quotaSnapshot(user = {}) {
   const today = new Date().toISOString().slice(0, 10);
   const usage = normalizeUsage(user.usage, today);
@@ -14862,6 +14961,24 @@ async function recordLearningAnalysis(result, body, context) {
   });
   result.learningId = id;
   return id;
+}
+
+async function persistAnalysisBestEffort(result, body, context) {
+  const savedId = await promiseWithTimeout(
+    recordLearningAnalysis(result, body, context).catch((error) => {
+      logOnce("analysis-learning-write", error.message);
+      return null;
+    }),
+    1_200,
+    null,
+  );
+  if (!savedId) {
+    result.meta = {
+      ...(result.meta || {}),
+      storageDegraded: true,
+    };
+  }
+  return savedId;
 }
 
 // For any OPEN analysis that actually went through a real broker order (semi-
