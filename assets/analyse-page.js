@@ -567,6 +567,7 @@
           </div>
         </div>
         ${renderStorageDegraded(result)}
+        ${renderExecutionDataNotice(result)}
         ${renderObservedCalibration(result)}
         ${renderTargetProfileSummary(result)}
         <div class="levels-table result-level-grid">
@@ -639,6 +640,24 @@
   function renderStorageDegraded(result) {
     if (!result.meta?.storageDegraded) return "";
     return "<div class='mt-3 rounded-lg border border-amber-400/30 bg-amber-500/10 p-3 text-sm text-amber-100' role='status'><strong>Stockage temporairement indisponible.</strong> L'analyse continue en mode d\u00e9grad\u00e9. L'enregistrement dans l'historique n'est pas confirm\u00e9; le quota provisoire reste en m\u00e9moire du serveur.</div>";
+  }
+
+  function renderExecutionDataNotice(result) {
+    const readiness = result.meta?.executionReadiness;
+    if (!readiness) return "";
+    const historySource = result.meta?.historySource || "historique indisponible";
+    const quoteSource = result.meta?.livePriceSource || "cotation live indisponible";
+    const alignment = readiness.feedConfirmed
+      ? "Prix live et bougies Deriv alignés."
+      : `Sources non alignées pour une exécution Deriv : bougies ${historySource}, prix ${quoteSource}.`;
+    const spread = readiness.bidAskConfirmed
+      ? "Le bid/ask est présent dans la réponse."
+      : "Le bid/ask Deriv n'a pas été confirmé; le coût réel du spread reste inconnu.";
+    return `<div class="mt-3 rounded-lg border border-amber-400/30 bg-amber-500/10 p-3 text-sm text-amber-100" role="status" aria-label="Limites des données d'exécution">
+      <strong>Plan indicatif — contrôle manuel avant toute entrée</strong>
+      <p class="mt-1">${escapeHtml(alignment)} ${escapeHtml(spread)}</p>
+      <p class="mt-1">${escapeHtml(readiness.reason || "Le score affiché mesure la cohérence de l'analyse, pas une probabilité de gain.")} Vérifie le symbole, le cours et les frais sur ton graphique Deriv/MT5 avant d'utiliser ces niveaux.</p>
+    </div>`;
   }
 
   function renderNoSignalResult(result) {
@@ -1379,6 +1398,8 @@
       `TAKE PROFIT 1: ${result.tp1}`,
       `TAKE PROFIT 2: ${result.tp2}`,
       `R/R TP1: ${result.rr || "—"}`,
+      result.meta?.executionReadiness
+        ? `STATUT: PLAN INDICATIF — vérifier le cours et le spread sur Deriv/MT5; le score n'est pas une probabilité de gain.` : "",
       result.meta?.targetProfile === "mdt_extended" && Number.isFinite(Number(result.meta?.tp2R))
         ? `R/R TP2: 1:${Number(result.meta.tp2R).toFixed(2)}` : "",
       "Note: la zone d'entrée est indicative; SL, TP et R/R sont calculés depuis le centre.",

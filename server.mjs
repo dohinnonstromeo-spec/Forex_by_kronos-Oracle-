@@ -6226,7 +6226,11 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
       ? buildSmcOnlyAnswer(smcAnalysis)
       : priceActionResearchMode
       ? buildPriceActionResearchText({ pair: selectedPair, timeframe: selectedTimeframe, priceActionAnalysis, technicalSnapshot })
-      : !deepAnalysis && !images.length
+      // In rapid mode the default chartless Price Action scalp path used to
+      // return a hardcoded no-signal answer, even with valid live OHLC. Give it
+      // the same bounded AI evaluation as the other chartless styles; the normal
+      // validation and deterministic no-signal fallback remain in force.
+      : !deepAnalysis && !images.length && !chartlessPriceActionMode
       ? buildDeterministicAnalysisText({
         pair: selectedPair,
         timeframe: selectedTimeframe,
@@ -9303,7 +9307,10 @@ STYLE_EFFICACITE:Price Action=45`;
 }
 
 function isUnproductiveAnalysis(answer = "") {
-  return /aucun signal|pas de signal|setup non confirm|signal non valid|niveaux? non exploit|entrée non exploit|entree non exploit|impossible de proposer|ne pas entrer/i.test(String(answer || ""));
+  const text = String(answer || "");
+  const decision = String(text.match(/(?:signal détecté|décision(?: d'exécution)?)\s*:\s*([^\r\n]+)/i)?.[1] || "").trim();
+  if (decision) return /^(?:aucun signal|pas de signal|signal non validé|setup non validé|attendre|ne pas entrer)\b/i.test(decision);
+  return /^\s*(?:aucun signal|pas de signal|setup non confirmé)\b/im.test(text);
 }
 
 function shouldUseApiOnlySetup({ livePrice, technicalSnapshot, newsContext, multiTimeframe = [] }) {
@@ -10674,24 +10681,10 @@ function normalizeAnalysis(answer, body = {}, context = {}) {
     sections: extractNarrativeSections(text),
     deterministicCrossCheck: context.deterministicCrossCheck || null,
   };
-  const chartlessExecutionBlocked = strictPriceActionScalp && !hasChartImages
-    && (!meta.derivFeedConfirmed || !meta.derivSpreadConfirmed);
-  const executionIssueSummary = [
-    ...(!meta.derivFeedConfirmed ? ["cotation et bougies Deriv non alignées"] : []),
-    ...(!meta.derivSpreadConfirmed ? ["bid/ask Deriv absent"] : []),
-  ].join("; ");
-  const displayText = chartlessExecutionBlocked
-    ? buildPriceActionScalpNoSignalText({
-      pair: body.pair || "EUR/USD",
-      timeframe: body.timeframe || "M5",
-      livePrice,
-      technicalSnapshot: context.technicalSnapshot || {},
-      priceActionAnalysis: context.priceActionAnalysis || null,
-      newsContext: context.newsContext || {},
-      multiTimeframe: context.multiTimeframe || [],
-      reason: "le plan d'ordre est bloqué: cotation, bougies Deriv et/ou bid/ask ne sont pas confirmés ensemble",
-    })
-    : stripMachineTags(text);
+  // Feed alignment and bid/ask are execution-quality checks, not prerequisites
+  // for returning the market analysis. Keep the answer intact and report missing
+  // broker data separately instead of replacing every plan with generic no-signal.
+  const displayText = stripMachineTags(text);
   if (!normalized.scoreParsed) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, 35),
@@ -10703,13 +10696,17 @@ VALIDATION KRONOS: format de réponse IA non reconnu (SCORE_CONFIANCE manquant) 
       meta,
     });
   }
-  const explicitNoSignal = /\baucun signal\b|pas de signal|signal non valid|setup non valid/i.test(text);
+  const declaredDecision = String(text.match(/(?:signal détecté|décision(?: d'exécution)?)\s*:\s*([^\r\n]+)/i)?.[1] || "").trim();
+  const explicitNoSignal = /^(?:aucun signal|pas de signal|signal non validé|setup non validé)\b/i.test(declaredDecision)
+    || /^\s*(?:aucun signal|pas de signal|setup non confirmé)\b/im.test(text);
   const researchOnlyPaCandidate = strictPriceActionScalp
     && !hasChartImages
     && meta.priceActionAnalysis?.researchOnly === true
     && Array.isArray(meta.priceActionAnalysis.candidates)
     && meta.priceActionAnalysis.candidates.length > 0;
-  if (explicitNoSignal || researchOnlyPaCandidate) {
+  // The research-only PA candidate is informational and cannot veto a separate
+  // prudent analysis; only the answer's explicit no-signal decision blocks it.
+  if (explicitNoSignal) {
     return blockAnalysis(normalized, {
       score: Math.min(normalized.score, validation.score, 45),
       technique: normalized.technique === "Mixte" ? "Aucun style validé" : normalized.technique || validation.technique,
@@ -10729,32 +10726,6 @@ VALIDATION KRONOS: ${researchOnlyPaCandidate ? "candidat expérimental conservé
 VALIDATION KRONOS: qualité image insuffisante (${imageQuality.reason}).`,
       validation: { ...validation, valid: false, reason: `Qualité image insuffisante: ${imageQuality.reason}` },
       meta,
-    });
-  }
-  if (strictPriceActionScalp && (!meta.derivFeedConfirmed || !meta.derivSpreadConfirmed)) {
-    return blockAnalysis(normalized, {
-      score: Math.min(normalized.score, validation.score, 35),
-      technique: validation.technique,
-      explanation: `${displayText}\n\nVALIDATION KRONOS: scalp Price Action bloqué. Il faut le prix, les bougies et le bid/ask du flux public Deriv; les données d'un autre fournisseur ne seront pas mélangées et le coût de spread ne sera pas supposé.`,
-      validation: { ...validation, valid: false, reason: "Flux Deriv ou spread bid/ask non confirmé." },
-      meta: {
-        ...meta,
-        derivFeedConfirmed: Boolean(meta.derivFeedConfirmed),
-        derivSpreadConfirmed: Boolean(meta.derivSpreadConfirmed),
-        executionReadiness: {
-          ready: false,
-          feedConfirmed: Boolean(meta.derivFeedConfirmed),
-          historyConfirmed: Boolean(Number(meta.technicalSnapshot?.bars) >= 30
-            && meta.technicalSnapshot?.historyFresh === true
-            && meta.technicalSnapshot?.timeframeCompatible !== false
-            && meta.technicalSnapshot?.historyIntegrityConfirmed !== false
-            && Number(meta.technicalSnapshot?.continuousBars ?? meta.technicalSnapshot?.bars) >= 30),
-          bidAskConfirmed: Boolean(meta.derivSpreadConfirmed),
-          researchCandidateDetected: Boolean(meta.executionReadiness?.researchCandidateDetected),
-          triggerConfirmed: Boolean(meta.executionReadiness?.researchCandidateDetected),
-          reason: executionIssueSummary || "Données d'exécution Deriv incomplètes.",
-        },
-      },
     });
   }
   if (!quickMode && !hasChartImages && !apiOnlySetup && meta.technicalSnapshot && meta.technicalSnapshot.valid === false) {
