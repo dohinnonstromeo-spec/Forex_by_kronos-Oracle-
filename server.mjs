@@ -6308,10 +6308,9 @@ SCORE_CONFIANCE et STYLE_EFFICACITE sont des indices internes de cohérence sur 
     // The deterministic price snapshot (SMA/RSI + trend) is context, not a
     // Price Action trigger. Preserve the completed analysis and keep execution
     // checks separate from the chartless OHLC read.
-    // Keep a completed OHLC/AI analysis intact. Execution gates below may
-    // suspend copying an order when the Deriv quote or spread is unverified,
-    // but must not replace every chartless Price Action answer with the same
-    // unconditional no-signal paragraph.
+    // Keep a completed OHLC/AI analysis separate from broker execution readiness.
+    // Missing Deriv quote/spread is surfaced to the user, not used to erase the
+    // market read or its validated indicative levels.
     const visionConsensus = await visionConsensusPromise;
     const deterministicCheck = await crossCheckPromise;
     // Reported live: a real user kept getting entries visibly far from the price they
