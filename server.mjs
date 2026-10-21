@@ -6134,14 +6134,23 @@ async function runKronosAnalysis({ body, images, req, user }) {
         events: [],
         headlines: [],
       };
-    const calibrationOutcomes = await promiseWithTimeout(
-      loadCalibrationOutcomes().catch((error) => {
-        logOnce("analysis-calibration", error.message);
-        return [];
-      }),
-      1200,
-      [],
-    );
+    let calibrationOutcomes = [];
+    if (!databaseKnownUnavailable()) {
+      const calibrationResult = await promiseWithTimeout(
+        loadCalibrationOutcomes().then(
+          (value) => ({ value }),
+          (error) => ({ error }),
+        ),
+        1200,
+        { timedOut: true },
+      );
+      if (calibrationResult?.timedOut || calibrationResult?.error) {
+        markAnalysisStorageUnavailable(calibrationResult.error?.message || "analysis calibration lookup timed out");
+      } else {
+        calibrationOutcomes = Array.isArray(calibrationResult?.value) ? calibrationResult.value : [];
+        markAnalysisStorageAvailable();
+      }
+    }
     const calibration = calibrationFor({ outcomes: calibrationOutcomes }, body);
     const quickApiSetup = !deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice);
     const deepAssistedSetup = deepAnalysis && !images.length && Number.isFinite(Number(livePrice?.price)) && isUsableLivePrice(livePrice)
@@ -13280,7 +13289,8 @@ function databaseKnownUnavailable() {
   if (!health || health.fail <= health.ok) return false;
   const lastFail = Date.parse(health.lastFail || "") || 0;
   const lastOk = Date.parse(health.lastOk || "") || 0;
-  return !lastOk || lastFail >= lastOk;
+  return lastFail >= lastOk
+    && Date.now() - lastFail < ANALYSIS_STORAGE_FAILURE_COOLDOWN_MS;
 }
 
 function markAnalysisStorageUnavailable(reason = "storage_unavailable") {
@@ -15004,19 +15014,30 @@ async function recordLearningAnalysis(result, body, context) {
 }
 
 async function persistAnalysisBestEffort(result, body, context) {
+  if (databaseKnownUnavailable()) {
+    result.meta = {
+      ...(result.meta || {}),
+      storageDegraded: true,
+    };
+    return null;
+  }
+
   const savedId = await promiseWithTimeout(
     recordLearningAnalysis(result, body, context).catch((error) => {
-      logOnce("analysis-learning-write", error.message);
+      markAnalysisStorageUnavailable(error.message || "analysis history save failed");
       return null;
     }),
     1_200,
     null,
   );
   if (!savedId) {
+    if (!databaseKnownUnavailable()) markAnalysisStorageUnavailable("analysis history save timed out");
     result.meta = {
       ...(result.meta || {}),
       storageDegraded: true,
     };
+  } else {
+    markAnalysisStorageAvailable();
   }
   return savedId;
 }
