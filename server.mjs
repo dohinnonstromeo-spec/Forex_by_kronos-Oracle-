@@ -7120,7 +7120,6 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   const cachedHasOpen = !options.requireOpen || cached.every((bar) => Number.isFinite(Number(bar.open)));
   const preferredIntervals = historyIntervals(symbol, options);
   let fallbackHistory = cached.length >= 30 && cachedHasOpen ? cached : [];
-  let staleDerivContextOnly = false;
   // Chartless history and quote requests run concurrently, so the quote may not
   // be available yet. Completed Deriv candles still support a read-only analysis;
   // executable setups are separately gated on a trustworthy live quote.
@@ -7158,9 +7157,9 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
         if (derivCompatible && derivBars._meta?.stale && canReadHistoricalDeriv) {
           // Preserve the broker's last completed session for a chartless market
           // read. Its stale metadata remains attached, so the PA/SMC and order
-          // gates cannot treat this context as a current setup.
+          // gates cannot treat this context as a current setup. Keep it as the
+          // last-resort fallback while trying fresh, exact-interval providers.
           fallbackHistory = derivBars;
-          staleDerivContextOnly = true;
           diagnostics.attempts.push({ provider: "deriv_ws", interval: options.timeframe || null, result: "stale_context_only", bars: derivBars.length });
           recordProviderHealth("deriv_ws_history", false, "stale_context_only");
         } else {
@@ -7174,12 +7173,6 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
       diagnostics.errors.push(`deriv_ws:${reason}`);
       recordProviderHealth("deriv_ws_history", false, reason);
     }
-  }
-  if (staleDerivContextOnly) {
-    // Do not replace broker-specific closed-session candles with a different
-    // provider that labels its response fresh without checking the latest bar's
-    // timestamp. This is a historical read only; stale metadata stays in place.
-    return finish(fallbackHistory, "deriv_contexte_perime");
   }
   if (cached.length >= 30 && cachedHasOpen && !cached._meta?.stale && isHistoryCompatible(cached, options)) {
     diagnostics.cache = true;
@@ -7262,7 +7255,7 @@ async function getHistoryForSymbol(symbol, price = null, options = {}) {
   }
   const errorSummary = diagnostics.errors.join(" | ") || "no_history";
   recordProviderHealth("history_single", false, errorSummary);
-  const fallbackStatus = /^deriv_ws:/i.test(String(fallbackHistory?._meta?.source || ""))
+  const fallbackStatus = /^(?:cache:)*deriv_ws:/i.test(String(fallbackHistory?._meta?.source || ""))
     ? "deriv_contexte_perime"
     : fallbackHistory.length ? "cache_perime" : "aucune_source_disponible";
   return finish(fallbackHistory, fallbackStatus);
