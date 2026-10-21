@@ -23,7 +23,6 @@ import {
 import { analyzeKronosSmc, inspectClosedOhlcHistory } from "./smc-engine.mjs";
 import {
   analyzeLatestPriceActionScalp,
-  isDerivPriceActionHistorySource,
   KRONOS_PRICE_ACTION_VERSION,
   PRICE_ACTION_RULES,
 } from "./price-action-scalp-engine.mjs";
@@ -9653,8 +9652,14 @@ function priceActionTickSize(pair) {
   return null;
 }
 
+function priceActionResearchProvider(source = "") {
+  const match = String(source).trim().match(/^(?:cache:)*(deriv_ws|massive|twelve_data|yahoo|stooq):/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
 function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], livePrice = null }) {
   const source = String(history?._meta?.source || "inconnue");
+  const provider = priceActionResearchProvider(source);
   const base = {
     version: KRONOS_PRICE_ACTION_VERSION,
     pair,
@@ -9678,8 +9683,14 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   if (!["M1", "M5", "M15"].includes(String(timeframe || "").toUpperCase())) {
     return unavailable("unsupported_timeframe", "Unité non backtestée", "La règle est en recherche sur M1, M5 et M15; ce timeframe n'a pas été évalué.");
   }
-  if (!isDerivPriceActionHistorySource(source) || history?._meta?.stale || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true })) {
-    return unavailable("deriv_history_unconfirmed", "Historique Deriv exact indisponible", "Aucun candidat n'est calculé sans bougies Deriv récentes et alignées sur le timeframe sélectionné.");
+  if (!provider || history?._meta?.stale || !isHistoryCompatible(history, { timeframe, requireExactTimeframe: true })) {
+    return unavailable("history_unconfirmed", "Historique OHLC exact indisponible", "Aucun candidat n'est calculé sans historique récent, horodaté et exact sur l'unité choisie, provenant d'une source reconnue.");
+  }
+  // Yahoo's XAU/USD mapping is GC=F (gold futures), not the selected spot/CFD
+  // instrument. Keep its chart read visible, but don't print mismatched price
+  // levels as even a research candidate.
+  if (pairKey === "XAUUSD" && provider === "yahoo") {
+    return unavailable("proxy_instrument", "Instrument proxy non concordant", "Yahoo fournit ici le future GC=F, pas le XAU/USD spot/CFD sélectionné; les niveaux seraient exprimés sur un autre instrument.");
   }
   const nowMs = Date.now();
   const integrity = inspectClosedOhlcHistory(history, timeframe, nowMs);
@@ -9700,6 +9711,14 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   const qualityWindow = inspectClosedOhlcHistory(cleanBars.slice(-qualityWindowBars), timeframe, nowMs);
   base.bars = cleanBars.length;
   base.continuousBars = qualityWindow.trailingConsecutiveBars;
+  const intervalMs = timeframeMinutes(timeframe) * 60_000;
+  const latestClosedAtMs = integrity.bars.length && Number.isFinite(intervalMs)
+    ? integrity.bars.at(-1).startMs + intervalMs
+    : Number.NaN;
+  const latestClosedAgeMs = Number.isFinite(latestClosedAtMs) ? Math.max(0, nowMs - latestClosedAtMs) : Number.POSITIVE_INFINITY;
+  const maxClosedAgeMs = Math.max(intervalMs * 3, 60_000);
+  base.lastClosedAt = Number.isFinite(latestClosedAtMs) ? new Date(latestClosedAtMs).toISOString() : null;
+  base.historyAgeMinutes = Number.isFinite(latestClosedAgeMs) ? Number((latestClosedAgeMs / 60_000).toFixed(1)) : null;
   base.historyQuality = {
     checkedBars: Math.min(history.length, qualityWindowBars),
     validClosedBars: qualityWindow.bars.length,
@@ -9711,6 +9730,9 @@ function buildPriceActionResearchSnapshot({ pair, timeframe, history = [], liveP
   };
   if (integrity.invalidBars || integrity.conflictingDuplicates || !integrity.hasTimestamps) {
     return unavailable("incoherent_ohlc", "Bougies OHLC à vérifier", "Aucun candidat de recherche n'est calculé : l'historique récent contient des OHLC invalides ou des valeurs contradictoires au même horodatage.");
+  }
+  if (latestClosedAgeMs > maxClosedAgeMs) {
+    return unavailable("stale_history", "Dernier OHLC trop ancien", `La dernière bougie clôturée date de ${base.historyAgeMinutes ?? "?"} min; limite pour ${timeframe} : ${(maxClosedAgeMs / 60_000).toFixed(1)} min.`);
   }
   const requiredCandidateBars = PRICE_ACTION_RULES.lookbackBars + 3;
   if (qualityWindow.trailingConsecutiveBars < requiredCandidateBars) {

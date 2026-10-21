@@ -968,6 +968,8 @@
     };
     const candidates = Array.isArray(research.candidates) ? research.candidates : [];
     const costsVerified = research.costValidation?.status === "spread_confirmed_commission_unknown";
+    const historyAge = Number(research.historyAgeMinutes);
+    const historyAgeLabel = Number.isFinite(historyAge) ? ` · dernière clôture il y a ${historyAge} min` : "";
     const candidateMarkup = candidates.length ? candidates.map((candidate) => `
       <div class="pa-research-candidate">
         <strong>${candidate.setup === "break_retest" ? "Cassure + retest" : "Rejet confirmé"} · ${escapeHtml(candidate.directionLabel || (candidate.direction === 1 ? "ACHAT" : "VENTE"))}</strong>
@@ -982,8 +984,8 @@
     return `
       <section class="pa-research-panel" aria-label="Diagnostic Price Action OHLC expérimental">
         <div class="pa-research-heading"><div><span>PRICE ACTION OHLC · ${escapeHtml(research.version || "recherche")}</span><strong>${escapeHtml(research.statusLabel || "Diagnostic")}</strong></div><b>NON EXÉCUTABLE</b></div>
-        <p>${escapeHtml(research.summary || "Le moteur attend des bougies Deriv alignées.")}</p>
-        <small>${escapeHtml(research.timeframe || result.meta?.timeframe || "UT")} · ${Number(research.bars || 0)} bougies clôturées · ${escapeHtml(research.source || "source inconnue")}</small>
+        <p>${escapeHtml(research.summary || "Le moteur attend un historique OHLC frais et aligné sur l'unité choisie.")}</p>
+        <small>${escapeHtml(research.timeframe || result.meta?.timeframe || "UT")} · ${Number(research.bars || 0)} bougies clôturées · ${escapeHtml(research.source || "source inconnue")}${historyAgeLabel}</small>
         <div class="pa-research-candidates">${candidateMarkup}</div>
         <small>${escapeHtml(research.rule || "Cassure clôturée puis retest confirmé.")} ${costsVerified
           ? "Spread ponctuel mesuré, commission non confirmée; un tick de slippage par côté est modélisé."
