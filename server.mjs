@@ -4415,7 +4415,10 @@ async function handleApi(req, res, url) {
         ok: true,
         ready: true,
         degraded: true,
-        storage: { status: "unavailable" },
+        storage: {
+          status: "unavailable",
+          reasonCode: databaseFailureReasonCode(error),
+        },
         capabilities: { analysis: "available_with_visitor_quota" },
       });
     }
@@ -13282,6 +13285,20 @@ const MAX_DEGRADED_ANALYSIS_QUOTA_ENTRIES = 10_000;
 const ANALYSIS_STORAGE_CHECK_TIMEOUT_MS = 1_800;
 const ANALYSIS_STORAGE_FAILURE_COOLDOWN_MS = 30_000;
 let analysisStorageUnavailableUntil = 0;
+
+function databaseFailureReasonCode(error) {
+  const code = String(error?.code || "").toUpperCase();
+  const message = String(error?.message || "").toLowerCase();
+  if (["28P01", "28000"].includes(code)) return "credentials_rejected";
+  if (code === "3D000") return "database_name_invalid";
+  if (code === "42501") return "database_permission_denied";
+  if (code.startsWith("42") || code.startsWith("3F")) return "database_schema_or_query_error";
+  if (["ENOTFOUND", "EAI_AGAIN"].includes(code)) return "database_host_unresolved";
+  if (["ECONNREFUSED", "ECONNRESET", "08001", "08006", "57P01"].includes(code)) return "database_connection_failed";
+  if (["ETIMEDOUT", "ESOCKETTIMEDOUT", "57014"].includes(code) || /timeout|timed out/.test(message)) return "database_connection_timeout";
+  if (/ssl|tls|certificate/.test(`${code} ${message}`)) return "database_tls_error";
+  return "database_unavailable";
+}
 
 function databaseKnownUnavailable() {
   const health = providerHealth.get("database");
